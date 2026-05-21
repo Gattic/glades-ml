@@ -1,11 +1,14 @@
 // GPU transformer state implementation.
 #include "gpu_transformer_state.h"
 #include "gpu_kernels.h"
+#include <algorithm>
+#include <cmath>
 
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace glades {
@@ -37,7 +40,8 @@ GpuTransformerWeights::GpuTransformerWeights()
       matraBatchDescriptorsUploaded(false),
       adamPtrsUploaded(false),
       adamMetricMetaUploaded(false), adamMetricScope(0u),
-      matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL)
+      matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL),
+      lowpReady(false), lowpDType(0), lowpIsCanonical(false)
 {
 }
 
@@ -53,13 +57,80 @@ static bool allocBuf(GpuBuffer<float>& buf, size_t n)
 	return buf.allocate(n);
 }
 
+static bool allocBuf(GpuBuffer<uint16_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
+static bool allocBuf(GpuBuffer<int8_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
+static bool allocBuf(GpuBuffer<uint8_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
 bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned int nh,
                                       unsigned int nkvh, unsigned int nl,
                                       unsigned int vs, unsigned int is, unsigned int os,
                                       unsigned int ffk, bool tm, bool te,
-                                      bool skipAdamBufs)
+                                      bool skipAdamBufs,
+                                      bool adamStateBf16,
+                                      int mlaLatentDim,
+                                      bool adamStateInt8,
+                                      bool faceEmbedding,
+                                      bool gradStorageBf16,
+                                      bool gradStorageBf16Phase2,
+                                      bool weightStorageBf16)
 {
 	free();
+	// int8 wins over bf16 if both flags accidentally set (it's the more
+	// aggressive compression — see MixedPrecisionConfig comments).
+	const bool useInt8    = adamStateInt8 && !skipAdamBufs;
+	const bool useBf16    = adamStateBf16 && !skipAdamBufs && !useInt8;
+	// FACE on tokE replaces ALL dense Adam state on the embedding (m, v
+	// in any precision).  When tm && faceEmbedding, allocate FACE state
+	// instead of vTokE/v2TokE/vTokE_bf16/etc.
+	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
+	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
+	const bool useBf16GradsPh2 = gradStorageBf16Phase2 && useBf16Grads;
+	const bool useBf16Weights_ = weightStorageBf16 && useBf16GradsPh2;
+	// Set the canonical-bf16 flag here so ensureLowpMirrors short-circuits
+	// (mirrors are the canonical store, no FP32 master refresh).
+	lowpIsCanonical = useBf16Weights_;
+	// Phase-2: per-block W{q,k,v,o,1,2}, gWIn, gWOut FP32 grad buffers are
+	// RETIRED (backward writes scratch+commit-bf16 directly).  Bias grads
+	// and gTokE keep their FP32 allocs (gTokE goes through Phase-1 cast
+	// path due to the bf16-scatter precision issue).  All retired by default
+	// in Phase-2; the GLADES_BF16_PH2_RETIRE env var (off|w2|w1|wq|wk|wv|wo|win|wout|all)
+	// remains as a per-tensor diagnostic override for debugging.
+	const char* phase2Mode_env = useBf16GradsPh2 ? std::getenv("GLADES_BF16_PH2_RETIRE") : NULL;
+	const bool ph2DiagOff   = phase2Mode_env && !std::strcmp(phase2Mode_env, "off");
+	const bool ph2RetireAll = useBf16GradsPh2 && !ph2DiagOff
+	    && (phase2Mode_env == NULL || !std::strcmp(phase2Mode_env, "all"));
+	const bool ph2RetireW2  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w2"));
+	const bool ph2RetireW1  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w1"));
+	const bool ph2RetireWq  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wq"));
+	const bool ph2RetireWk  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wk"));
+	const bool ph2RetireWv  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wv"));
+	const bool ph2RetireWo  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wo"));
+	const bool ph2RetireWIn = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "win"));
+	const bool ph2RetireWOut= ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wout"));
+	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
+	const bool allocBfMV  = useBf16;
+	const bool allocI8MV  = useInt8;
+	// Per-256-element absmax-scale array length (matches ADAM_INT8_BS in the
+	// kernel).  Kept inline here so this header doesn't need to reach into
+	// gpu_kernels.h for the constant.
+	#define I8_SCALE_N(n_) (((n_) + 255UL) >> 8)
 
 	dModel = dm;
 	dFF = df;
@@ -77,39 +148,122 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF; // SwiGLU vs MLP
 
-	// Token embedding
+	// Stage 8b deeper refactor: when bf16 is the canonical weight store,
+	// allocate ONE shared FP32 staging buffer sized to the largest single
+	// weight tensor (typically tokE = vs × dm ≈ 250 MB at 1.84B/V=32k).
+	// uploadFp32MasterAsBf16() routes host FP32 → staging → bf16 mirror,
+	// removing the need to allocate per-tensor FP32 masters during init.
+	// At L=53 d=2048 dFF=5632, this saves ~7.7 GB of init peak (the
+	// FP32 master cost from allocBuf() on Wq/Wk/Wv/Wo/W1/W2 across blocks),
+	// unlocking flagship 1.84B fit on a 16 GB GPU.
+	if (useBf16Weights_)
+	{
+		size_t maxTensor = 0;
+		if (tokenModel) maxTensor = std::max(maxTensor, (size_t)vs * dm);
+		maxTensor = std::max(maxTensor, (size_t)dm * is);  // WIn
+		if (!tieEmbeddings) maxTensor = std::max(maxTensor, (size_t)os * dm);  // WOut
+		// Per-block: max(Wq/Wk/Wv/Wo, W1, W2)
+		maxTensor = std::max(maxTensor, (size_t)dm * dm);             // Wq/Wo
+		maxTensor = std::max(maxTensor, (size_t)dm * dModelKV);       // Wk/Wv
+		maxTensor = std::max(maxTensor, (size_t)ff1Width * dm);       // W1
+		maxTensor = std::max(maxTensor, (size_t)dm * df);             // W2
+		if (!allocBuf(lowpStagingFp32, maxTensor)) return false;
+	}
+
+	// Token embedding.  FP32 master always allocated here so
+	// uploadTransformerWeights can write into it; freed AFTER the first
+	// ensureLowpMirrors cast when useBf16Weights_=true (see freeFp32Masters
+	// below).  Forward gather/GEMM checks gb.tokE.size() to route through
+	// the bf16 mirror once the master is freed.
+	//
+	// Stage 8b deeper refactor: when useBf16Weights_=true, the FP32 master
+	// is NEVER allocated.  Caller's upload path uses lowpStagingFp32 as
+	// transient FP32 staging then casts to the bf16 mirror.  The bf16
+	// mirror itself is pre-allocated here (vs. lazy in ensureLowpMirrors)
+	// so the upload kernel has a fixed destination.
 	if (tokenModel)
 	{
-		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(vTokE, (size_t)vs * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(tokE, (size_t)vs * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(tokELowp, (size_t)vs * dm)) return false;
+		// FACE replaces all dense Adam state on tokE — skip the m/v allocations
+		// in that case and instead allocate FACE state.  The dispatch in
+		// sgd_transformer.cpp picks FACE over int8/bf16/FP32 when faceEmbedding
+		// is set.
+		const bool tokE_fp_mv = allocFpMV && !useFaceTokE;
+		const bool tokE_bf_mv = allocBfMV && !useFaceTokE;
+		const bool tokE_i8_mv = allocI8MV && !useFaceTokE;
+		if (tokE_fp_mv && !allocBuf(vTokE, (size_t)vs * dm)) return false;
+		if (tokE_fp_mv && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (tokE_bf_mv && !allocBuf(vTokE_bf16, (size_t)vs * dm)) return false;
+		if (tokE_bf_mv && !allocBuf(v2TokE_bf16, (size_t)vs * dm)) return false;
+		if (tokE_i8_mv) {
+			const size_t n_ = (size_t)vs * dm;
+			if (!allocBuf(vTokE_int8,   n_))               return false;
+			if (!allocBuf(v2TokE_int8,  n_))               return false;
+			if (!allocBuf(vTokEScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2TokEScale,  I8_SCALE_N(n_)))   return false;
+		}
+		if (useFaceTokE) {
+			if (!allocBuf(faceZnBar,  (size_t)vs))  return false;
+			if (!allocBuf(faceDnBar,  (size_t)dm))  return false;
+			if (!allocBuf(faceQHat,   (size_t)1))   return false;
+			if (!allocBuf(faceGFHat,  (size_t)1))   return false;
+			if (!allocBuf(faceZnNew,  (size_t)vs))  return false;
+			if (!allocBuf(faceDnRaw,  (size_t)dm))  return false;
+			if (!allocBuf(faceQStep,  (size_t)1))   return false;
+			if (!allocBuf(faceGFStep, (size_t)1))   return false;
+		}
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
+		if (useBf16Grads && !allocBuf(gTokE_bf16, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(mLmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(v2LmBias, vs)) return false;
 		if (!allocBuf(gLmBias, vs)) return false;
 	}
 
-	// Input projection
+	// Input projection.  FP32 master allocated for upload; freed by
+	// freeFp32Masters when useBf16Weights_=true.
 	if (!tokenModel)
 	{
-		if (!allocBuf(WIn, (size_t)dm * is)) return false;
-		if (!skipAdamBufs && !allocBuf(vWIn, (size_t)dm * is)) return false;
-		if (!skipAdamBufs && !allocBuf(v2WIn, (size_t)dm * is)) return false;
-		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
+		if (!useBf16Weights_ && !allocBuf(WIn, (size_t)dm * is)) return false;
+		if (useBf16Weights_  && !allocBuf(WInLowp, (size_t)dm * is)) return false;
+		if (allocFpMV && !allocBuf(vWIn, (size_t)dm * is)) return false;
+		if (allocFpMV && !allocBuf(v2WIn, (size_t)dm * is)) return false;
+		if (allocBfMV && !allocBuf(vWIn_bf16, (size_t)dm * is)) return false;
+		if (allocBfMV && !allocBuf(v2WIn_bf16, (size_t)dm * is)) return false;
+		if (allocI8MV) {
+			const size_t n_ = (size_t)dm * is;
+			if (!allocBuf(vWIn_int8,   n_))               return false;
+			if (!allocBuf(v2WIn_int8,  n_))               return false;
+			if (!allocBuf(vWInScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2WInScale,  I8_SCALE_N(n_)))   return false;
+		}
+		if (!ph2RetireWIn && !allocBuf(gWIn, (size_t)dm * is)) return false;
+		if (useBf16Grads && !allocBuf(gWIn_bf16, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(v2BIn, dm)) return false;
 		if (!allocBuf(gBIn, dm)) return false;
 	}
 
-	// Output projection
+	// Output projection.  FP32 master allocated for upload; freed by
+	// freeFp32Masters when useBf16Weights_=true.
 	if (!tokenModel)
 	{
 		if (!allocBuf(WOut, (size_t)os * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(vWOut, (size_t)os * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(v2WOut, (size_t)os * dm)) return false;
-		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
+		if (allocFpMV && !allocBuf(vWOut, (size_t)os * dm)) return false;
+		if (allocFpMV && !allocBuf(v2WOut, (size_t)os * dm)) return false;
+		if (allocBfMV && !allocBuf(vWOut_bf16, (size_t)os * dm)) return false;
+		if (allocBfMV && !allocBuf(v2WOut_bf16, (size_t)os * dm)) return false;
+		if (allocI8MV) {
+			const size_t n_ = (size_t)os * dm;
+			if (!allocBuf(vWOut_int8,   n_))               return false;
+			if (!allocBuf(v2WOut_int8,  n_))               return false;
+			if (!allocBuf(vWOutScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2WOutScale,  I8_SCALE_N(n_)))   return false;
+		}
+		if (!ph2RetireWOut && !allocBuf(gWOut, (size_t)os * dm)) return false;
+		if (useBf16Grads && !allocBuf(gWOut_bf16, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(v2BOut, os)) return false;
@@ -142,23 +296,94 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gLn1Gamma, dm)) return false;
 		if (!allocBuf(b.gLn1Beta, dm)) return false;
 
-		// QKV+O projections
-		if (!allocBuf(b.Wq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.Wo, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWo, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.gWq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.gWo, (size_t)dm * dm)) return false;
+		// QKV+O projections.  FP32 master allocated for upload; freed by
+		// freeFp32Masters when useBf16Weights_=true.
+		// Stage 8b deeper: under useBf16Weights_, skip FP32 master entirely
+		// and pre-allocate the bf16 mirror as the canonical store.  The
+		// upload path uses lowpStagingFp32 as transient FP32 staging.
+		if (!useBf16Weights_ && !allocBuf(b.Wq, (size_t)dm * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wo, (size_t)dm * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WqLowp, (size_t)dm * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WkLowp, (size_t)dm * dModelKV)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WvLowp, (size_t)dm * dModelKV)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WoLowp, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.vWo, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vWq_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vWk_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.vWv_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.vWo_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wq_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wk_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wv_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wo_bf16, (size_t)dm * dm)) return false;
+		if (allocI8MV) {
+			const size_t nQ = (size_t)dm * dm;
+			const size_t nK = (size_t)dm * dModelKV;
+			const size_t nV = (size_t)dm * dModelKV;
+			const size_t nO = (size_t)dm * dm;
+			if (!allocBuf(b.vWq_int8,   nQ))             return false;
+			if (!allocBuf(b.vWk_int8,   nK))             return false;
+			if (!allocBuf(b.vWv_int8,   nV))             return false;
+			if (!allocBuf(b.vWo_int8,   nO))             return false;
+			if (!allocBuf(b.v2Wq_int8,  nQ))             return false;
+			if (!allocBuf(b.v2Wk_int8,  nK))             return false;
+			if (!allocBuf(b.v2Wv_int8,  nV))             return false;
+			if (!allocBuf(b.v2Wo_int8,  nO))             return false;
+			if (!allocBuf(b.vWqScale,   I8_SCALE_N(nQ))) return false;
+			if (!allocBuf(b.vWkScale,   I8_SCALE_N(nK))) return false;
+			if (!allocBuf(b.vWvScale,   I8_SCALE_N(nV))) return false;
+			if (!allocBuf(b.vWoScale,   I8_SCALE_N(nO))) return false;
+			if (!allocBuf(b.v2WqScale,  I8_SCALE_N(nQ))) return false;
+			if (!allocBuf(b.v2WkScale,  I8_SCALE_N(nK))) return false;
+			if (!allocBuf(b.v2WvScale,  I8_SCALE_N(nV))) return false;
+			if (!allocBuf(b.v2WoScale,  I8_SCALE_N(nO))) return false;
+		}
+		if (!ph2RetireWq && !allocBuf(b.gWq, (size_t)dm * dm)) return false;
+		if (!ph2RetireWk && !allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
+		if (!ph2RetireWv && !allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
+		if (!ph2RetireWo && !allocBuf(b.gWo, (size_t)dm * dm)) return false;
+		if (useBf16Grads) {
+			if (!allocBuf(b.gWq_bf16, (size_t)dm * dm)) return false;
+			if (!allocBuf(b.gWk_bf16, (size_t)dm * dModelKV)) return false;
+			if (!allocBuf(b.gWv_bf16, (size_t)dm * dModelKV)) return false;
+			if (!allocBuf(b.gWo_bf16, (size_t)dm * dm)) return false;
+		}
+
+		// Paradigm shift #76 MLA latent projections (allocated when mlaLatentDim > 0).
+		if (mlaLatentDim > 0) {
+			const size_t dC = (size_t)mlaLatentDim;
+			if (!allocBuf(b.Wdkv, (size_t)dm * dC)) return false;
+			if (!allocBuf(b.Wuk,  dC * (size_t)dModelKV)) return false;
+			if (!allocBuf(b.Wuv,  dC * (size_t)dModelKV)) return false;
+			if (allocFpMV) {
+				if (!allocBuf(b.vWdkv,  (size_t)dm * dC)) return false;
+				if (!allocBuf(b.vWuk,   dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.vWuv,   dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.v2Wdkv, (size_t)dm * dC)) return false;
+				if (!allocBuf(b.v2Wuk,  dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.v2Wuv,  dC * (size_t)dModelKV)) return false;
+			}
+			if (!allocBuf(b.gWdkv, (size_t)dm * dC)) return false;
+			if (!allocBuf(b.gWuk,  dC * (size_t)dModelKV)) return false;
+			if (!allocBuf(b.gWuv,  dC * (size_t)dModelKV)) return false;
+			if (useBf16Grads) {
+				if (!allocBuf(b.gWdkv_bf16, (size_t)dm * dC)) return false;
+				if (!allocBuf(b.gWuk_bf16,  dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.gWuv_bf16,  dC * (size_t)dModelKV)) return false;
+			}
+			// Forward scratch sized per batch — actual size T*dC depends on
+			// runtime T; allocate at upper bound T_max via gpuTransformerScratch
+			// instead. Mark these as zero-allocated here.
+		}
 
 		if (!allocBuf(b.bq, dm)) return false;
 		if (!allocBuf(b.bk, dModelKV)) return false;
@@ -187,15 +412,44 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gLn2Gamma, dm)) return false;
 		if (!allocBuf(b.gLn2Beta, dm)) return false;
 
-		// FFN
-		if (!allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.W2, (size_t)dm * df)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vW2, (size_t)dm * df)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2W2, (size_t)dm * df)) return false;
-		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
+		// FFN.  FP32 master allocated for upload; freed by freeFp32Masters
+		// when useBf16Weights_=true.  IMPORTANT: if paradigm-#74 binary FFN is
+		// enabled, the forward pass reads gb.W1/W2 FP32 master directly
+		// (sign() discretization) — incompatible with retire.  See the
+		// freeFp32Masters site in sgd_transformer for the binaryFFN guard.
+		// Stage 8b deeper: skip FP32 master + pre-alloc bf16 mirror under
+		// useBf16Weights_.  Largest tensor pair (~64 MB at 1.84B/L=53/dFF=5632
+		// for W1, half that for W2).
+		if (!useBf16Weights_ && !allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.W2, (size_t)dm * df)) return false;
+		if (useBf16Weights_  && !allocBuf(b.W1Lowp, (size_t)ff1Width * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.W2Lowp, (size_t)dm * df)) return false;
+		if (allocFpMV && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vW2, (size_t)dm * df)) return false;
+		if (allocFpMV && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2W2, (size_t)dm * df)) return false;
+		if (allocBfMV && !allocBuf(b.vW1_bf16, (size_t)ff1Width * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vW2_bf16, (size_t)dm * df)) return false;
+		if (allocBfMV && !allocBuf(b.v2W1_bf16, (size_t)ff1Width * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2W2_bf16, (size_t)dm * df)) return false;
+		if (allocI8MV) {
+			const size_t n1 = (size_t)ff1Width * dm;
+			const size_t n2 = (size_t)dm * df;
+			if (!allocBuf(b.vW1_int8,   n1))             return false;
+			if (!allocBuf(b.vW2_int8,   n2))             return false;
+			if (!allocBuf(b.v2W1_int8,  n1))             return false;
+			if (!allocBuf(b.v2W2_int8,  n2))             return false;
+			if (!allocBuf(b.vW1Scale,   I8_SCALE_N(n1))) return false;
+			if (!allocBuf(b.vW2Scale,   I8_SCALE_N(n2))) return false;
+			if (!allocBuf(b.v2W1Scale,  I8_SCALE_N(n1))) return false;
+			if (!allocBuf(b.v2W2Scale,  I8_SCALE_N(n2))) return false;
+		}
+		if (!ph2RetireW1 && !allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
+		if (!ph2RetireW2 && !allocBuf(b.gW2, (size_t)dm * df)) return false;
+		if (useBf16Grads) {
+			if (!allocBuf(b.gW1_bf16, (size_t)ff1Width * dm)) return false;
+			if (!allocBuf(b.gW2_bf16, (size_t)dm * df)) return false;
+		}
 		if (!allocBuf(b.b1, ff1Width)) return false;
 		if (!allocBuf(b.b2, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(b.mB1, ff1Width)) return false;
@@ -209,7 +463,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// Allocate batched Adam device arrays shared by AdamW-like backbones.
 	// ECHO-specific batched observe / metric metadata is allocated lazily when
 	// the fused ECHO path is actually active.
-	int maxGroups = 6 + 16 * static_cast<int>(nl);
+	// Match sgd_transformer.cpp's maxAdamGroups: base 6 + 16 per layer + 3
+	// per layer when MLA is active. Without MLA, the +3 is unused but
+	// over-allocating a few pointer slots is harmless.
+	const int adamPerLayer = 16 + (mlaLatentDim > 0 ? 3 : 0);
+	int maxGroups = 6 + adamPerLayer * static_cast<int>(nl);
 	cudaError_t e;
 	echoObserveCapacity = 0;
 	echoObserveEntryCount = 0;
@@ -368,7 +626,127 @@ void GpuTransformerWeights::free()
 	matraBatchDescriptorCount = 0;
 	matraBatchDescriptorHash = 0ULL;
 	initialized = false;
+	lowpReady = false;
+	lowpDType = 0;
+	lowpIsCanonical = false;
 	// GpuBuffer destructors handle cudaFree automatically.
+}
+
+// Populate every BF16 Lowp mirror from its FP32 master via the existing
+// cast_f32_to_bf16 kernel. Allocates mirror buffers on first call.
+bool GpuTransformerWeights::ensureLowpMirrors()
+{
+	if (!initialized)
+		return false;
+
+	// BF16-weights mode: *Lowp buffers ARE the canonical weight store.
+	// Subsequent refreshes from FP32 master would overwrite the in-place
+	// Adam updates.  First call (lowpReady=false) still goes through the
+	// cast pass below to seed the mirrors from the just-uploaded FP32
+	// init weights; later calls short-circuit.
+	if (lowpIsCanonical && lowpReady) return true;
+
+	// Stage 8b deeper refactor: when lowpIsCanonical=true, the FP32
+	// masters were never allocated (allocate() skipped them under
+	// useBf16Weights_=true). The bf16 mirrors were filled directly by
+	// uploadFp32MasterAsBf16() during the upload phase.  This call
+	// short-circuits to lowpReady=true with no work to do.
+	if (lowpIsCanonical)
+	{
+		lowpReady = true;
+		return true;
+	}
+
+	// Stage 8b: under lowpIsCanonical, retire each master IMMEDIATELY after
+	// its cast — instead of waiting for freeFp32Masters() at end-of-init.
+	// (Retained for the legacy path where FP32 masters DO get allocated;
+	// no-op now under the deeper refactor since lowpIsCanonical short-circuits
+	// above.)
+	const bool retireEager = lowpIsCanonical;
+
+	// For each master -> mirror pair, allocate the mirror if empty, cast, and
+	// (when retireEager) free the master.  Helper captures the shape from the
+	// master buffer's allocated size.
+#define GLADES_LOWP_ENSURE(master, mirror)                                 \
+	do {                                                                   \
+		const size_t n_ = (master).size();                                 \
+		if (n_ == 0) { break; }                                            \
+		if ((mirror).size() != n_) {                                       \
+			if (!(mirror).allocate(n_)) return false;                      \
+		}                                                                  \
+		if (!cast_f32_to_bf16((master).data(), (mirror).data(), n_))       \
+			return false;                                                  \
+		if (retireEager) (master).free();                                  \
+	} while (0)
+
+	if (tokenModel)
+		GLADES_LOWP_ENSURE(tokE, tokELowp);
+	GLADES_LOWP_ENSURE(WIn, WInLowp);
+	if (!tieEmbeddings)
+		GLADES_LOWP_ENSURE(WOut, WOutLowp);
+
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		Block& b = blocks[li];
+		GLADES_LOWP_ENSURE(b.Wq, b.WqLowp);
+		GLADES_LOWP_ENSURE(b.Wk, b.WkLowp);
+		GLADES_LOWP_ENSURE(b.Wv, b.WvLowp);
+		GLADES_LOWP_ENSURE(b.Wo, b.WoLowp);
+		GLADES_LOWP_ENSURE(b.W1, b.W1Lowp);
+		GLADES_LOWP_ENSURE(b.W2, b.W2Lowp);
+	}
+#undef GLADES_LOWP_ENSURE
+
+	lowpReady = true;
+	// lowpDType is set by the caller (sgd_transformer) based on
+	// TrainingConfig.mixedPrecision.weightDType; only BF16 is supported here.
+	return true;
+}
+
+bool GpuTransformerWeights::uploadFp32MasterAsBf16(uint16_t* dst_bf16,
+                                                    const float* src_host_fp32,
+                                                    size_t n)
+{
+	// Stage 8b deeper refactor: route host FP32 → lowpStagingFp32 → cast
+	// to bf16 mirror, avoiding per-tensor FP32 master allocation.
+	// Caller must ensure dst_bf16 is sized to n (allocated in allocate()).
+	if (!dst_bf16 || !src_host_fp32 || n == 0) return false;
+	if (lowpStagingFp32.size() < n)
+	{
+		std::fprintf(stderr,
+		    "[glades-cuda] uploadFp32MasterAsBf16: staging buffer (%zu) < n (%zu)\n",
+		    lowpStagingFp32.size(), n);
+		return false;
+	}
+	if (!lowpStagingFp32.upload(src_host_fp32, n)) return false;
+	if (!cast_f32_to_bf16(lowpStagingFp32.data(), dst_bf16, n)) return false;
+	return true;
+}
+
+void GpuTransformerWeights::freeFp32Masters()
+{
+	if (!initialized) return;
+	if (!lowpIsCanonical) return;  // not in bf16-weights canonical mode
+	if (!lowpReady) return;        // mirrors not yet built — refuse to free
+
+	// Free FP32 master buffers whose forward path now reads from the bf16
+	// mirror.  GpuBuffer::free() is idempotent — safe if already freed.
+	if (tokenModel) tokE.free();
+	WIn.free();
+	WOut.free();
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		Block& b = blocks[li];
+		b.Wq.free();
+		b.Wk.free();
+		b.Wv.free();
+		b.Wo.free();
+		b.W1.free();
+		b.W2.free();
+	}
+	// MLA tensors (Wdkv/Wuk/Wuv) NOT freed — paradigm-#76 mla_attention_forward_gpu
+	// reads them as FP32 directly.  Adding bf16 dispatch is future Stage 7d.
+	// LN/bias tensors NOT freed — small absolute size, no bf16 dispatch.
 }
 
 // ---- GpuTransformerScratch ----
@@ -377,6 +755,7 @@ GpuTransformerScratch::GpuTransformerScratch()
     : initialized(false),
       T(0), dModel(0), dFF(0), dModelKV(0), nHeads(0), nLayers(0),
       inputSize(0), outSize(0), ff1Width(0),
+      slotsPerLayer(0), nCheckpoints(0),
       d_dKdVZeroPtrs(0), d_dKdVZeroSizes(0)
 {
 }
@@ -394,6 +773,16 @@ bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
 	if (!scratch)
 		return false;
 
+	// Effective slot count expected for this config (used for shape match).
+	unsigned int expectedSlots = cfg.nLayers;
+	if (cfg.activationCheckpoint && cfg.nLayers > 1u)
+	{
+		double k = std::ceil(std::sqrt(static_cast<double>(cfg.nLayers)));
+		unsigned int K = static_cast<unsigned int>(k);
+		if (K < 1u) K = 1u;
+		if (K > cfg.nLayers) K = cfg.nLayers;
+		expectedSlots = K;
+	}
 	const bool shapeMatches =
 	    scratch->initialized &&
 	    scratch->T >= cfg.T &&
@@ -404,18 +793,21 @@ bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
 	    scratch->dModelKV == cfg.dModelKV &&
 	    scratch->nHeads == cfg.nHeads &&
 	    scratch->nLayers == cfg.nLayers &&
-	    scratch->ff1Width == cfg.ff1Width;
+	    scratch->ff1Width == cfg.ff1Width &&
+	    scratch->slotsPerLayer == expectedSlots;
 	if (shapeMatches)
 		return true;
 
 	return scratch->allocate(cfg.T, cfg.inputSize, cfg.outSize,
 	                         cfg.dModel, cfg.dFF, cfg.dModelKV,
-	                         cfg.nHeads, cfg.nLayers, cfg.ff1Width);
+	                         cfg.nHeads, cfg.nLayers, cfg.ff1Width,
+	                         cfg.activationCheckpoint);
 }
 
 bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigned int os,
                                       unsigned int dm, unsigned int df, unsigned int dmkv,
-                                      unsigned int nh, unsigned int nl, unsigned int f1w)
+                                      unsigned int nh, unsigned int nl, unsigned int f1w,
+                                      bool activationCheckpoint)
 {
 	free();
 
@@ -429,6 +821,28 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	nLayers = nl;
 	ff1Width = f1w;
 
+	// Activation gradient checkpointing: shrink per-layer activation scratches
+	// to slotsPerLayer = ⌈√L⌉ slots (cyclic li%K addressing).  When disabled,
+	// slotsPerLayer == nLayers — modulo collapses to identity, behavior
+	// identical to pre-checkpoint allocation.
+	if (activationCheckpoint && nl > 1u)
+	{
+		double k = std::ceil(std::sqrt(static_cast<double>(nl)));
+		unsigned int K = static_cast<unsigned int>(k);
+		if (K < 1u) K = 1u;
+		if (K > nl) K = nl;
+		slotsPerLayer = K;
+		// Number of segments = ⌈nl / K⌉; checkpoints = nSegments - 1 (segment 0
+		// reads from `h`, no checkpoint needed).
+		const unsigned int nSegments = (nl + K - 1u) / K;
+		nCheckpoints = (nSegments > 0u) ? (nSegments - 1u) : 0u;
+	}
+	else
+	{
+		slotsPerLayer = nl;
+		nCheckpoints = 0u;
+	}
+
 	const size_t sT = static_cast<size_t>(T);
 	const size_t sdm = static_cast<size_t>(dm);
 	const size_t sdf = static_cast<size_t>(df);
@@ -437,26 +851,35 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	const size_t sf1w = static_cast<size_t>(f1w);
 	const size_t sis = static_cast<size_t>(is);
 	const size_t sos = static_cast<size_t>(os);
+	// Per-layer activation slot count (= snl when checkpointing off).
+	const size_t sSlots = static_cast<size_t>(slotsPerLayer);
+	const size_t sCkpt  = static_cast<size_t>(nCheckpoints);
 
 	// Forward
 	if (!x.allocate(sT * sis)) return false;
 	if (!h.allocate(sT * sdm)) return false;
-	if (!ln1Mean.allocate(snl * sT)) return false;
-	if (!ln1InvStd.allocate(snl * sT)) return false;
-	if (!x1.allocate(snl * sT * sdm)) return false;
-	if (!Q.allocate(snl * sT * sdm)) return false;
-	if (!K.allocate(snl * sT * sdmkv)) return false;
-	if (!V.allocate(snl * sT * sdmkv)) return false;
-	if (!attnConcat.allocate(snl * sT * sdm)) return false;
-	if (!attnOut.allocate(snl * sT * sdm)) return false;
-	if (!hAfterAttn.allocate(snl * sT * sdm)) return false;
-	if (!ln2Mean.allocate(snl * sT)) return false;
-	if (!ln2InvStd.allocate(snl * sT)) return false;
-	if (!x2.allocate(snl * sT * sdm)) return false;
-	if (!ff1.allocate(snl * sT * sf1w)) return false;
-	if (!ff1Act.allocate(snl * sT * sdf)) return false;
-	if (!ffOut.allocate(snl * sT * sdm)) return false;
-	if (!hAfterFF.allocate(snl * sT * sdm)) return false;
+	if (!ln1Mean.allocate(sSlots * sT)) return false;
+	if (!ln1InvStd.allocate(sSlots * sT)) return false;
+	if (!x1.allocate(sSlots * sT * sdm)) return false;
+	if (!Q.allocate(sSlots * sT * sdm)) return false;
+	if (!K.allocate(sSlots * sT * sdmkv)) return false;
+	if (!V.allocate(sSlots * sT * sdmkv)) return false;
+	if (!attnConcat.allocate(sSlots * sT * sdm)) return false;
+	if (!attnOut.allocate(sSlots * sT * sdm)) return false;
+	if (!hAfterAttn.allocate(sSlots * sT * sdm)) return false;
+	if (!ln2Mean.allocate(sSlots * sT)) return false;
+	if (!ln2InvStd.allocate(sSlots * sT)) return false;
+	if (!x2.allocate(sSlots * sT * sdm)) return false;
+	if (!ff1.allocate(sSlots * sT * sf1w)) return false;
+	if (!ff1Act.allocate(sSlots * sT * sdf)) return false;
+	if (!ffOut.allocate(sSlots * sT * sdm)) return false;
+	if (!hAfterFF.allocate(sSlots * sT * sdm)) return false;
+	// Activation checkpoints: hAfterFF at every Kth segment boundary.
+	if (sCkpt > 0u)
+	{
+		if (!checkpoints.allocate(sCkpt * sT * sdm)) return false;
+	}
+	(void)snl; // silence unused-when-checkpointing-on if compiler warns
 	if (!hPostFinalLN.allocate(sT * sdm)) return false;
 	if (!lnFinalMean.allocate(sT)) return false;
 	if (!lnFinalInvStd.allocate(sT)) return false;
@@ -489,12 +912,54 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!gpuInvFreq.allocate(dHead / 2)) return false;
 	if (!gpuTargetsT.allocate(sT)) return false;
 
+	// BF16 activation staging, sized for the widest activation tile in the net
+	// (T * max(dModel, ff1Width, vocabSize, inputSize)). Allocated
+	// unconditionally so mpEnable can be toggled without re-allocating scratch.
+	{
+		size_t widest = sT * sdm;
+		if (sT * sf1w > widest) widest = sT * sf1w;
+		if (sT * sdf  > widest) widest = sT * sdf;
+		if (sT * sos  > widest) widest = sT * sos;
+		if (sT * sis  > widest) widest = sT * sis;
+		if (!activationLowp.allocate(widest)) return false;
+		if (!activationLowp2.allocate(widest)) return false;
+		// Q/K/V BF16 scratches: one layer's worth each. Use max(dModel, dModelKV)
+		// to cover both Q (dModel) and K/V (dModelKV) within a single dimension.
+		const size_t qkvMax = (sdm > sdmkv ? sT * sdm : sT * sdmkv);
+		if (!qLowp.allocate(sT * sdm)) return false;
+		if (!kLowp.allocate(qkvMax)) return false;
+		if (!vLowp.allocate(qkvMax)) return false;
+	}
+
 	// GPU loss computation scalars
 	if (!lossSum.allocate(1)) return false;
 	if (!lossCount.allocate(1)) return false;
 	if (!correctCount.allocate(1)) return false;
 	if (!validCount.allocate(1)) return false;
 	if (!lossPack.allocate(4)) return false;
+
+	// Shared FP32 grad-write scratch.  Sized to the widest weight tensor
+	// across the model so any single backward GEMM can write here with
+	// beta=0; bf16_accum_axpy then commits the result to the persistent
+	// BF16 grad buffer (when MixedPrecisionConfig::gradStorageBf16=true).
+	// Always allocated — it's ≤260 MB at 1.84B and simplifies the dispatch.
+	{
+		size_t widestWeight = sdm * sdm;                          // Wq, Wo
+		if (sdm * sdmkv > widestWeight) widestWeight = sdm * sdmkv;  // Wk, Wv
+		if (sf1w * sdm > widestWeight) widestWeight = sf1w * sdm;    // W1
+		if (sdm * sdf  > widestWeight) widestWeight = sdm * sdf;     // W2
+		if (sos * sdm > widestWeight) widestWeight = sos * sdm;      // tokE / WOut
+		if (!gradScratchFp32.allocate(widestWeight)) return false;
+
+		// Same shape; allocated only when weightStorageBf16 mode is on (caller
+		// can re-allocate later via ensureWeightScratchFp32).  Initial alloc
+		// here because it's tied to the model shape; caller toggles it on by
+		// re-calling allocate() with the right config.
+		// (Allocated unconditionally; 260 MB at 1.84B is small relative to
+		// what we save by retiring FP32 weight masters, and the caller may
+		// not have known weightStorageBf16 at scratch-allocate time.)
+		if (!weightScratchFp32.allocate(widestWeight)) return false;
+	}
 
 	// Persistent device arrays for batch-zeroing dK/dV.
 	{
@@ -534,13 +999,24 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	if (!gpu.initialized)
 		return false;
 
+	// Stage 8b deeper: when canonical (FP32 master never allocated), route
+	// host FP32 → gpu.lowpStagingFp32 → cast → bf16 mirror.
+	const bool canonicalBf16 = gpu.lowpIsCanonical;
 	if (gpu.tokenModel && tokE && tokESize > 0)
 	{
-		if (!gpu.tokE.upload(tokE, tokESize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.tokELowp.data(), tokE, tokESize)) return false;
+		} else {
+			if (!gpu.tokE.upload(tokE, tokESize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && WIn && WInSize > 0)
 	{
-		if (!gpu.WIn.upload(WIn, WInSize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.WInLowp.data(), WIn, WInSize)) return false;
+		} else {
+			if (!gpu.WIn.upload(WIn, WInSize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && bIn && bInSize > 0)
 	{
@@ -548,7 +1024,11 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	}
 	if (!gpu.tokenModel && WOut && WOutSize > 0)
 	{
-		if (!gpu.WOut.upload(WOut, WOutSize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.WOutLowp.data(), WOut, WOutSize)) return false;
+		} else {
+			if (!gpu.WOut.upload(WOut, WOutSize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && bOut && bOutSize > 0)
 	{
@@ -570,6 +1050,36 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	return true;
 }
 
+// Helper: download a possibly-retired FP32 master into a host buffer.
+// When the FP32 master is alive (master.size() > 0) → direct download.
+// When retired (master freed for memory) but the bf16 mirror is canonical
+// (mirror.size() > 0) → download bf16 mirror to a temporary host buffer
+// and cast bf16→FP32 element-wise on host.  Returns true on success.
+static bool downloadFpOrBf16Master(const GpuBuffer<float>& master,
+                                    const GpuBuffer<uint16_t>& mirror,
+                                    float* dst, size_t dstSize)
+{
+	if (master.size() > 0)
+	{
+		return master.download(dst, dstSize);
+	}
+	if (mirror.size() == 0)
+	{
+		// Neither alive — leave host buffer untouched (init values stale).
+		return true;
+	}
+	// bf16-canonical path: download mirror to host bf16 staging, cast on host.
+	std::vector<uint16_t> staging(dstSize);
+	if (!mirror.download(staging.data(), dstSize)) return false;
+	for (size_t i = 0; i < dstSize; ++i)
+	{
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(staging[i]) << 16;
+		dst[i] = uv.f;
+	}
+	return true;
+}
+
 bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* tokE, size_t tokESize,
                                  float* WIn, size_t WInSize,
@@ -585,11 +1095,11 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
 
 	if (gpu.tokenModel && tokE && tokESize > 0)
 	{
-		if (!gpu.tokE.download(tokE, tokESize)) return false;
+		if (!downloadFpOrBf16Master(gpu.tokE, gpu.tokELowp, tokE, tokESize)) return false;
 	}
 	if (!gpu.tokenModel && WIn && WInSize > 0)
 	{
-		if (!gpu.WIn.download(WIn, WInSize)) return false;
+		if (!downloadFpOrBf16Master(gpu.WIn, gpu.WInLowp, WIn, WInSize)) return false;
 	}
 	if (!gpu.tokenModel && bIn && bInSize > 0)
 	{
@@ -597,7 +1107,7 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
 	}
 	if (!gpu.tokenModel && WOut && WOutSize > 0)
 	{
-		if (!gpu.WOut.download(WOut, WOutSize)) return false;
+		if (!downloadFpOrBf16Master(gpu.WOut, gpu.WOutLowp, WOut, WOutSize)) return false;
 	}
 	if (!gpu.tokenModel && bOut && bOutSize > 0)
 	{
@@ -627,7 +1137,10 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
                                     const float* bq, const float* bk, const float* bv, const float* bo,
                                     const float* ln2Gamma, const float* ln2Beta,
                                     const float* W1, const float* W2,
-                                    const float* b1, const float* b2)
+                                    const float* b1, const float* b2,
+                                    int mlaLatentDim,
+                                    const float* Wdkv, const float* Wuk, const float* Wuv,
+                                    GpuTransformerWeights* parent)
 {
 	const size_t dm = static_cast<size_t>(dModel);
 	const size_t dmkv = static_cast<size_t>(dModelKV);
@@ -636,20 +1149,49 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
 
 	if (!b.ln1Gamma.upload(ln1Gamma, dm)) return false;
 	if (!b.ln1Beta.upload(ln1Beta, dm)) return false;
-	if (!b.Wq.upload(Wq, dm * dm)) return false;
-	if (!b.Wk.upload(Wk, dm * dmkv)) return false;
-	if (!b.Wv.upload(Wv, dm * dmkv)) return false;
-	if (!b.Wo.upload(Wo, dm * dm)) return false;
+	// Stage 8b deeper: when canonical (FP32 master never allocated), route
+	// host FP32 → parent->lowpStagingFp32 → cast → b.W{q,k,v,o}Lowp.
+	const bool canonicalBf16 = (parent != NULL) && parent->lowpIsCanonical;
+	if (canonicalBf16)
+	{
+		if (!parent->uploadFp32MasterAsBf16(b.WqLowp.data(), Wq, dm * dm))     return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WkLowp.data(), Wk, dm * dmkv))   return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WvLowp.data(), Wv, dm * dmkv))   return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WoLowp.data(), Wo, dm * dm))     return false;
+	}
+	else
+	{
+		if (!b.Wq.upload(Wq, dm * dm)) return false;
+		if (!b.Wk.upload(Wk, dm * dmkv)) return false;
+		if (!b.Wv.upload(Wv, dm * dmkv)) return false;
+		if (!b.Wo.upload(Wo, dm * dm)) return false;
+	}
 	if (!b.bq.upload(bq, dm)) return false;
 	if (!b.bk.upload(bk, dmkv)) return false;
 	if (!b.bv.upload(bv, dmkv)) return false;
 	if (!b.bo.upload(bo, dm)) return false;
 	if (!b.ln2Gamma.upload(ln2Gamma, dm)) return false;
 	if (!b.ln2Beta.upload(ln2Beta, dm)) return false;
-	if (!b.W1.upload(W1, f1w * dm)) return false;
-	if (!b.W2.upload(W2, dm * df)) return false;
+	if (canonicalBf16)
+	{
+		if (!parent->uploadFp32MasterAsBf16(b.W1Lowp.data(), W1, f1w * dm)) return false;
+		if (!parent->uploadFp32MasterAsBf16(b.W2Lowp.data(), W2, dm * df))  return false;
+	}
+	else
+	{
+		if (!b.W1.upload(W1, f1w * dm)) return false;
+		if (!b.W2.upload(W2, dm * df)) return false;
+	}
 	if (!b.b1.upload(b1, f1w)) return false;
 	if (!b.b2.upload(b2, dm)) return false;
+
+	// Paradigm #76 MLA: upload latent projections if active.
+	if (mlaLatentDim > 0 && Wdkv && Wuk && Wuv) {
+		const size_t dC = (size_t)mlaLatentDim;
+		if (!b.Wdkv.upload(Wdkv, dm * dC)) return false;
+		if (!b.Wuk.upload(Wuk,   dC * dmkv)) return false;
+		if (!b.Wuv.upload(Wuv,   dC * dmkv)) return false;
+	}
 
 	return true;
 }
@@ -688,6 +1230,32 @@ static bool download_host_buffer(const GpuBuffer<float>& src,
 	return src.download(dst.data, dst.size);
 }
 
+// bf16-mirror-aware variant: when the FP32 master is retired (freeFp32Masters)
+// the bf16 mirror is the canonical store; download the mirror into a host
+// staging buffer and cast bf16→FP32 element-wise.  When master is alive,
+// behaves identically to download_host_buffer.
+static bool download_host_buffer_bf16_aware(const GpuBuffer<float>& master,
+                                             const GpuBuffer<uint16_t>& mirror,
+                                             const HostFloatBufferView& dst)
+{
+	if (dst.size == 0u)
+		return true;
+	if (!dst.data) return false;
+	if (master.allocated() && master.size() >= dst.size)
+		return master.download(dst.data, dst.size);
+	if (!mirror.allocated() || mirror.size() < dst.size)
+		return false;
+	std::vector<uint16_t> staging(dst.size);
+	if (!mirror.download(staging.data(), dst.size)) return false;
+	for (size_t i = 0; i < dst.size; ++i)
+	{
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(staging[i]) << 16;
+		dst.data[i] = uv.f;
+	}
+	return true;
+}
+
 bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
                                       const TransformerHostWeightsView& host)
 {
@@ -713,12 +1281,14 @@ bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
 	{
 		const GpuTransformerWeights::Block& gb = gpu.blocks[l];
 		const TransformerHostBlockWeightsView& hb = host.blocks[l];
-		if (!download_host_buffer(gb.Wq, hb.Wq)) return false;
-		if (!download_host_buffer(gb.Wk, hb.Wk)) return false;
-		if (!download_host_buffer(gb.Wv, hb.Wv)) return false;
-		if (!download_host_buffer(gb.Wo, hb.Wo)) return false;
-		if (!download_host_buffer(gb.W1, hb.W1)) return false;
-		if (!download_host_buffer(gb.W2, hb.W2)) return false;
+		// bf16-aware: route through the bf16 mirror when the FP32 master
+		// has been retired by freeFp32Masters() (--bf16-weights mode).
+		if (!download_host_buffer_bf16_aware(gb.Wq, gb.WqLowp, hb.Wq)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wk, gb.WkLowp, hb.Wk)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wv, gb.WvLowp, hb.Wv)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wo, gb.WoLowp, hb.Wo)) return false;
+		if (!download_host_buffer_bf16_aware(gb.W1, gb.W1Lowp, hb.W1)) return false;
+		if (!download_host_buffer_bf16_aware(gb.W2, gb.W2Lowp, hb.W2)) return false;
 		if (!download_host_buffer(gb.bq, hb.bq)) return false;
 		if (!download_host_buffer(gb.bk, hb.bk)) return false;
 		if (!download_host_buffer(gb.bv, hb.bv)) return false;
@@ -813,6 +1383,55 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 	cudaMemcpy(d_sizes, hSizes, count * sizeof(int),    cudaMemcpyHostToDevice);
 
 	return zero_buffers_batch(d_ptrs, d_sizes, count);
+}
+
+bool zeroTransformerGradientsBf16(GpuTransformerWeights& gpu)
+{
+	if (!gpu.initialized) return false;
+	// Phase-2: zero only the BF16 grad mirrors that exist (allocated when
+	// MixedPrecisionConfig::gradStorageBf16=true).  bf16 element is 2 bytes;
+	// cudaMemset of 0 yields exact bf16 zero (sign=0, exp=0, mant=0).
+	if (gpu.gTokE_bf16.allocated())
+		cudaMemset(gpu.gTokE_bf16.data(), 0,
+		    gpu.gTokE_bf16.size() * sizeof(uint16_t));
+	if (gpu.gWIn_bf16.allocated())
+		cudaMemset(gpu.gWIn_bf16.data(), 0,
+		    gpu.gWIn_bf16.size() * sizeof(uint16_t));
+	if (gpu.gWOut_bf16.allocated())
+		cudaMemset(gpu.gWOut_bf16.data(), 0,
+		    gpu.gWOut_bf16.size() * sizeof(uint16_t));
+	for (unsigned int l = 0; l < gpu.nLayers; ++l)
+	{
+		GpuTransformerWeights::Block& b = gpu.blocks[l];
+		if (b.gWq_bf16.allocated())
+			cudaMemset(b.gWq_bf16.data(), 0,
+			    b.gWq_bf16.size() * sizeof(uint16_t));
+		if (b.gWk_bf16.allocated())
+			cudaMemset(b.gWk_bf16.data(), 0,
+			    b.gWk_bf16.size() * sizeof(uint16_t));
+		if (b.gWv_bf16.allocated())
+			cudaMemset(b.gWv_bf16.data(), 0,
+			    b.gWv_bf16.size() * sizeof(uint16_t));
+		if (b.gWo_bf16.allocated())
+			cudaMemset(b.gWo_bf16.data(), 0,
+			    b.gWo_bf16.size() * sizeof(uint16_t));
+		if (b.gW1_bf16.allocated())
+			cudaMemset(b.gW1_bf16.data(), 0,
+			    b.gW1_bf16.size() * sizeof(uint16_t));
+		if (b.gW2_bf16.allocated())
+			cudaMemset(b.gW2_bf16.data(), 0,
+			    b.gW2_bf16.size() * sizeof(uint16_t));
+		if (b.gWdkv_bf16.allocated())
+			cudaMemset(b.gWdkv_bf16.data(), 0,
+			    b.gWdkv_bf16.size() * sizeof(uint16_t));
+		if (b.gWuk_bf16.allocated())
+			cudaMemset(b.gWuk_bf16.data(), 0,
+			    b.gWuk_bf16.size() * sizeof(uint16_t));
+		if (b.gWuv_bf16.allocated())
+			cudaMemset(b.gWuv_bf16.data(), 0,
+			    b.gWuv_bf16.size() * sizeof(uint16_t));
+	}
+	return true;
 }
 
 } // namespace gpu

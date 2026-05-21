@@ -1,0 +1,28 @@
+
+============================================================
+VESTA GPU scale ladder: AdamW vs VESTA-plain-raw
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=50 seq=512 LR=1.0e-02 r=8 GPU=1
+
+dModel    optimizer           n     trainNLL              testNLL               wall(s)   
+------    ---------           ---   --------------------  --------------------  ----------
+256       AdamW-GPU           3      1.0835 +/- 0.0367     1.6726 +/- 0.0380      2.3 +/- 0.0  
+256       VESTA-plain-raw     3      2.1984 +/- 0.0714     2.4495 +/- 0.0754      3.4 +/- 0.0  
+          delta = +0.7769 nats   (VESTA-plain-raw vs AdamW)
+
+512       AdamW-GPU           3      1.1390 +/- 0.0483     1.8839 +/- 0.0242     11.4 +/- 0.0  
+512       VESTA-plain-raw     3      1.3291 +/- 0.0421     1.7743 +/- 0.0413     16.7 +/- 0.1  
+          delta = -0.1096 nats   (VESTA-plain-raw vs AdamW)
+
+1024      AdamW-GPU           3      1.5624 +/- 0.0846     1.8690 +/- 0.0540     31.2 +/- 0.1  
+1024      VESTA-plain-raw     3      1.1482 +/- 0.0069     1.7114 +/- 0.0415     59.8 +/- 0.9  
+          delta = -0.1577 nats   (VESTA-plain-raw vs AdamW)
+
+2048      AdamW-GPU           3      3.1018 +/- 0.0576     3.1206 +/- 0.0577     99.5 +/- 0.2  
+2048      VESTA-plain-raw     3      1.0893 +/- 0.0293     1.7634 +/- 0.0438    308.0 +/- 24.6 
+          delta = -1.3572 nats   (VESTA-plain-raw vs AdamW)
+
+========================
+| Unit Tests Completed |
+========================

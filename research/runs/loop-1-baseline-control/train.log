@@ -1,0 +1,30 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[i]2026-05-13 22:57:37 [chiron]: [chiron-train] device: NVIDIA GeForce RTX 4080 SUPER (sm_8.9), 15.6 GB VRAM
+[i]2026-05-13 22:57:54 [chiron]: [scfa] allocated SCFA state: B=[T=8192 × k=512]=16.00 MB (shared), D=[m=2048 × w+1=9] × L=24 (+dD)=3.38 MB, compression 16×, conv half-width 8
+[i]2026-05-13 22:57:54 [chiron]: [scfa] design attention speedup at T=8192, k=512: 14.6× (O(T²) → O(Tk + k² + Tw))
+[i]2026-05-13 22:57:54 [chiron]: [chiron-train] VRAM usage after allocation: 12.91 / 15.56 GB (17.1% free)
+[i]2026-05-13 22:57:54 [chiron]: [chiron-train] T=8192 m=2048 dModel=4096 L=24 nH=16 dH=256 V=32000  params=870.94M  (3322.4 MB FP32)
+[i]2026-05-13 22:57:54 [chiron]: [chiron-train] lr=1.00e-04 wd=1.00e-02 seed=1337 max_steps=5000 adam=int8 attn=bf16-tiled bf16_grads=1 bf16_weights=1 local_attn_W=0 warmup=500 grad_clip=0.50 accum=1 (effective batch=8192 tokens)
+[i]2026-05-13 22:57:54 [chiron]: [fuse-attn-reln] ACTIVE: at layer L-1, q ← q + p BEFORE the existing reln; final LN normalizes the fused signal (task #31).  Wq/Wk/Wv/Wo gradients flow through bounded LayerNorm; stable at L ≤ 24 but breaks at L ≥ 48.
+[i]2026-05-13 22:57:54 [chiron]: [step      1] loss=10.4746 ema=10.4746 best=10.4746@1 acc=0.0004 ||g||=2.710 scale=0.185 lr=2.00e-07 tok/s=14353 wall=0.6s
+[i]2026-05-13 23:00:08 [chiron]: [step    250] loss=8.7760 ema=8.9535 best=8.7679@245 acc=0.0548 ||g||=4.026 scale=0.124 lr=5.00e-05 tok/s=15250 wall=134.3s
+[i]2026-05-13 23:02:22 [chiron]: [step    500] loss=8.2768 ema=8.3847 best=8.1973@494 acc=0.0818 ||g||=3.122 scale=0.160 lr=1.00e-04 tok/s=15232 wall=268.8s
+[i]2026-05-13 23:04:37 [chiron]: [step    750] loss=7.8261 ema=7.9736 best=7.6952@745 acc=0.0895 ||g||=6.676 scale=0.075 lr=9.93e-05 tok/s=15227 wall=403.3s
+[i]2026-05-13 23:06:51 [chiron]: [step   1000] loss=7.5975 ema=7.8442 best=7.4584@891 acc=0.0966 ||g||=7.410 scale=0.067 lr=9.73e-05 tok/s=15227 wall=537.8s
+[i]2026-05-13 23:09:06 [chiron]: [step   1250] loss=7.4318 ema=7.5975 best=7.1558@1241 acc=0.0967 ||g||=7.050 scale=0.071 lr=9.40e-05 tok/s=15223 wall=672.3s
+[i]2026-05-13 23:11:20 [chiron]: [step   1500] loss=7.3848 ema=7.2794 best=6.9134@1493 acc=0.1180 ||g||=6.002 scale=0.083 lr=8.95e-05 tok/s=15225 wall=806.8s
+[i]2026-05-13 23:13:35 [chiron]: [step   1750] loss=7.1900 ema=7.0418 best=6.6705@1707 acc=0.1071 ||g||=17.349 scale=0.029 lr=8.39e-05 tok/s=15223 wall=941.4s
+[i]2026-05-13 23:15:50 [chiron]: [step   2000] loss=7.3967 ema=6.8692 best=6.4806@1938 acc=0.1155 ||g||=2.034 scale=0.246 lr=7.75e-05 tok/s=15220 wall=1075.9s
+[i]2026-05-13 23:18:04 [chiron]: [step   2250] loss=6.3758 ema=6.4669 best=6.2629@2156 acc=0.1180 ||g||=2.192 scale=0.228 lr=7.04e-05 tok/s=15224 wall=1210.4s
+[i]2026-05-13 23:20:19 [chiron]: [step   2500] loss=6.3785 ema=6.3251 best=6.0941@2398 acc=0.1053 ||g||=2.351 scale=0.213 lr=6.28e-05 tok/s=15228 wall=1344.9s
+[i]2026-05-13 23:22:33 [chiron]: [step   2750] loss=5.9270 ema=6.3255 best=5.9270@2750 acc=0.1138 ||g||=1.177 scale=0.425 lr=5.50e-05 tok/s=15226 wall=1479.4s
+[i]2026-05-13 23:24:48 [chiron]: [step   3000] loss=5.8634 ema=6.0445 best=5.7710@2885 acc=0.1123 ||g||=1.959 scale=0.255 lr=4.72e-05 tok/s=15217 wall=1614.0s
+[i]2026-05-13 23:27:02 [chiron]: [step   3250] loss=5.9676 ema=6.1055 best=5.6479@3202 acc=0.1285 ||g||=1.708 scale=0.293 lr=3.96e-05 tok/s=15222 wall=1748.6s
+[i]2026-05-13 23:29:17 [chiron]: [step   3500] loss=6.1864 ema=6.0353 best=5.5938@3346 acc=0.1106 ||g||=1.765 scale=0.283 lr=3.25e-05 tok/s=15223 wall=1883.1s
+[i]2026-05-13 23:31:31 [chiron]: [step   3750] loss=6.2953 ema=5.9426 best=5.4149@3505 acc=0.1101 ||g||=3.344 scale=0.150 lr=2.61e-05 tok/s=15221 wall=2017.7s
+[i]2026-05-13 23:33:46 [chiron]: [step   4000] loss=5.6214 ema=5.7866 best=5.4149@3505 acc=0.1155 ||g||=1.959 scale=0.255 lr=2.05e-05 tok/s=15218 wall=2152.2s
+[i]2026-05-13 23:36:00 [chiron]: [step   4250] loss=5.6328 ema=5.6740 best=5.4149@3505 acc=0.1146 ||g||=1.390 scale=0.360 lr=1.60e-05 tok/s=15219 wall=2286.8s
+[i]2026-05-13 23:38:15 [chiron]: [step   4500] loss=6.0187 ema=5.9750 best=5.4084@4458 acc=0.1156 ||g||=1.746 scale=0.286 lr=1.27e-05 tok/s=15217 wall=2421.4s
+[i]2026-05-13 23:40:30 [chiron]: [step   4750] loss=5.6138 ema=5.8446 best=5.4084@4458 acc=0.1157 ||g||=1.360 scale=0.368 lr=1.07e-05 tok/s=15223 wall=2555.9s
+[i]2026-05-13 23:42:44 [chiron]: [step   5000] loss=5.6286 ema=5.7410 best=5.3282@4907 acc=0.1130 ||g||=1.668 scale=0.300 lr=1.00e-05 tok/s=15228 wall=2690.4s
+[i]2026-05-13 23:42:44 [chiron]: [chiron-train] done: steps=5000 total_tokens=40960000 wall=2690.4s

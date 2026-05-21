@@ -89,6 +89,9 @@ struct AttnFwdCtx
 	unsigned int groupSize;
 	bool causal;
 	const unsigned char* keyAllowed;
+	// Paradigm shift #78 ATTENTION-SINK + sliding window. Both default to 0 (disabled).
+	unsigned int sinkCount;
+	unsigned int windowSize;
 };
 
 void attn_fwd_body(void* ud, unsigned int begin, unsigned int end);
@@ -114,6 +117,9 @@ struct AttnBwdCtx
 	unsigned int nChunksPerHead;
 	unsigned int totalItems;
 	float* dKVscratch;
+	// Paradigm shift #78 ATTENTION-SINK + sliding window. Both default to 0 (disabled).
+	unsigned int sinkCount;
+	unsigned int windowSize;
 };
 
 void attn_bwd_body(void* ud, unsigned int begin, unsigned int end);

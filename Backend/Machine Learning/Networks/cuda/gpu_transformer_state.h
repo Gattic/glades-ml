@@ -6,6 +6,8 @@
 
 #include "gpu_buffer.h"
 #include "gpu_atlas.h"
+#include "gpu_vesta.h"
+#include "gpu_helios.h"
 #include <cstddef>
 
 #ifdef GLADES_HAVE_CUDA
@@ -75,6 +77,7 @@ struct TransformerGpuScratchConfig
 	unsigned int nHeads;
 	unsigned int nLayers;
 	unsigned int ff1Width;
+	bool activationCheckpoint;
 
 	TransformerGpuScratchConfig()
 	    : T(0u),
@@ -85,7 +88,8 @@ struct TransformerGpuScratchConfig
 	      dModelKV(0u),
 	      nHeads(0u),
 	      nLayers(0u),
-	      ff1Width(0u)
+	      ff1Width(0u),
+	      activationCheckpoint(false)
 	{
 	}
 };
@@ -114,6 +118,45 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vTokE;   // Adam m1
 	GpuBuffer<float> v2TokE;  // Adam m2
 	GpuBuffer<float> gTokE;   // gradients
+	// BF16 low-precision mirror, kept in sync with the FP32 master after each
+	// optimizer step (ensureGpuLowpMirrors). Empty when mixed precision is off.
+	GpuBuffer<uint16_t> tokELowp;
+	// BF16 Adam state (m1, m2) — used when MixedPrecisionConfig::adamStateBf16
+	// is true. Exactly one of {vTokE, vTokE_bf16, vTokE_int8} (and corresponding
+	// v2) is allocated at a time to save VRAM; allocate() picks based on config.
+	GpuBuffer<uint16_t> vTokE_bf16;
+	GpuBuffer<uint16_t> v2TokE_bf16;
+	// int8 Adam state — used when MixedPrecisionConfig::adamStateInt8 is true.
+	// Storage: m as int8 [N], v as uint8 [N], plus FP32 absmax scales per
+	// 256-element block (ceil(N/256) entries each).  ~1.016 bytes/param/moment
+	// vs 2 bytes BF16 vs 4 bytes FP32.  Ported from CHIRON paradigm #11 MFIO.
+	GpuBuffer<int8_t>  vTokE_int8;
+	GpuBuffer<uint8_t> v2TokE_int8;
+	GpuBuffer<float>   vTokEScale;
+	GpuBuffer<float>   v2TokEScale;
+	// FACE Adafactor state — used when TransformerRunConfig::faceEmbedding
+	// is true.  Replaces dense Adam on tokE entirely with the frequency-
+	// debiased preconditioner from paradigm shift #28.  Persistent state:
+	// faceZnBar [V] row-norm EMA, faceDnBar [dModel] col-norm EMA, plus
+	// 2 device scalars (faceQHat, faceGFHat).  Per-step scratch reuses
+	// faceZnNew/faceDnRaw/faceQStep/faceGFStep so we don't churn on alloc.
+	GpuBuffer<float>   faceZnBar;
+	GpuBuffer<float>   faceDnBar;
+	GpuBuffer<float>   faceQHat;     // 1 element
+	GpuBuffer<float>   faceGFHat;    // 1 element
+	GpuBuffer<float>   faceZnNew;    // [V] scratch
+	GpuBuffer<float>   faceDnRaw;    // [dModel] scratch
+	GpuBuffer<float>   faceQStep;    // 1 element scratch
+	GpuBuffer<float>   faceGFStep;   // 1 element scratch
+	// BF16 grad mirror — used when MixedPrecisionConfig::gradStorageBf16
+	// is true.  Persistent grad accumulator at half the memory of FP32
+	// grads.  Backward GEMMs still write FP32 (into a scratch buffer in
+	// GpuTransformerScratch), but the persistent storage between Adam
+	// steps is BF16.  Adam reads BF16 directly (adam_update_*_bf16grad
+	// kernel variants).
+	GpuBuffer<uint16_t> gTokE_bf16;
+	GpuBuffer<uint16_t> gWIn_bf16;
+	GpuBuffer<uint16_t> gWOut_bf16;
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -126,6 +169,13 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vWIn;
 	GpuBuffer<float> v2WIn;
 	GpuBuffer<float> gWIn;
+	GpuBuffer<uint16_t> WInLowp;
+	GpuBuffer<uint16_t> vWIn_bf16;
+	GpuBuffer<uint16_t> v2WIn_bf16;
+	GpuBuffer<int8_t>   vWIn_int8;
+	GpuBuffer<uint8_t>  v2WIn_int8;
+	GpuBuffer<float>    vWInScale;
+	GpuBuffer<float>    v2WInScale;
 	GpuBuffer<float> bIn;    // [dModel]
 	GpuBuffer<float> mBIn;
 	GpuBuffer<float> v2BIn;
@@ -136,6 +186,13 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vWOut;
 	GpuBuffer<float> v2WOut;
 	GpuBuffer<float> gWOut;
+	GpuBuffer<uint16_t> WOutLowp;
+	GpuBuffer<uint16_t> vWOut_bf16;
+	GpuBuffer<uint16_t> v2WOut_bf16;
+	GpuBuffer<int8_t>   vWOut_int8;
+	GpuBuffer<uint8_t>  v2WOut_int8;
+	GpuBuffer<float>    vWOutScale;
+	GpuBuffer<float>    v2WOutScale;
 	GpuBuffer<float> bOut;   // [outSize]
 	GpuBuffer<float> mBOut;
 	GpuBuffer<float> v2BOut;
@@ -169,6 +226,49 @@ struct GpuTransformerWeights
 		GpuBuffer<float> vWq, vWk, vWv, vWo;
 		GpuBuffer<float> v2Wq, v2Wk, v2Wv, v2Wo;
 		GpuBuffer<float> gWq, gWk, gWv, gWo;
+		GpuBuffer<uint16_t> WqLowp, WkLowp, WvLowp, WoLowp;
+		// Paradigm shift #76 MLA latent projections (allocated only when
+		// trainingConfig.transformer.mlaLatentDim > 0).
+		// Wdkv: [dModel, dC] ; Wuk: [dC, dModelKV] ; Wuv: [dC, dModelKV]
+		GpuBuffer<float> Wdkv, Wuk, Wuv;
+		GpuBuffer<float> vWdkv, vWuk, vWuv;
+		GpuBuffer<float> v2Wdkv, v2Wuk, v2Wuv;
+		GpuBuffer<float> gWdkv, gWuk, gWuv;
+		// MLA forward scratch: c[T, dC] cached across forward+backward.
+		GpuBuffer<float> mlaC, mlaDc;
+		// MLA backward BF16 staging (avoids aliasing the per-step
+		// activationLowp/activationLowp2 buffers which other paths use).
+		GpuBuffer<unsigned short> mlaBf16ScratchA;
+		GpuBuffer<unsigned short> mlaBf16ScratchB;
+
+		// Paradigm shift #74 BitNet QAT FFN W2 scratch (lazy-allocated when
+		// trainingConfig.transformer.binaryFFN && WMMA B1 path is taken).
+		// W2: [dModel, dFF] applied as Y = X[T,dFF] @ W2.T -> [T, dModel]
+		GpuBuffer<unsigned int> bitnetXBits;   // [T * dFF / 32]
+		GpuBuffer<unsigned int> bitnetWBits;   // [dModel * dFF / 32]
+		GpuBuffer<float>        bitnetAlphaX;  // [T]
+		GpuBuffer<float>        bitnetAlphaW;  // [dModel]
+		GpuBuffer<int>          bitnetCPop;    // [T * dModel]
+
+		// W1 BitNet scratch: W1 [ff1Width, dModel] applied as Y = X[T,dModel]
+		// @ W1.T -> [T, ff1Width]. Lazy-allocated alongside W2 path.
+		GpuBuffer<unsigned int> bitnetXBitsW1;   // [T * dModel / 32]
+		GpuBuffer<unsigned int> bitnetWBitsW1;   // [ff1Width * dModel / 32]
+		GpuBuffer<float>        bitnetAlphaXW1;  // [T]
+		GpuBuffer<float>        bitnetAlphaWW1;  // [ff1Width]
+		GpuBuffer<int>          bitnetCPopW1;    // [T * ff1Width]
+		// BF16 Adam state (used when adamStateBf16=true, saves ~2x VRAM).
+		GpuBuffer<uint16_t> vWq_bf16, vWk_bf16, vWv_bf16, vWo_bf16;
+		GpuBuffer<uint16_t> v2Wq_bf16, v2Wk_bf16, v2Wv_bf16, v2Wo_bf16;
+		// int8 Adam state (used when adamStateInt8=true, saves ~4x VRAM vs FP32).
+		GpuBuffer<int8_t>  vWq_int8, vWk_int8, vWv_int8, vWo_int8;
+		GpuBuffer<uint8_t> v2Wq_int8, v2Wk_int8, v2Wv_int8, v2Wo_int8;
+		GpuBuffer<float>   vWqScale, vWkScale, vWvScale, vWoScale;
+		GpuBuffer<float>   v2WqScale, v2WkScale, v2WvScale, v2WoScale;
+		// BF16 grad mirrors — used when gradStorageBf16=true.  See
+		// GpuTransformerWeights::gTokE_bf16 for mechanism.
+		GpuBuffer<uint16_t> gWq_bf16, gWk_bf16, gWv_bf16, gWo_bf16;
+		GpuBuffer<uint16_t> gWdkv_bf16, gWuk_bf16, gWuv_bf16;
 		GpuBuffer<float> bq, bk, bv, bo;     // [dModel] or [dModelKV]
 		GpuBuffer<float> mBq, mBk, mBv, mBo;
 		GpuBuffer<float> v2Bq, v2Bk, v2Bv, v2Bo;
@@ -188,7 +288,16 @@ struct GpuTransformerWeights
 		GpuBuffer<float> W1, W2;
 		GpuBuffer<float> vW1, vW2;
 		GpuBuffer<float> v2W1, v2W2;
+		GpuBuffer<uint16_t> vW1_bf16, vW2_bf16;
+		GpuBuffer<uint16_t> v2W1_bf16, v2W2_bf16;
+		GpuBuffer<int8_t>  vW1_int8, vW2_int8;
+		GpuBuffer<uint8_t> v2W1_int8, v2W2_int8;
+		GpuBuffer<float>   vW1Scale, vW2Scale;
+		GpuBuffer<float>   v2W1Scale, v2W2Scale;
+		// BF16 grad mirrors for FFN weights.
+		GpuBuffer<uint16_t> gW1_bf16, gW2_bf16;
 		GpuBuffer<float> gW1, gW2;
+		GpuBuffer<uint16_t> W1Lowp, W2Lowp;
 		GpuBuffer<float> b1, b2;     // [dFF or 2*dFF], [dModel]
 		GpuBuffer<float> mB1, mB2;
 		GpuBuffer<float> v2B1, v2B2;
@@ -197,6 +306,10 @@ struct GpuTransformerWeights
 		// ATLAS optimizer state (one per weight matrix)
 		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
 		GpuAtlasWeightState atlasW1, atlasW2;
+		GpuVestaWeightState vestaWq, vestaWk, vestaWv, vestaWo;
+		GpuVestaWeightState vestaW1, vestaW2;
+		GpuHeliosWeightState heliosWq, heliosWk, heliosWv, heliosWo;
+		GpuHeliosWeightState heliosW1, heliosW2;
 		GpuEchoWeightState echoWq, echoWk, echoWv, echoWo;
 		GpuEchoWeightState echoW1, echoW2;
 		GpuBiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
@@ -270,6 +383,12 @@ struct GpuTransformerWeights
 	GpuAtlasWeightState atlasTokE;
 	GpuAtlasWeightState atlasWIn;
 	GpuAtlasWeightState atlasWOut;
+	GpuVestaWeightState vestaTokE;
+	GpuVestaWeightState vestaWIn;
+	GpuVestaWeightState vestaWOut;
+	GpuHeliosWeightState heliosTokE;
+	GpuHeliosWeightState heliosWIn;
+	GpuHeliosWeightState heliosWOut;
 	GpuEchoWeightState echoTokE;
 	GpuEchoWeightState echoWIn;
 	GpuEchoWeightState echoWOut;
@@ -292,6 +411,20 @@ struct GpuTransformerWeights
 	GpuMuonWeightState muonWIn;
 	GpuMuonWeightState muonWOut;
 
+	// BF16 mixed-precision state.
+	// When mixed precision is enabled (training_config.mixedPrecision.enable),
+	// the *Lowp buffers above hold a BF16 mirror of every major weight matrix,
+	// refreshed from the FP32 master after every optimizer step. Inference and
+	// BF16 matmul paths read from the Lowp mirrors; gradients and master
+	// weights stay FP32 throughout.
+	bool lowpReady;      // true after ensureLowpMirrors has populated all Lowp buffers
+	int  lowpDType;      // glades::transformer_kernels::LOWP_BF16 (others unsupported on GPU for now)
+	// True when MixedPrecisionConfig.weightStorageBf16 is active: the *Lowp
+	// buffers ARE the canonical weight store (no FP32 master).  ensureLowp
+	// Mirrors() must NOT refresh from FP32 master in this mode (would
+	// overwrite the in-place Adam updates).
+	bool lowpIsCanonical;
+
 	GpuTransformerWeights();
 	~GpuTransformerWeights();
 
@@ -299,11 +432,22 @@ struct GpuTransformerWeights
 	// When skipAdamBufs is true, Adam moment buffers (v*/v2*/m*) are not
 	// allocated on GPU.  Used when the optimizer is ATLAS (which maintains
 	// its own per-matrix state) to avoid wasting ~2x model-size in VRAM.
+	// When adamStateBf16 is true, the m/v moments for the 9 large weight
+	// matrices (tokE, WIn, WOut, Wq/Wk/Wv/Wo/W1/W2 per block) are stored
+	// in BF16 (uint16_t) instead of FP32, halving their VRAM cost. Biases
+	// and LN params keep FP32 state (their size is negligible).
 	bool allocate(unsigned int dModel, unsigned int dFF, unsigned int nHeads,
 	              unsigned int nKVHeads, unsigned int nLayers,
 	              unsigned int vocabSize, unsigned int inputSize, unsigned int outSize,
 	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings,
-	              bool skipAdamBufs = false);
+	              bool skipAdamBufs = false,
+	              bool adamStateBf16 = false,
+	              int mlaLatentDim = 0,
+	              bool adamStateInt8 = false,
+	              bool faceEmbedding = false,
+	              bool gradStorageBf16 = false,
+	              bool gradStorageBf16Phase2 = false,
+	              bool weightStorageBf16 = false);
 
 	// Free all GPU memory.
 	void free();
@@ -311,6 +455,39 @@ struct GpuTransformerWeights
 	// Allocate ECHO-specific batched observe / metric metadata buffers on demand.
 	// Plain AdamW and non-ECHO ATLAS variants do not need these arrays.
 	bool ensureEchoBuffers();
+
+	// Allocate every BF16 Lowp mirror (if not already sized) and populate each
+	// one from its FP32 master via the on-device cast kernel. Should be called
+	// once after the FP32 weights have been uploaded (ensureGpuState) and then
+	// after every optimizer step while mixed precision is enabled.
+	// Returns false if any device allocation or cast kernel dispatch fails.
+	bool ensureLowpMirrors();
+
+	// bf16-weights mode: free the FP32 weight masters AFTER the bf16 mirrors
+	// have been populated by the first ensureLowpMirrors call.  Steady-state
+	// memory savings: ~3.7 GB at 1.84B (per-block Wq/Wk/Wv/Wo/W1/W2 + WIn +
+	// WOut + tokE).  No-op when lowpIsCanonical=false (the flag set by
+	// allocate() when weightStorageBf16=true).  Safe to call repeatedly:
+	// idempotent (frees already-freed buffers as no-op).
+	//
+	// Caller MUST guarantee the FP32 masters are no longer needed at any
+	// downstream call site.  Currently safe call sites are post-init in
+	// transformerGpuTrainEpoch under the recipe (--bf16-weights without
+	// --binary-ffn / without atlas).  See site comment for the guards.
+	void freeFp32Masters();
+
+	// Stage 8b deeper refactor: shared FP32 staging buffer used for upload-then-cast
+	// path when weightStorageBf16 is set.  Sized to the largest single weight tensor
+	// at allocate() time (typically tokE = vocabSize × dModel ≈ 250 MB at 1.84B).
+	// uploadFp32MasterAsBf16() routes host FP32 → this staging → bf16 mirror,
+	// avoiding the need to allocate per-tensor FP32 masters that would otherwise
+	// peak the GPU at >16 GB during init at L≥48.
+	GpuBuffer<float> lowpStagingFp32;
+
+	// Upload N host FP32 floats to a bf16 mirror via the lowpStagingFp32 buffer.
+	// dst_bf16 must already be allocated to size n.  Used by the upload path in
+	// network.cpp when lowpIsCanonical=true and the FP32 master is empty.
+	bool uploadFp32MasterAsBf16(uint16_t* dst_bf16, const float* src_host_fp32, size_t n);
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.
@@ -378,6 +555,44 @@ struct GpuTransformerScratch
 	GpuBuffer<float> gpuInvFreq; // [dHead/2]  (RoPE inverse frequencies)
 	GpuBuffer<int> gpuTargetsT;  // [T]        (target token IDs for loss/backward)
 
+	// BF16 activation staging for mixed-precision GEMMs. Sized to T*max(dModel,
+	// ff1Width) so a single buffer can hold any single activation tile. Used
+	// at forward/backward GEMM call sites to cast FP32 activations to BF16
+	// right before feeding cublasGemmEx with BF16 weight mirrors.
+	GpuBuffer<uint16_t> activationLowp;
+	// Secondary BF16 activation staging used when two distinct activations
+	// must be live at once (e.g. dY and X for the weight-grad GEMM).
+	GpuBuffer<uint16_t> activationLowp2;
+	// BF16 scratches for Q/K/V that feed flash_attention_multihead_forward_bf16.
+	// Only live for the current layer's attention forward; cast from the FP32
+	// Q/K/V buffers right before the attention call.
+	GpuBuffer<uint16_t> qLowp;
+	GpuBuffer<uint16_t> kLowp;
+	GpuBuffer<uint16_t> vLowp;
+
+	// Full attention scores matrix [nHeads, T, T] used by the
+	// cuBLAS-tiled flash_attention path (research/WMMA_ATTENTION_PLAN.md).
+	// Trades O(nH*T^2) memory for tensor-core throughput.  Allocated
+	// lazily on first use when the fast path is eligible (nHeads == nKVHeads).
+	// Left unallocated (empty) otherwise to keep VRAM budget unchanged.
+	GpuBuffer<float> attnScoresScratch;
+
+	// Second [nHeads, T, T] scratch used by the cuBLAS-tiled
+	// flash_attention BACKWARD kernel for the dP intermediate.
+	// Allocated lazily.
+	GpuBuffer<float> attnDPScratch;
+
+	// BF16 scratches for the cuBLAS-tiled BF16 flash-attention variant
+	// (research/WMMA_ATTENTION_PLAN.md — doubles the attention GEMM
+	// throughput by running on BF16 tensor cores).  Q/K/V are cast
+	// from the FP32 inputs once per forward.  P is cast after softmax.
+	// Allocated lazily and shared across the FWD path; the BWD path
+	// still uses the FP32 cuBLAS variant for numerical safety on dP.
+	GpuBuffer<uint16_t> attnQbf16;      // [T, dModel]
+	GpuBuffer<uint16_t> attnKbf16;      // [T, dModelKV]
+	GpuBuffer<uint16_t> attnVbf16;      // [T, dModelKV]
+	GpuBuffer<uint16_t> attnPbf16;      // [nHeads, T, T]
+
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)
@@ -390,12 +605,44 @@ struct GpuTransformerScratch
 	float** d_dKdVZeroPtrs;  // device array of 2 float*
 	int*    d_dKdVZeroSizes; // device array of 2 ints
 
+	// Shared FP32 grad-write scratch (used when MixedPrecisionConfig::
+	// gradStorageBf16 is true).  Sized to the widest weight tensor on
+	// allocate (max(V·dModel, dFF·dModel, dModel·dModel)).  Each backward
+	// GEMM writes into this scratch with beta=0 (overwrite); afterward
+	// bf16_accum_axpy commits the result into the persistent BF16 grad
+	// buffer.  Allocated empty when gradStorageBf16=false.
+	GpuBuffer<float> gradScratchFp32;
+
+	// Shared FP32 weight scratch (allocated only when weightStorageBf16 is true).
+	// Sized to widest weight tensor (same as gradScratchFp32).  Per Adam tensor
+	// step: cast bf16 weight (Lowp) → weightScratchFp32 → existing FP32 Adam
+	// kernel modifies in place → cast back to bf16 (Lowp) with stochastic
+	// rounding.  Reused across all weight tensors within a step (sequential).
+	// Cost ~256 MB at 1.84B (V·d max) in exchange for retiring all FP32
+	// weight masters (~8 GB at 1.84B).
+	GpuBuffer<float> weightScratchFp32;
+
+	// Activation gradient checkpointing (sqrt-L scheme).  When activationCheckpoint
+	// is requested at allocate(), per-layer scratches (x1/Q/K/V/attnConcat/attnOut/
+	// hAfterAttn/x2/ff1/ff1Act/ffOut/hAfterFF + LN stats) are sized to slotsPerLayer
+	// = ⌈√nLayers⌉ instead of nLayers.  When false, slotsPerLayer == nLayers and the
+	// modulo `li % slotsPerLayer` collapses to `li` — behavior identical.
+	unsigned int slotsPerLayer;
+	// Number of checkpoint boundaries: ⌈nLayers/slotsPerLayer⌉ - 1 (no checkpoint
+	// at the very first layer; layer 0 reads from `h`).  Allocated empty when
+	// activationCheckpoint=false.
+	unsigned int nCheckpoints;
+	// Checkpoint storage: [nCheckpoints, T, dModel].  Holds hAfterFF at layer
+	// boundary (c+1)*slotsPerLayer - 1 — i.e. the input to layer (c+1)*slotsPerLayer.
+	GpuBuffer<float> checkpoints;
+
 	GpuTransformerScratch();
 	~GpuTransformerScratch();
 
 	bool allocate(unsigned int T, unsigned int inputSize, unsigned int outSize,
 	              unsigned int dModel, unsigned int dFF, unsigned int dModelKV,
-	              unsigned int nHeads, unsigned int nLayers, unsigned int ff1Width);
+	              unsigned int nHeads, unsigned int nLayers, unsigned int ff1Width,
+	              bool activationCheckpoint = false);
 	void free();
 };
 
@@ -428,6 +675,10 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* lnFinalBeta, size_t lnFinalBetaSize);
 
 // Upload/download a single block's weights.
+// `parent` is required when bf16-canonical (FP32 masters never allocated):
+// the upload path then routes host FP32 → parent->lowpStagingFp32 → cast →
+// b.W{q,k,v,o,1,2}Lowp.  Legacy callers may pass NULL for parent in non-
+// canonical mode.
 bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     unsigned int dModel, unsigned int dModelKV,
                                     unsigned int ff1Width, unsigned int dFF,
@@ -436,7 +687,13 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     const float* bq, const float* bk, const float* bv, const float* bo,
                                     const float* ln2Gamma, const float* ln2Beta,
                                     const float* W1, const float* W2,
-                                    const float* b1, const float* b2);
+                                    const float* b1, const float* b2,
+                                    // Paradigm shift #76 MLA — pass NULL when not active.
+                                    int mlaLatentDim = 0,
+                                    const float* Wdkv = NULL,
+                                    const float* Wuk  = NULL,
+                                    const float* Wuv  = NULL,
+                                    GpuTransformerWeights* parent = NULL);
 
 bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
                                const int* tokenIds, size_t count);
@@ -449,6 +706,11 @@ bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
 
 // Zero all gradient buffers on GPU.
 bool zeroTransformerGradients(GpuTransformerWeights& gpu);
+
+// Zero only the BF16 grad mirrors (used in BF16-grad Phase-2: backward
+// commits straight to bf16 with beta=1, so the mirrors must start each
+// Adam step at zero).  No-op if no BF16 mirrors are allocated.
+bool zeroTransformerGradientsBf16(GpuTransformerWeights& gpu);
 
 } // namespace gpu
 } // namespace glades

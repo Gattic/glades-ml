@@ -247,7 +247,7 @@ void attn_fwd_body(void* ud, unsigned int begin, unsigned int end)
 		    !checked_mul_size(static_cast<size_t>(kvHead), static_cast<size_t>(c.dHead), vOff) ||
 		    !checked_mul_size(static_cast<size_t>(h), static_cast<size_t>(c.dHead), oOff))
 			return;
-		glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+		glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided_sw(
 		    c.Q + qOff,
 		    c.dModel,
 		    c.K + kOff,
@@ -258,6 +258,8 @@ void attn_fwd_body(void* ud, unsigned int begin, unsigned int end)
 		    c.dHead,
 		    c.dHead,
 		    c.causal,
+		    c.sinkCount,
+		    c.windowSize,
 		    c.O + oOff,
 		    c.dModel,
 		    c.keyAllowed);
@@ -296,7 +298,7 @@ void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 				size_t hhOff = 0u;
 				if (!checked_mul_size(static_cast<size_t>(hh), static_cast<size_t>(c.dHead), hhOff))
 					continue;
-				glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+				glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided_sw(
 				    c.Q + hhOff,
 				    c.dModel,
 				    c.K + kvhOff,
@@ -306,6 +308,7 @@ void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 				    c.dO + hhOff,
 				    c.dModel,
 				    c.T, c.dHead, c.dHead, c.causal,
+				    c.sinkCount, c.windowSize,
 				    c.dQ + hhOff,
 				    c.dModel,
 				    c.dK + kvhOff,
@@ -332,7 +335,7 @@ void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 		    !checked_mul_size(static_cast<size_t>(kvh), static_cast<size_t>(c.dHead), kvhOff))
 			continue;
 
-		glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk(
+		glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk_sw(
 		    c.Q + hOff,
 		    c.dModel,
 		    c.K + kvhOff,
@@ -343,6 +346,7 @@ void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 		    c.dModel,
 		    tBegin, tEnd,
 		    c.T, c.dHead, c.dHead, c.causal,
+		    c.sinkCount, c.windowSize,
 		    c.dQ + hOff,
 		    c.dModel,
 		    dKlocal, dVlocal,

@@ -1,0 +1,21 @@
+
+============================================================
+VESTA same-memory shootout (50 epochs, GPU)
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=50 seq=512 LR=1.0e-02 r=8 GPU=1
+
+variant                         model_MiB   opt_MiB       n     trainNLL              testNLL               wall(s)   
+-------                         ---------   -------       ---   --------------------  --------------------  ----------
+AdamW d=512                     32.0        64.0          3      1.1846 +/- 0.1299     1.9266 +/- 0.0377     11.4 +/- 0.1  
+VESTA-plain-raw d=896           98.0        1.5           3      1.0813 +/- 0.0065     1.7159 +/- 0.0612     40.0 +/- 0.4  
+AdamW d=896 (ref, +mem)         98.0        196.0         3      1.6274 +/- 0.4050     2.0094 +/- 0.1902     27.3 +/- 0.0  
+
+Compare row 1 (AdamW d=512) vs row 2 (VESTA-plain-raw d=896):
+  Row 1 total memory: ~99 MiB.  Row 2 total memory: ~120 MiB.
+  At ~comparable memory, VESTA at 1.75x dModel should beat AdamW.
+  Row 3 (AdamW @ d=896) is the upper-bound 'AdamW with VESTA's wider model' check.
+
+========================
+| Unit Tests Completed |
+========================

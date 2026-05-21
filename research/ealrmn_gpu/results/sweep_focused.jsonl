@@ -1,0 +1,1 @@
+{"model":"ealrmn_attmem","task":"needle","m":512,"T":2048,"seed":0,"step":300,"train_loss":0.00719314,"val_loss":0.00705598,"val_acc":1,"tok_per_sec":77694.3,"n_params":842252,"wall_s":63.2633,"tag":"focused"}

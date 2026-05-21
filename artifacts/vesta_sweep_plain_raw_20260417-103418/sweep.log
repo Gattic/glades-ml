@@ -1,0 +1,24 @@
+
+============================================================
+VESTA-plain-raw (stateless complement) at dModel=1024, 50 epochs
+============================================================
+Config: dModel=1024 dFF=2048 layers=4 epochs=50 LR=1.0e-02
+
+variant                         n     trainNLL              testNLL               wall(s)   
+-------                         ---   --------------------  --------------------  ----------
+AdamW                           3      1.8021 +/- 0.3560     2.2256 +/- 0.1212     31.2 +/- 0.5  
+VESTA-plain-raw lp=0.2          3      1.7910 +/- 0.0094     2.1403 +/- 0.0262    221.3 +/- 0.8  
+VESTA-plain-raw lp=0.5          3      1.1899 +/- 0.0456     1.7937 +/- 0.0217    221.5 +/- 1.1  
+VESTA-plain-raw lp=1.0          3      1.0203 +/- 0.0375     1.7509 +/- 0.0051    221.3 +/- 0.7  
+VESTA-plain-raw lp=2.0          3      0.8965 +/- 0.0277     1.7393 +/- 0.0382    220.5 +/- 1.4  
+
+Best VESTA-plain-raw: lp=2.0 testNLL=1.7393 +/- 0.0382
+Delta vs AdamW: -0.4863 nats
+
+Memory at dModel=1024 (approximate, summed over weight matrices):
+  AdamW:           262 MiB
+  VESTA-plain-raw: 1.83 MiB   (0.70% of AdamW)
+
+========================
+| Unit Tests Completed |
+========================

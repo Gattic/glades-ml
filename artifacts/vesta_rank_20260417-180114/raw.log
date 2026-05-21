@@ -1,0 +1,35 @@
+
+============================================================
+VESTA rank sweep at dModel=2048, 50 epochs (GPU)
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[i]2026-04-17 22:05:17 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=753.687 token_lm_loss_kind=full_softmax nll=3.28355 perplexity=26.6703 acc_top1=8.21918 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:06:58 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=758.16 token_lm_loss_kind=full_softmax nll=3.2477 perplexity=25.7311 acc_top1=12.9159 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:08:39 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=750.367 token_lm_loss_kind=full_softmax nll=3.07109 perplexity=21.5653 acc_top1=27.7886 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+AdamW reference: testNLL = 3.2008 +/- 0.1137  wall 100.1 s
+
+rank        n     trainNLL              testNLL               wall(s)     opt MiB   
+----        ---   --------------------  --------------------  ----------  -------   
+[i]2026-04-17 22:13:29 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=813.694 token_lm_loss_kind=full_softmax nll=2.96955 perplexity=19.4831 acc_top1=19.3738 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:17:41 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=764.97 token_lm_loss_kind=full_softmax nll=1.92762 perplexity=6.87315 acc_top1=69.863 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:22:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=774.242 token_lm_loss_kind=full_softmax nll=1.82385 perplexity=6.19564 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=4         3      2.0421 +/- 0.7786     2.2403 +/- 0.6336    270.2 +/- 19.6   1.75      
+[i]2026-04-17 22:27:39 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=786.154 token_lm_loss_kind=full_softmax nll=1.83387 perplexity=6.25805 acc_top1=69.0802 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:33:06 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=787.365 token_lm_loss_kind=full_softmax nll=1.90335 perplexity=6.70836 acc_top1=69.863 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:38:15 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=789.799 token_lm_loss_kind=full_softmax nll=1.80321 perplexity=6.06908 acc_top1=70.8415 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=8         3      1.5667 +/- 0.0266     1.8468 +/- 0.0513    320.4 +/- 10.3   3.50      
+[i]2026-04-17 22:46:01 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=791.022 token_lm_loss_kind=full_softmax nll=1.86208 perplexity=6.43709 acc_top1=68.4932 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 22:53:41 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=792.248 token_lm_loss_kind=full_softmax nll=1.8771 perplexity=6.53455 acc_top1=69.863 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 23:01:16 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=774.242 token_lm_loss_kind=full_softmax nll=1.76737 perplexity=5.85541 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=16        3      1.5337 +/- 0.0226     1.8355 +/- 0.0595    459.5 +/- 5.5    7.00      
+[i]2026-04-17 23:13:35 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=775.417 token_lm_loss_kind=full_softmax nll=1.79601 perplexity=6.02556 acc_top1=69.2759 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 23:25:23 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=782.542 token_lm_loss_kind=full_softmax nll=1.8311 perplexity=6.24078 acc_top1=69.863 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 23:34:50 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=805.994 token_lm_loss_kind=full_softmax nll=1.71971 perplexity=5.58292 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=32        3      1.4573 +/- 0.0279     1.7823 +/- 0.0570    670.7 +/- 91.1   14.00     
+[i]2026-04-17 23:55:23 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=799.687 token_lm_loss_kind=full_softmax nll=1.77207 perplexity=5.88301 acc_top1=69.2759 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-18 00:16:07 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=820.225 token_lm_loss_kind=full_softmax nll=1.78545 perplexity=5.96226 acc_top1=70.2544 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-18 00:37:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=821.543 token_lm_loss_kind=full_softmax nll=1.67532 perplexity=5.34052 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=64        3      1.3935 +/- 0.0201     1.7443 +/- 0.0601    1246.2 +/- 16.4   28.00     
+========================
+| Unit Tests Completed |
+========================

@@ -1,0 +1,8 @@
+Sweep 'focused' starting at Tue May 19 03:21:03 AM EDT 2026, output: results/sweep_focused.jsonl
+GPU: NVIDIA GeForce RTX 4080 SUPER, 16376 MiB
+[03:21:03] BEGIN ealrmn_attmem/needle m=512 T=2048 seed=0 steps=1500
+Model ealrmn_attmem task needle m=512 T=2048 B=8 steps=1500 seed=0 n_params=842252
+[ealrmn_attmem/needle m=512 T=2048 s=0] step     1 train_loss=2.0705 lr=0.000002 tok/s=70446.7
+[ealrmn_attmem/needle m=512 T=2048 s=0] step   150 train_loss=1.1343 lr=0.000225 tok/s=77033.2
+[ealrmn_attmem/needle m=512 T=2048 s=0] step   300 train_loss=0.0072 lr=0.000296 tok/s=77792.1
+  EVAL step   300 val_loss=0.0071 val_acc=1.0000 wall_s=63.3

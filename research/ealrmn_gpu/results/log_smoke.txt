@@ -1,0 +1,45 @@
+Sweep 'smoke' starting at Tue May 19 03:18:58 AM EDT 2026, output: results/sweep_smoke.jsonl
+GPU: NVIDIA GeForce RTX 4080 SUPER, 16376 MiB
+[03:18:58] BEGIN ealrmn_attmem/needle m=128 T=256 seed=0 steps=200
+[ealrmn_attmem/needle m=128 T=256 s=0] step   120 train_loss=1.8510 lr=0.000180 tok/s=91692.2
+  EVAL step   120 val_loss=1.9231 val_acc=0.3750 wall_s=2.7
+[ealrmn_attmem/needle m=128 T=256 s=0] step   140 train_loss=1.9287 lr=0.000210 tok/s=91615.6
+[ealrmn_attmem/needle m=128 T=256 s=0] step   160 train_loss=1.6124 lr=0.000240 tok/s=91775.3
+  EVAL step   160 val_loss=1.6390 val_acc=0.8125 wall_s=3.6
+[ealrmn_attmem/needle m=128 T=256 s=0] step   180 train_loss=1.8492 lr=0.000270 tok/s=91662.0
+[ealrmn_attmem/needle m=128 T=256 s=0] step   200 train_loss=1.5536 lr=0.000300 tok/s=91768.1
+  EVAL step   200 val_loss=1.5186 val_acc=0.8125 wall_s=4.5
+[03:19:03] END   ealrmn_attmem/needle m=128 T=256 seed=0 steps=200  wall=5s
+[03:19:03] BEGIN rnn/needle m=128 T=256 seed=0 steps=200
+[rnn/needle m=128 T=256 s=0] step   120 train_loss=1.8289 lr=0.000180 tok/s=149315.0
+  EVAL step   120 val_loss=1.8327 val_acc=0.3750 wall_s=1.7
+[rnn/needle m=128 T=256 s=0] step   140 train_loss=1.7685 lr=0.000210 tok/s=148362.9
+[rnn/needle m=128 T=256 s=0] step   160 train_loss=1.4535 lr=0.000240 tok/s=148143.3
+  EVAL step   160 val_loss=1.5757 val_acc=0.7500 wall_s=2.2
+[rnn/needle m=128 T=256 s=0] step   180 train_loss=1.3763 lr=0.000270 tok/s=147626.4
+[rnn/needle m=128 T=256 s=0] step   200 train_loss=1.3699 lr=0.000300 tok/s=147571.0
+  EVAL step   200 val_loss=1.2378 val_acc=1.0000 wall_s=2.8
+[03:19:06] END   rnn/needle m=128 T=256 seed=0 steps=200  wall=3s
+[03:19:06] BEGIN ealrmn_attmem/needle m=128 T=256 seed=1 steps=200
+[ealrmn_attmem/needle m=128 T=256 s=1] step   120 train_loss=1.8510 lr=0.000180 tok/s=88186.9
+  EVAL step   120 val_loss=1.8868 val_acc=0.3125 wall_s=2.8
+[ealrmn_attmem/needle m=128 T=256 s=1] step   140 train_loss=1.9287 lr=0.000210 tok/s=88119.6
+[ealrmn_attmem/needle m=128 T=256 s=1] step   160 train_loss=1.6124 lr=0.000240 tok/s=88270.6
+  EVAL step   160 val_loss=1.7260 val_acc=0.6250 wall_s=3.7
+[ealrmn_attmem/needle m=128 T=256 s=1] step   180 train_loss=1.8492 lr=0.000270 tok/s=88217.7
+[ealrmn_attmem/needle m=128 T=256 s=1] step   200 train_loss=1.5536 lr=0.000300 tok/s=88370.1
+  EVAL step   200 val_loss=1.4318 val_acc=0.8750 wall_s=4.6
+[03:19:11] END   ealrmn_attmem/needle m=128 T=256 seed=1 steps=200  wall=5s
+[03:19:11] BEGIN rnn/needle m=128 T=256 seed=1 steps=200
+[rnn/needle m=128 T=256 s=1] step   120 train_loss=1.8289 lr=0.000180 tok/s=149338.9
+  EVAL step   120 val_loss=1.8023 val_acc=0.5625 wall_s=1.7
+[rnn/needle m=128 T=256 s=1] step   140 train_loss=1.7685 lr=0.000210 tok/s=149076.1
+[rnn/needle m=128 T=256 s=1] step   160 train_loss=1.4535 lr=0.000240 tok/s=148781.7
+  EVAL step   160 val_loss=1.6027 val_acc=0.9375 wall_s=2.2
+[rnn/needle m=128 T=256 s=1] step   180 train_loss=1.3763 lr=0.000270 tok/s=148077.1
+[rnn/needle m=128 T=256 s=1] step   200 train_loss=1.3699 lr=0.000300 tok/s=147857.2
+  EVAL step   200 val_loss=1.2403 val_acc=1.0000 wall_s=2.8
+[03:19:14] END   rnn/needle m=128 T=256 seed=1 steps=200  wall=3s
+Sweep 'smoke' finished at Tue May 19 03:19:14 AM EDT 2026
+Output: results/sweep_smoke.jsonl
+-rw-rw-r-- 1 robert robert 3957 May 19 03:19 results/sweep_smoke.jsonl

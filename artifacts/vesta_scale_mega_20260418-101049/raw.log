@@ -1,0 +1,136 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+
+============================================================
+VESTA mega-scale sweep at dModel=8192, 30 epochs (GPU)
+============================================================
+Running AdamW reference ...
+[i]2026-04-18 14:11:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=0 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.5331 token_lm_loss_kind=full_softmax nll=5.23453 perplexity=187.641 acc_top1=0.392157 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=1
+[i]2026-04-18 14:11:23 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=1 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.3755 token_lm_loss_kind=full_softmax nll=11.19 perplexity=72401.6 acc_top1=3.92157 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=2
+[i]2026-04-18 14:11:36 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=2 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.0946 token_lm_loss_kind=full_softmax nll=8.42501 perplexity=4559.7 acc_top1=3.92157 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=3
+[i]2026-04-18 14:11:49 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=3 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.5331 token_lm_loss_kind=full_softmax nll=7.4497 perplexity=1719.36 acc_top1=5.09804 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=4
+[i]2026-04-18 14:12:01 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=4 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.6428 token_lm_loss_kind=full_softmax nll=6.74772 perplexity=852.115 acc_top1=4.31373 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=5
+[i]2026-04-18 14:12:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=5 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.6461 token_lm_loss_kind=full_softmax nll=6.49095 perplexity=659.15 acc_top1=4.31373 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=6
+[i]2026-04-18 14:12:26 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=6 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.8948 token_lm_loss_kind=full_softmax nll=6.29924 perplexity=544.157 acc_top1=0.784314 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=7
+[i]2026-04-18 14:12:38 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=7 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.5728 token_lm_loss_kind=full_softmax nll=6.13032 perplexity=459.584 acc_top1=3.13725 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=8
+[i]2026-04-18 14:12:50 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=8 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=21.3765 token_lm_loss_kind=full_softmax nll=5.60049 perplexity=270.558 acc_top1=7.05882 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=9
+[i]2026-04-18 14:13:02 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=9 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.2864 token_lm_loss_kind=full_softmax nll=5.72414 perplexity=306.17 acc_top1=6.27451 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=10
+[i]2026-04-18 14:13:15 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=10 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.6011 token_lm_loss_kind=full_softmax nll=5.67158 perplexity=290.494 acc_top1=8.23529 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=11
+[i]2026-04-18 14:13:27 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=11 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.505 token_lm_loss_kind=full_softmax nll=5.43057 perplexity=228.279 acc_top1=5.4902 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=12
+[i]2026-04-18 14:13:40 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=12 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=2[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+55 targets_per_sec=20.418 token_lm_loss_kind=full_softmax nll=5.24988 perplexity=190.543 acc_top1=5.4902 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=13
+[i]2026-04-18 14:13:52 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=13 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.2477 token_lm_loss_kind=full_softmax nll=4.87968 perplexity=131.589 acc_top1=5.88235 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=14
+[i]2026-04-18 14:14:05 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=14 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.4836 token_lm_loss_kind=full_softmax nll=4.61084 perplexity=100.569 acc_top1=6.27451 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=15
+[i]2026-04-18 14:14:17 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=15 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.6344 token_lm_loss_kind=full_softmax nll=4.31667 perplexity=74.9386 acc_top1=3.52941 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=16
+[i]2026-04-18 14:14:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=16 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.267 token_lm_loss_kind=full_softmax nll=4.04367 perplexity=57.0352 acc_top1=4.70588 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=17
+[i]2026-04-18 14:14:42 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=17 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=19.9063 token_lm_loss_kind=full_softmax nll=3.93318 perplexity=51.0693 acc_top1=3.13725 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=18
+[i]2026-04-18 14:14:55 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=18 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.4638 token_lm_loss_kind=full_softmax nll=3.91318 perplexity=50.0579 acc_top1=3.13725 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=19
+[i]2026-04-18 14:15:07 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=19 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.8027 token_lm_loss_kind=full_softmax nll=3.94068 perplexity=51.4536 acc_top1=6.27451 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=20
+[i]2026-04-18 14:15:20 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=20 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.5017 token_lm_loss_kind=full_softmax nll=3.99138 perplexity=54.1296 acc_top1=8.23529 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=21
+[i]2026-04-18 14:15:32 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=21 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.7048 token_lm_loss_kind=full_softmax nll=4.01987 perplexity=55.6938 acc_top1=7.05882 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=22
+[i]2026-04-18 14:15:44 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=22 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=21.0067 token_lm_loss_kind=full_softmax nll=3.8662 perplexity=47.7605 acc_top1=6.27451 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=23
+[i]2026-04-18 14:15:57 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=23 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.505 token_lm_loss_kind=full_softmax nll=3.59404 perplexity=36.3809 acc_top1=6.66667 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=24
+[i]2026-04-18 14:16:09 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=24 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.9051 token_lm_loss_kind=full_softmax nll=3.37696 perplexity=29.2817 acc_top1=9.01961 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=25
+[i]2026-04-18 14:16:21 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=25 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+20.7317 token_lm_loss_kind=full_softmax nll=3.29879 perplexity=27.08 acc_top1=8.23529 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=26
+[i]2026-04-18 14:16:33 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=26 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.7909 token_lm_loss_kind=full_softmax nll=3.39668 perplexity=29.8647 acc_top1=8.23529 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=27
+[i]2026-04-18 14:16:46 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=27 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.9136 token_lm_loss_kind=full_softmax nll=3.53089 perplexity=34.1545 acc_top1=6.66667 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=28
+[i]2026-04-18 14:16:58 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=28 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=20.6997 token_lm_loss_kind=full_softmax nll=3.42995 perplexity=30.8752 acc_top1=13.7255 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=29
+[i]2026-04-18 14:17:10 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=29 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=21.1513 token_lm_loss_kind=full_softmax nll=3.37036 perplexity=29.089 acc_top1=8.62745 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=30
+[i]2026-04-18 14:17:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=30 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=90.6183 token_lm_loss_kind=full_softmax nll=3.40812 perplexity=30.2084 acc_top1=5.88235 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=30
+AdamW: testNLL = 3.4081  wall 380.7 s
+
+rank        n     trainNLL              testNLL               wall(s)     opt MiB   
+----        ---   --------------------  --------------------  ----------  -------   
+[i]2026-04-18 14:37:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=0 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=0.21451 token_lm_loss_kind=full_softmax nll=5.23453 perplexity=187.641 acc_top1=0.392157 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=1
+[i]2026-04-18 14:41:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=1 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05596 token_lm_loss_kind=full_softmax nll=4.39956 perplexity=81.4154 acc_top1=7.84314 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=2
+[i]2026-04-18 14:45:14 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=2 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06092 token_lm_loss_kind=full_softmax nll=3.71871 perplexity=41.2112 acc_top1=28.6275 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=3
+[i]2026-04-18 14:49:14 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=3 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06061 token_lm_loss_kind=full_softmax nll=2.9736 perplexity=19.5622 acc_top1=37.6471 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=4
+[i]2026-04-18 14:53:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=4 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06932 token_lm_loss_kind=full_softmax nll=2.4931 perplexity=12.0988 acc_top1=57.6471 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=5
+[i]2026-04-18 14:57:10 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=5 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07689 token_lm_loss_kind=full_softmax nll=1.92424 perplexity=6.84992 acc_top1=58.0392 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=6
+[i]2026-04-18 15:01:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=6 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05607 token_lm_loss_kind=full_softmax nll=1.38773 perplexity=4.00576 acc_top1=69.4118 lr_mult=1 grad_norm=na grad_norm_scale=na optimiz[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+er_step=7
+[i]2026-04-18 15:05:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=7 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05777 token_lm_loss_kind=full_softmax nll=1.22756 perplexity=3.41289 acc_top1=71.7647 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=8
+[i]2026-04-18 15:09:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=8 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05781 token_lm_loss_kind=full_softmax nll=1.11809 perplexity=3.05902 acc_top1=72.549 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=9
+[i]2026-04-18 15:13:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=9 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.0733 token_lm_loss_kind=full_softmax nll=1.06046 perplexity=2.88769 acc_top1=72.549 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=10
+[i]2026-04-18 15:17:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=10 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06002 token_lm_loss_kind=full_softmax nll=1.01311 perplexity=2.75414 acc_top1=72.9412 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=11
+[i]2026-04-18 15:21:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=11 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05815 token_lm_loss_kind=full_softmax nll=0.996255 perplexity=2.70812 acc_top1=72.1569 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=12
+[i]2026-04-18 15:25:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=12 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06118 token_lm_loss_kind=full_softmax nll=0.97353 perplexity=2.64727 acc_top1=74.5098 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=13
+[i]2026-04-18 15:29:13 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=13 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.05828 token_lm_loss_kind=full_softmax nll=1.01697 perplexity=2.76481 acc_top1=73.7255 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=14
+[i]2026-04-18 15:33:10 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=14 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07913 token_lm_loss_kind=full_softmax nll=0.952837 perplexity=2.59306 acc_top1=74.1176 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=15
+[i]2026-04-18 15:37:11 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=15 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.0585 token_lm_loss_kind=full_softmax nll=0.965724 perplexity=2.62669 acc_top1=76.0784 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=16
+[i]2026-04-18 15:56:35 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=16 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=0.219064 token_lm_loss_kind=full_softmax nll=0.952749 perplexity=2.59283 acc_top1=74.1176 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=17
+[i]2026-04-18 16:00:31 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=17 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07769 token_lm_loss_kind=full_softmax nll=0.963958 perplexity=2.62205 acc_top1=74.902 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=18
+[i]2026-04-18 16:04:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=18 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06749 token_lm_loss_kind=full_softmax nll=0.931118 perplexity=2.53734 acc_top1=76.4706 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=19
+[i]2026-04-18 16:08:26 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=19 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.08328 token_lm_loss_kind=full_softmax nll=0.901443 perplexity=2.46315 acc_top1=76.4706 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=20
+[i]202[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+[glades-cuda] cudaMalloc(134217728 floats, 536870912 bytes) failed: out of memory
+6-04-18 16:12:22 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=20 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.0804 token_lm_loss_kind=full_softmax nll=0.86594 perplexity=2.37724 acc_top1=76.0784 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=21
+[i]2026-04-18 16:16:20 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=21 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07119 token_lm_loss_kind=full_softmax nll=0.837545 perplexity=2.31069 acc_top1=77.2549 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=22
+[i]2026-04-18 16:20:18 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=22 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07126 token_lm_loss_kind=full_softmax nll=0.828515 perplexity=2.28992 acc_top1=76.4706 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=23
+[i]2026-04-18 16:24:16 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=23 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.072 token_lm_loss_kind=full_softmax nll=0.821413 perplexity=2.27371 acc_top1=77.2549 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=24
+[i]2026-04-18 16:28:14 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=24 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.0719 token_lm_loss_kind=full_softmax nll=0.818622 perplexity=2.26737 acc_top1=76.8627 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=25
+[i]2026-04-18 16:32:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=25 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06948 token_lm_loss_kind=full_softmax nll=0.814835 perplexity=2.2588 acc_top1=79.6078 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=26
+[i]2026-04-18 16:36:07 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=26 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.08557 token_lm_loss_kind=full_softmax nll=0.80649 perplexity=2.24003 acc_top1=77.6471 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=27
+[i]2026-04-18 16:40:04 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=27 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.07718 token_lm_loss_kind=full_softmax nll=0.810479 perplexity=2.24899 acc_top1=80 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=28
+[i]2026-04-18 16:43:58 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=28 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.08936 token_lm_loss_kind=full_softmax nll=0.787523 perplexity=2.19795 acc_top1=78.0392 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=29
+[i]2026-04-18 16:47:56 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=29 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.06975 token_lm_loss_kind=full_softmax nll=0.786829 perplexity=2.19642 acc_top1=78.8235 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=30
+[i]2026-04-18 16:47:58 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=30 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=113.082 token_lm_loss_kind=full_softmax nll=2.11996 perplexity=8.33078 acc_top1=63.9216 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=30
+r=8        1      0.7868              2.1200             9041.9       14.00     
+========================
+| Unit Tests Completed |
+========================

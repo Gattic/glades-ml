@@ -290,5 +290,516 @@ inline bool sample_token_from_logits_ptr(const float* logits,
 	return sample_token_from_logits_ptr_plan(logits, rng, plan, outToken, idxScratch, weightScratch);
 }
 
+// ============================================================================
+// Paradigm shift #75 — SPECULATIVE-DECODING-DISTILL primitives
+// ============================================================================
+//
+// Speculative decoding (Leviathan et al. 2023, Chen et al. 2023) accelerates
+// LLM inference by:
+//   1. A small "draft" model proposes K tokens autoregressively.
+//   2. The full "main" model verifies all K positions in parallel (single fwd).
+//   3. Rejection sampling: accept t_i with prob min(1, p_main(t_i)/p_draft(t_i)).
+//      On first reject, resample from the "residual" max(0, p_main - p_draft).
+//
+// Theorem 3.5 of Leviathan 2023: rejection sampling preserves p_main exactly.
+// NLL bit-exact at inference; output distribution = main's distribution.
+//
+// Production: vLLM, TensorRT-LLM, DeepSeek-V3, Eagle, Medusa.
+//
+// These are pure-CPU primitives: the model forward pass is the caller's
+// responsibility. The primitives implement the rejection-sampling math.
+
+inline float spec_total_variation_distance(const float* p_main,
+                                           const float* p_draft,
+                                           unsigned int vocab)
+{
+	if (!p_main || !p_draft || vocab == 0u)
+		return 0.0f;
+	double tvd = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		const double d = static_cast<double>(p_main[i]) - static_cast<double>(p_draft[i]);
+		tvd += (d > 0.0) ? d : -d;
+	}
+	tvd *= 0.5;
+	if (tvd < 0.0) tvd = 0.0;
+	if (tvd > 1.0) tvd = 1.0;
+	return static_cast<float>(tvd);
+}
+
+// Lower bound on per-token acceptance rate from Leviathan 2023 Theorem 3.5
+// corollary: P(accept) = sum_x min(p_main(x), p_draft(x)) = 1 - TVD(p_main, p_draft).
+inline float spec_acceptance_rate_bound(const float* p_main,
+                                        const float* p_draft,
+                                        unsigned int vocab)
+{
+	return 1.0f - spec_total_variation_distance(p_main, p_draft, vocab);
+}
+
+// Single-position rejection-sampling step.
+//
+// Inputs:
+//   p_main  [vocab]: full-model probabilities at this position.
+//   p_draft [vocab]: draft-model probabilities at this position.
+//   draft_token:    the token the draft proposed (must be in [0, vocab)).
+//   rng:            uniform [0,1) source.
+//
+// Outputs:
+//   acceptedOut: true iff the draft token was accepted.
+//   sampledTokenOut: if accepted, == draft_token; else, drawn from
+//     normalize(max(0, p_main - p_draft)) (the "residual" distribution).
+//
+// Returns false on bad inputs or degenerate (all-zero) probability vector.
+inline bool speculative_rejection_sample_step(const float* p_main,
+                                              const float* p_draft,
+                                              unsigned int draft_token,
+                                              unsigned int vocab,
+                                              glades::rng::Engine& rng,
+                                              bool& acceptedOut,
+                                              unsigned int& sampledTokenOut,
+                                              std::vector<float>& residualScratch)
+{
+	acceptedOut = false;
+	sampledTokenOut = 0u;
+	if (!p_main || !p_draft || vocab == 0u || draft_token >= vocab)
+		return false;
+
+	const float pm = p_main[draft_token];
+	const float pd = p_draft[draft_token];
+
+	// Acceptance probability: min(1, p_main / p_draft).
+	double acceptProb = 1.0;
+	if (pd > 0.0f)
+	{
+		const double r = static_cast<double>(pm) / static_cast<double>(pd);
+		acceptProb = (r < 1.0) ? r : 1.0;
+	}
+	// If pd == 0 but pm > 0: accept (any positive draft has prob 0 under draft,
+	// shouldn't happen; treat as accept since main supports it).
+	// If pd == 0 and pm == 0: degenerate, reject and resample.
+
+	const double u = static_cast<double>(glades::rng::uniform_double(rng, 0.0, 1.0));
+	if (u < acceptProb)
+	{
+		acceptedOut = true;
+		sampledTokenOut = draft_token;
+		return true;
+	}
+
+	// Reject: resample from normalize(max(0, p_main - p_draft)).
+	if (residualScratch.size() < vocab)
+		residualScratch.assign(vocab, 0.0f);
+	double residSum = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		const double d = static_cast<double>(p_main[i]) - static_cast<double>(p_draft[i]);
+		const float v = (d > 0.0) ? static_cast<float>(d) : 0.0f;
+		residualScratch[i] = v;
+		residSum += static_cast<double>(v);
+	}
+
+	if (residSum <= 0.0)
+	{
+		// Degenerate (p_draft pointwise dominates p_main). Fall back to p_main.
+		double mainSum = 0.0;
+		for (unsigned int i = 0; i < vocab; ++i)
+		{
+			residualScratch[i] = p_main[i];
+			mainSum += static_cast<double>(p_main[i]);
+		}
+		if (mainSum <= 0.0)
+		{
+			// Fully degenerate: pick token 0.
+			sampledTokenOut = 0u;
+			return true;
+		}
+		residSum = mainSum;
+	}
+
+	const double inv = 1.0 / residSum;
+	const double r = static_cast<double>(glades::rng::uniform_double(rng, 0.0, 1.0));
+	double cum = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		cum += static_cast<double>(residualScratch[i]) * inv;
+		if (r < cum)
+		{
+			sampledTokenOut = i;
+			return true;
+		}
+	}
+	sampledTokenOut = vocab - 1u;
+	return true;
+}
+
+// Verify a K-token draft proposal against main probabilities.
+//
+// Inputs:
+//   p_main   [(K+1) * vocab]: main probabilities at draft positions [1..K]
+//                              plus position K+1 (used if all K accepted).
+//   p_draft  [K * vocab]:      draft probabilities at positions [1..K].
+//   draft_tokens [K]:          tokens the draft proposed.
+//   K, vocab:                  dimensions.
+//
+// Outputs:
+//   nAccepted: number of accepted tokens (0..K).
+//   tailToken: the token emitted after the last accept:
+//     - if nAccepted == K: drawn from p_main row K (the "bonus" token from
+//       Leviathan 2023 — main's distribution after the verified prefix).
+//     - else (rejected at position nAccepted): drawn from
+//       normalize(max(0, p_main_row_nAccepted - p_draft_row_nAccepted)).
+//
+// Returns the count of tokens emitted total (= nAccepted + 1).
+inline unsigned int speculative_verify_K(const float* p_main,
+                                         const float* p_draft,
+                                         const unsigned int* draft_tokens,
+                                         unsigned int K,
+                                         unsigned int vocab,
+                                         glades::rng::Engine& rng,
+                                         unsigned int& nAcceptedOut,
+                                         unsigned int& tailTokenOut,
+                                         std::vector<float>& residualScratch,
+                                         std::vector<unsigned int>& idxScratch,
+                                         std::vector<float>& weightScratch)
+{
+	nAcceptedOut = 0u;
+	tailTokenOut = 0u;
+	if (!p_main || !p_draft || !draft_tokens || K == 0u || vocab == 0u)
+		return 0u;
+
+	for (unsigned int i = 0; i < K; ++i)
+	{
+		const float* pmRow = p_main + static_cast<size_t>(i) * vocab;
+		const float* pdRow = p_draft + static_cast<size_t>(i) * vocab;
+		bool accepted = false;
+		unsigned int tok = 0u;
+		if (!speculative_rejection_sample_step(pmRow, pdRow, draft_tokens[i], vocab,
+		                                       rng, accepted, tok, residualScratch))
+			return nAcceptedOut;
+		if (accepted)
+		{
+			++nAcceptedOut;
+			continue;
+		}
+		// Rejected: tok is the resample from residual; emit it as tail and stop.
+		tailTokenOut = tok;
+		return nAcceptedOut + 1u;
+	}
+
+	// All K accepted: bonus-sample from the (K+1)-th main row (greedy/argmax for
+	// determinism in tests; production would route through SamplingPlan).
+	const float* pmBonus = p_main + static_cast<size_t>(K) * vocab;
+	double bestP = -1.0;
+	unsigned int bestTok = 0u;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		const double v = static_cast<double>(pmBonus[i]);
+		if (v > bestP)
+		{
+			bestP = v;
+			bestTok = i;
+		}
+	}
+	(void)idxScratch; (void)weightScratch;
+	tailTokenOut = bestTok;
+	return nAcceptedOut + 1u;
+}
+
+// ============================================================================
+// Paradigm shift #97 — DRAFT-VERIFIER-CO-LEARN-DISTILL primitives
+// ============================================================================
+//
+// Builds on #75 SPECULATIVE-DECODING: at each rejected draft token, log the
+// triple (context, draft_distribution, main_distribution); after accumulating
+// rejections, fine-tune the draft via co-learning loss:
+//
+//   L = α · CE(draft, main_argmax) + (1-α) · τ² · KL(draft_τ || main_τ)
+//
+// where τ = temperature, draft_τ = softmax(draft_logits / τ), and similarly
+// for main_τ. Each co-learning round reduces TVD(p_draft, p_main); per #75
+// Theorem 3, this raises acceptance rate.
+
+inline void softmax_with_temperature(const float* logits,
+                                     unsigned int vocab,
+                                     float tau,
+                                     float* probsOut)
+{
+	if (!logits || !probsOut || vocab == 0u) return;
+	const float invTau = 1.0f / (tau > 0.0f ? tau : 1e-6f);
+	float maxL = logits[0] * invTau;
+	for (unsigned int i = 1; i < vocab; ++i)
+		if (logits[i] * invTau > maxL) maxL = logits[i] * invTau;
+	double sum = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		const double e = exp(static_cast<double>(logits[i] * invTau - maxL));
+		probsOut[i] = static_cast<float>(e);
+		sum += e;
+	}
+	if (sum <= 0.0) return;
+	const float inv = static_cast<float>(1.0 / sum);
+	for (unsigned int i = 0; i < vocab; ++i)
+		probsOut[i] *= inv;
+}
+
+// KL(p || q) = sum_i p_i log(p_i / q_i)
+inline float kl_divergence(const float* p, const float* q,
+                           unsigned int vocab,
+                           float qFloor = 1e-10f)
+{
+	if (!p || !q || vocab == 0u) return 0.0f;
+	double s = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		if (p[i] <= 0.0f) continue;
+		float qi = q[i];
+		if (qi < qFloor) qi = qFloor;
+		s += static_cast<double>(p[i]) *
+		     log(static_cast<double>(p[i]) / static_cast<double>(qi));
+	}
+	return static_cast<float>(s);
+}
+
+// Cross-entropy CE(target_token, draft_distribution) = -log p_draft[target_token]
+inline float cross_entropy_at_token(const float* p_draft,
+                                    unsigned int target_token,
+                                    unsigned int vocab,
+                                    float floor = 1e-10f)
+{
+	if (!p_draft || target_token >= vocab) return 0.0f;
+	float p = p_draft[target_token];
+	if (p < floor) p = floor;
+	return -static_cast<float>(log(static_cast<double>(p)));
+}
+
+// argmax of a distribution
+inline unsigned int argmax_token(const float* p, unsigned int vocab)
+{
+	if (!p || vocab == 0u) return 0u;
+	unsigned int best = 0u;
+	float bestv = p[0];
+	for (unsigned int i = 1; i < vocab; ++i)
+		if (p[i] > bestv) { bestv = p[i]; best = i; }
+	return best;
+}
+
+// Combined co-learning loss for one rejection site.
+//   p_draft_at_tau:  softmax(draft_logits / tau)
+//   p_main_at_tau:   softmax(main_logits / tau)
+//   p_draft_at_one:  softmax(draft_logits) (used for CE term)
+//   p_main_at_one:   softmax(main_logits)  (target_token = argmax(p_main_at_one))
+//   alpha:           CE-vs-KL blend (α=0.3 typical, per #56 SUPER-DISTILL)
+//   tau:             temperature
+//
+// Returns scalar loss = α · CE + (1-α) · τ² · KL.
+inline float co_learn_loss(const float* p_draft_at_tau,
+                           const float* p_main_at_tau,
+                           const float* p_draft_at_one,
+                           const float* p_main_at_one,
+                           unsigned int vocab,
+                           float alpha,
+                           float tau)
+{
+	const unsigned int target = argmax_token(p_main_at_one, vocab);
+	const float ce = cross_entropy_at_token(p_draft_at_one, target, vocab);
+	const float kl = kl_divergence(p_main_at_tau, p_draft_at_tau, vocab);
+	return alpha * ce + (1.0f - alpha) * tau * tau * kl;
+}
+
+// ============================================================================
+// Paradigm shift #95 — MULTI-TEACHER-ROUTING-DISTILL primitives
+// ============================================================================
+//
+// Per-sample argmax classifier routing across K teachers, refining the
+// rejected #70-B ensemble approach. For each sample x:
+//   c*    = argmax_c P(class | x; θ_classifier)
+//   loss  = α · CE_groundtruth + (1-α) · KL(student || T_{c*})
+//
+// This eliminates the teacher-disagreement variance that broke #70-B.
+
+// Argmax routing across K teachers given classifier probabilities.
+// Returns the selected teacher index in [0, K).
+inline unsigned int route_to_teacher(const float* class_probs,
+                                     unsigned int K)
+{
+	if (!class_probs || K == 0u) return 0u;
+	unsigned int best = 0u;
+	float bestv = class_probs[0];
+	for (unsigned int c = 1; c < K; ++c)
+		if (class_probs[c] > bestv) { bestv = class_probs[c]; best = c; }
+	return best;
+}
+
+// Compute the per-sample routed loss given classifier output, K teacher
+// distributions, and student distribution.
+//
+//   class_probs:  [K]                           classifier P(class|x)
+//   teachers:     [K * vocab]                   per-class teacher distributions
+//   student:      [vocab]                       student distribution
+//   gt_token:     ground-truth token (for CE term)
+//   alpha, vocab, K
+//
+// Returns scalar loss = α · CE(student, gt) + (1-α) · KL(student, T_{c*})
+inline float multi_teacher_routed_loss(const float* class_probs,
+                                       const float* teachers,
+                                       const float* student,
+                                       unsigned int gt_token,
+                                       unsigned int vocab,
+                                       unsigned int K,
+                                       float alpha)
+{
+	if (!class_probs || !teachers || !student || vocab == 0u || K == 0u)
+		return 0.0f;
+	const unsigned int c = route_to_teacher(class_probs, K);
+	const float* teacher_c = teachers + static_cast<size_t>(c) * vocab;
+	const float ce = cross_entropy_at_token(student, gt_token, vocab);
+	const float kl = kl_divergence(student, teacher_c, vocab);
+	return alpha * ce + (1.0f - alpha) * kl;
+}
+
+// Ensemble loss for comparison (the #70-B mechanism that was rejected):
+//   L_ens = α · CE + Σ_k β_k · KL(student, T_k)
+// where β = class_probs (used as weights instead of routing).
+inline float multi_teacher_ensemble_loss(const float* class_probs,
+                                         const float* teachers,
+                                         const float* student,
+                                         unsigned int gt_token,
+                                         unsigned int vocab,
+                                         unsigned int K,
+                                         float alpha)
+{
+	if (!class_probs || !teachers || !student || vocab == 0u || K == 0u)
+		return 0.0f;
+	const float ce = cross_entropy_at_token(student, gt_token, vocab);
+	float klSum = 0.0f;
+	for (unsigned int c = 0; c < K; ++c)
+	{
+		const float* teacher_c = teachers + static_cast<size_t>(c) * vocab;
+		klSum += class_probs[c] * kl_divergence(student, teacher_c, vocab);
+	}
+	return alpha * ce + (1.0f - alpha) * klSum;
+}
+
+// Class-collapse detection: returns the maximum routing fraction across K
+// classes given a sample histogram. Below 0.80 = healthy; >= 0.80 = collapse.
+inline float max_class_routing_fraction(const unsigned int* histogram,
+                                        unsigned int K,
+                                        unsigned int total_samples)
+{
+	if (!histogram || K == 0u || total_samples == 0u) return 0.0f;
+	unsigned int maxCount = histogram[0];
+	for (unsigned int c = 1; c < K; ++c)
+		if (histogram[c] > maxCount) maxCount = histogram[c];
+	return static_cast<float>(maxCount) / static_cast<float>(total_samples);
+}
+
+// ============================================================================
+// Paradigm shift #69 — REASONING-DISTILL-CHIRON primitives
+// ============================================================================
+//
+// Reasoning-trace capture + amortized distillation. Per #69 design:
+//   - Teacher (DeepSeek-R1 / o1 / Claude-extended-thinking) emits reasoning
+//     chain `<THINK>...</THINK>` followed by answer.
+//   - Student trained on full sequence with KL-CE blended loss; weighting
+//     can differ between reasoning and answer regions.
+//   - Top-K teacher logit caching to bound storage at scale.
+
+// Compute a 0/1 region mask: 1 inside [think_open, think_close] (inclusive),
+// 0 outside. Handles nested or unmatched delimiters by treating each
+// think_open as toggling-into and think_close as toggling-out-of region.
+inline void region_mask_from_special_tokens(const unsigned int* token_ids,
+                                            unsigned int n,
+                                            unsigned int think_open,
+                                            unsigned int think_close,
+                                            unsigned char* mask_out)
+{
+	if (!token_ids || !mask_out || n == 0u) return;
+	bool inRegion = false;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const unsigned int tok = token_ids[i];
+		if (tok == think_open)
+		{
+			inRegion = true;
+			mask_out[i] = 1u;  // include the open delimiter
+		}
+		else if (tok == think_close)
+		{
+			mask_out[i] = inRegion ? 1u : 0u;  // include close if in region
+			inRegion = false;
+		}
+		else
+		{
+			mask_out[i] = inRegion ? 1u : 0u;
+		}
+	}
+}
+
+// Region-weighted loss: scalar = Σ_t (w_in if region[t] else w_out) · per_token_loss[t]
+// Returns a tuple via two scalars: total_weight (for normalization), and weighted_sum.
+inline float region_weighted_loss(const float* per_token_loss,
+                                  const unsigned char* region_mask,
+                                  unsigned int n,
+                                  float weight_in_region,
+                                  float weight_out_region,
+                                  float* total_weight_out)
+{
+	if (!per_token_loss || !region_mask || n == 0u)
+	{
+		if (total_weight_out) *total_weight_out = 0.0f;
+		return 0.0f;
+	}
+	double s = 0.0;
+	double tw = 0.0;
+	for (unsigned int t = 0; t < n; ++t)
+	{
+		const float w = region_mask[t] ? weight_in_region : weight_out_region;
+		s += static_cast<double>(w) * static_cast<double>(per_token_loss[t]);
+		tw += static_cast<double>(w);
+	}
+	if (total_weight_out) *total_weight_out = static_cast<float>(tw);
+	return static_cast<float>(s);
+}
+
+// Top-K logit cache: select the K largest logits and their indices in
+// out_indices[K] / out_values[K]. For #69's storage-bounded distillation
+// (cache only top-K=16 or 64 per token to bound TB-scale corpus storage).
+inline void top_k_logits(const float* logits,
+                         unsigned int vocab,
+                         unsigned int K,
+                         unsigned int* out_indices,
+                         float* out_values)
+{
+	if (!logits || !out_indices || !out_values || vocab == 0u || K == 0u || K > vocab)
+		return;
+	// O(K * vocab) selection. For unit-test correctness only; production
+	// would use partial sort or min-heap.
+	std::vector<bool> taken(vocab, false);
+	for (unsigned int i = 0; i < K; ++i)
+	{
+		unsigned int best = vocab;
+		float bestv = -1e30f;
+		for (unsigned int v = 0; v < vocab; ++v)
+		{
+			if (taken[v]) continue;
+			if (logits[v] > bestv) { bestv = logits[v]; best = v; }
+		}
+		out_indices[i] = best;
+		out_values[i] = bestv;
+		taken[best] = true;
+	}
+}
+
+// Storage saving fraction for top-K caching vs full vocab logits.
+inline float top_k_storage_fraction(unsigned int vocab, unsigned int K)
+{
+	if (vocab == 0u) return 0.0f;
+	// Each top-K entry uses 4 bytes (int index) + 2 bytes (BF16 value).
+	// Full vocab uses 2 bytes (BF16) per token.
+	const float topKBytes = 6.0f * static_cast<float>(K);
+	const float fullBytes = 2.0f * static_cast<float>(vocab);
+	return topKBytes / fullBytes;
+}
+
 } // namespace sampling
 } // namespace glades

@@ -1,0 +1,63 @@
+HMTA Forward Prototype — paradigm #261 Gate-0 (kernel-correctness)
+=================================================================
+Seed: 42
+
+Config: T=512 d=64 s0=64 eta=2 noise=0.100
+        clusters Nc=8  tree depth D=3
+        admissible far-pair stride: |Delta| > 2 clusters
+
+
+--- Truncation error scan ---
+ rank_r | p=4 rel_L2 | p=8 rel_L2 | p=16 rel_L2 | flat-SDPA Y_norm
+--------+------------+------------+-------------+------------------
+     2  |   0.2495   |   0.2259   |   0.2042    |   22.259
+     4  |   0.2490   |   0.2346   |   0.1910    |   21.761
+     8  |   0.2441   |   0.2214   |   0.1999    |   20.722
+    16  |   0.2551   |   0.2266   |   0.2071    |   21.984
+    32  |   0.2793   |   0.2607   |   0.2211    |   22.754
+
+--- Singular-value decay probe (Conjecture C4) ---
+(measures sigma_{p+1}/||L||_F on admissible cluster-pair logit submatrices)
+ true_rank | p | median retention | median sigma_{p+1}/||L||_F
+-----------+---+------------------+----------------------------
+      2    |  4 |     0.9361       |     0.1099
+      2    |  8 |     0.9722       |     0.0443
+      2    | 16 |     0.9861       |     0.0308
+      4    |  4 |     0.8847       |     0.1555
+      4    |  8 |     0.9640       |     0.0745
+      4    | 16 |     0.9886       |     0.0297
+      8    |  4 |     0.6509       |     0.2668
+      8    |  8 |     0.9225       |     0.1194
+      8    | 16 |     0.9880       |     0.0395
+     16    |  4 |     0.5211       |     0.2898
+     16    |  8 |     0.7931       |     0.2196
+     16    | 16 |     0.9800       |     0.0731
+     32    |  4 |     0.3418       |     0.2640
+     32    |  8 |     0.6093       |     0.2206
+     32    | 16 |     0.8839       |     0.1343
+
+--- FLOP-ratio scaling: HMTA(design) vs flat-SDPA ---
+(uses HMTA's intended O(T log T) production cost formula; the prototype above uses an O(T^2) inner loop for simplicity.)
+ T      | s0  | p | eta | SDPA FLOPs | HMTA FLOPs | ratio
+--------+-----+---+-----+------------+------------+--------
+   512  |  64 | 8 |  2  | 3.355e+07 | 2.753e+06 |   12.2x
+  1024  |  64 | 8 |  2  | 1.342e+08 | 6.423e+06 |   20.9x
+  2048  |  64 | 8 |  2  | 5.369e+08 | 1.468e+07 |   36.6x
+  4096  |  64 | 8 |  2  | 2.147e+09 | 3.303e+07 |   65.0x
+  8192  |  64 | 8 |  2  | 8.590e+09 | 7.340e+07 |  117.0x
+ 16384  |  64 | 8 |  2  | 3.436e+10 | 1.615e+08 |  212.8x
+
+--- SDPA-recovery sanity (p = s0 = 64, eta = Nc = 8) ---
+  rel_L2(SDPA, HMTA[p=s0,eta=Nc])  =  1.616923e-07   (should be < 1e-3)
+
+--- SCFA-shape sanity (eta = 0, single near = self) ---
+  rel_L2(SDPA, HMTA[eta=0,p=8])  =  0.4201   (should be moderate; SCFA-class accuracy)
+
+=================================================================
+PASS criteria (Gate-0 kernel-correctness branch):
+  C0a  HMTA at p=8 has rel_L2 error <= 0.20 vs flat-SDPA at
+       true_rank r in {4, 8} (the design's target regime).
+  C0b  Median rank-p retention >= 0.85 at p = 8 for r <= 8.
+  C0c  HMTA production FLOPs <= 1/10 of flat-SDPA at T = 16384.
+  C0d  SDPA-recovery error at p = s0, eta = Nc is < 1e-3.
+=================================================================

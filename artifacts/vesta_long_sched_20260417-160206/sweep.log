@@ -1,0 +1,27 @@
+
+============================================================
+VESTA long-horizon (100 epochs) + cosine LR schedule (GPU)
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=100 seq=512 LR=1.0e-02 r=8 GPU=1
+Schedule: WARMUP_LINEAR(10 steps) + COSINE(T_max=100, min=0.01)
+
+--- dModel=1024 ---
+config                          n     trainNLL              testNLL               wall(s)   
+------                          ---   --------------------  --------------------  ----------
+AdamW fixed LR                  3      1.3418 +/- 0.1113     1.9978 +/- 0.0736     62.5 +/- 0.1  
+AdamW cosine+warmup             3      1.1960 +/- 0.1227     1.9274 +/- 0.0073     62.2 +/- 0.0  
+VESTA-plain-raw fixed           3      0.9625 +/- 0.0251     1.7669 +/- 0.0341    116.5 +/- 0.6  
+VESTA-plain-raw cos             3      1.0869 +/- 0.0159     1.7314 +/- 0.0173    117.1 +/- 1.4  
+
+--- dModel=2048 ---
+config                          n     trainNLL              testNLL               wall(s)   
+------                          ---   --------------------  --------------------  ----------
+AdamW fixed LR                  3      1.5773 +/- 0.2671     1.9355 +/- 0.1078    198.5 +/- 0.2  
+AdamW cosine+warmup             3      1.5086 +/- 0.2073     1.8563 +/- 0.1006    198.3 +/- 0.3  
+VESTA-plain-raw fixed           3      1.2524 +/- 0.0177     1.7321 +/- 0.0665    613.0 +/- 22.4 
+VESTA-plain-raw cos             3      1.6010 +/- 0.0622     1.9103 +/- 0.0506    627.8 +/- 11.3 
+
+========================
+| Unit Tests Completed |
+========================

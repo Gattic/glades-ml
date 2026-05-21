@@ -1,0 +1,52 @@
+
+============================================================
+VESTA GPU scale ladder: AdamW vs VESTA-plain-raw
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=50 seq=512 LR=1.0e-02 r=8 GPU=1
+
+dModel    optimizer           n     trainNLL              testNLL               wall(s)   
+------    ---------           ---   --------------------  --------------------  ----------
+[i]2026-04-17 17:05:18 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=7984.38 token_lm_loss_kind=full_softmax nll=1.69222 perplexity=5.4315 acc_top1=72.0157 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:05:21 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=9290.91 token_lm_loss_kind=full_softmax nll=1.67032 perplexity=5.31385 acc_top1=71.82 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:05:23 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=9641.51 token_lm_loss_kind=full_softmax nll=1.63922 perplexity=5.15112 acc_top1=72.9941 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+256       AdamW-GPU           3      1.0791 +/- 0.0455     1.6672 +/- 0.0266      2.3 +/- 0.0  
+[i]2026-04-17 17:05:26 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=9462.96 token_lm_loss_kind=full_softmax nll=2.42759 perplexity=11.3316 acc_top1=68.2975 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:05:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=9290.91 token_lm_loss_kind=full_softmax nll=2.40389 perplexity=11.0661 acc_top1=70.6458 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:05:33 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=9125 token_lm_loss_kind=full_softmax nll=2.4927 perplexity=12.0939 acc_top1=69.2759 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+256       VESTA-plain-raw     3      2.1643 +/- 0.0647     2.4414 +/- 0.0460      3.4 +/- 0.0  
+          delta = +0.7741 nats   (VESTA-plain-raw vs AdamW)
+
+[i]2026-04-17 17:05:45 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4088 token_lm_loss_kind=full_softmax nll=1.89288 perplexity=6.63848 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:05:56 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4223.14 token_lm_loss_kind=full_softmax nll=1.97153 perplexity=7.18164 acc_top1=68.4932 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:06:08 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4603.6 token_lm_loss_kind=full_softmax nll=1.81651 perplexity=6.15035 acc_top1=72.7984 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+512       AdamW-GPU           3      1.1471 +/- 0.0314     1.8936 +/- 0.0775     11.4 +/- 0.0  
+[i]2026-04-17 17:06:25 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4055.56 token_lm_loss_kind=full_softmax nll=1.78483 perplexity=5.95856 acc_top1=69.863 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:06:42 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4223.14 token_lm_loss_kind=full_softmax nll=1.75451 perplexity=5.78061 acc_top1=71.2329 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:06:59 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4023.62 token_lm_loss_kind=full_softmax nll=1.75053 perplexity=5.75764 acc_top1=71.2329 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+512       VESTA-plain-raw     3      1.3043 +/- 0.0200     1.7633 +/- 0.0188     16.8 +/- 0.1  
+          delta = -0.1304 nats   (VESTA-plain-raw vs AdamW)
+
+[i]2026-04-17 17:07:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1697.67 token_lm_loss_kind=full_softmax nll=2.08398 perplexity=8.03637 acc_top1=60.8611 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:08:02 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1780.49 token_lm_loss_kind=full_softmax nll=2.04932 perplexity=7.7626 acc_top1=67.9061 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:08:33 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1780.49 token_lm_loss_kind=full_softmax nll=1.74861 perplexity=5.74661 acc_top1=71.4286 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+1024      AdamW-GPU           3      1.6743 +/- 0.1321     1.9606 +/- 0.1844     31.1 +/- 0.1  
+[i]2026-04-17 17:09:31 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1812.06 token_lm_loss_kind=full_softmax nll=1.74191 perplexity=5.70822 acc_top1=70.6458 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:10:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1851.45 token_lm_loss_kind=full_softmax nll=1.70254 perplexity=5.48789 acc_top1=70.6458 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:11:28 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1786.71 token_lm_loss_kind=full_softmax nll=1.66072 perplexity=5.2631 acc_top1=72.407 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+1024      VESTA-plain-raw     3      1.1350 +/- 0.0173     1.7017 +/- 0.0406     58.0 +/- 0.2  
+          delta = -0.2589 nats   (VESTA-plain-raw vs AdamW)
+
+[i]2026-04-17 17:13:09 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=755.917 token_lm_loss_kind=full_softmax nll=3.10619 perplexity=22.3357 acc_top1=29.7456 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:14:49 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=778.963 token_lm_loss_kind=full_softmax nll=3.16771 perplexity=23.753 acc_top1=19.9609 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:16:30 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=812.401 token_lm_loss_kind=full_softmax nll=3.08599 perplexity=21.8891 acc_top1=29.3542 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+2048      AdamW-GPU           3      3.0933 +/- 0.0794     3.1200 +/- 0.0426     99.8 +/- 0.0  
+[i]2026-04-17 17:21:56 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=789.799 token_lm_loss_kind=full_softmax nll=1.87114 perplexity=6.49572 acc_top1=69.4716 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:27:14 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=786.154 token_lm_loss_kind=full_softmax nll=1.7678 perplexity=5.85793 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 17:32:26 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=762.687 token_lm_loss_kind=full_softmax nll=1.73934 perplexity=5.6936 acc_top1=72.6027 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+2048      VESTA-plain-raw     3      1.0660 +/- 0.0571     1.7928 +/- 0.0694    317.8 +/- 7.3  
+          delta = -1.3272 nats   (VESTA-plain-raw vs AdamW)
+
+========================
+| Unit Tests Completed |
+========================

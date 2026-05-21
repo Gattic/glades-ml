@@ -1,0 +1,16 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[i]2026-05-13 22:13:10 [chiron]: [chiron-train] device: NVIDIA GeForce RTX 4080 SUPER (sm_8.9), 15.6 GB VRAM
+[i]2026-05-13 22:13:26 [chiron]: [scfa-bf16-inner] BF16 inner scratches overlay scfa_qpar: ~26.00 MB used of 64.00 MB (zero extra VRAM)
+[i]2026-05-13 22:13:26 [chiron]: [scfa] allocated SCFA state: B=[T=8192 × k=512]=16.00 MB (shared), D=[m=2048 × w+1=9] × L=24 (+dD)=3.38 MB, compression 16×, conv half-width 8
+[i]2026-05-13 22:13:26 [chiron]: [scfa] design attention speedup at T=8192, k=512: 14.6× (O(T²) → O(Tk + k² + Tw))
+[i]2026-05-13 22:13:26 [chiron]: [chiron-train] VRAM usage after allocation: 12.91 / 15.56 GB (17.1% free)
+[i]2026-05-13 22:13:26 [chiron]: [chiron-train] T=8192 m=2048 dModel=4096 L=24 nH=16 dH=256 V=32000  params=870.94M  (3322.4 MB FP32)
+[i]2026-05-13 22:13:26 [chiron]: [chiron-train] lr=1.00e-04 wd=1.00e-02 seed=1337 max_steps=50 adam=int8 attn=bf16-tiled bf16_grads=1 bf16_weights=1 local_attn_W=0 warmup=10 grad_clip=0.50 accum=1 (effective batch=8192 tokens)
+[i]2026-05-13 22:13:26 [chiron]: [fuse-attn-reln] ACTIVE: at layer L-1, q ← q + p BEFORE the existing reln; final LN normalizes the fused signal (task #31).  Wq/Wk/Wv/Wo gradients flow through bounded LayerNorm; stable at L ≤ 24 but breaks at L ≥ 48.
+[i]2026-05-13 22:13:26 [chiron]: [step      1] loss=10.4746 ema=10.4746 best=10.4746@1 acc=0.0004 ||g||=2.709 scale=0.185 lr=1.00e-05 tok/s=14745 wall=0.6s
+[i]2026-05-13 22:13:31 [chiron]: [step     10] loss=10.2759 ema=10.4440 best=10.2759@10 acc=0.0010 ||g||=2.143 scale=0.233 lr=1.00e-04 tok/s=16936 wall=4.9s
+[i]2026-05-13 22:13:36 [chiron]: [step     20] loss=9.8506 ema=10.1709 best=9.8506@20 acc=0.0059 ||g||=1.888 scale=0.265 lr=8.68e-05 tok/s=16936 wall=9.7s
+[i]2026-05-13 22:13:40 [chiron]: [step     30] loss=10.1092 ema=9.9549 best=9.6456@26 acc=0.0017 ||g||=3.184 scale=0.157 lr=5.50e-05 tok/s=16936 wall=14.6s
+[i]2026-05-13 22:13:45 [chiron]: [step     40] loss=9.4950 ema=9.8081 best=9.4950@40 acc=0.0266 ||g||=3.395 scale=0.147 lr=2.32e-05 tok/s=16918 wall=19.4s
+[i]2026-05-13 22:13:50 [chiron]: [step     50] loss=9.3223 ema=9.5763 best=9.2693@49 acc=0.1117 ||g||=8.987 scale=0.056 lr=1.00e-05 tok/s=16927 wall=24.3s
+[i]2026-05-13 22:13:50 [chiron]: [chiron-train] done: steps=50 total_tokens=409600 wall=24.3s

@@ -50,6 +50,22 @@ bool GpuBuffer<float>::allocate(size_t count)
 	if (count == 0)
 		return true;
 
+	// Diagnostic: when GLADES_LOG_GPU_ALLOC=1, print every >50M-float
+	// (200 MB) cudaMalloc as it happens.  Useful for tracing which scratch
+	// buffer is the binding constraint at the next param-ceiling lift.
+	// GLADES_LOG_GPU_ALLOC=2 lowers the threshold to 1M floats (4 MB) to
+	// catch the smaller per-block weight allocations.
+	{
+		static int s_log = -1;
+		if (s_log < 0) { const char* e = getenv("GLADES_LOG_GPU_ALLOC");
+		                 s_log = (e ? (*e == '2' ? 2 : (*e == '1' ? 1 : 0)) : 0); }
+		const size_t threshFloats = (s_log == 2) ? (1ULL * 1024ULL * 1024ULL)
+		                                          : (50ULL * 1024ULL * 1024ULL);
+		if (s_log && count > threshFloats)
+			fprintf(stderr, "[glades-cuda-alloc] %zu floats (%.2f MB)\n",
+			        count, (double)(count * sizeof(float)) / (1024.0 * 1024.0));
+	}
+
 	cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_ptr), count * sizeof(float));
 	if (err != cudaSuccess)
 	{
@@ -585,6 +601,86 @@ bool GpuBuffer<unsigned char>::zeroAsync()
 		return false;
 	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(unsigned char), computeStream());
 	return err == cudaSuccess;
+}
+
+// ---- int8_t (signed char) specialization ----
+// Used for int8-packed Adam optimizer state.
+
+template <>
+GpuBuffer<int8_t>::GpuBuffer() : d_ptr(0), n(0) {}
+
+template <>
+void GpuBuffer<int8_t>::free()
+{
+	if (d_ptr) { cudaFree(d_ptr); d_ptr = 0; }
+	n = 0;
+}
+
+template <>
+GpuBuffer<int8_t>::~GpuBuffer() { free(); }
+
+template <>
+bool GpuBuffer<int8_t>::allocate(size_t count)
+{
+	free();
+	if (count == 0) return true;
+	cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_ptr), count * sizeof(int8_t));
+	if (err != cudaSuccess) { d_ptr = 0; n = 0; return false; }
+	n = count;
+	return true;
+}
+
+template <>
+bool GpuBuffer<int8_t>::upload(const int8_t* src, size_t count)
+{
+	if (!d_ptr || !src) return false;
+	if (count == 0) count = n;
+	if (count > n) return false;
+	if (!syncBlockingBufferOp()) return false;
+	return cudaMemcpy(d_ptr, src, count * sizeof(int8_t), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+template <>
+bool GpuBuffer<int8_t>::uploadAsync(const int8_t* src, size_t count)
+{
+	if (!d_ptr || !src) return false;
+	if (count == 0) count = n;
+	if (count > n) return false;
+	return cudaMemcpyAsync(d_ptr, src, count * sizeof(int8_t), cudaMemcpyHostToDevice, transferStream()) == cudaSuccess;
+}
+
+template <>
+bool GpuBuffer<int8_t>::download(int8_t* dst, size_t count) const
+{
+	if (!d_ptr || !dst) return false;
+	if (count == 0) count = n;
+	if (count > n) return false;
+	if (!syncBlockingBufferOp()) return false;
+	return cudaMemcpy(dst, d_ptr, count * sizeof(int8_t), cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+template <>
+bool GpuBuffer<int8_t>::downloadAsync(int8_t* dst, size_t count) const
+{
+	if (!d_ptr || !dst) return false;
+	if (count == 0) count = n;
+	if (count > n) return false;
+	return cudaMemcpyAsync(dst, d_ptr, count * sizeof(int8_t), cudaMemcpyDeviceToHost, transferStream()) == cudaSuccess;
+}
+
+template <>
+bool GpuBuffer<int8_t>::zero()
+{
+	if (!d_ptr) return false;
+	if (!syncBlockingBufferOp()) return false;
+	return cudaMemset(d_ptr, 0, n * sizeof(int8_t)) == cudaSuccess;
+}
+
+template <>
+bool GpuBuffer<int8_t>::zeroAsync()
+{
+	if (!d_ptr) return false;
+	return cudaMemsetAsync(d_ptr, 0, n * sizeof(int8_t), computeStream()) == cudaSuccess;
 }
 
 } // namespace gpu

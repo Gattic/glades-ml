@@ -1,0 +1,35 @@
+MEDAL Corruption-Process Math Test — paradigm #262 iter 42
+===========================================================
+Seed: 42
+V_actual=32, MASK=32, schedule α(t)=t
+
+[T1] Forward marginal: Pr[x_t=⊥] should equal α(t)
+    t=0.00  α(t)=0.000  observed=0.0000  err=0.0000  PASS
+    t=0.25  α(t)=0.250  observed=0.2489  err=0.0011  PASS
+    t=0.50  α(t)=0.500  observed=0.5011  err=0.0011  PASS
+    t=0.75  α(t)=0.750  observed=0.7503  err=0.0003  PASS
+    t=1.00  α(t)=1.000  observed=1.0000  err=0.0000  PASS
+
+[T2] Forward independence: per-position mask events uncorrelated
+    on-diag : observed=0.4977  expected α(t)=0.5000  err=0.0023
+    off-diag: observed=0.2478  expected α(t)²=0.2500 err=0.0022
+    PASS
+
+[T3] Oracle denoiser K-step recovery: K-step sample == x_0 exactly
+    K=   1 : mismatches = 0 / 6400 positions  PASS
+    K=   4 : mismatches = 0 / 6400 positions  PASS
+    K=  16 : mismatches = 0 / 6400 positions  PASS
+    K=  64 : mismatches = 0 / 6400 positions  PASS
+    K= 256 : mismatches = 0 / 6400 positions  PASS
+
+[T4] Uniform denoiser K-step output: per-position freq uniform on V
+    chi-square (V=32, n=320000) = 32.9  (threshold 80) PASS
+
+[T5] Continuous-time self-consistency: forward(x_0, t) then oracle
+     reverse(K=4096) returns x_0 exactly.
+    K=4096, 10 trials: mismatches = 0 / 640  PASS
+
+============================================================
+MEDAL math test: 13 / 13 sub-tests pass.
+VERDICT: C0-iter42 PASS.  Closed-form Bayes-reverse correctly
+         implemented.  Ready for iter 43 trainable prototype.

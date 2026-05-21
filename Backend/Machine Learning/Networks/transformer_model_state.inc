@@ -5,6 +5,13 @@
 	struct TensorTransformerState
 	{
 		bool initialized;
+		// True when ensureTensorParametersInitialized skipped the host-side
+		// Glorot/normal init because trainingConfig.gpu.enable was set; the
+		// device-side init kernel (gpu::initTransformerWeightsOnDevice, called
+		// from ensureGpuState) is then responsible for filling weights.  Reset
+		// to false once GPU init has run.  Saves ~10 min of serial CPU init at
+		// 200M+ params.
+		bool gpuInitDeferred;
 		// Dataset shapes
 		unsigned int inputSize; // featureCount per timestep
 		unsigned int outSize;   // expected output size per timestep
@@ -29,6 +36,13 @@
 		bool tieEmbeddings;
 		// Optimizer update step (used for Adam bias correction).
 		unsigned long long optimizerStep;
+		// HELIOS sharpness-probe state (framework Section 7 step 10): counts
+		// how many minibatches have elapsed since the last FD-HVP probe, and
+		// cycles through target weight matrices round-robin across probes.
+		// Ignored unless trainingConfig.optimizer.type == HELIOS and
+		// trainingConfig.helios.alpha > 0 and trainingConfig.helios.kHvp > 0.
+		unsigned long long heliosHvpStepCounter;
+		unsigned long long heliosHvpCycleCounter;
 		// Token embedding table E: [vocabSize, dModel]
 		std::vector<float> tokE;
 		// Low-precision weight copy of tokE used by mixed-precision training (optional).
@@ -92,6 +106,18 @@
 			std::vector<float> v2Bq, v2Bk, v2Bv, v2Bo;
 			std::vector<float> gBq, gBk, gBv, gBo;
 
+			// Paradigm shift #76 MLA latent projections (allocated only when
+			// trainingConfig.transformer.mlaLatentDim > 0; otherwise empty).
+			//   Wdkv: [dModel, dC]      down-projection h -> c
+			//   Wuk:  [dC, dModelKV]    up-projection c -> K
+			//   Wuv:  [dC, dModelKV]    up-projection c -> V
+			// When MLA is active, the standard Wk/Wv tensors are not used in
+			// the attention forward; the MLA forward replaces them.
+			std::vector<float> Wdkv, Wuk, Wuv;
+			std::vector<float> vWdkv, vWuk, vWuv;
+			std::vector<float> v2Wdkv, v2Wuk, v2Wuv;
+			std::vector<float> gWdkv, gWuk, gWuv;
+
 			// Pre-LN 2
 			std::vector<float> ln2Gamma; // [dModel]
 			std::vector<float> ln2Beta;  // [dModel]
@@ -135,6 +161,10 @@
 			atlas::ArgosWeightState argosW1, argosW2;
 			atlas::MuonWeightState muonWq, muonWk, muonWv, muonWo;
 			atlas::MuonWeightState muonW1, muonW2;
+			vesta::WeightState vestaWq, vestaWk, vestaWv, vestaWo;
+			vesta::WeightState vestaW1, vestaW2;
+			helios::WeightState heliosWq, heliosWk, heliosWv, heliosWo;
+			helios::WeightState heliosW1, heliosW2;
 		};
 
 		std::vector<Block> blocks;
@@ -167,6 +197,12 @@
 		atlas::MuonWeightState muonWIn;
 		atlas::MuonWeightState muonWOut;
 		atlas::MuonWeightState muonTokE;
+		vesta::WeightState vestaWIn;
+		vesta::WeightState vestaWOut;
+		vesta::WeightState vestaTokE;
+		helios::WeightState heliosWIn;
+		helios::WeightState heliosWOut;
+		helios::WeightState heliosTokE;
 
 		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
 		// top level so AdamW and plain ATLAS-BSRP runs can report the same
@@ -617,6 +653,7 @@
 
 		TensorTransformerState()
 		    : initialized(false),
+		      gpuInitDeferred(false),
 		      inputSize(0u),
 		      outSize(0u),
 		      dModel(0u),
@@ -656,6 +693,7 @@
 		void reset()
 		{
 			initialized = false;
+			gpuInitDeferred = false;
 			inputSize = 0u;
 			outSize = 0u;
 			dModel = 0u;
@@ -670,6 +708,8 @@
 			padTokenId = -1;
 			tieEmbeddings = true;
 			optimizerStep = 0ULL;
+			heliosHvpStepCounter = 0ULL;
+			heliosHvpCycleCounter = 0ULL;
 			gapApplyCount = 0ULL;
 			gapInputUpdateNormSum = 0.0;
 			gapBlockUpdateNormSums.clear();

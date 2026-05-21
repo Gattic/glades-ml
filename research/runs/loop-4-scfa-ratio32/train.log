@@ -1,0 +1,16 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[i]2026-05-14 08:26:37 [chiron]: [chiron-train] device: NVIDIA GeForce RTX 4080 SUPER (sm_8.9), 15.6 GB VRAM
+[i]2026-05-14 08:26:52 [chiron]: [scfa-bf16-inner] BF16 inner scratches overlay scfa_qpar: ~11.00 MB used of 64.00 MB (zero extra VRAM)
+[i]2026-05-14 08:26:52 [chiron]: [scfa-bf16-outer] outer projection GEMMs routed through cublasGemmEx FAST_16BF (BF16-TC, FP32 in/out); 9 GEMMs/layer × L=24 = 216 GEMMs/step at shape (k=256, m=2048, T=8192)
+[i]2026-05-14 08:26:52 [chiron]: [scfa] allocated SCFA state: B=[T=8192 × k=256]=8.00 MB (shared), D=[m=2048 × w+1=9] × L=24 (+dD)=3.38 MB, compression 32×, conv half-width 8
+[i]2026-05-14 08:26:52 [chiron]: [scfa] design attention speedup at T=8192, k=256: 29.2× (O(T²) → O(Tk + k² + Tw))
+[i]2026-05-14 08:26:52 [chiron]: [chiron-train] VRAM usage after allocation: 12.84 / 15.56 GB (17.5% free)
+[i]2026-05-14 08:26:52 [chiron]: [chiron-train] T=8192 m=2048 dModel=4096 L=24 nH=16 dH=256 V=32000  params=870.94M  (3322.4 MB FP32)
+[i]2026-05-14 08:26:52 [chiron]: [chiron-train] lr=1.00e-04 wd=1.00e-02 seed=1337 max_steps=5000 adam=int8 attn=bf16-tiled bf16_grads=1 bf16_weights=1 local_attn_W=0 warmup=500 grad_clip=0.50 accum=1 (effective batch=8192 tokens)
+[i]2026-05-14 08:26:52 [chiron]: [bf16-logits] tied-readout logits GEMMs routed through cublasGemmEx FAST_16BF (BF16-TC, FP32 in/out); 3 GEMMs/step at shape (T=8192, V=32000, m=2048) = 1073.74 GFLOP each
+[i]2026-05-14 08:26:52 [chiron]: [fuse-attn-reln] ACTIVE: at layer L-1, q ← q + p BEFORE the existing reln; final LN normalizes the fused signal (task #31).  Wq/Wk/Wv/Wo gradients flow through bounded LayerNorm; stable at L ≤ 24 but breaks at L ≥ 48.
+[i]2026-05-14 08:26:53 [chiron]: [step      1] loss=10.4984 ema=10.4984 best=10.4984@1 acc=0.0004 ||g||=2.842 scale=0.176 lr=2.00e-07 tok/s=18472 wall=0.4s
+[i]2026-05-14 08:28:25 [chiron]: [step    250] loss=9.0704 ema=9.2318 best=9.0297@229 acc=0.0256 ||g||=4.027 scale=0.124 lr=5.00e-05 tok/s=22190 wall=92.4s
+[i]2026-05-14 08:29:57 [chiron]: [step    500] loss=8.7142 ema=8.8513 best=8.6535@497 acc=0.0505 ||g||=2.931 scale=0.171 lr=1.00e-04 tok/s=22181 wall=184.7s
+[i]2026-05-14 08:31:29 [chiron]: [step    750] loss=8.5171 ema=8.6635 best=8.3831@658 acc=0.0476 ||g||=4.803 scale=0.104 lr=9.93e-05 tok/s=22176 wall=277.0s
+[i]2026-05-14 08:33:02 [chiron]: [step   1000] loss=8.3246 ema=8.5157 best=8.1533@982 acc=0.0511 ||g||=4.671 scale=0.107 lr=9.73e-05 tok/s=22175 wall=369.4s

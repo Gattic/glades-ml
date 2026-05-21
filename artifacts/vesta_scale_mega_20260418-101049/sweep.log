@@ -1,0 +1,18 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+
+============================================================
+VESTA mega-scale sweep at dModel=8192, 30 epochs (GPU)
+============================================================
+Running AdamW reference ...
+55 targets_per_sec=20.418 token_lm_loss_kind=full_softmax nll=5.24988 perplexity=190.543 acc_top1=5.4902 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=13
+20.7317 token_lm_loss_kind=full_softmax nll=3.29879 perplexity=27.08 acc_top1=8.23529 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=26
+AdamW: testNLL = 3.4081  wall 380.7 s
+
+rank        n     trainNLL              testNLL               wall(s)     opt MiB   
+----        ---   --------------------  --------------------  ----------  -------   
+er_step=7
+6-04-18 16:12:22 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=train epoch=20 seq_done=1 seq_total=1 tokens_seen=256 targets_seen=255 targets_per_sec=1.0804 token_lm_loss_kind=full_softmax nll=0.86594 perplexity=2.37724 acc_top1=76.0784 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=21
+r=8        1      0.7868              2.1200             9041.9       14.00     
+========================
+| Unit Tests Completed |
+========================

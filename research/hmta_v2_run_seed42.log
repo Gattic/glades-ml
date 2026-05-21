@@ -1,0 +1,58 @@
+HMTA Forward Prototype v2 — paradigm #261 iter 38 (basis study)
+===============================================================
+Seed: 42
+
+Config: T=512 d=64 s0=64 eta=2 noise=0.100
+Clusters Nc=8, tree depth D=3
+
+=== Forward L2 error table (5 seeds median) ===
+
+  basis = joint[K|V]
+  r \ p |   p=4   |   p=8   |   p=16
+  ------+---------+---------+--------
+  r= 2  | 0.2303  | 0.2072  | 0.1802
+  r= 4  | 0.2474  | 0.2255  | 0.1874
+  r= 8  | 0.2454  | 0.2152  | 0.1788
+  r=16  | 0.2560  | 0.2284  | 0.1931
+  r=32  | 0.2552  | 0.2379  | 0.2027
+
+  basis = K-only,V-only
+  r \ p |   p=4   |   p=8   |   p=16
+  ------+---------+---------+--------
+  r= 2  | 0.2292  | 0.2059  | 0.1779
+  r= 4  | 0.2467  | 0.2241  | 0.1833
+  r= 8  | 0.2454  | 0.2138  | 0.1737
+  r=16  | 0.2574  | 0.2300  | 0.1873
+  r=32  | 0.2576  | 0.2353  | 0.1911
+
+  basis = multi-level
+  r \ p |   p=4   |   p=8   |   p=16
+  ------+---------+---------+--------
+  r= 2  | 0.2273  | 0.2094  | 0.1778
+  r= 4  | 0.2508  | 0.2292  | 0.1848
+  r= 8  | 0.2462  | 0.2209  | 0.1797
+  r=16  | 0.2566  | 0.2282  | 0.1871
+  r=32  | 0.2568  | 0.2359  | 0.1941
+
+=== SDPA recovery sanity (p=s0=64, eta=Nc=8, rank=8) ===
+  joint[K|V] : rel_L2 = 1.682492e-07
+  K-only,V-only : rel_L2 = 1.682492e-07
+  multi-level : rel_L2 = 1.682492e-07
+
+=== FLOP scaling (design O(T log T) formula, p=8 eta=2 s0=64) ===
+ T      | SDPA FLOPs   | HMTA FLOPs   | ratio
+--------+--------------+--------------+--------
+   512  | 3.355e+07   | 2.753e+06   |   12.2x
+  1024  | 1.342e+08   | 6.423e+06   |   20.9x
+  2048  | 5.369e+08   | 1.468e+07   |   36.6x
+  4096  | 2.147e+09   | 3.303e+07   |   65.0x
+  8192  | 8.590e+09   | 7.340e+07   |  117.0x
+ 16384  | 3.436e+10   | 1.615e+08   |  212.8x
+
+=== C0a-v2 verdict ===
+Target: median forward L2 at p=8, r in {4,8,16} <= 0.15.
+  basis=joint[K|V]   (v1)            median = 0.2271
+  basis=K-only,V-only single-level   median = 0.2256
+  basis=multi-level                  median = 0.2226
+
+  C0a-v2 PASS iff K-only median <= 0.15: FAIL

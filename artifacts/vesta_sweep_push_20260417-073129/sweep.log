@@ -1,0 +1,24 @@
+
+============================================================
+VESTA push-NLL sweep at dModel=512
+50 epochs, 5 seeds, rank sweep over {8, 16, 32}
+============================================================
+Config: dModel=512 dFF=1024 layers=4 heads=4 epochs=50 corpus=384 LR=1.0e-02
+
+variant             n     trainNLL              testNLL               wall(s)   
+-------             ---   --------------------  --------------------  ----------
+AdamW               5      1.1148 +/- 0.1218     1.9331 +/- 0.0756     12.3 +/- 0.1  
+VESTA-plain r=8     5      3.2667 +/- 0.3053     3.0433 +/- 0.1753     54.5 +/- 0.1  
+VESTA+mom r=8       5      2.6082 +/- 0.2049     2.8130 +/- 0.2654     55.0 +/- 0.3  
+VESTA+mom r=16      5      2.5181 +/- 0.3299     2.6549 +/- 0.1703     92.7 +/- 0.2  
+VESTA+mom r=32      5      1.9806 +/- 0.3422     2.3127 +/- 0.2194    174.5 +/- 0.4  
+
+Deltas vs AdamW (testNLL, lower is better):
+  VESTA-plain r=8   : +1.1103 nats  (pooled sd 0.1909, ratio 5.82)
+  VESTA+mom r=8     : +0.8800 nats  (pooled sd 0.2760, ratio 3.19)
+  VESTA+mom r=16    : +0.7218 nats  (pooled sd 0.1864, ratio 3.87)
+  VESTA+mom r=32    : +0.3796 nats  (pooled sd 0.2321, ratio 1.64)
+
+========================
+| Unit Tests Completed |
+========================
