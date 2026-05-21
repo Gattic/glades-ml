@@ -2985,6 +2985,95 @@ bool softmax_backward_attn(const float* P, const float* dP,
 }
 
 // ===========================================================================
+//  iter 123 (2026-05-21): GQA broadcast + reduce helpers
+// ===========================================================================
+// Forward broadcast: replicate K/V values across query heads in each KV group.
+// Layout: src is [T, nKVHeads, dH] interleaved; dst is [T, nHeads, dH] where
+// nHeads is a multiple of nKVHeads (groupSize = nHeads / nKVHeads).
+// dst[t, h, d] = src[t, h / groupSize, d]
+namespace {
+
+__global__ void chiron_gqa_broadcast_kv_kernel(
+    const float* __restrict__ src,    // [T, nKVHeads * dH]
+    float* __restrict__ dst,           // [T, nHeads * dH]
+    int T, int nKVHeads, int nHeads, int dH)
+{
+    const int groupSize = nHeads / nKVHeads;
+    const int dModel = nHeads * dH;
+    const int dModelKV = nKVHeads * dH;
+
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+    if (idx >= total) return;
+
+    const int t = static_cast<int>(idx / dModel);
+    const int col = static_cast<int>(idx % dModel);
+    const int h = col / dH;
+    const int d = col - h * dH;
+    const int kvh = h / groupSize;
+
+    dst[idx] = src[static_cast<size_t>(t) * dModelKV + kvh * dH + d];
+}
+
+// Backward reduce: sum gradient contributions across query heads in each KV
+// group.  dst_compressed[t, kvh, d] = sum_{h in group kvh} src_full[t, h, d]
+__global__ void chiron_gqa_reduce_dkv_kernel(
+    const float* __restrict__ src_full,        // [T, nHeads * dH]
+    float* __restrict__ dst_compressed,        // [T, nKVHeads * dH]
+    int T, int nKVHeads, int nHeads, int dH)
+{
+    const int groupSize = nHeads / nKVHeads;
+    const int dModel = nHeads * dH;
+    const int dModelKV = nKVHeads * dH;
+
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(T) * static_cast<size_t>(dModelKV);
+    if (idx >= total) return;
+
+    const int t = static_cast<int>(idx / dModelKV);
+    const int kvh_d = static_cast<int>(idx % dModelKV);
+    const int kvh = kvh_d / dH;
+    const int d = kvh_d - kvh * dH;
+
+    float sum = 0.0f;
+    for (int g = 0; g < groupSize; ++g) {
+        const int h = kvh * groupSize + g;
+        sum += src_full[static_cast<size_t>(t) * dModel + h * dH + d];
+    }
+    dst_compressed[idx] = sum;
+}
+
+} // anonymous namespace
+
+bool chiron_gqa_broadcast_kv(const float* src, float* dst,
+                              int T, int nKVHeads, int nHeads, int dH)
+{
+    if (T <= 0 || nKVHeads <= 0 || nHeads <= 0 || dH <= 0) return true;
+    if (nHeads % nKVHeads != 0) return false;
+    const size_t total = static_cast<size_t>(T) * nHeads * dH;
+    const int block = 256;
+    const size_t grid = (total + block - 1) / block;
+    chiron_gqa_broadcast_kv_kernel<<<(unsigned int)grid, block, 0, computeStream()>>>(
+        src, dst, T, nKVHeads, nHeads, dH);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool chiron_gqa_reduce_dkv(const float* src, float* dst,
+                            int T, int nKVHeads, int nHeads, int dH)
+{
+    if (T <= 0 || nKVHeads <= 0 || nHeads <= 0 || dH <= 0) return true;
+    if (nHeads % nKVHeads != 0) return false;
+    const size_t total = static_cast<size_t>(T) * nKVHeads * dH;
+    const int block = 256;
+    const size_t grid = (total + block - 1) / block;
+    chiron_gqa_reduce_dkv_kernel<<<(unsigned int)grid, block, 0, computeStream()>>>(
+        src, dst, T, nKVHeads, nHeads, dH);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
 //  15c-fused. iter 115: causal softmax + softmax_backward_attn — one kernel
 // ===========================================================================
 //

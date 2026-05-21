@@ -842,6 +842,15 @@ bool causal_softmax_with_bwd_attn(float* S, const float* dP,
                                    int batchSize, int T,
                                    float outputScale, float* dS);
 
+// iter 123 (2026-05-21): GQA helpers.  Forward broadcast replicates K/V values
+// across query heads in each KV group (src [T, nKVHeads*dH] → dst [T, nHeads*dH]).
+// Backward reduce sums gradient contributions across query heads in each group
+// (src [T, nHeads*dH] → dst [T, nKVHeads*dH]).  Both require nHeads % nKVHeads == 0.
+bool chiron_gqa_broadcast_kv(const float* src, float* dst,
+                              int T, int nKVHeads, int nHeads, int dH);
+bool chiron_gqa_reduce_dkv(const float* src, float* dst,
+                            int T, int nKVHeads, int nHeads, int dH);
+
 // ---------------------------------------------------------------------------
 // Loss computation
 // ---------------------------------------------------------------------------
@@ -1146,6 +1155,8 @@ inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
 inline bool causal_mask_softmax_bf16_out(float*, uint16_t*, int, int) { return false; }
 inline bool softmax_backward_attn(const float*, const float*, int, int, float, float*) { return false; }
 inline bool causal_softmax_with_bwd_attn(float*, const float*, int, int, float, float*) { return false; }
+inline bool chiron_gqa_broadcast_kv(const float*, float*, int, int, int, int) { return false; }
+inline bool chiron_gqa_reduce_dkv(const float*, float*, int, int, int, int) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
 inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,

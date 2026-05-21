@@ -334,7 +334,10 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           unsigned short* scratch_Qbf16,
                                           unsigned short* scratch_Kbf16,
                                           unsigned short* scratch_Vbf16,
-                                          unsigned short* scratch_Pbf16);
+                                          unsigned short* scratch_Pbf16,
+                                          int nKVHeads = -1,          // iter 123 GQA
+                                          float* scratch_sK_c = NULL,
+                                          float* scratch_sV_c = NULL);
 
 // FP8 (E4M3) projection variant of `chiron_attention_shear_bf16w_tiled`
 // (paradigm #50 HELIUM).  Projections Q/K/V/O run via
@@ -413,8 +416,12 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV,
     float* scratch_P, float* scratch_dP,
-    bool dw_beta_zero = false);  // iter 108: dW_bf cuBLAS beta (0=overwrite for
-                                  // single micro-batch; 1=accumulate for grad accum).
+    bool dw_beta_zero = false,    // iter 108 FAIL: ignored, dW_bf cuBLAS uses beta=1.
+    int nKVHeads = -1,            // iter 123 GQA: -1 = no GQA (use nHeads).
+    float* scratch_sK_c = NULL,   // [T, nKVHeads*dHead] when gqaActive
+    float* scratch_sV_c = NULL,
+    float* scratch_sdK_c = NULL,
+    float* scratch_sdV_c = NULL);
 
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
@@ -648,7 +655,8 @@ inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
                                                  unsigned short*, unsigned short*,
                                                  float*, float*, float*, float*, float*,
                                                  unsigned short*, unsigned short*,
-                                                 unsigned short*, unsigned short*) { return false; }
+                                                 unsigned short*, unsigned short*,
+                                                 int = -1, float* = NULL, float* = NULL) { return false; }
 inline bool chiron_attention_shear_fp8w_tiled(const float*, float*,
                                                 const unsigned short*, const unsigned short*,
                                                 const unsigned short*, const unsigned short*,
@@ -679,7 +687,8 @@ inline bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     unsigned short*, unsigned short*,
     float*, float*, float*, float*,
     float*, float*, float*, float*,
-    float*, float*, bool = false) { return false; }
+    float*, float*, bool = false,
+    int = -1, float* = NULL, float* = NULL, float* = NULL, float* = NULL) { return false; }
 inline bool flash_attention_backward_cublas_tiled(
     const float*, const float*, const float*,
     const float*, const float*,
