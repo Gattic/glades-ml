@@ -8384,6 +8384,104 @@ __global__ void scfa_dwconv_dx_tiled_kernel(
 	}
 }
 
+// iter 99 (2026-05-21): dual-output variant of scfa_dwconv_dx_kernel.
+// Writes the per-element dx contribution TWICE: dx_primary[idx] += acc (for
+// accumulation into s.dq_buf which already has prior cuBLAS content), and
+// dx_secondary[idx] = acc (single-assign, for downstream cuBLAS at line 7453
+// that reads scfa_yperp = dq_perp).  Eliminates the explicit axpy at the
+// bwd end (line ~7495) that adds scfa_yperp into s.dq_buf: that += is now
+// done inline in this kernel.
+// Math: bit-identical accumulator value `acc`; only differs by ordering of
+// FP32 adds (current path adds B·inner_p first then scfa_yperp; this path
+// adds scfa_yperp first then B·inner_p) — sub-ULP rounding drift, same
+// drift class as iter 74/97.
+// Profile (iter 96 nsys): axpy_kernel is 2.6% of step wall (25 calls/step at
+// ~650 µs each, 132 MB×2 read + 132 MB write each), most from line 7495.
+__global__ void scfa_dwconv_dx_kernel_dual_out(const float* __restrict__ dy,
+                                                const float* __restrict__ K,
+                                                int T, int m, int w,
+                                                float* __restrict__ dx_primary,
+                                                float* __restrict__ dx_secondary)
+{
+	int t = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || c >= m) return;
+	float acc = 0.0f;
+	for (int i = 0; i <= w; ++i)
+	{
+		int src = t + i;
+		if (src >= T) break;
+		acc += K[(size_t)c * (size_t)(w + 1) + (size_t)i] *
+		       dy[(size_t)src * (size_t)m + (size_t)c];
+	}
+	const size_t idx = (size_t)t * (size_t)m + (size_t)c;
+	dx_primary[idx]  += acc;   // accumulate into s.dq_buf
+	dx_secondary[idx] = acc;   // single-assign to scfa_yperp
+}
+
+// iter 99 tiled variant — extends iter 95 dx tile to dual-output.
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_dwconv_dx_tiled_kernel_dual_out(
+    const float* __restrict__ dy,
+    const float* __restrict__ K,
+    int T, int m,
+    float* __restrict__ dx_primary,
+    float* __restrict__ dx_secondary)
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int DY_ROWS = N_OUT + W_FILTER - 1;
+
+	__shared__ float dy_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			const int t_in = t_base + k;
+			dy_smem[k][threadIdx.x] = (t_in < T)
+			    ? dy[(size_t)t_in * (size_t)m + (size_t)c]
+			    : 0.0f;
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			dy_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t = t_base + dt;
+		if (t >= T) return;
+
+		float acc = 0.0f;
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t + i >= T) break;
+			acc += K_smem[threadIdx.x][i] * dy_smem[dt + i][threadIdx.x];
+		}
+		const size_t idx = (size_t)t * (size_t)m + (size_t)c;
+		dx_primary[idx]  += acc;
+		dx_secondary[idx] = acc;
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
@@ -8456,6 +8554,65 @@ bool scfa_depthwise_causal_conv_bwd_tiled(const float* x, const float* K,
 		dim3 grid((m + block - 1) / block, T);
 		scfa_dwconv_dx_kernel<<<grid, block, 0, s>>>(
 		    dy, K, T, m, w, dx);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// dK kernel: same _par variant as the legacy bwd.
+	{
+		const int BLOCK_M = 64;
+		const int BLOCK_T = 8;
+		int wp1 = w + 1;
+		dim3 grid((m + BLOCK_M - 1) / BLOCK_M, wp1);
+		dim3 block(BLOCK_M, BLOCK_T);
+		scfa_dwconv_dK_kernel_par<64, 8><<<grid, block, 0, s>>>(
+		    x, dy, T, m, w, dK);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+// iter 99 (2026-05-21): dual-output bwd dispatch.  dx kernel writes the
+// per-element dx contribution to BOTH dx_primary (+= accumulator) AND
+// dx_secondary (= single-assign).  Eliminates the explicit axpy at the end
+// of scfa_attention_backward (line ~7495: `s.dq_buf += scfa_yperp`) by
+// having this kernel accumulate directly into s.dq_buf inline.
+// Specializes W_FILTER=5 (w=4) and W_FILTER=9 (w=8) tiled; row-major fallback.
+// dK kernel: unchanged (_par variant).
+// Math: bit-identical accumulator value `acc`; differs only in FP32 add
+// ordering vs the (current cuBLAS then axpy) chain (sub-ULP rounding drift).
+bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
+                                              const float* dy,
+                                              int T, int m, int w,
+                                              float* dx_primary,
+                                              float* dx_secondary,
+                                              float* dK,
+                                              cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+
+	// dx kernel: dual-output variant.  Tiled for w == 4 or w == 8.
+	if (w == 4) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_dwconv_dx_tiled_kernel_dual_out<COLS, N_OUT, 5>
+		    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	} else if (w == 8) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_dwconv_dx_tiled_kernel_dual_out<COLS, N_OUT, 9>
+		    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	} else {
+		int block = 256;
+		dim3 grid((m + block - 1) / block, T);
+		scfa_dwconv_dx_kernel_dual_out<<<grid, block, 0, s>>>(
+		    dy, K, T, m, w, dx_primary, dx_secondary);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 

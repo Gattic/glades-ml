@@ -269,6 +269,22 @@ bool scfa_depthwise_causal_conv_bwd_tiled(const float* x, const float* K,
                                             float* dx, float* dK,
                                             cudaStream_t stream = 0);
 
+// iter 99 (2026-05-21): dual-output bwd dispatch.  dx kernel writes the
+// per-element dx contribution to BOTH dx_primary (+= accumulator) AND
+// dx_secondary (= single-assign).  Eliminates the explicit axpy at the end
+// of scfa_attention_backward (line ~7495: `s.dq_buf += scfa_yperp`) by
+// having this kernel accumulate directly into s.dq_buf inline.  Math:
+// bit-identical accumulator value; FP32 add ordering differs vs current
+// (cuBLAS then axpy) chain — sub-ULP drift class.  Tiled for w == 4 / w == 8;
+// row-major fallback.  dK kernel unchanged.
+bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
+                                              const float* dy,
+                                              int T, int m, int w,
+                                              float* dx_primary,
+                                              float* dx_secondary,
+                                              float* dK,
+                                              cudaStream_t stream = 0);
+
 // Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
 // to k columns.  Used as the sequence-spectral basis in SCFA.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
@@ -1039,6 +1055,7 @@ inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int
 inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd_dual_out(const float*, const float*, const float*, int, int, int, float*, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
