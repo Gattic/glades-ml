@@ -1056,17 +1056,10 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           unsigned short* scratch_Qbf16,
                                           unsigned short* scratch_Kbf16,
                                           unsigned short* scratch_Vbf16,
-                                          unsigned short* scratch_Pbf16,
-                                          int nKVHeads,
-                                          float* scratch_sK_c,
-                                          float* scratch_sV_c)
+                                          unsigned short* scratch_Pbf16)
 {
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
-	// iter 123 GQA support.
-	const int effNKV = (nKVHeads <= 0 || nKVHeads >= nHeads) ? nHeads : nKVHeads;
-	const bool gqaActive = (effNKV < nHeads);
-	const int dModelKV = effNKV * dHead;
 
 	// Cast q FP32 -> BF16 once per layer.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
@@ -1075,24 +1068,10 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	// BF16 x BF16 -> FP32 projections via BF16 tensor cores.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel))
 		return false;
-	if (gqaActive)
-	{
-		if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_sK_c, dModelKV))
-			return false;
-		if (!chiron_gqa_broadcast_kv(scratch_sK_c, scratch_K, T, effNKV, nHeads, dHead))
-			return false;
-		if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_sV_c, dModelKV))
-			return false;
-		if (!chiron_gqa_broadcast_kv(scratch_sV_c, scratch_V, T, effNKV, nHeads, dHead))
-			return false;
-	}
-	else
-	{
-		if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel))
-			return false;
-		if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel))
-			return false;
-	}
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel))
+		return false;
 
 	// Attention core (BF16 inputs, FP32 output).
 	if (!flash_attention_cublas_tiled_bf16(
@@ -1344,23 +1323,16 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV,
     float* scratch_P, float* scratch_dP,
-    bool dw_beta_zero,    // iter 108 FAIL — param ignored, beta stays at 1.0f
-    int nKVHeads,         // iter 123: GQA support (-1 = no GQA = use nHeads)
-    float* scratch_sK_c,
-    float* scratch_sV_c,
-    float* scratch_sdK_c,
-    float* scratch_sdV_c)
+    bool dw_beta_zero)  // iter 108 FAIL: when true, dW_bf cuBLAS would use
+                          // beta=0 (overwrite).  Math was non-bit-identical at
+                          // production — NLL +0.5 nat drift.  Param retained
+                          // for API stability but dw_beta forced to 1.0f
+                          // (legacy behavior) regardless.
 {
-	(void)dw_beta_zero;
+	(void)dw_beta_zero;  // iter 108 FAIL — param ignored, beta stays at 1.0f.
 	const float dw_beta = 1.0f;
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
-	// iter 123 (2026-05-21): GQA path.  When nKVHeads < nHeads, Wk/Wv stored
-	// compressed at [m, dModelKV]; broadcast to full sK/sV before inner attn,
-	// reduce sdK/sdV back to compressed for gradient cuBLAS.
-	const int effNKV = (nKVHeads <= 0 || nKVHeads >= nHeads) ? nHeads : nKVHeads;
-	const bool gqaActive = (effNKV < nHeads);
-	const int dModelKV = effNKV * dHead;
 
 	// 1. Cast q -> BF16 for projections.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
@@ -1369,26 +1341,10 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
 		return false;
-	if (gqaActive)
-	{
-		// iter 123 GQA: Wk_bf is [m, dModelKV].  cuBLAS produces sK_compressed
-		// [T, dModelKV], then broadcast replicates per group to sK [T, dModel].
-		if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_sK_c, dModelKV))
-			return false;
-		if (!chiron_gqa_broadcast_kv(scratch_sK_c, sK, T, effNKV, nHeads, dHead))
-			return false;
-		if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_sV_c, dModelKV))
-			return false;
-		if (!chiron_gqa_broadcast_kv(scratch_sV_c, sV, T, effNKV, nHeads, dHead))
-			return false;
-	}
-	else
-	{
-		if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
-			return false;
-		if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
-			return false;
-	}
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
+		return false;
 	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
 	                                    sO, scratch_P))
 		return false;
@@ -1419,23 +1375,14 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	        sdQ, sdK, sdV, scratch_P, scratch_dP))
 		return false;
 
-	// iter 123 GQA: reduce full-size sdK/sdV across query heads in each KV group
-	// → compressed [T, dModelKV].  Used by both dq accumulation and dWk/dWv grad.
-	if (gqaActive)
-	{
-		if (!chiron_gqa_reduce_dkv(sdK, scratch_sdK_c, T, effNKV, nHeads, dHead))
-			return false;
-		if (!chiron_gqa_reduce_dkv(sdV, scratch_sdV_c, T, effNKV, nHeads, dHead))
-			return false;
-	}
-
 	// Recast q to BF16 for the weight-grad GEMMs.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
 		return false;
 
 	// 6+7 fused per direction.  dq accumulates FP32 (beta=1 — cross-Q/K/V dq
-	// contributions sum into single dq buffer).  dW_bf uses dw_beta.
-	// Q (unchanged): full-size sdQ, Wq, dWq.
+	// contributions sum into single dq buffer).  dW_bf uses dw_beta (iter 108:
+	// 0=overwrite for single micro-batch, 1=accumulate for grad accum).
+	// Q:
 	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
@@ -1443,49 +1390,22 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
 	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWq_bf, dModel))
 		return false;
-	// K: GQA-aware.  When gqaActive, use scratch_sdK_c (compressed) + smaller
-	// Wk_bf/dWk_bf dims.  Otherwise, full-size sdK + standard cuBLAS.
-	if (gqaActive)
-	{
-		if (!cast_f32_to_bf16(scratch_sdK_c, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
-			return false;
-		if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wk_bf, dModelKV, 1.0f, dq, m))
-			return false;
-		if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
-		        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWk_bf, dModelKV))
-			return false;
-	}
-	else
-	{
-		if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
-			return false;
-		if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
-			return false;
-		if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-		        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWk_bf, dModel))
-			return false;
-	}
-	// V: same pattern as K.
-	if (gqaActive)
-	{
-		if (!cast_f32_to_bf16(scratch_sdV_c, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
-			return false;
-		if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wv_bf, dModelKV, 1.0f, dq, m))
-			return false;
-		if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
-		        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWv_bf, dModelKV))
-			return false;
-	}
-	else
-	{
-		if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
-			return false;
-		if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
-			return false;
-		if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-		        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWv_bf, dModel))
-			return false;
-	}
+	// K:
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWk_bf, dModel))
+		return false;
+	// V:
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWv_bf, dModel))
+		return false;
 	return true;
 }
 
