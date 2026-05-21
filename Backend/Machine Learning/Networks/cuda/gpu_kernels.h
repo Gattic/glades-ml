@@ -240,6 +240,19 @@ bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
                                      float* dx, float* dK,
                                      cudaStream_t stream = 0);
 
+// iter 95 (2026-05-21): tiled-dx variant of conv bwd.  Mirrors iter 73's
+// forward-conv shared-mem tiling to the acausal dx path (dy[t+i] forward).
+// Each block processes N_OUT=16 t-rows × COLS=256 columns of dx, loading
+// (N_OUT + w) dy rows + filter slice into smem once.  Bit-identical math to
+// scfa_depthwise_causal_conv_bwd (same FMA order, same break-on-OOB).
+// dx kernel: tiled for w == 4 (W_FILTER=5) or w == 8 (W_FILTER=9); row-major
+// fallback for other w.  dK kernel: unchanged (already _par optimized).
+bool scfa_depthwise_causal_conv_bwd_tiled(const float* x, const float* K,
+                                            const float* dy,
+                                            int T, int m, int w,
+                                            float* dx, float* dK,
+                                            cudaStream_t stream = 0);
+
 // Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
 // to k columns.  Used as the sequence-spectral basis in SCFA.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
@@ -1008,6 +1021,7 @@ inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const vo
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }

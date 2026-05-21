@@ -8168,6 +8168,85 @@ __global__ void scfa_dwconv_dK_kernel_par(const float* __restrict__ x,
 	}
 }
 
+// iter 95 (2026-05-21): shared-memory tiled variant of scfa_dwconv_dx_kernel.
+// Extends iter 73's forward-conv tiling to the backward dx path, which is the
+// acausal mirror of forward (reads dy[t+i] instead of x[t-i]).  Each block
+// processes N_OUT consecutive t rows × COLS_PER_BLOCK columns.  Cooperatively
+// loads (N_OUT + w) dy rows + the column-local filter slice into shared
+// memory, eliminating L2 thrashing on dy reads.
+// Math: bit-identical to scfa_dwconv_dx_kernel — same K*dy accumulation order
+// (i = 0, 1, ..., w), same break-on-OOB (t+i >= T) semantics, FP32 accumulator,
+// same += output (caller pre-zeros dx).
+// Template params: COLS_PER_BLOCK=256, N_OUT=16, W_FILTER=w+1 (=5 at w=4,
+// =9 at w=8).  Static smem at N_OUT=16, W_FILTER=5: dy_smem 20×256×4=20 KB +
+// K_smem 256×5×4=5 KB = 25 KB (fits in 48 KB default smem on Ada sm_8.9).
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_dwconv_dx_tiled_kernel(
+    const float* __restrict__ dy,    // [T, m]
+    const float* __restrict__ K,     // [m, W_FILTER]
+    int T, int m,
+    float* __restrict__ dx)          // [T, m]; kernel does += accumulator
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int DY_ROWS = N_OUT + W_FILTER - 1;   // = N_OUT + w
+
+	__shared__ float dy_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	// Load filter: each thread loads its own column's W_FILTER weights.
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	// Load dy rows: each thread loads DY_ROWS rows for its column.
+	// Row k in smem corresponds to global row t_base + k (acausal direction,
+	// mirror of the forward kernel's t_base - w + k causal load).
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			const int t_in = t_base + k;
+			dy_smem[k][threadIdx.x] = (t_in < T)
+			    ? dy[(size_t)t_in * (size_t)m + (size_t)c]
+			    : 0.0f;
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			dy_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	// Compute N_OUT outputs for this column.
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t = t_base + dt;
+		if (t >= T) return;
+
+		float acc = 0.0f;
+		// Loop matching legacy kernel's break-on-OOB:
+		//   for (i = 0; i <= w; ++i) if (t + i >= T) break; else acc += K*dy
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t + i >= T) break;
+			acc += K_smem[threadIdx.x][i] * dy_smem[dt + i][threadIdx.x];
+		}
+		// += accumulate (matches legacy kernel)
+		dx[(size_t)t * (size_t)m + (size_t)c] += acc;
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
@@ -8190,6 +8269,60 @@ bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
 	// block (coalesced memory) × BLOCK_T parallel T-partitions, reduced via SMEM.
 	// Replaces the legacy "1 thread per (c,i), loop t" kernel which was both
 	// non-coalesced and severely under-parallel at production scale.
+	{
+		const int BLOCK_M = 64;
+		const int BLOCK_T = 8;
+		int wp1 = w + 1;
+		dim3 grid((m + BLOCK_M - 1) / BLOCK_M, wp1);
+		dim3 block(BLOCK_M, BLOCK_T);
+		scfa_dwconv_dK_kernel_par<64, 8><<<grid, block, 0, s>>>(
+		    x, dy, T, m, w, dK);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+// iter 95 (2026-05-21): tiled-dx dispatch.  Uses scfa_dwconv_dx_tiled_kernel
+// for w == 4 (W_FILTER=5, production triple-stack flagship) or w == 8
+// (W_FILTER=9, prior w=8 flagship); row-major fallback for other w.
+// dK kernel unchanged (already _par optimized in scfa_depthwise_causal_conv_bwd).
+// Math: bit-identical to scfa_depthwise_causal_conv_bwd (same FMA order, same
+// break-on-OOB).  Gated by --iter95-dwconv-bwd-dx-tiled flag in trainer.
+bool scfa_depthwise_causal_conv_bwd_tiled(const float* x, const float* K,
+                                            const float* dy,
+                                            int T, int m, int w,
+                                            float* dx, float* dK,
+                                            cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+
+	// dx kernel: tiled for w == 4 or w == 8; row-major fallback otherwise.
+	if (w == 4) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_dwconv_dx_tiled_kernel<COLS, N_OUT, 5>
+		    <<<grid, block, 0, s>>>(dy, K, T, m, dx);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	} else if (w == 8) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_dwconv_dx_tiled_kernel<COLS, N_OUT, 9>
+		    <<<grid, block, 0, s>>>(dy, K, T, m, dx);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	} else {
+		int block = 256;
+		dim3 grid((m + block - 1) / block, T);
+		scfa_dwconv_dx_kernel<<<grid, block, 0, s>>>(
+		    dy, K, T, m, w, dx);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// dK kernel: same _par variant as the legacy bwd.
 	{
 		const int BLOCK_M = 64;
 		const int BLOCK_T = 8;
