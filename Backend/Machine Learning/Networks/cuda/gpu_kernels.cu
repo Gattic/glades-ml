@@ -2815,6 +2815,88 @@ __global__ void causal_mask_softmax_kernel(float* __restrict__ S,
         sRow[j] *= invSum;
 }
 
+// iter 102 (2026-05-21): fused causal-masked softmax + FP32→BF16 cast.
+// Identical to causal_mask_softmax_kernel through Pass 1 (mask) + Pass 2
+// (row-max + exp/sum), but Pass 3 writes the normalized result directly
+// to a BF16 output buffer (P_bf) instead of writing back to FP32 S.
+// Eliminates the explicit cast_f32_to_bf16 launch + the FP32 S → BF16 P
+// memory roundtrip in the inner attention path (flash_attention_cublas_tiled_bf16
+// at gpu_chiron.cu:1602/1611).
+// Math: FP32 max/exp/sum/normalize all identical to causal_mask_softmax_kernel.
+// Final BF16 write uses RN-even rounding bit-identical to k_cast_f32_to_bf16
+// (same union reinterpret, same `0x7FFF + lsb` rounding bias, same NaN flush
+// to BF16 quiet NaN).  Bit-identical end-to-end with (softmax then cast).
+// Per-row layout matches causal_mask_softmax_kernel: one block per (batch, row).
+// Profile (iter 96): causal_mask_softmax is 3.8% of step wall; the cast launch
+// adds ~50 µs × 24 layers + 64 MB read + 32 MB write per call.
+__global__ void causal_mask_softmax_bf16_out_kernel(float* __restrict__ S,
+                                                     uint16_t* __restrict__ P_bf,
+                                                     int T)
+{
+    int idx = blockIdx.x;
+    int row = idx % T;
+    float* sRow = S + (size_t)idx * T;
+    uint16_t* pRow = P_bf + (size_t)idx * T;
+
+    extern __shared__ float smem[];
+    float* sMax = smem;
+    float* sSum = smem + (blockDim.x / 32 + 1);
+
+    // Apply causal mask (same as causal_mask_softmax_kernel).
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        if (j > row)
+            sRow[j] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    // Pass 1: row max.
+    float localMax = -FLT_MAX;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        localMax = fmaxf(localMax, sRow[j]);
+    localMax = blockReduceMax(localMax, sMax);
+
+    __shared__ float sRowMax;
+    if (threadIdx.x == 0) sRowMax = localMax;
+    __syncthreads();
+    float rowMax = sRowMax;
+
+    // Pass 2: sum of exp(x - max), write exp back to FP32 S (same as legacy).
+    float localSum = 0.0f;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        float e = expf(sRow[j] - rowMax);
+        sRow[j] = e;
+        localSum += e;
+    }
+    localSum = blockReduceSum(localSum, sSum);
+
+    __shared__ float sRowSum;
+    if (threadIdx.x == 0) sRowSum = localSum;
+    __syncthreads();
+    float invSum = 1.0f / sRowSum;
+
+    // Pass 3 (iter 102 fusion): normalize AND cast to BF16 in one step.
+    // Writes BF16 to pRow instead of FP32 back to sRow.  RN-even rounding
+    // matches k_cast_f32_to_bf16 (gpu_kernels.cu:5751) exactly.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        float p = sRow[j] * invSum;
+        union { float f; uint32_t u; } v;
+        v.f = p;
+        uint16_t bf;
+        if (isnan(p)) {
+            const uint32_t sign = v.u & 0x80000000u;
+            bf = (uint16_t)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+        } else {
+            const uint32_t lsb = (v.u >> 16) & 1u;
+            const uint32_t roundingBias = 0x7FFFu + lsb;
+            bf = (uint16_t)((v.u + roundingBias) >> 16);
+        }
+        pRow[j] = bf;
+    }
+}
+
 } // anonymous namespace
 
 bool causal_mask_softmax_inplace(float* S, int batchSize, int T)
@@ -2824,6 +2906,23 @@ bool causal_mask_softmax_inplace(float* S, int batchSize, int T)
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
     causal_mask_softmax_kernel<<<totalRows, block, smemBytes, computeStream()>>>(S, T);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// iter 102 (2026-05-21): fused causal-masked softmax + BF16 output.
+// Math bit-identical to (causal_mask_softmax_inplace THEN cast_f32_to_bf16):
+// same FP32 max/exp/sum/normalize, same RN-even BF16 cast.  Caller passes
+// FP32 S (input, modified in-place during passes 1-2) and BF16 P (output,
+// written by pass 3 — replaces the separate cast_f32_to_bf16 call).
+bool causal_mask_softmax_bf16_out(float* S, uint16_t* P_bf,
+                                   int batchSize, int T)
+{
+    if (batchSize <= 0 || T <= 0) return true;
+    int totalRows = batchSize * T;
+    int block = rowBlockSize(T);
+    int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+    causal_mask_softmax_bf16_out_kernel<<<totalRows, block, smemBytes, computeStream()>>>(S, P_bf, T);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }

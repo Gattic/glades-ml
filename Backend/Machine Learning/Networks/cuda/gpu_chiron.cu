@@ -1596,19 +1596,23 @@ bool flash_attention_cublas_tiled_bf16(
 	        nHeads))
 		return false;
 
-	// Softmax in FP32 (same as FP32 path).
+	// iter 102 (2026-05-21): when causal, fuse softmax + FP32→BF16 cast into
+	// a single kernel that writes BF16 P directly to scratch_Pbf16.  Eliminates
+	// the separate cast_f32_to_bf16 launch + the FP32 S → BF16 P memory
+	// round-trip.  Math bit-identical to (softmax_inplace THEN cast).
+	// Non-causal path keeps the legacy (softmax_forward + cast) chain since
+	// the inner attention is always causal at CHIRON production (medalTrain=false).
 	if (causal)
 	{
-		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T)) return false;
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
+			return false;
 	}
 	else
 	{
 		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
+		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
 	}
-
-	// Cast P to BF16 for the PV GEMM.
-	const size_t nScores = static_cast<size_t>(nHeads) * T * T;
-	if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores)) return false;
 
 	// O = P · V via BF16 batched (plain NN).
 	if (!sgemm_batched_strided_bf16(

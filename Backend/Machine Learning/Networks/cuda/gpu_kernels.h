@@ -814,6 +814,18 @@ bool reduce_rows_sum(const float* input, int rows, int cols,
 // Each (batch, row) block: set S[i,j]==-FLT_MAX for j>i, then stable softmax.
 bool causal_mask_softmax_inplace(float* S, int batchSize, int T);
 
+// iter 102 (2026-05-21): fused causal-masked softmax + FP32→BF16 cast.
+// Same FP32 mask/max/exp/sum/normalize as causal_mask_softmax_inplace, but
+// pass 3 writes the BF16 result directly to P_bf instead of normalizing
+// in-place on S.  Eliminates a separate cast_f32_to_bf16 launch + the
+// FP32 S → BF16 P memory round-trip.  Math bit-identical to
+// (softmax_inplace THEN cast_f32_to_bf16): same FP32 math, same RN-even
+// BF16 rounding (matching k_cast_f32_to_bf16).  S is modified during
+// passes 1-2 (mask + exp/sum) but its post-call content is no longer
+// needed by downstream callers in the bf16-inner attention path.
+bool causal_mask_softmax_bf16_out(float* S, uint16_t* P_bf,
+                                   int batchSize, int T);
+
 // Softmax backward for attention: dS = outputScale * P * (dP - row_sum(dP * P)),
 // zero above-diagonal for causal mask.
 // P, dP, dS are [batchSize, T, T] row-major.
@@ -1121,6 +1133,7 @@ inline bool flash_attention_multihead_backward(const float*, const float*, const
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }
 inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
+inline bool causal_mask_softmax_bf16_out(float*, uint16_t*, int, int) { return false; }
 inline bool softmax_backward_attn(const float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
