@@ -91,7 +91,7 @@ endif()
 # Generate code for common architectures.
 # Users can override via CMAKE_CUDA_ARCHITECTURES.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "60;70;75;80;86;89;90")
+	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
 endif()
 
 install(TARGETS GladesCUDA EXPORT gladesConfig

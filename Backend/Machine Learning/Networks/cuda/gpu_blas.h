@@ -171,6 +171,19 @@ bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
                                   float beta,
                                   float* C, int ldc);
 
+// CUDA 13.2 optimization (2026-05-21): register a (FP32, BF16) pointer pair
+// as a "constant" — when the FAST_16BF wrappers see fp32_ptr as A or B with
+// matching element count, they skip the FP32→BF16 cast and use bf16_ptr
+// directly.  Caller must guarantee bf16_ptr is a valid BF16 representation
+// of *fp32_ptr for at least `n` elements AND that fp32_ptr's values never
+// change.  Cleared by unregister_fast16bf_constant().  Up to 16 constants
+// can be registered.  Returns false if the table is full or already has an
+// entry with the same fp32_ptr.
+bool register_fast16bf_constant(const float* fp32_ptr,
+                                 const unsigned short* bf16_ptr,
+                                 size_t n);
+bool unregister_fast16bf_constant(const float* fp32_ptr);
+
 // ralph-loop iter 6 (2026-05-14): FAST_16BF ATB variant dispatched on a
 // dedicated side cuBLAS handle bound to its own CUDA stream
 // (sideComputeStream()).  Used for GEMMs that can run concurrently with
@@ -403,6 +416,8 @@ inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*,
 inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool register_fast16bf_constant(const float*, const unsigned short*, size_t) { return false; }
+inline bool unregister_fast16bf_constant(const float*) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_bf16_bf16out(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, unsigned short*, int) { return false; }

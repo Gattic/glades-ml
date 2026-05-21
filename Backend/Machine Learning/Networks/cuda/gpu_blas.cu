@@ -6,7 +6,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <algorithm>
 #include "gpu_device.h"
+#include "gpu_kernels.h"
 
 namespace glades {
 namespace gpu {
@@ -17,6 +19,61 @@ static bool g_initialized = false;
 // iter 180: when false, all wrappers below select CUBLAS_DEFAULT_MATH (no TF32).
 static bool g_tf32_enabled = true;
 static float* g_deviceOne = 0;
+
+// CUDA 13.2 mitigation (2026-05-21): cuBLAS 13.x heuristic for cublasGemmEx
+// with CUDA_R_32F inputs + CUBLAS_COMPUTE_32F_FAST_16BF dispatches to a
+// non-bf16-specialized s1688gemm kernel on Ada (sm_8.9), ~1.7-1.8x slower
+// than the s16816_bf16 fast path that CUDA 12.0 picks for the same call.
+// The FAST_16BF wrappers below now pre-cast FP32 inputs to BF16 in scratch
+// and call cublasGemmEx with CUDA_R_16BF inputs to force the fast path.
+// Math envelope unchanged (one BF16 round-trip before TC, same as before).
+static uint16_t* g_fast16bf_scratch_a = 0;
+static uint16_t* g_fast16bf_scratch_b = 0;
+static size_t    g_fast16bf_scratch_a_n = 0;
+static size_t    g_fast16bf_scratch_b_n = 0;
+
+static bool ensureFast16bfScratch(uint16_t** scratch, size_t* size_n, size_t needed_n)
+{
+	if (*size_n >= needed_n) return true;
+	if (*scratch) cudaFree(*scratch);
+	cudaError_t err = cudaMalloc(scratch, needed_n * sizeof(uint16_t));
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] fast16bf-bf16cast scratch alloc failed: %zu elements (%s)\n",
+		        needed_n, cudaGetErrorString(err));
+		*scratch = 0;
+		*size_n = 0;
+		return false;
+	}
+	*size_n = needed_n;
+	return true;
+}
+
+// Constant-BF16 cache: skip the FP32->BF16 cast for pre-registered constant
+// inputs (e.g. SCFA basis scfa_B that never changes).  Caller supplies the
+// BF16 mirror buffer; we just remember the pointer pair.
+struct Fast16bfConstantEntry
+{
+	const float*    fp32_ptr;
+	const uint16_t* bf16_ptr;
+	size_t          n;
+};
+static const int kMaxFast16bfConstants = 16;
+static Fast16bfConstantEntry g_fast16bf_constants[kMaxFast16bfConstants];
+static int g_fast16bf_constants_count = 0;
+
+static const uint16_t* lookupFast16bfConstant(const float* fp32_ptr, size_t needed_n)
+{
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr &&
+		    g_fast16bf_constants[i].n >= needed_n)
+		{
+			return g_fast16bf_constants[i].bf16_ptr;
+		}
+	}
+	return 0;
+}
 
 // ralph-loop iter 6 (2026-05-14): side cuBLAS handle bound to a dedicated
 // side stream, used to dispatch GEMMs that can run concurrently with the
@@ -1109,12 +1166,46 @@ static bool sgemm_rowmajor_fast16bf_impl(cublasOperation_t transa,
 {
 	if (!g_initialized && !blasInit()) return false;
 
+	// CUDA 13.2 mitigation: pre-cast FP32 inputs to BF16 scratch, then call
+	// cublasGemmEx with CUDA_R_16BF inputs.  Routes dispatch to the
+	// s16816_bf16 fast path on Ada (vs the s1688gemm slow path that
+	// cuBLAS 13.x picks for FP32-input FAST_16BF).  Numerics unchanged
+	// (FAST_16BF compute path also casts to BF16 internally).
+	//
+	// Size derivation in our row-major calling convention:
+	//   (transa,transb)=(N,N) no-trans wrapper:  A=[M,K] lda=K, B=[K,N] ldb=N
+	//   (transa,transb)=(N,T) atb wrapper (A^T): A=[K,M] lda=M, B=[K,N] ldb=N
+	//   (transa,transb)=(T,N) abt wrapper (B^T): A=[M,K] lda=K, B=[N,K] ldb=K
+	// transa applies to A_cublas (= our B); transb applies to B_cublas (= our A).
+	// So A's storage flips (M→K rows) when transb=T; B's storage flips when transa=T.
+	size_t A_n = (size_t)lda * (size_t)(transb == CUBLAS_OP_N ? M : K);
+	size_t B_n = (size_t)ldb * (size_t)(transa == CUBLAS_OP_N ? K : N);
+
+	// Look up registered constants first (skip cast if hit).
+	const uint16_t* A_bf16 = lookupFast16bfConstant(A, A_n);
+	const uint16_t* B_bf16 = lookupFast16bfConstant(B, B_n);
+
+	if (!A_bf16)
+	{
+		if (!ensureFast16bfScratch(&g_fast16bf_scratch_a, &g_fast16bf_scratch_a_n, A_n))
+			return false;
+		if (!cast_f32_to_bf16(A, g_fast16bf_scratch_a, A_n)) return false;
+		A_bf16 = g_fast16bf_scratch_a;
+	}
+	if (!B_bf16)
+	{
+		if (!ensureFast16bfScratch(&g_fast16bf_scratch_b, &g_fast16bf_scratch_b_n, B_n))
+			return false;
+		if (!cast_f32_to_bf16(B, g_fast16bf_scratch_b, B_n)) return false;
+		B_bf16 = g_fast16bf_scratch_b;
+	}
+
 	cublasStatus_t st = cublasGemmEx(g_handle,
 	                                 transa, transb,
 	                                 N, M, K,
 	                                 &alpha,
-	                                 B, CUDA_R_32F, ldb,
-	                                 A, CUDA_R_32F, lda,
+	                                 B_bf16, CUDA_R_16BF, ldb,
+	                                 A_bf16, CUDA_R_16BF, lda,
 	                                 &beta,
 	                                 C, CUDA_R_32F, ldc,
 	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
@@ -1165,6 +1256,49 @@ bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
 	                                     M, N, K,
 	                                     alpha, A, lda, B, ldb, beta, C, ldc,
 	                                     "cublasGemmEx(FAST_16BF,ABT)");
+}
+
+bool register_fast16bf_constant(const float* fp32_ptr,
+                                 const unsigned short* bf16_ptr,
+                                 size_t n)
+{
+	if (!fp32_ptr || !bf16_ptr || n == 0) return false;
+	// Already registered? Update in place.
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr)
+		{
+			g_fast16bf_constants[i].bf16_ptr = bf16_ptr;
+			g_fast16bf_constants[i].n        = n;
+			return true;
+		}
+	}
+	if (g_fast16bf_constants_count >= kMaxFast16bfConstants)
+	{
+		fprintf(stderr, "[glades-cuda] register_fast16bf_constant: table full (max %d)\n",
+		        kMaxFast16bfConstants);
+		return false;
+	}
+	g_fast16bf_constants[g_fast16bf_constants_count].fp32_ptr = fp32_ptr;
+	g_fast16bf_constants[g_fast16bf_constants_count].bf16_ptr = bf16_ptr;
+	g_fast16bf_constants[g_fast16bf_constants_count].n        = n;
+	++g_fast16bf_constants_count;
+	return true;
+}
+
+bool unregister_fast16bf_constant(const float* fp32_ptr)
+{
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr)
+		{
+			// Compact (swap with last, pop).
+			g_fast16bf_constants[i] = g_fast16bf_constants[g_fast16bf_constants_count - 1];
+			--g_fast16bf_constants_count;
+			return true;
+		}
+	}
+	return false;
 }
 
 // ralph-loop iter 6 (2026-05-14): FAST_16BF GEMMs dispatched on the side
