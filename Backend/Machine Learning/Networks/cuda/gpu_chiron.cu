@@ -1576,6 +1576,21 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
 // Same algorithm as flash_attention_cublas_tiled but with Q/K/V cast to
 // BF16 and GEMMs running on BF16 tensor cores (2x over TF32 on 4080 SUPER).
 // Softmax runs on the FP32 scratch_S; P is cast to BF16 for the PV GEMM.
+//
+// iter 118 (2026-05-21): when set_iter118_fa_inner_fwd(true) is called,
+// the cuBLAS+softmax+PV pipeline is replaced by a single FA-style fused
+// kernel (flash_attention_multihead_forward).  FP32 compute (no tensor
+// cores) — math validation Gate-0.  iter 119 will port to BF16/MMA for
+// wall improvement.
+
+namespace {
+static bool g_iter118_fa_inner_fwd = false;
+}
+
+void set_iter118_fa_inner_fwd(bool on)
+{
+	g_iter118_fa_inner_fwd = on;
+}
 
 bool flash_attention_cublas_tiled_bf16(
     const float* Q, const float* K, const float* V,
@@ -1587,6 +1602,18 @@ bool flash_attention_cublas_tiled_bf16(
     unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
 {
 	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	// iter 118: drop-in FA kernel replaces cuBLAS+softmax+PV pipeline.
+	// FP32 compute, no BF16 casts (saves 3 cast launches + intermediate
+	// buffers).  Skips materializing scratch_S, scratch_*bf16 — but they
+	// remain allocated by the caller.
+	if (g_iter118_fa_inner_fwd)
+	{
+		return flash_attention_multihead_forward(
+		    Q, K, V,
+		    T, nHeads, /*nKVHeads=*/nHeads,
+		    dHead, dModel, /*dModelKV=*/dModel,
+		    causal, O);
+	}
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
 	const size_t nPacked = static_cast<size_t>(T) * dModel;
 

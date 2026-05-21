@@ -475,6 +475,13 @@ bool flash_attention_cublas_tiled_bf16(
     unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
     unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16);
 
+// iter 118 (2026-05-21): library-side toggle to replace the cuBLAS+softmax+PV
+// pipeline inside flash_attention_cublas_tiled_bf16 with a single FA-style
+// fused kernel (flash_attention_multihead_forward).  FP32 compute, no BF16
+// casts.  Caller sets this once at startup (e.g. trainer based on a CLI flag).
+// Default OFF.
+void set_iter118_fa_inner_fwd(bool on);
+
 // cuBLAS-tiled backward counterpart.  Given Q, K, V, O (unused, kept for
 // API symmetry), and the upstream gradient dO, produces dQ, dK, dV.
 //
@@ -627,6 +634,7 @@ inline bool flash_attention_cublas_tiled_bf16(
     int, int, int, int, bool,
     float*, float*,
     unsigned short*, unsigned short*, unsigned short*, unsigned short*) { return false; }
+inline void set_iter118_fa_inner_fwd(bool) {}
 inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
                                                  const unsigned short*, const unsigned short*,
                                                  const unsigned short*, const unsigned short*,
