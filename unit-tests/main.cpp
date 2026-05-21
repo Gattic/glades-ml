@@ -42,9 +42,14 @@
 #include "Backend/Machine Learning/atlas-test.h"
 #include "Backend/Machine Learning/atlas-bench.h"
 #include "Backend/Machine Learning/atlas-alt-bench.h"
+#include "Backend/Machine Learning/vesta-test.h"
+#include "Backend/Machine Learning/helios-test.h"
+#include "Backend/Machine Learning/chiron-test.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
+#include "Backend/Machine Learning/sfa-parity-test.h"
+#include "Backend/Machine Learning/sfa-bench-test.h"
 #include "Backend/Machine Learning/sampling-test.h"
 #include "Backend/Machine Learning/attention-backward-test.h"
 #include "Backend/Machine Learning/transformer-ops-test.h"
@@ -196,6 +201,54 @@ int main(int argc, char* argv[])
 		ATLASBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "atlas-alt-bench") == 0)
 		ATLASAltBenchmark(argc, argv);
+	    else if (strcmp(argv[1], "vesta") == 0)
+		VESTAUnitTest();
+	    else if (strcmp(argv[1], "helios") == 0)
+		HELIOSUnitTest();
+	    else if (strcmp(argv[1], "chiron") == 0)
+		CHIRONUnitTest();
+	    else if (strcmp(argv[1], "chiron-bench") == 0)
+		CHIRONBenchmark();
+	    else if (strcmp(argv[1], "vesta-sweep") == 0)
+		VESTASweepBenchmark();
+	    else if (strcmp(argv[1], "vesta-sweep-v2") == 0)
+		VESTASweepV2Benchmark();
+	    else if (strcmp(argv[1], "vesta-sweep-lp") == 0)
+		VESTASweepLambdaPerpExtended();
+	    else if (strcmp(argv[1], "vesta-sweep-mom") == 0)
+		VESTASweepMomentumCompare();
+	    else if (strcmp(argv[1], "vesta-sweep-ablation") == 0)
+		VESTASweepAblationCompare();
+	    else if (strcmp(argv[1], "vesta-sweep-scale") == 0)
+		VESTASweepScaleLadder();
+	    else if (strcmp(argv[1], "vesta-sweep-scale-push") == 0)
+		VESTASweepScalePush();
+	    else if (strcmp(argv[1], "vesta-sweep-raw") == 0)
+		VESTASweepRawMomentumLongHorizon();
+	    else if (strcmp(argv[1], "vesta-sweep-plain-raw") == 0)
+		VESTASweepPlainRawAtScale();
+	    else if (strcmp(argv[1], "vesta-sweep-scale-gpu") == 0)
+		VESTASweepScaleGpu();
+	    else if (strcmp(argv[1], "vesta-sweep-lp-scale") == 0)
+		VESTASweepLpAtScale();
+	    else if (strcmp(argv[1], "vesta-sweep-long-sched") == 0)
+		VESTASweepLongHorizonSchedule();
+	    else if (strcmp(argv[1], "vesta-sweep-same-mem") == 0)
+		VESTASweepSameMemory();
+	    else if (strcmp(argv[1], "vesta-sweep-rank") == 0)
+		VESTASweepRankAtScale();
+	    else if (strcmp(argv[1], "vesta-sweep-ultra") == 0)
+		VESTASweepScaleUltra();
+	    else if (strcmp(argv[1], "vesta-sweep-mega") == 0)
+		VESTASweepScaleMega();
+	    else if (strcmp(argv[1], "vesta-profile-bench") == 0)
+		VESTAProfileBench();
+	    else if (strcmp(argv[1], "vesta-profile-bench-long") == 0)
+		VESTAProfileBenchLong();
+	    else if (strcmp(argv[1], "vesta-refresh-bench") == 0)
+		VESTAGpuRefreshBenchmark();
+	    else if (strcmp(argv[1], "vesta-step-bench") == 0)
+		VESTAGpuStepBenchmark();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)
@@ -208,6 +261,12 @@ int main(int argc, char* argv[])
 		TransformerGradientUnitTest();
 	    else if (strcmp(argv[1], "simd-parity") == 0)
 		SIMDParityUnitTest();
+	    else if (strcmp(argv[1], "sfa-parity") == 0)
+		SFAParityUnitTest();
+	    else if (strcmp(argv[1], "sfa-defect-parity") == 0)
+		SFADefectParityUnitTest();
+	    else if (strcmp(argv[1], "sfa-bench") == 0)
+		SFABenchUnitTest();
 	    else if (strcmp(argv[1], "sampling") == 0)
 		SamplingUnitTest();
 	    else if (strcmp(argv[1], "attention-bwd") == 0)

@@ -159,6 +159,69 @@ struct TransformerRunConfig
 	// Residual dropout: applied to attention output and FFN output before residual adds.
 	float residualDropoutRate;
 
+	// Local-window attention (paradigm shift #6 extension for main transformer).
+	// If > 0, each query attends to ±localAttnWindow tokens (plus BOS), giving
+	// O(T·W) compute instead of O(T²).  If 0, full attention.  Requires the
+	// flash path; silently ignored on the non-flash path.
+	// Validated via CHIRONLocalAttentionFullWindowParityTest + chiron_train
+	// `--local-attn` benchmarks (5.2-38.1× speedup at T=2k-16k).
+	int localAttnWindow;
+
+	// Attention-sink count (paradigm shift #78 ATTENTION-SINK-DISTILL-CHIRON).
+	// If > 0, the first `attnSinkCount` positions are always allowed in
+	// attention regardless of sliding-window restriction. Composes with
+	// localAttnWindow (W) to give StreamingLLM-style infinite-context
+	// attention: keys are allowed iff (u < S) OR (u + W > t), with causal
+	// restriction u <= t. KV cache is bounded at S+W positions independent
+	// of total context length T. Default 0 = disabled.
+	// Reference: Xiao et al. 2023 "Efficient Streaming Language Models with
+	// Attention Sinks". Production-validated by vLLM, lmdeploy, llama.cpp,
+	// MLC-LLM, TGI.
+	int attnSinkCount;
+
+	// Binary FFN forward (paradigm shift #74 PHOENIX-1BIT-DISTILL-COMBO).
+	// When true, the FFN W2 (output) projection is computed as Y = X @
+	// sign(W2).T via an on-the-fly binary kernel — no multiplies on the
+	// hot path. Float master weights are still kept for backward (STE)
+	// and Adam updates; the speedup is FLOP-side only at training time.
+	// At inference the float weights can be dropped. Default false.
+	bool binaryFFN;
+
+	// MLA latent rank (paradigm shift #76 MLA-DISTILL-CHIRON). When > 0,
+	// switch the K/V projections from standard MHA W_K, W_V to a low-rank
+	// latent: K = h @ W_DKV @ W_UK ; V = h @ W_DKV @ W_UV with latent
+	// dimension d_c = mlaLatentDim. Cache stores c (T × d_c) instead of
+	// K, V (T × n_heads × d_kv × 2). Default 0 = standard MHA.
+	int mlaLatentDim;
+
+	// FACE Adafactor on the token embedding (paradigm shift #28).  When true,
+	// the tokE [V × dModel] table is updated via a frequency-debiased,
+	// row/col-normalized preconditioner instead of dense Adam.  State drops
+	// from ~8·V·dModel bytes (FP32 m+v) to 4·(V + dModel + 2) bytes
+	// (zn̄, dn̄, q̂, gF̄ all FP32 scalars/vectors) — typically ~250-1000×
+	// compression on the embedding optimizer state.  Default false.
+	bool faceEmbedding;
+	// FACE EMA decays.  betaRow=0.98 keeps inactive (rare) tokens'
+	// per-row stats stable; betaCol=0.95 lets column/scalar EMAs adapt
+	// faster.  Defaults match CHIRON's FACE preset.
+	float faceBetaRow;
+	float faceBetaCol;
+	// Numerical floor on the FACE preconditioner denominator.  Default
+	// 1e-8 (matches paradigm-28 design).
+	float faceEps;
+
+	// Paradigm shift #39 RLG (Reversible Layer Growth) — port from CHIRON.
+	// When > 0 and < nLayers, the trainer initializes layers
+	// [rlgInitialLayers, nLayers) with Wo = W2 = bo = b2 = 0, making each
+	// such block bit-exact identity to the residual stream at step 0.
+	// The forward pass through these layers contributes zero; gradient
+	// flow at init is therefore equivalent to a smaller L = rlgInitialLayers
+	// model, sidestepping the depth-amplified gradient variance that
+	// breaks deep transformers at 1.84B. The optimizer naturally grows
+	// the inactive layers as ∂loss/∂Wo is non-zero whenever the residual
+	// has non-zero norm. Default 0 = disabled (all layers Glorot-init).
+	int rlgInitialLayers;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -182,7 +245,16 @@ struct TransformerRunConfig
 	      ffnKind(FFN_MLP),
 	      ffnActivation(FFN_RELU),
 	      embeddingDropoutRate(0.0f),
-	      residualDropoutRate(0.0f)
+	      residualDropoutRate(0.0f),
+	      localAttnWindow(0),
+	      attnSinkCount(0),
+	      binaryFFN(false),
+	      mlaLatentDim(0),
+	      faceEmbedding(false),
+	      faceBetaRow(0.98f),
+	      faceBetaCol(0.95f),
+	      faceEps(1e-8f),
+	      rlgInitialLayers(0)
 	{
 	}
 };
@@ -372,16 +444,28 @@ struct OptimizerConfig
 	{
 		SGD_MOMENTUM = 0,
 		ADAMW = 1,
-		ATLAS = 2
+		ATLAS = 2,
+		VESTA = 3,
+		HELIOS = 4,
+		// Paradigm shift #55 SOPHIA-G (Liu et al. 2023, gradient-squared variant).
+		// Drop-in Adam variant with clipped second-order update; published
+		// 1.5-2× steps reduction to fixed final NLL.
+		SOPHIA_G = 5
 	};
 
 	Type type;
 
-	// AdamW parameters (used when type==ADAMW).
+	// AdamW parameters (used when type==ADAMW or SOPHIA_G inherits beta1/beta2).
 	float adamBeta1;
 	float adamBeta2;
 	float adamEps;
 	bool adamBiasCorrection;
+
+	// SOPHIA_G parameters (Liu et al. 2023 defaults: gamma=0.05, rho=1.0,
+	// beta1=0.965, beta2=0.99 — the latter two override adamBeta1/adamBeta2
+	// when type==SOPHIA_G).
+	float sophiaGamma;   // denominator scale on Hessian proxy
+	float sophiaRho;     // update clip magnitude
 
 	// Enable groupwise AdamW modulation. This keeps the exact AdamW update law
 	// but multiplies each parameter group's effective step size by a cheap
@@ -413,6 +497,11 @@ struct OptimizerConfig
 	      adamBeta2(0.999f),
 	      adamEps(1e-8f),
 	      adamBiasCorrection(true),
+	      sophiaGamma(0.05f),
+	      // Sophia paper (Liu 2023) uses rho=0.04 for LLM pre-training.
+	      // ρ=1.0 (initially set per the design doc) caused 14e-2 nat
+	      // divergence at 250 steps in 213M smoke — too aggressive.
+	      sophiaRho(0.04f),
 	      adamGroupwiseEnabled(false),
 	      adamGroupStabilityScale(0.05f),
 	      adamGroupSnrScale(0.05f),
@@ -1568,6 +1657,66 @@ struct MixedPrecisionConfig
 	// Low-precision dtype for weight copies used in forward/backward.
 	WeightDType weightDType;
 
+	// Store AdamW optimizer state (m, v) in BF16 instead of FP32. Halves
+	// optimizer-state VRAM (4 bytes -> 2 bytes per parameter per moment,
+	// so 4x params -> 2x params per GB). Compute (EMA, bias-correction,
+	// sqrt, division) still happens in FP32 — only storage is BF16. BF16's
+	// 8-bit exponent avoids FP16's underflow in v; 7-bit mantissa incurs
+	// ~0.4% per-update quantization bias that the EMA averages out.
+	// Requires GPU; takes the non-batched Adam path.
+	bool adamStateBf16;
+
+	// Store AdamW optimizer state (m as int8, v as uint8) with per-256-element
+	// FP32 absmax scales.  ~1.016 bytes/param/moment vs. 4 bytes FP32 (4× drop)
+	// or 2 bytes BF16 (~2× drop).  Mechanism: dequant on read with
+	// (val/127 or val/255) * scale, EMA in FP32, requantize on write via
+	// block-wide absmax reduction.  v uses unsigned [0,255] — doubles
+	// precision near zero where 1/√v matters most.  Ported from CHIRON
+	// (paradigm #11 MFIO mechanism).  Mutually exclusive with adamStateBf16
+	// when both are set; int8 wins (it's the more aggressive compression).
+	bool adamStateInt8;
+
+	// Store gradients as BF16 instead of FP32.  Halves grad-buffer VRAM
+	// (~3.7 GB savings at 1.84B).  Mechanism: each backward GEMM writes
+	// into a shared scratch FP32 buffer (sized to the widest weight tensor),
+	// then bf16_accum_axpy commits the result into the persistent BF16 grad
+	// buffer with stochastic-rounding-equivalent rebanding.  Adam reads the
+	// BF16 grad directly (uses adam_update_*_bf16grad kernels).  Required
+	// alongside adamStateBf16 or adamStateInt8 to fit 1.84B-class on a 16 GB
+	// GPU.  Ported from CHIRON's BF16-grads path (paradigm-stack at ≥500M).
+	bool gradStorageBf16;
+
+	// Phase-2 of BF16 grad storage: backward GEMMs commit DIRECTLY to the BF16
+	// mirrors via a single shared FP32 scratch buffer; the Phase-1 cast pass
+	// (FP32 grad -> BF16 mirror) is skipped; grad-norm reads BF16 mirrors.
+	// Implies gradStorageBf16=true.  Mutually exclusive with non-compressed
+	// Adam paths (full Adam batch, atlas/geode/muon) — those still want FP32
+	// grads.  When phase2 active, the FP32 grad buffers are still allocated
+	// (other code paths reference them) but never written to by backward;
+	// retiring those allocations is a follow-on memory-cleanup task.
+	bool gradStorageBf16Phase2;
+
+	// CHIRON-style BF16 weight storage: per-block weights (Wq/Wk/Wv/Wo/W1/W2)
+	// + tokE + WIn + WOut persist as BF16 on GPU (no FP32 master).  Adam reads
+	// BF16 → casts to one shared FP32 scratch → applies update → casts back to
+	// BF16 with stochastic rounding.  Saves another ~50% on weight VRAM (~3.7
+	// GB at 1.84B) on top of the bf16-grad savings.  Forward already uses BF16
+	// mirrors via gpu_gemm_mp, so no forward-side change is needed.
+	bool weightStorageBf16;
+
+	// Activation gradient checkpointing (sqrt-L scheme).  When enabled the
+	// per-layer activation scratches (x1/Q/K/V/attnConcat/attnOut/hAfterAttn/
+	// x2/ff1/ff1Act/ffOut/hAfterFF and LN stats) are sized to K = ⌈√L⌉ slots
+	// instead of L; layer li writes into slot `li % K`.  At checkpoint
+	// boundaries (every K layers) the layer-input residual hAfterFF is copied
+	// into a `checkpoints[c]` buffer.  Backward walks segments from highest
+	// down to 0 — for each segment it re-runs forward starting from the
+	// checkpoint to repopulate the K slots, then runs backward in reverse over
+	// the segment.  Saves ~3.6 GB at 1.84B (4.2 GB stash → 0.55 GB scratch +
+	// checkpoints) at the cost of ~33% extra compute (one extra forward per
+	// step).  Composes with bf16-weights and bf16-grads.
+	bool activationCheckpoint;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1585,6 +1734,12 @@ struct MixedPrecisionConfig
 	MixedPrecisionConfig()
 	    : enable(false),
 	      weightDType(WEIGHT_F16),
+	      adamStateBf16(false),
+	      adamStateInt8(false),
+	      gradStorageBf16(false),
+	      gradStorageBf16Phase2(false),
+	      weightStorageBf16(false),
+	      activationCheckpoint(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),
@@ -1713,6 +1868,256 @@ struct DeconvConfig
 	}
 };
 
+// VESTA optimizer configuration (Variational Entropy-Spectral Trust-region Adaptation).
+//
+// Per-weight-matrix Bregman mirror descent on the von Neumann spectral entropy
+// potential Phi(W) = -1/2 tr(W^T W log W^T W) + mu/2 |W|_F^2. Tracks the top-r
+// SVD of each weight matrix; updates are derived from the KKT conditions of a
+// trust-region-constrained mirror step with spectral-homeostatic regularization.
+// No second-moment EMA of squared gradients is maintained.
+struct VestaConfig
+{
+	// Sketch rank per weight matrix. Clamped to min(rank, min(m, n)) at init.
+	unsigned int rank;
+
+	// Frobenius stabilizer of the spectral entropy potential Phi(W).
+	// Must satisfy mu >= 3.0 for strict convexity near sigma=1; default 4.0.
+	float mu;
+
+	// Strength of the spectral-control regularizer R(W) = 1/2 * sum (ell - ellStar)^2.
+	// 0 disables spectral homeostasis; default 0.1.
+	float tau;
+
+	// Operator-norm trust-region radius: max exp(ell[0]) is clamped to
+	// (1 + rho) * prev_max. Default 0.05.
+	float rho;
+
+	// Scale of the signed complement step (for gradient components outside the
+	// tracked subspace). Default 0.2.
+	float lambdaPerp;
+
+	// EMA rate for log-scale momentum beta = (1-gamma)*beta + gamma*ell. Default 0.01.
+	float gamma;
+
+	// Feedback rate from beta to ell: ell = (1-kappa)*ell + kappa*beta. Default 0.1.
+	float kappa;
+
+	// Homeostasis rate for ellStar update: ellStar = (1-nu)*ellStar + nu*ell.
+	// Default 0.01.
+	float nu;
+
+	// Subspace refresh period (steps between sketched SVD refresh). Default 4.
+	unsigned int tSk;
+
+	// Homeostasis update period (steps between ellStar update). Default 1000.
+	unsigned int tHom;
+
+	// Power iteration count inside the sketch refresh. Default 2.
+	unsigned int powerIters;
+
+	// Clamp range on ell = log(sigma) to prevent over/underflow.
+	float ellMin; // default -10.0
+	float ellMax; // default   4.0
+
+	// Numerical floor on phi_dd = -2*ell - 3 + mu to avoid division by near-zero.
+	float phiDdFloor; // default 0.1
+
+	// Lion-style momentum on the signed complement step. When enabled, VESTA
+	// tracks an EMA of the out-of-subspace gradient and signs the EMA rather
+	// than the instantaneous gradient. Costs one extra [m*n] buffer per weight
+	// matrix, but empirically closes a large fraction of the AdamW gap.
+	bool complementMomentumEnabled; // default false (opt-in)
+	float complementBeta;           // default 0.9 (heavy-ball-style EMA rate)
+
+	// When complementMomentumEnabled is true, controls whether the step is
+	//   sign(m_perp)  — Lion-style, fixed-magnitude (default, good short horizons)
+	// or
+	//   m_perp        — classical heavy-ball, gradient-magnitude-aware (good long horizons)
+	// Set to false to switch to raw-momentum mode. The lr * lambdaPerp product
+	// typically needs re-tuning: raw-mode optima have lambdaPerp 3-10x larger
+	// than sign-mode optima because the step magnitude now scales with the
+	// gradient's own EMA.
+	bool complementUseSign;         // default true (Lion-style)
+
+	// Sign-stabilized tracked update: maintain an EMA of the tracked-subspace
+	// diagonal A[i,i] = (U^T g V)_ii and use the EMA (rather than the
+	// instantaneous value) in the log-scale mirror step. Kills per-step
+	// variance in ell without changing the Bregman-mirror geometry.
+	// Costs r fp32 floats of extra state per weight matrix.
+	bool trackedEmaEnabled;         // default false (opt-in)
+	float trackedEmaBeta;           // default 0.9
+
+	// Basis source for the tracked subspace:
+	//   0 = weights  (sketched SVD of W; original VESTA design)
+	//   1 = gradient (sketched SVD of EMA(g); Fisher-adjacent)
+	// When 1, an m*n buffer per matrix tracks the gradient EMA.
+	unsigned int basisSource;       // default 0 (weights)
+	float basisEmaBeta;             // default 0.99 (EMA rate for gradientEma)
+
+	// If true, the GPU sketched-SVD refresh is executed on-device (cuBLAS GEMMs,
+	// on-device modified Gram-Schmidt). Only the small B matrix [rp x n] is
+	// downloaded for the Jacobi eigendecomposition and the right singular
+	// vectors are uploaded back. If false, the GPU path downloads W to host,
+	// runs the CPU sketched SVD, and uploads U/V/ell -- useful for strict
+	// CPU/GPU parity tests. Default true (production speedup; at dModel=2048
+	// the host roundtrip is ~50% of VESTA wall-clock per step).
+	bool gpuRefreshOnDevice;
+
+	VestaConfig()
+	    : rank(32u),
+	      mu(4.0f),
+	      tau(0.1f),
+	      rho(0.05f),
+	      lambdaPerp(0.2f),
+	      gamma(0.01f),
+	      kappa(0.1f),
+	      nu(0.01f),
+	      tSk(4u),
+	      tHom(1000u),
+	      powerIters(2u),
+	      ellMin(-10.0f),
+	      ellMax(4.0f),
+	      phiDdFloor(0.1f),
+	      complementMomentumEnabled(false),
+	      complementBeta(0.9f),
+	      complementUseSign(true),
+	      trackedEmaEnabled(false),
+	      trackedEmaBeta(0.9f),
+	      basisSource(0u),
+	      basisEmaBeta(0.99f),
+	      gpuRefreshOnDevice(true)
+	{
+	}
+};
+
+// HELIOS optimizer configuration (Hamiltonian Ensemble Langevin Integrator with
+// Sharpness-adaptive Thermostat).
+//
+// HELIOS discretizes an underdamped Langevin-Nose-Hoover SDE with the BAOAB
+// stochastic-symplectic splitting. Minimum viable instantiation uses a scalar
+// global temperature, a single thermostat variable, no sharpness feedback, and
+// no anchor regularizer. The full design (per-group T, sharpness probe,
+// anchor EMA, Li-Sato-Tan noise correction) is described in
+// research/HELIOS_framework.md.
+//
+// Per-weight-matrix state: momentum p [m*n] (and optional anchor thetaBar [m*n]).
+// Per-group scalar state: {xi, T, kappa, m_mass}.
+struct HeliosConfig
+{
+	// Step size h. Used only inside the integrator (the outer learning-rate
+	// schedule still multiplies it). Default 1.0 so that `lr` passed to
+	// applyStep acts as the effective step.
+	float h;
+
+	// Base friction floor gamma_0 (>= 0). The effective per-parameter friction
+	// is Gamma = gamma_0 + xi + alpha * kappa. Default 0.1.
+	float gamma0;
+
+	// Target temperature T_0. Sets the invariant-measure scale: at static T,
+	// the theta-marginal is prop. exp(-U(theta)/T). Default 1e-4.
+	// For deterministic descent behavior set to 0.
+	float T0;
+
+	// Scalar group mass m (units of mass). Momentum has kinetic energy
+	// (1/2) * ||p||^2 / m, so effective step on theta is (h/m) * p. Default 1.0.
+	float mass;
+
+	// Nose-Hoover thermostat inertia Q. Standard tuning gives Q = N * T /
+	// omega_xi^2 with omega_xi ~ 1/(10 h) (i.e. xi relaxes ~10 steps).
+	// When 0, thermostat is disabled (pure underdamped Langevin). Default 0.
+	float Q;
+
+	// Sharpness feedback coefficient alpha (>= 0). Scales the contribution of
+	// kappa to Gamma. Set 0 to disable (minimum viable instantiation). Default 0.
+	float alpha;
+
+	// Upper clamp on the sharpness probe kappa_g (prevents runaway friction).
+	// Only used when alpha > 0. Default 1e4.
+	float kappaMax;
+
+	// Sharpness probe refresh period K_hvp (one HVP per K_hvp steps, round-
+	// robined across groups when per-group is enabled). 0 disables HVP
+	// probing entirely (kappa stays at 0 and alpha is effectively ignored).
+	// Default 0 (off in minimum viable instantiation).
+	unsigned int kHvp;
+
+	// Anchor EMA decay beta_a. theta_bar <- beta_a * theta_bar + (1-beta_a) * theta.
+	// Anchor penalty in U is (lambda_a/2) * ||theta - theta_bar||^2. When
+	// lambda_a == 0 the anchor is disabled and theta_bar is not allocated.
+	// Defaults: beta_a = 0.999, lambda_a = 0 (off).
+	float betaAnchor;
+	float lambdaAnchor;
+
+	// Li-Sato-Tan noise-temperature correction: T_eff = T0 + (h/4) *
+	// tr(Sigma_B) / N, where tr(Sigma_B) is the mini-batch gradient noise
+	// covariance trace. 0 disables the correction. Default 0 (off in minimum
+	// viable instantiation).
+	float noiseCorrection;
+
+	HeliosConfig()
+	    : h(1.0f),
+	      gamma0(0.1f),
+	      T0(1e-4f),
+	      mass(1.0f),
+	      Q(0.0f),
+	      alpha(0.0f),
+	      kappaMax(1e4f),
+	      kHvp(0u),
+	      betaAnchor(0.999f),
+	      lambdaAnchor(0.0f),
+	      noiseCorrection(0.0f)
+	{
+	}
+};
+
+// CHIRON reversible-flow transformer configuration.  When enabled, the
+// training loop treats the transformer as a sequence of symplectic
+// bijective blocks and reconstructs activations during backward via the
+// block inverse rather than storing them (framework:
+// research/CHIRON_framework.md).
+//
+// See research/CHIRON_PROGRESS.md for the current implementation phase.
+// Default = disabled: existing code paths are untouched when enable=false.
+struct ChironConfig
+{
+	// Master enable.  When false, CHIRON machinery is inert and the
+	// standard transformer block path is used unchanged.
+	bool enable;
+
+	// Rank of the per-layer sketch used for BF16 reconstruction-error
+	// correction (framework §4.4 / amendment §11a). Ignored when enable
+	// is false or when anchorPeriod == 1.
+	int sketchRank;
+
+	// Per-token local sketch vs global block sketch. Per-token is the
+	// practical choice (framework amendment §11a mitigation 1): the
+	// effective sketch input dim shrinks from 2·T·m to 2·m, giving
+	// √(T)× tighter per-coord correction at the same rank.
+	bool perTokenSketch;
+
+	// Anchor period k (framework §6.4 remedy 2 / amendment §11a
+	// mitigation 2). Every k-th block stores a full BF16 activation
+	// "anchor" so drift accumulation is capped at length k. With k=1
+	// every block is an anchor (degenerates to full-activation
+	// training); with k=L no anchors (pure sketch-corrected inverse).
+	// Default 8 is the practical sweet spot per the framework.
+	int anchorPeriod;
+
+	// Deterministic seed base for sketch matrix generation. The actual
+	// per-layer seed is `sketchSeed + layerIndex`. Sketches are
+	// regenerated on demand from this seed rather than being stored.
+	unsigned int sketchSeed;
+
+	ChironConfig()
+	    : enable(false),
+	      sketchRank(256),
+	      perTokenSketch(true),
+	      anchorPeriod(8),
+	      sketchSeed(0xC4120Fu)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -1726,6 +2131,21 @@ struct TrainingConfig
 	// Global grad-norm clipping (0 disables).
 	float globalGradClipNorm;
 
+	// Paradigm shift #38 SLC mini-LR-warmup (port from CHIRON iter-178).
+	// At each T-schedule transition (managed by the trainer), the trainer
+	// calls NNetwork::setSLCTransitionStep(optimizerStep, slcMiniWarmupSteps)
+	// to mark the transition.  The per-step LR multiplier in sgd_transformer
+	// then applies min(warmupMult, (optimizerStep - slcLastTransitionStep) /
+	// slcMiniWarmupSteps) for the first slcMiniWarmupSteps after each
+	// transition.  This linear ramp from 0 to full lr after a T jump lets
+	// the optimizer's m/v EMAs adapt to the new gradient covariance and
+	// prevents the post-transition gradient spike that drove flagship
+	// 1.84B Phase-2 (T=512) to clipped-stagnation in the SLC test.
+	// Default -1 (disabled).  Set to 0 by the trainer at chunk-1 to skip
+	// the warmup before any transition has occurred.
+	long long slcLastTransitionStep;
+	int slcMiniWarmupSteps;
+
 	// Per-element gradient clipping (<= 0 disables).
 	//
 	// Historical engine behavior clipped many intermediate gradients/deltas to +/-10.
@@ -1738,6 +2158,12 @@ struct TrainingConfig
 
 	// ATLAS optimizer configuration (used when optimizer.type==ATLAS).
 	ATLASConfig atlas;
+
+	// VESTA optimizer configuration (used when optimizer.type==VESTA).
+	VestaConfig vesta;
+
+	// HELIOS optimizer configuration (used when optimizer.type==HELIOS).
+	HeliosConfig helios;
 
 	// Learning rate schedule multiplier configuration.
 	LearningRateScheduleConfig lrSchedule;
@@ -1781,6 +2207,11 @@ struct TrainingConfig
 	// during backward instead of storing all per-layer intermediates.
 	bool gradientCheckpointing;
 
+	// CHIRON reversible-flow transformer configuration. When enabled, the
+	// transformer backward reconstructs activations via the block inverse
+	// rather than storing them (research/CHIRON_framework.md).
+	ChironConfig chiron;
+
 	// CNN run config (used only for TYPE_CNN).
 	CNNConfig cnn;
 
@@ -1788,9 +2219,12 @@ struct TrainingConfig
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
 	      globalGradClipNorm(0.0f),
+	      slcLastTransitionStep(-1),
+	      slcMiniWarmupSteps(0),
 	      perElementGradClip(10.0f),
 	      optimizer(),
 	      atlas(),
+	      vesta(),
 	      lrSchedule(),
 	      bayesianLR(),
 	      transformer(),
@@ -1799,6 +2233,7 @@ struct TrainingConfig
 	      warmup(),
 	      ddp(),
 	      gradientCheckpointing(false),
+	      chiron(),
 	      cnn()
 	{
 	}

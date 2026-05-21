@@ -27,6 +27,8 @@
 #include "training_callbacks.h"
 #include "training_config.h"
 #include "atlas_optimizer.h"
+#include "vesta_optimizer.h"
+#include "helios_optimizer.h"
 #include "../nnetwork_status.h"
 #include "bayes.h"
 #include "bayes-optimizer.h"
@@ -53,6 +55,8 @@
 #include "cuda/gpu_dff_state.h"
 #include "cuda/gpu_rnn_state.h"
 #include "cuda/gpu_cnn_state.h"
+#include "cuda/gpu_init.h"
+#include "cuda/gpu_face.h"
 #endif
 
 // Concurrency primitives:
@@ -1881,6 +1885,13 @@ private:
 	float lrScheduleMultiplier; // computed each epoch by the scheduler; starts at 1
 	int lrScheduleEpochOffset;  // added to epochFromStart in Trainer::run(); caller sets this
 	                            // when train() is called once per epoch in a loop
+	int runStartingEpochs;      // 2026-05-13 task #29 fix: Trainer::run sets this at run
+	                            // start so per-step LR computations in SGDHelper can
+	                            // subtract it (mirrors Trainer::run's starting_epochs
+	                            // local).  Without this subtraction, callers that set
+	                            // lrScheduleEpochOffset + iterate per-chunk see
+	                            // epochIdx + offset double-counted by 2× (epochIdx is
+	                            // cumulative net.epochs which already equals offset).
 	float lastGradNorm;
 	float lastGradNormScale;
 	int64_t lastStepLogTime;
@@ -2019,6 +2030,46 @@ private:
 	                                unsigned int& seqInBatch,
 	                                unsigned int& timeStepsInBatch);
 
+#ifdef GLADES_HAVE_CUDA
+	// Runs the GPU forward pass (embedding → per-layer blocks → final LN →
+	// output head → softmax) for ONE sequence. Token IDs must already be
+	// uploaded to gpuTransformerScratch->tokenIds (tokenLM mode) by the
+	// caller. Does NOT compute loss/metrics and does NOT run backward.
+	// Writes logits/probs to scratch buffers. Used for both the normal
+	// training forward and the HELIOS FD-HVP probe's perturbed re-forward.
+	//
+	// gpuPerfOpaque: nullable pointer to TransformerGpuPerfBreakdown (cast
+	// internally to avoid exposing the perf struct in this header).
+	bool transformerGpuRunForwardOnly(const TransformerEpochCfg& cfg,
+	                                  unsigned int T,
+	                                  bool useBf16, bool useRope,
+	                                  bool bf16WIn, bool bf16Wq, bool bf16Wk,
+	                                  bool bf16Wv, bool bf16Wo, bool bf16W1,
+	                                  bool bf16W2, bool bf16Head,
+	                                  int ropeDimOverride,
+	                                  void* gpuPerfOpaque);
+
+	// Activation-checkpoint helper.  Re-runs the per-layer forward body for
+	// layers in [segStart, segEnd) (exclusive end), populating the cyclic
+	// activation slots so the backward path can read them.  When
+	// segmentInputOverride is non-NULL it is used as the input to layer
+	// segStart (e.g. a checkpoint hAfterFF copy); otherwise the standard
+	// layerIn formula `(li == 0) ? h : hAfterFF[prevSlot]` is used.  Same
+	// kernel sequence as transformerGpuRunForwardOnly's layer loop, minus
+	// embedding/final-LN/output-head — those are handled once per step in
+	// the train epoch and don't need recomputing.
+	bool transformerGpuLayerRangeForward(
+	    const TransformerEpochCfg& cfg,
+	    unsigned int T,
+	    unsigned int segStart, unsigned int segEnd,
+	    const float* segmentInputOverride,
+	    bool useBf16, bool useRope,
+	    bool bf16Wq, bool bf16Wk, bool bf16Wv,
+	    bool bf16Wo, bool bf16W1, bool bf16W2,
+	    int ropeDimOverride);
+#endif
+
+
 	// Owned resources (used only in some construction paths)
 	shmea::GPointer<NNInfo> ownedSkeleton;
 
@@ -2073,7 +2124,15 @@ public:
 		// Transformer decoder-only: causal self-attention over sequences.
 		TYPE_TRANSFORMER_DECODER = 5,
 		// Convolutional neural network: im2col+SGEMM convolution, pooling, FC head.
-		TYPE_CNN = 6
+		TYPE_CNN = 6,
+		// CHIRON reversible-flow transformer: bijective symplectic blocks,
+		// O(1)-in-depth activation memory (research/CHIRON_framework.md).
+		// When enabled via cfg.chiron.enable, the training loop routes
+		// forward/backward through CHIRON primitives (chiron_attention_shear,
+		// chiron_reln_forward/inverse/backward, chiron_attention_shear_backward)
+		// instead of storing activations. Phase A: dispatch enum + feature
+		// flag. Phase B: full forward/backward orchestration.
+		TYPE_TRANSFORMER_CHIRON = 7
 	};
 
 	enum
@@ -2173,6 +2232,26 @@ public:
 	void setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier);
 	float getLearningRateMultiplier() const { return lrScheduleMultiplier; }
 	void setLrScheduleEpochOffset(int offset) { lrScheduleEpochOffset = offset; }
+
+	// Read-only accessor for the transformer's optimizer step count.
+	// Used by trainers driving paradigm-#38 SLC mini-warmup to mark the
+	// current step as the "last transition" right before a chunk that
+	// changes T.  Returns 0 if the network is not a transformer or hasn't
+	// trained yet.
+	unsigned long long getTransformerOptimizerStep() const
+	{
+		return tensorTransformer.optimizerStep;
+	}
+
+	// Paradigm shift #39 RLG (Reversible Layer Growth) — scheduled
+	// re-zeroing.  Trainer drives this at each --l-schedule transition:
+	// zeros Wo + W2 (and Adam M/V state where present) of transformer
+	// blocks [activeLayers, nLayers), making those blocks bit-exact
+	// identity to the residual.  Stale optimizer state is cleared so
+	// the regrown layers start fresh at every transition.  No-op when
+	// activeLayers >= nLayers or not a transformer network.  Operates
+	// on the GPU mirrors when GPU is enabled.
+	void rlgRezeroDeepLayers(unsigned int activeLayers);
 	void setGlobalGradClipNorm(float clipNorm);
 	float getGlobalGradClipNorm() const { return trainingConfig.globalGradClipNorm; }
 	void setPerElementGradClip(float clipLimit);

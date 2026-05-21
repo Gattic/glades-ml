@@ -17,6 +17,7 @@
 #include "network.h"
 #include "transformer_config.h"
 #include "transformer_public_api.h"
+#include "cuda/gpu_kernels.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
@@ -83,6 +84,20 @@ bool atlas_transformer_needs_adam_moments(const glades::TrainingConfig& training
 	            || trainingConfig.atlas.matraEnabled
 	            || trainingConfig.atlas.argosEnabled
 	            || trainingConfig.atlas.muonEnabled));
+}
+
+// True when GPU bf16/int8 Adam state is the canonical store and the host-side
+// FP32 m/v vectors are dead weight from init forward.  Skipping their
+// O(N_params) assign() at init avoids the host-RAM thrash that has blocked
+// 1.84B-class flagship training on 62 GB hosts (without this gate, per-layer
+// vWq/v2Wq/vW1/v2W1/etc. sums to ~21 GB at L=53 d=2048 dFF=5632, pushing
+// resident set into swap during the otherwise-quick init phase).
+bool transformer_skip_host_adam_mv(const glades::TrainingConfig& trainingConfig)
+{
+	return trainingConfig.gpu.enable
+	    && trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW
+	    && (trainingConfig.mixedPrecision.adamStateBf16
+	        || trainingConfig.mixedPrecision.adamStateInt8);
 }
 
 void ensure_transformer_moment_buffer(std::vector<float>& buffer, size_t wanted)
@@ -407,6 +422,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -456,6 +472,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -2076,6 +2093,7 @@ void glades::NNetwork::clean()
 	// Schedule bookkeeping resets each run
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -2506,6 +2524,7 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		const unsigned int ff1Width = modelCfg.ff1Width;
 
 		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
+		const bool skipHostAdamMV = transformer_skip_host_adam_mv(trainingConfig);
 		const bool mismatch = (!tensorTransformer.initialized) || (tensorTransformer.inputSize != inputSize) || (tensorTransformer.outSize != outSize) ||
 		                      (tensorTransformer.dModel != dModel) || (tensorTransformer.dFF != dFF) || (tensorTransformer.nHeads != nHeads) ||
 		                      (tensorTransformer.nKVHeads != nKVHeads) || (tensorTransformer.ffnKind != ffnKind) ||
@@ -2598,6 +2617,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.padTokenId = modelCfg.padTokenId;
 		tensorTransformer.tieEmbeddings = modelCfg.tieEmbeddings;
 		tensorTransformer.optimizerStep = 0ULL;
+		tensorTransformer.heliosHvpStepCounter = 0ULL;
+		tensorTransformer.heliosHvpCycleCounter = 0ULL;
 
 		// ATLAS normally uses its own per-matrix state and skips AdamW moments to
 		// save memory. Some transformer-side experimental branches reuse Adam-style
@@ -2607,33 +2628,33 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		{
 			const size_t eN = static_cast<size_t>(vocabSize) * static_cast<size_t>(dModel);
 			tensorTransformer.tokE.assign(eN, 0.0f);
-			if (needAdamMoments) tensorTransformer.vTokE.assign(eN, 0.0f);
-			if (needAdamMoments) tensorTransformer.v2TokE.assign(eN, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vTokE.assign(eN, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2TokE.assign(eN, 0.0f);
 			tensorTransformer.gTokE.assign(eN, 0.0f);
 			tensorTransformer.lmBias.assign(vocabSize, 0.0f);
-			if (needAdamMoments) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
-			if (needAdamMoments) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
 			tensorTransformer.gLmBias.assign(vocabSize, 0.0f);
 		}
 
 		const size_t inW = static_cast<size_t>(dModel) * static_cast<size_t>(inputSize);
 		tensorTransformer.WIn.assign(inW, 0.0f);
-		if (needAdamMoments) tensorTransformer.vWIn.assign(inW, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2WIn.assign(inW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vWIn.assign(inW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2WIn.assign(inW, 0.0f);
 		tensorTransformer.gWIn.assign(inW, 0.0f);
 		tensorTransformer.bIn.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mBIn.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2BIn.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mBIn.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2BIn.assign(dModel, 0.0f);
 		tensorTransformer.gBIn.assign(dModel, 0.0f);
 
 		const size_t outW = static_cast<size_t>(outSize) * static_cast<size_t>(dModel);
 		tensorTransformer.WOut.assign(outW, 0.0f);
-		if (needAdamMoments) tensorTransformer.vWOut.assign(outW, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2WOut.assign(outW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vWOut.assign(outW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2WOut.assign(outW, 0.0f);
 		tensorTransformer.gWOut.assign(outW, 0.0f);
 		tensorTransformer.bOut.assign(outSize, 0.0f);
-		if (needAdamMoments) tensorTransformer.mBOut.assign(outSize, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2BOut.assign(outSize, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mBOut.assign(outSize, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2BOut.assign(outSize, 0.0f);
 		tensorTransformer.gBOut.assign(outSize, 0.0f);
 
 		tensorTransformer.blocks.resize(static_cast<size_t>(H));
@@ -2644,18 +2665,18 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
 			b.ln1Gamma.assign(dModel, 1.0f);
 			b.ln1Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn1Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln1Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn1Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln1Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn1Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn1Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Beta.assign(dModel, 0.0f);
 			b.gLn1Gamma.assign(dModel, 0.0f);
 			b.gLn1Beta.assign(dModel, 0.0f);
 			b.ln2Gamma.assign(dModel, 1.0f);
 			b.ln2Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn2Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln2Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn2Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln2Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn2Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln2Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn2Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln2Beta.assign(dModel, 0.0f);
 			b.gLn2Gamma.assign(dModel, 0.0f);
 			b.gLn2Beta.assign(dModel, 0.0f);
 
@@ -2665,18 +2686,38 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			b.Wk.assign(mkv, 0.0f);
 			b.Wv.assign(mkv, 0.0f);
 			b.Wo.assign(mm, 0.0f);
-			if (needAdamMoments) { b.vWq.assign(mm, 0.0f); b.vWk.assign(mkv, 0.0f); b.vWv.assign(mkv, 0.0f); b.vWo.assign(mm, 0.0f); }
-			if (needAdamMoments) { b.v2Wq.assign(mm, 0.0f); b.v2Wk.assign(mkv, 0.0f); b.v2Wv.assign(mkv, 0.0f); b.v2Wo.assign(mm, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.vWq.assign(mm, 0.0f); b.vWk.assign(mkv, 0.0f); b.vWv.assign(mkv, 0.0f); b.vWo.assign(mm, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2Wq.assign(mm, 0.0f); b.v2Wk.assign(mkv, 0.0f); b.v2Wv.assign(mkv, 0.0f); b.v2Wo.assign(mm, 0.0f); }
 			b.gWq.assign(mm, 0.0f);
 			b.gWk.assign(mkv, 0.0f);
 			b.gWv.assign(mkv, 0.0f);
 			b.gWo.assign(mm, 0.0f);
+
+			// Paradigm shift #76 MLA latent projections.
+			const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+			if (mlaDc > 0) {
+				const size_t dC = (size_t)mlaDc;
+				const size_t wDkv = (size_t)dModel * dC;
+				const size_t wUk  = dC * (size_t)dModelKV;
+				const size_t wUv  = dC * (size_t)dModelKV;
+				b.Wdkv.assign(wDkv, 0.0f);
+				b.Wuk.assign(wUk, 0.0f);
+				b.Wuv.assign(wUv, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) {
+					b.vWdkv.assign(wDkv, 0.0f); b.vWuk.assign(wUk, 0.0f); b.vWuv.assign(wUv, 0.0f);
+					b.v2Wdkv.assign(wDkv, 0.0f); b.v2Wuk.assign(wUk, 0.0f); b.v2Wuv.assign(wUv, 0.0f);
+				}
+				b.gWdkv.assign(wDkv, 0.0f);
+				b.gWuk.assign(wUk, 0.0f);
+				b.gWuv.assign(wUv, 0.0f);
+			}
+
 			b.bq.assign(dModel, 0.0f);
 			b.bk.assign(dModelKV, 0.0f);
 			b.bv.assign(dModelKV, 0.0f);
 			b.bo.assign(dModel, 0.0f);
-			if (needAdamMoments) { b.mBq.assign(dModel, 0.0f); b.mBk.assign(dModelKV, 0.0f); b.mBv.assign(dModelKV, 0.0f); b.mBo.assign(dModel, 0.0f); }
-			if (needAdamMoments) { b.v2Bq.assign(dModel, 0.0f); b.v2Bk.assign(dModelKV, 0.0f); b.v2Bv.assign(dModelKV, 0.0f); b.v2Bo.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.mBq.assign(dModel, 0.0f); b.mBk.assign(dModelKV, 0.0f); b.mBv.assign(dModelKV, 0.0f); b.mBo.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2Bq.assign(dModel, 0.0f); b.v2Bk.assign(dModelKV, 0.0f); b.v2Bv.assign(dModelKV, 0.0f); b.v2Bo.assign(dModel, 0.0f); }
 			b.gBq.assign(dModel, 0.0f);
 			b.gBk.assign(dModelKV, 0.0f);
 			b.gBv.assign(dModelKV, 0.0f);
@@ -2685,44 +2726,72 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			const size_t w1 = static_cast<size_t>(ff1Width) * static_cast<size_t>(dModel);
 			const size_t w2 = static_cast<size_t>(dModel) * static_cast<size_t>(dFF);
 			b.W1.assign(w1, 0.0f); b.W2.assign(w2, 0.0f);
-			if (needAdamMoments) { b.vW1.assign(w1, 0.0f); b.vW2.assign(w2, 0.0f); }
-			if (needAdamMoments) { b.v2W1.assign(w1, 0.0f); b.v2W2.assign(w2, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.vW1.assign(w1, 0.0f); b.vW2.assign(w2, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2W1.assign(w1, 0.0f); b.v2W2.assign(w2, 0.0f); }
 			b.gW1.assign(w1, 0.0f); b.gW2.assign(w2, 0.0f);
 			b.b1.assign(ff1Width, 0.0f); b.b2.assign(dModel, 0.0f);
-			if (needAdamMoments) { b.mB1.assign(ff1Width, 0.0f); b.mB2.assign(dModel, 0.0f); }
-			if (needAdamMoments) { b.v2B1.assign(ff1Width, 0.0f); b.v2B2.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.mB1.assign(ff1Width, 0.0f); b.mB2.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2B1.assign(ff1Width, 0.0f); b.v2B2.assign(dModel, 0.0f); }
 			b.gB1.assign(ff1Width, 0.0f); b.gB2.assign(dModel, 0.0f);
 		}
 
 		// Final LayerNorm: gamma=1, beta=0, Adam/grad state=0
 		tensorTransformer.lnFinalGamma.assign(dModel, 1.0f);
 		tensorTransformer.lnFinalBeta.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mLnFinalGamma.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2LnFinalGamma.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mLnFinalBeta.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2LnFinalBeta.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLnFinalGamma.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LnFinalGamma.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLnFinalBeta.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LnFinalBeta.assign(dModel, 0.0f);
 		tensorTransformer.gLnFinalGamma.assign(dModel, 0.0f);
 		tensorTransformer.gLnFinalBeta.assign(dModel, 0.0f);
 		tensorTransformer.adamBeta1Power = 1.0;
 		tensorTransformer.adamBeta2Power = 1.0;
 
-		InitGlorot::run(rngEngine, tensorTransformer.WIn, inputSize, dModel);
-		InitGlorot::run(rngEngine, tensorTransformer.WOut, dModel, outSize);
-		if (tokenModel)
+		// GPU init shortcut: if --gpu is on, skip the O(N_params) host-side
+		// random fill.  ensureGpuState() will run curand kernels directly on
+		// the device buffers after the (zero-fill) upload.  Saves ~10 minutes
+		// of serial CPU work at 200M+ params and frees host RAM for the data
+		// cache.  Bias/LayerNorm/Adam state are already zeroed by the assign()
+		// calls above; their GPU mirror is a cheap cudaMemset, so we still
+		// upload them as zeros below — only the heavy weight tensors are
+		// deferred to the device.
+		const bool gpuInitNow =
+#ifdef GLADES_HAVE_CUDA
+		    trainingConfig.gpu.enable;
+#else
+		    false;
+#endif
+		if (!gpuInitNow)
 		{
-			// Initialize embeddings with N(0, 0.02) (standard LLM practice).
-			for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
-				tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
+			InitGlorot::run(rngEngine, tensorTransformer.WIn, inputSize, dModel);
+			InitGlorot::run(rngEngine, tensorTransformer.WOut, dModel, outSize);
+			if (tokenModel)
+			{
+				// Initialize embeddings with N(0, 0.02) (standard LLM practice).
+				for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
+					tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
+			}
+			for (int li = 0; li < H; ++li)
+			{
+				TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
+				InitGlorot::run(rngEngine, b.Wq, dModel, dModel);
+				InitGlorot::run(rngEngine, b.Wk, dModel, dModelKV);
+				InitGlorot::run(rngEngine, b.Wv, dModel, dModelKV);
+				InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
+				InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
+				InitGlorot::run(rngEngine, b.W2, dFF, dModel);
+				// Paradigm shift #76 MLA initialization (when active).
+				if (!b.Wdkv.empty()) {
+					const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+					InitGlorot::run(rngEngine, b.Wdkv, dModel, mlaDc);
+					InitGlorot::run(rngEngine, b.Wuk, mlaDc, dModelKV);
+					InitGlorot::run(rngEngine, b.Wuv, mlaDc, dModelKV);
+				}
+			}
 		}
-		for (int li = 0; li < H; ++li)
+		else
 		{
-			TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
-			InitGlorot::run(rngEngine, b.Wq, dModel, dModel);
-			InitGlorot::run(rngEngine, b.Wk, dModel, dModelKV);
-			InitGlorot::run(rngEngine, b.Wv, dModel, dModelKV);
-			InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
-			InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
-			InitGlorot::run(rngEngine, b.W2, dFF, dModel);
+			tensorTransformer.gpuInitDeferred = true;
 		}
 
 		// DDP: broadcast weights from rank 0 so all workers start with identical parameters.
@@ -4113,6 +4182,8 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorTransformer.padTokenId = static_cast<int>(padTokenU);
 		tensorTransformer.tieEmbeddings = (tieEmbU != 0u);
 		tensorTransformer.optimizerStep = 0ULL;
+		tensorTransformer.heliosHvpStepCounter = 0ULL;
+		tensorTransformer.heliosHvpCycleCounter = 0ULL;
 
 		// Validate transformer dimensions before any large allocations.
 		if (dModel == 0u || nHeads == 0u)
@@ -4406,6 +4477,7 @@ void glades::NNetwork::setLearningRateScheduleNone()
 	trainingConfig.lrSchedule.setNone();
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleStep(int stepSizeEpochs, float gamma)
@@ -4413,6 +4485,7 @@ void glades::NNetwork::setLearningRateScheduleStep(int stepSizeEpochs, float gam
 	trainingConfig.lrSchedule.setStep(stepSizeEpochs, gamma);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleExp(float gamma)
@@ -4420,6 +4493,7 @@ void glades::NNetwork::setLearningRateScheduleExp(float gamma)
 	trainingConfig.lrSchedule.setExp(gamma);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier)
@@ -4427,6 +4501,7 @@ void glades::NNetwork::setLearningRateScheduleCosine(int tMaxEpochs, float minMu
 	trainingConfig.lrSchedule.setCosine(tMaxEpochs, minMultiplier);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setGlobalGradClipNorm(float clipNorm)
@@ -4473,6 +4548,7 @@ glades::NNetworkStatus glades::NNetwork::setTrainingConfig(const glades::Trainin
 	// Reset schedule bookkeeping to avoid leaking stale multipliers into the next run.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -4550,10 +4626,32 @@ bool glades::NNetwork::ensureGpuState()
 		{
 			if (gpuTransformerWeights->initialized)
 				gpuTransformerWeights->free();
+			const bool useBf16State =
+			    trainingConfig.mixedPrecision.adamStateBf16
+			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
+			const bool useInt8State =
+			    trainingConfig.mixedPrecision.adamStateInt8
+			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
+			const bool useFaceEmb =
+			    trainingConfig.transformer.faceEmbedding
+			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW)
+			    && ts.tokenModel;
+			const bool useBf16Grads =
+			    trainingConfig.mixedPrecision.gradStorageBf16
+			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
+			const bool useBf16GradsPh2 =
+			    trainingConfig.mixedPrecision.gradStorageBf16Phase2
+			    && useBf16Grads;
+			const bool useWeightStorageBf16 =
+			    trainingConfig.mixedPrecision.weightStorageBf16
+			    && useBf16GradsPh2;
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
-			                                      ts.tieEmbeddings, skipAdam))
+			                                      ts.tieEmbeddings, skipAdam, useBf16State,
+			                                      trainingConfig.transformer.mlaLatentDim,
+			                                      useInt8State, useFaceEmb, useBf16Grads,
+			                                      useBf16GradsPh2, useWeightStorageBf16))
 			{
 				return false;
 			}
@@ -4591,7 +4689,12 @@ bool glades::NNetwork::ensureGpuState()
 			                                   cb.W1.empty() ? NULL : &cb.W1[0],
 			                                   cb.W2.empty() ? NULL : &cb.W2[0],
 			                                   cb.b1.empty() ? NULL : &cb.b1[0],
-			                                   cb.b2.empty() ? NULL : &cb.b2[0]);
+			                                   cb.b2.empty() ? NULL : &cb.b2[0],
+			                                   trainingConfig.transformer.mlaLatentDim,
+			                                   cb.Wdkv.empty() ? NULL : &cb.Wdkv[0],
+			                                   cb.Wuk.empty()  ? NULL : &cb.Wuk[0],
+			                                   cb.Wuv.empty()  ? NULL : &cb.Wuv[0],
+			                                   gpuTransformerWeights);
 		}
 
 		// Upload optimizer state (Adam m1/m2) for each weight tensor
@@ -4664,6 +4767,131 @@ bool glades::NNetwork::ensureGpuState()
 		if (!ts.v2LnFinalGamma.empty()) gpuTransformerWeights->v2LnFinalGamma.upload(&ts.v2LnFinalGamma[0], ts.v2LnFinalGamma.size());
 		if (!ts.mLnFinalBeta.empty()) gpuTransformerWeights->mLnFinalBeta.upload(&ts.mLnFinalBeta[0], ts.mLnFinalBeta.size());
 		if (!ts.v2LnFinalBeta.empty()) gpuTransformerWeights->v2LnFinalBeta.upload(&ts.v2LnFinalBeta[0], ts.v2LnFinalBeta.size());
+
+		// === GPU-side weight init (curand) ===
+		//
+		// When ensureTensorParametersInitialized skipped the host-side Glorot/normal
+		// fills (because trainingConfig.gpu.enable was set), the device buffers we just
+		// uploaded are full of zeros.  Run curand kernels in-place to fill them with
+		// the correct distributions.  Tensor IDs are assigned deterministically below
+		// so re-runs at the same seed produce bit-exact starting weights.  Layer
+		// index uses a step of 16 to leave room for additional per-layer tensors
+		// without renumbering existing seeds.
+		if (tensorTransformer.gpuInitDeferred)
+		{
+			const uint64_t initSeed = rngEngine.seed;
+
+			// Stage 8b deeper: when canonical bf16-weights, FP32 masters are
+			// not allocated — init goes to the bf16 mirror via the shared
+			// FP32 staging buffer (init → staging → cast → mirror).
+			const bool canonInit = gpuTransformerWeights->lowpIsCanonical;
+			float* const staging = canonInit
+			    ? gpuTransformerWeights->lowpStagingFp32.data() : NULL;
+
+			// Helper lambda — init Glorot to (master if non-empty) OR
+			// (staging + cast to mirror).  Mirror size matches master/staging.
+			#define GLADES_INIT_GLOROT_DISPATCH(masterBuf, mirrorBuf, fanIn, fanOut, seedKey) \
+			do {                                                                 \
+				if ((masterBuf).size() > 0) {                                    \
+					glades::gpu::initGlorotUniform((masterBuf).data(), (masterBuf).size(), \
+					                               (fanIn), (fanOut), initSeed, (seedKey)); \
+				} else if (canonInit && (mirrorBuf).size() > 0 && staging) {      \
+					glades::gpu::initGlorotUniform(staging, (mirrorBuf).size(),  \
+					                               (fanIn), (fanOut), initSeed, (seedKey)); \
+					glades::gpu::cast_f32_to_bf16(staging, (mirrorBuf).data(),    \
+					                              (mirrorBuf).size());           \
+				}                                                                \
+			} while (0)
+			#define GLADES_INIT_NORMAL_DISPATCH(masterBuf, mirrorBuf, mean, sd, seedKey) \
+			do {                                                                 \
+				if ((masterBuf).size() > 0) {                                    \
+					glades::gpu::initNormal((masterBuf).data(), (masterBuf).size(), \
+					                        (mean), (sd), initSeed, (seedKey));  \
+				} else if (canonInit && (mirrorBuf).size() > 0 && staging) {      \
+					glades::gpu::initNormal(staging, (mirrorBuf).size(),         \
+					                        (mean), (sd), initSeed, (seedKey));  \
+					glades::gpu::cast_f32_to_bf16(staging, (mirrorBuf).data(),    \
+					                              (mirrorBuf).size());           \
+				}                                                                \
+			} while (0)
+
+			// Global tensors.
+			GLADES_INIT_GLOROT_DISPATCH(gpuTransformerWeights->WIn,
+			                            gpuTransformerWeights->WInLowp,
+			                            ts.inputSize, ts.dModel, 0ULL);
+			GLADES_INIT_GLOROT_DISPATCH(gpuTransformerWeights->WOut,
+			                            gpuTransformerWeights->WOutLowp,
+			                            ts.dModel, ts.outSize, 1ULL);
+			if (ts.tokenModel)
+			{
+				GLADES_INIT_NORMAL_DISPATCH(gpuTransformerWeights->tokE,
+				                            gpuTransformerWeights->tokELowp,
+				                            0.0f, 0.02f, 2ULL);
+			}
+
+			// Per-layer tensors.  LN gammas were already host-set to 1.0 before
+			// the gpuInitNow gate and uploaded faithfully — no GPU-side re-init.
+			for (unsigned int l = 0; l < ts.nLayers; ++l)
+			{
+				glades::gpu::GpuTransformerWeights::Block& gb =
+				    gpuTransformerWeights->blocks[l];
+				const uint64_t base = 1000ULL + (uint64_t)l * 16ULL;
+
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wq, gb.WqLowp, ts.dModel, ts.dModel, base + 0ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wk, gb.WkLowp, ts.dModel, dModelKV, base + 1ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wv, gb.WvLowp, ts.dModel, dModelKV, base + 2ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wo, gb.WoLowp, ts.dModel, ts.dModel, base + 3ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.W1, gb.W1Lowp, ts.dModel, ff1Width,  base + 4ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.W2, gb.W2Lowp, ts.dFF,    ts.dModel, base + 5ULL);
+
+				// MLA latent projections (paradigm shift #76).
+				const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+				if (mlaDc > 0)
+				{
+					if (gb.Wdkv.size() > 0) glades::gpu::initGlorotUniform(gb.Wdkv.data(), gb.Wdkv.size(), ts.dModel, (unsigned int)mlaDc, initSeed, base + 6ULL);
+					if (gb.Wuk.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuk.data(),  gb.Wuk.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 7ULL);
+					if (gb.Wuv.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuv.data(),  gb.Wuv.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 8ULL);
+				}
+			}
+			#undef GLADES_INIT_GLOROT_DISPATCH
+			#undef GLADES_INIT_NORMAL_DISPATCH
+
+			// Paradigm shift #39 RLG (Reversible Layer Growth) — zero-init.
+			// After Glorot init, zero Wo (attn out) and W2 (FFN out) for
+			// layers >= rlgInitialLayers. Each such block becomes bit-exact
+			// identity to the residual: x' = x + Wo·attn(LN x) = x + 0 = x;
+			// y = x' + W2·ffn(LN x') = x' + 0 = x'. Gradient flow at init
+			// is equivalent to a smaller L = rlgInitialLayers model,
+			// sidestepping depth-amplified gradient variance at deep L.
+			// Biases bo and b2 are already 0 from host-side assign(0.0f).
+			{
+				const int rlgInitial = trainingConfig.transformer.rlgInitialLayers;
+				if (rlgInitial > 0 && (unsigned int)rlgInitial < ts.nLayers)
+				{
+					for (unsigned int l = (unsigned int)rlgInitial; l < ts.nLayers; ++l)
+					{
+						glades::gpu::GpuTransformerWeights::Block& gb =
+						    gpuTransformerWeights->blocks[l];
+						if (gb.Wo.size() > 0)     gb.Wo.zero();
+						if (gb.WoLowp.size() > 0) gb.WoLowp.zero();
+						if (gb.W2.size() > 0)     gb.W2.zero();
+						if (gb.W2Lowp.size() > 0) gb.W2Lowp.zero();
+					}
+					std::fprintf(stderr, "[rlg] zero-init Wo+W2 for layers [%d, %u) "
+					                     "(initial active L = %d)\n",
+					             rlgInitial, ts.nLayers, rlgInitial);
+				}
+			}
+
+			// Stage 8b deeper: when canonical, ensureLowpMirrors short-circuits
+			// (mirrors were filled by init+cast above).  Mark lowpReady here
+			// so freeFp32Masters() can no-op cleanly downstream.
+			if (canonInit) {
+				gpuTransformerWeights->lowpReady = true;
+			}
+
+			tensorTransformer.gpuInitDeferred = false;
+		}
 	}
 
 	gpuStateReady = true;
@@ -4672,6 +4900,52 @@ bool glades::NNetwork::ensureGpuState()
 	(void)0;
 	return false;
 #endif
+}
+
+// Paradigm shift #39 RLG (Reversible Layer Growth) — scheduled re-zeroing.
+// Zero Wo + W2 (output projections) plus their Adam moments for every
+// transformer block in [activeLayers, nLayers).  Each such block becomes
+// bit-exact identity to the residual stream and the optimizer state is
+// cleared, so when the next phase grows activeLayers the regrown layers
+// start fresh.  All edits are applied to the GPU mirrors when GPU is
+// enabled.  Biases bo and b2 are already zero from host-side init.
+void glades::NNetwork::rlgRezeroDeepLayers(unsigned int activeLayers)
+{
+	if (netType != TYPE_TRANSFORMER_ENCODER && netType != TYPE_TRANSFORMER_DECODER)
+		return;
+	if (activeLayers >= tensorTransformer.nLayers)
+		return;
+
+#ifdef GLADES_HAVE_CUDA
+	if (trainingConfig.gpu.enable && gpuTransformerWeights != NULL &&
+	    gpuTransformerWeights->initialized)
+	{
+		for (unsigned int l = activeLayers; l < tensorTransformer.nLayers; ++l)
+		{
+			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
+			if (gb.Wo.size()    > 0) gb.Wo.zero();
+			if (gb.WoLowp.size()> 0) gb.WoLowp.zero();
+			if (gb.W2.size()    > 0) gb.W2.zero();
+			if (gb.W2Lowp.size()> 0) gb.W2Lowp.zero();
+			// Reset Adam state for the regrown projections so stale
+			// momentum/variance don't fight the fresh identity start.
+			if (gb.vWo.size() > 0) gb.vWo.zero();
+			if (gb.v2Wo.size()> 0) gb.v2Wo.zero();
+			if (gb.vW2.size() > 0) gb.vW2.zero();
+			if (gb.v2W2.size()> 0) gb.v2W2.zero();
+		}
+		std::fprintf(stderr, "[rlg] re-zero Wo+W2+AdamState for layers [%u, %u) "
+		                     "(new active L = %u)\n",
+		             activeLayers, tensorTransformer.nLayers, activeLayers);
+	}
+#else
+	(void)activeLayers;
+#endif
+
+	// Host-side biases bo, b2 are already 0 (assign(N, 0.0f) on init); no
+	// further host work needed.  Host Adam M/V are skipped under bf16+int8
+	// Adam (Stage 8a); when host-resident, the GPU mirrors above already
+	// cleared the canonical copies.
 }
 
 void glades::NNetwork::freeGpuState()

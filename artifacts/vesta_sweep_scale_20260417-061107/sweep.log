@@ -1,0 +1,42 @@
+
+============================================================
+VESTA scale ladder: AdamW vs VESTA-plain vs VESTA+mom
+dModel in {64, 128, 256, 512}, 3 seeds each
+============================================================
+Fixed: vocab=29 layers=4 heads=4 epochs=15 corpus=384 LR=1.0e-02 rank=8
+
+Optimizer state (KiB, fp32, summed across all transformer weights):
+dModel    AdamW(KiB)  VESTA_plain   plain/Adam   VESTA+mom     +mom/Adam  
+------    ----------  ------------  -----------  ------------  -----------
+64        1038.5      116.5         0.112        635.7         0.612      
+128       4125.0      230.5         0.056        2293.0        0.556      
+256       16442.0     458.5         0.028        8679.5        0.528      
+
+Train/test NLL at each scale:
+
+dModel    optimizer     n     trainNLL            testNLL             wall(s)   
+------    ----------    ---   ------------------  ------------------  ----------
+64        AdamW         3     2.5280 +/- 0.0173   2.5717 +/- 0.0236    0.38 +/- 0.02 
+64        VESTA-plain   3     2.7300 +/- 0.0336   2.7454 +/- 0.0153    1.05 +/- 0.04 
+64        VESTA+mom     3     2.6204 +/- 0.0097   2.6638 +/- 0.0175    1.02 +/- 0.05 
+          plain:  testNLL delta = +0.1737 nats   wall ratio = 2.80x
+          +mom :  testNLL delta = +0.0922 nats   wall ratio = 2.72x
+
+128       AdamW         3     1.7599 +/- 0.0509   1.8615 +/- 0.0173    0.85 +/- 0.03 
+128       VESTA-plain   3     1.9565 +/- 0.0303   2.0487 +/- 0.0196    3.42 +/- 0.04 
+128       VESTA+mom     3     1.8713 +/- 0.0386   1.9677 +/- 0.0132    3.40 +/- 0.01 
+          plain:  testNLL delta = +0.1871 nats   wall ratio = 4.03x
+          +mom :  testNLL delta = +0.1062 nats   wall ratio = 4.00x
+
+256       AdamW         3     1.2483 +/- 0.0472   1.5813 +/- 0.0298    1.83 +/- 0.03 
+256       VESTA-plain   3     1.4232 +/- 0.0135   1.6585 +/- 0.0717   22.88 +/- 0.15 
+256       VESTA+mom     3     1.2060 +/- 0.0177   1.5781 +/- 0.0124   22.81 +/- 0.37 
+          plain:  testNLL delta = +0.0773 nats   wall ratio = 12.49x
+          +mom :  testNLL delta = -0.0031 nats   wall ratio = 12.45x
+
+
+End of ladder. Look for monotone shrinking gap in +mom delta
+and an asymptotically small wall-clock ratio as scale grows.
+========================
+| Unit Tests Completed |
+========================

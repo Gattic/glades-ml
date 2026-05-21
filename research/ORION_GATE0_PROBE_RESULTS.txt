@@ -1,0 +1,44 @@
+== ORION slow-rank probe ==
+checkpoints: 10
+d (total weights) = 870940672  (V=32000 m=2048 L=24 dModel=4096)
+subsample = 10000000 indices (xorshift32 seed=1337)
+[1/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step500  step=500  ‖θ‖=6.5306e+01  loaded 10000000 samples
+[2/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step1000  step=1000  ‖θ‖=6.6052e+01  loaded 10000000 samples
+[3/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step1500  step=1500  ‖θ‖=6.7442e+01  loaded 10000000 samples
+[4/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step2000  step=2000  ‖θ‖=6.8556e+01  loaded 10000000 samples
+[5/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step2500  step=2500  ‖θ‖=6.9033e+01  loaded 10000000 samples
+[6/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step3000  step=3000  ‖θ‖=6.9569e+01  loaded 10000000 samples
+[7/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step3500  step=3500  ‖θ‖=7.0081e+01  loaded 10000000 samples
+[8/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step4000  step=4000  ‖θ‖=7.0658e+01  loaded 10000000 samples
+[9/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step4500  step=4500  ‖θ‖=7.1246e+01  loaded 10000000 samples
+[10/10] /home/robert/dev/glades-trainer/research/runs/2026-05-17-orion-probe-T16384/probe.step5000  step=5000  ‖θ‖=7.1832e+01  loaded 10000000 samples
+
+Gram matrix Δ^T Δ (9x9):
+ +8.065e+01 +1.233e+02 +1.442e+02 +1.467e+02 +1.484e+02 +1.487e+02 +1.488e+02 +1.487e+02 +1.490e+02
+ +1.233e+02 +2.546e+02 +3.010e+02 +3.051e+02 +3.069e+02 +3.064e+02 +3.059e+02 +3.051e+02 +3.048e+02
+ +1.442e+02 +3.010e+02 +4.091e+02 +4.219e+02 +4.308e+02 +4.348e+02 +4.386e+02 +4.408e+02 +4.432e+02
+ +1.467e+02 +3.051e+02 +4.219e+02 +4.825e+02 +5.004e+02 +5.128e+02 +5.239e+02 +5.318e+02 +5.391e+02
+ +1.484e+02 +3.069e+02 +4.308e+02 +5.004e+02 +5.640e+02 +5.824e+02 +6.001e+02 +6.140e+02 +6.260e+02
+ +1.487e+02 +3.064e+02 +4.348e+02 +5.128e+02 +5.824e+02 +6.447e+02 +6.675e+02 +6.869e+02 +7.034e+02
+ +1.488e+02 +3.059e+02 +4.386e+02 +5.239e+02 +6.001e+02 +6.675e+02 +7.349e+02 +7.589e+02 +7.802e+02
+ +1.487e+02 +3.051e+02 +4.408e+02 +5.318e+02 +6.140e+02 +6.869e+02 +7.589e+02 +8.276e+02 +8.522e+02
+ +1.490e+02 +3.048e+02 +4.432e+02 +5.391e+02 +6.260e+02 +7.034e+02 +7.802e+02 +8.522e+02 +9.202e+02
+
+Singular spectrum (sorted desc):
+  σ[0] = 6.6339e+01   energy = 0.894782   cumulative = 0.894782
+  σ[1] = 1.8520e+01   energy = 0.069739   cumulative = 0.964521
+  σ[2] = 8.2527e+00   energy = 0.013848   cumulative = 0.978369
+  σ[3] = 5.8001e+00   energy = 0.006840   cumulative = 0.985208
+  σ[4] = 4.7235e+00   energy = 0.004536   cumulative = 0.989745
+  σ[5] = 3.9878e+00   energy = 0.003233   cumulative = 0.992978
+  σ[6] = 3.6118e+00   energy = 0.002652   cumulative = 0.995630
+  σ[7] = 3.3461e+00   energy = 0.002277   cumulative = 0.997907
+  σ[8] = 3.2087e+00   energy = 0.002093   cumulative = 1.000000
+
+Cumulative energy by rank r:
+  r=1 : 0.894782  (0.80-0.95: marginal)
+  r=2 : 0.964521  (≥0.95 ✓ slow-rank holds)
+  r=4 : 0.985208  (≥0.95 ✓ slow-rank holds)
+  r=8 : 0.997907  (≥0.95 ✓ slow-rank holds)
+
+Verdict: PASS — ORION viable at r=4 (energy 0.9852)

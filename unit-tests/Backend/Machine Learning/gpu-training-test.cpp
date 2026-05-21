@@ -21,6 +21,8 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include <math.h>
+#include <vector>
+#include <stdint.h>
 
 static bool approxEqual(float a, float b, float eps)
 {
@@ -199,6 +201,104 @@ void GpuTrainingUnitTest()
 		}
 
 		printf("  softmax_backward_attn: PASSED\n");
+	}
+
+	// =========================================================================
+	// Test 3: adam_update_bf16_state — Parity with FP32 Adam
+	//
+	// Runs both kernels with identical init (same seed gradients) for 100
+	// steps and checks that weight trajectories agree within BF16 precision
+	// (~0.5% relative on weight values after 100 steps). The kernels compute
+	// identical math; they differ only in the m, v storage precision.
+	// =========================================================================
+	printf("Test 3: adam_update_bf16_state parity vs adam_update (FP32)\n");
+	{
+		const int N = 512; // parameters
+		std::vector<float> W0(N), g(N);
+		for (int i = 0; i < N; ++i)
+		{
+			W0[i] = 0.1f * static_cast<float>((i * 7) % 17 - 8);
+			g[i]  = 0.01f * static_cast<float>((i * 13) % 11 - 5);
+		}
+
+		// FP32 path.
+		std::vector<float> Wfp(W0);
+		std::vector<float> mfp(N, 0.0f), vfp(N, 0.0f);
+		glades::gpu::GpuBuffer<float> dWfp, dG, dMfp, dVfp;
+		ASSERT("alloc Wfp", dWfp.allocate(N));
+		ASSERT("alloc G",   dG.allocate(N));
+		ASSERT("alloc Mfp", dMfp.allocate(N));
+		ASSERT("alloc Vfp", dVfp.allocate(N));
+		ASSERT("upload Wfp", dWfp.upload(&Wfp[0], N));
+		ASSERT("upload G",   dG.upload(&g[0], N));
+		ASSERT("upload Mfp", dMfp.upload(&mfp[0], N));
+		ASSERT("upload Vfp", dVfp.upload(&vfp[0], N));
+
+		// BF16-state path.
+		std::vector<float> Wbf(W0);
+		std::vector<uint16_t> mBf(N, 0), vBf(N, 0);
+		glades::gpu::GpuBuffer<float> dWbf;
+		glades::gpu::GpuBuffer<uint16_t> dMbf, dVbf;
+		ASSERT("alloc Wbf", dWbf.allocate(N));
+		ASSERT("alloc Mbf", dMbf.allocate(N));
+		ASSERT("alloc Vbf", dVbf.allocate(N));
+		ASSERT("upload Wbf", dWbf.upload(&Wbf[0], N));
+		ASSERT("upload Mbf", dMbf.upload(&mBf[0], N));
+		ASSERT("upload Vbf", dVbf.upload(&vBf[0], N));
+
+		const float lr = 1e-3f, beta1 = 0.9f, beta2 = 0.999f, epsA = 1e-8f;
+		const float wd = 0.0f, gradScale = 1.0f;
+		for (int step = 1; step <= 100; ++step)
+		{
+			ASSERT("fp adam step",
+			       glades::gpu::adam_update(dWfp.data(), dG.data(),
+			                                 dMfp.data(), dVfp.data(),
+			                                 lr, beta1, beta2, epsA, wd,
+			                                 gradScale, step, N));
+			ASSERT("bf adam step",
+			       glades::gpu::adam_update_bf16_state(dWbf.data(), dG.data(),
+			                                            dMbf.data(), dVbf.data(),
+			                                            lr, beta1, beta2, epsA, wd,
+			                                            gradScale, step, N));
+		}
+
+		std::vector<float> WfpOut(N), WbfOut(N);
+		ASSERT("download Wfp", dWfp.download(&WfpOut[0], N));
+		ASSERT("download Wbf", dWbf.download(&WbfOut[0], N));
+
+		// Compare RELATIVE only where |Wfp| > a meaningful floor, since
+		// weights can cross zero during training making tiny denominators
+		// blow up rel error. Also report weight-space L2 deviation.
+		float maxAbs = 0.0f, meanAbs = 0.0f, maxRelFiltered = 0.0f;
+		double l2NumSq = 0.0, l2DenSq = 0.0;
+		int relSamples = 0;
+		for (int i = 0; i < N; ++i)
+		{
+			const float diff = fabsf(WfpOut[i] - WbfOut[i]);
+			if (diff > maxAbs) maxAbs = diff;
+			meanAbs += diff;
+			l2NumSq += static_cast<double>(diff) * diff;
+			l2DenSq += static_cast<double>(WfpOut[i]) * WfpOut[i];
+			if (fabsf(WfpOut[i]) > 1e-3f)
+			{
+				const float rel = diff / fabsf(WfpOut[i]);
+				if (rel > maxRelFiltered) maxRelFiltered = rel;
+				++relSamples;
+			}
+		}
+		meanAbs /= static_cast<float>(N);
+		const float l2Rel = (l2DenSq > 0.0)
+		    ? static_cast<float>(sqrt(l2NumSq / l2DenSq)) : 0.0f;
+		printf("  after 100 steps: maxAbs=%.6g meanAbs=%.6g "
+		       "maxRel(|W|>1e-3, %d samples)=%.3g L2rel=%.3g\n",
+		       maxAbs, meanAbs, relSamples, maxRelFiltered, l2Rel);
+		// L2-relative deviation is the right aggregate metric for BF16 EMA
+		// state: per-coordinate rel can blow up near zero crossings but
+		// overall trajectory drift should stay small. BF16's 7-bit mantissa
+		// gives ~0.4% per-update quantization bias; 100 steps accumulated
+		// should stay well under 2% L2 drift.
+		ASSERT("parity weight L2-relative < 2%", l2Rel < 0.02f);
+		printf("  adam_update_bf16_state: PASSED\n");
 	}
 
 	printf("-----------------------------------\n");

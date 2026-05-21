@@ -1,0 +1,49 @@
+
+============================================================
+VESTA scale ladder: AdamW vs VESTA-plain vs VESTA+mom
+dModel in {64, 128, 256, 512}, 3 seeds each
+============================================================
+Fixed: vocab=29 layers=4 heads=4 epochs=15 corpus=384 LR=1.0e-02 rank=8
+
+Optimizer state (KiB, fp32, summed across all transformer weights):
+dModel    AdamW(KiB)  VESTA_plain   plain/Adam   VESTA+mom     +mom/Adam  
+------    ----------  ------------  -----------  ------------  -----------
+128       4125.0      230.5         0.056        2293.0        0.556      
+256       16442.0     458.5         0.028        8679.5        0.528      
+512       65652.0     914.5         0.014        33740.5       0.514      
+1024      262376.0    1826.5        0.007        133014.5      0.507      
+
+Train/test NLL at each scale:
+
+dModel    optimizer     n     trainNLL            testNLL             wall(s)   
+------    ----------    ---   ------------------  ------------------  ----------
+128       AdamW         3     1.7599 +/- 0.0509   1.8615 +/- 0.0173    0.80 +/- 0.07 
+128       VESTA-plain   3     1.9676 +/- 0.0274   2.0404 +/- 0.0146    1.80 +/- 0.06 
+128       VESTA+mom     3     1.8711 +/- 0.0385   1.9682 +/- 0.0137    1.81 +/- 0.03 
+          plain:  testNLL delta = +0.1789 nats   wall ratio = 2.24x
+          +mom :  testNLL delta = +0.1067 nats   wall ratio = 2.26x
+
+256       AdamW         3     1.2483 +/- 0.0472   1.5813 +/- 0.0298    1.83 +/- 0.09 
+256       VESTA-plain   3     1.3918 +/- 0.0355   1.6522 +/- 0.0420    4.87 +/- 0.08 
+256       VESTA+mom     3     1.2054 +/- 0.0219   1.5767 +/- 0.0142    4.97 +/- 0.06 
+          plain:  testNLL delta = +0.0710 nats   wall ratio = 2.67x
+          +mom :  testNLL delta = -0.0045 nats   wall ratio = 2.72x
+
+512       AdamW         3     1.6032 +/- 0.2709   1.9046 +/- 0.2418    3.75 +/- 0.07 
+512       VESTA-plain   3     1.8587 +/- 0.2210   2.1677 +/- 0.0420   16.09 +/- 0.08 
+512       VESTA+mom     3     1.2838 +/- 0.1032   1.7583 +/- 0.0492   16.36 +/- 0.04 
+          plain:  testNLL delta = +0.2631 nats   wall ratio = 4.29x
+          +mom :  testNLL delta = -0.1464 nats   wall ratio = 4.36x
+
+1024      AdamW         3     2.8177 +/- 0.5768   2.9482 +/- 0.3379    9.89 +/- 0.41 
+1024      VESTA-plain   3     2.9102 +/- 0.3055   2.9174 +/- 0.5476   66.06 +/- 0.29 
+1024      VESTA+mom     3     2.7414 +/- 0.7523   2.8358 +/- 0.7290   67.37 +/- 0.29 
+          plain:  testNLL delta = -0.0308 nats   wall ratio = 6.68x
+          +mom :  testNLL delta = -0.1124 nats   wall ratio = 6.81x
+
+
+End of ladder. Look for monotone shrinking gap in +mom delta
+and an asymptotically small wall-clock ratio as scale grows.
+========================
+| Unit Tests Completed |
+========================

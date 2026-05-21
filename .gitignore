@@ -1,5 +1,6 @@
 *.o
 callgrind.*
+research/dsa_probe_o_prototype
 .DS_Store
 build/*
 database/*
@@ -12,3 +13,28 @@ alpaca.key
 .codex
 logs/
 artifacts/
+
+# Training run output: large logs and model checkpoints.  Specific
+# benches we want in git (e.g. the ralph-loop iter dirs referenced in
+# research/LOOP_RESULTS_2026_05_13.md) are committed explicitly with
+# `git add -f research/runs/loop-N-…/train.log`; gitignore only affects
+# files that are not already tracked.
+research/runs/
+
+# Session-local prompts and handoff notes (user working state, not
+# project artifacts).
+ralph.txt
+handoffs/
+research/orion_slow_rank_probe
+
+# Compiled research-prototype binaries (sources .cpp/.cu/.cuh are
+# tracked separately so the binaries are rebuildable).
+research/ealrmn_gpu/ealrmn_gpu
+research/ealrmn_gpu/aggregate
+research/ealrmn_gpu/md_table
+research/ealrmn_phase0_prototype
+research/ealrmn_phase0d_needle
+research/ealrmn_phase0e_pertoken
+research/ealrmn_phase0f_aux
+research/ealrmn_phase0g_attmem
+research/ealrmn_phase0k_scaleup
