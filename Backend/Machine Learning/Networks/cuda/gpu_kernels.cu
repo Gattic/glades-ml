@@ -8055,6 +8055,24 @@ bool scfa_depthwise_causal_conv_fwd_tiled(const float* x, const float* K,
 {
 	if (T <= 0 || m <= 0 || w < 0) return true;
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	// iter 96 (2026-05-21): W_FILTER=5 (w=4 production triple-stack flagship)
+	// specialization.  Bit-identical math to W_FILTER=9 path; same FMA order,
+	// same break-on-negative-src.  Profile (iter 96 nsys): scfa_depthwise_causal_conv_fwd_kernel
+	// row-major occupies 3.3% of step at w=4 production — switching to tiled
+	// tests whether the smem-cache mechanism (iter 73) helps at the smaller
+	// 5-tap filter.  Note: iter 95 NULL on backward dx tiled at w=4
+	// (matched pathology — dx working set 20 KB trivially L2-resident) suggests
+	// this path likely NULL too; iter 96 measures empirically.
+	if (w == 4) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_tiled_kernel<COLS, N_OUT, 5>
+		    <<<grid, block, 0, s>>>(x, K, T, m, y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
 	if (w == 8) {
 		const int COLS = 256;
 		const int N_OUT = 16;
