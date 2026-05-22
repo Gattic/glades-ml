@@ -280,6 +280,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (!allocBuf(gLnFinalGamma, dm)) return false;
 	if (!allocBuf(gLnFinalBeta, dm)) return false;
 
+	// MTP auxiliary head: Wmtp and gWmtp are NOT allocated here — they are
+	// lazily allocated in ensureGpuState (sgd_transformer.cpp / network.cpp)
+	// when mtpDepth > 0, using the !Wmtp.empty() guard at all use sites.
+	// Leaving them empty here keeps the GPU footprint unchanged at mtpDepth=0.
+
 	// Blocks
 	blocks = new Block[nl];
 	for (unsigned int l = 0; l < nl; ++l)
@@ -1321,9 +1326,9 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 	if (!gpu.initialized)
 		return false;
 
-	// Max buffers: 6 global + 16 per layer (256 layers max).
-	float* hPtrs[6 + 16 * 256];
-	int    hSizes[6 + 16 * 256];
+	// Max buffers: 7 global (6 + gWmtp) + 16 per layer (256 layers max).
+	float* hPtrs[7 + 16 * 256];
+	int    hSizes[7 + 16 * 256];
 	int count = 0;
 
 	if (gpu.tokenModel)
@@ -1362,6 +1367,9 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 
 	addBuf(gpu.gLnFinalGamma, hPtrs, hSizes, count);
 	addBuf(gpu.gLnFinalBeta, hPtrs, hSizes, count);
+
+	// MTP auxiliary head gradient (allocated only when mtpDepth > 0).
+	addBuf(gpu.gWmtp, hPtrs, hSizes, count);
 
 	if (count == 0)
 		return true;

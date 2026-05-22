@@ -4797,6 +4797,22 @@ bool glades::NNetwork::ensureGpuState()
 		if (!ts.mLnFinalBeta.empty()) gpuTransformerWeights->mLnFinalBeta.upload(&ts.mLnFinalBeta[0], ts.mLnFinalBeta.size());
 		if (!ts.v2LnFinalBeta.empty()) gpuTransformerWeights->v2LnFinalBeta.upload(&ts.v2LnFinalBeta[0], ts.v2LnFinalBeta.size());
 
+		// MTP auxiliary head: lazily allocate Wmtp/gWmtp on GPU and upload
+		// Wmtp from host.  Guarded on mtpDepth > 0 AND non-empty host Wmtp
+		// (Wmtp is empty at mtpDepth=0 — see sgd_transformer.cpp Task 3.4).
+		if (trainingConfig.transformer.mtpDepth > 0 && !ts.Wmtp.empty())
+		{
+			const size_t wmtpN = static_cast<size_t>(ts.dModel) * static_cast<size_t>(ts.dModel);
+			if (!gpuTransformerWeights->Wmtp.allocated())
+				if (!gpuTransformerWeights->Wmtp.allocate(wmtpN)) return false;
+			if (!gpuTransformerWeights->gWmtp.allocated())
+				if (!gpuTransformerWeights->gWmtp.allocate(wmtpN)) return false;
+			gpuTransformerWeights->Wmtp.upload(&ts.Wmtp[0], wmtpN);
+			// gWmtp starts at zero each time ensureGpuState runs (fresh training
+			// start or resume); the per-step Adam zero-out in sgd_transformer.cpp
+			// handles accumulator reset per optimizer step.
+		}
+
 		// === GPU-side weight init (curand) ===
 		//
 		// When ensureTensorParametersInitialized skipped the host-side Glorot/normal

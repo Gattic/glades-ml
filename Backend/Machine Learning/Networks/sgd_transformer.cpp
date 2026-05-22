@@ -11152,12 +11152,123 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			clsCorrect += static_cast<unsigned long long>(correctVal);
 			clsTotal += static_cast<unsigned long long>(validVal);
 
-			// TODO(Task 3.5): MTP GPU forward + backward not yet wired.
-			// mtpDepth > 0 runs MTP only on the CPU path (transformerCpuForwardPass/
-			// SGDHelper_TRANSFORMER metrics block). On this GPU training path, MTP
-			// contributes 0 to tokenLmNllSum until Task 3.5 lands the GPU
-			// forward+backward together (they share GPU scratch and are tightly coupled).
-			(void)trainingConfig.transformer.mtpDepth; // suppress unused-variable warning
+			// === MTP GPU forward ===
+			// Activated only when mtpDepth > 0 AND Wmtp is allocated on GPU
+			// (guarded via !Wmtp.empty(); uploaded in ensureGpuState when mtpDepth>0).
+			// At mtpDepth == 0 (default) the entire block is skipped → bit-identical.
+			if (trainingConfig.transformer.mtpDepth > 0
+			    && gpuTransformerWeights->Wmtp.allocated())
+			{
+				const int Tint = static_cast<int>(T);
+				const int dModelInt = static_cast<int>(dModel);
+				const int vocabInt = static_cast<int>(vocabSize);
+				const int ignoreLabel = (padTokenId >= 0) ? padTokenId : -1;
+
+				// Lazily allocate MTP scratch buffers on first use.
+				if (!gpuTransformerScratch->hMtp.allocated())
+					gpuTransformerScratch->hMtp.allocate(static_cast<size_t>(Tint) * dModelInt);
+				if (!gpuTransformerScratch->logitsMtp.allocated())
+					gpuTransformerScratch->logitsMtp.allocate(static_cast<size_t>(Tint) * vocabInt);
+				if (!gpuTransformerScratch->probsMtp.allocated())
+					gpuTransformerScratch->probsMtp.allocate(static_cast<size_t>(Tint) * vocabInt);
+				if (!gpuTransformerScratch->dLogitsMtp.allocated())
+					gpuTransformerScratch->dLogitsMtp.allocate(static_cast<size_t>(Tint) * vocabInt);
+				if (!gpuTransformerScratch->dHmtp.allocated())
+					gpuTransformerScratch->dHmtp.allocate(static_cast<size_t>(Tint) * dModelInt);
+				if (!gpuTransformerScratch->gpuTargetsMtp.allocated())
+					gpuTransformerScratch->gpuTargetsMtp.allocate(static_cast<size_t>(Tint));
+
+				// Upload updated Wmtp from host to GPU every sequence.
+				// CPU Adam updates tt.Wmtp each optimizer step; we must re-upload to GPU
+				// so the forward pass uses the current weight (not the stale initial upload).
+				// Wmtp is small (dModel^2 ≈ 16 MB at d=2048); upload cost is negligible.
+				if (!tt.Wmtp.empty())
+				{
+					const size_t wmtpN = static_cast<size_t>(dModelInt) * dModelInt;
+					glades::gpu::device_memcpy_h2d(
+					    gpuTransformerWeights->Wmtp.data(),
+					    &tt.Wmtp[0], wmtpN * sizeof(float));
+				}
+
+				// Compute MTP +2 targets host-side using the already-built gpuTargetIds
+				// (which holds +1 targets). MTP targets are +2 offset from input, i.e.
+				// targetsMtp[t] = gpuTargetIds[t+1] (with boundary ignored-label fill).
+				std::vector<int> hostTargetsMtp(static_cast<size_t>(Tint), ignoreLabel);
+				for (int t = 0; t < Tint - 1; ++t)
+					hostTargetsMtp[static_cast<size_t>(t)] = gpuTargetIds[static_cast<size_t>(t) + 1u];
+				// Last position: no +2 target, leave as ignoreLabel.
+
+				// Upload MTP targets to GPU.
+				gpuTransformerScratch->gpuTargetsMtp.uploadAsync(
+				    &hostTargetsMtp[0], static_cast<size_t>(Tint));
+				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
+
+				// hMtp = hPostFinalLN @ Wmtp^T   (T, dModel) @ (dModel, dModel)^T → (T, dModel)
+				// Wmtp is [dModel, dModel] row-major (out × in): Y = X @ W^T
+				// useBf16=false: BF16 scratch pointers are ignored by gpu_gemm_abt_mp.
+				if (!gpu_gemm_abt_mp(false /*Wmtp always FP32*/,
+				    Tint, dModelInt, dModelInt, 1.0f,
+				    gpuTransformerScratch->hPostFinalLN.data(),
+				    gpuTransformerScratch->activationLowp.data(), dModelInt,
+				    gpuTransformerWeights->Wmtp.data(),
+				    static_cast<const uint16_t*>(0) /*unused: useBf16=false*/, dModelInt,
+				    0.0f, gpuTransformerScratch->hMtp.data(), dModelInt))
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: MTP hMtp GEMM failed");
+					storeRunningFlag(false);
+					return;
+				}
+
+				// logitsMtp = hMtp @ tokE^T  (tied readout, T × vocabSize)
+				// hMtp: (T, dModel), tokE: (V, dModel) → logitsMtp: (T, V) = hMtp @ tokE^T
+				if (!gpu_gemm_abt_mp(bf16Head,
+				    Tint, vocabInt, dModelInt, 1.0f,
+				    gpuTransformerScratch->hMtp.data(),
+				    gpuTransformerScratch->activationLowp.data(), dModelInt,
+				    gpuTransformerWeights->tokE.data(),
+				    gpuTransformerWeights->tokELowp.data(), dModelInt,
+				    0.0f, gpuTransformerScratch->logitsMtp.data(), vocabInt))
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: MTP logitsMtp GEMM failed");
+					storeRunningFlag(false);
+					return;
+				}
+
+				// Softmax → probsMtp
+				gpu::softmax_forward(
+				    gpuTransformerScratch->logitsMtp.data(),
+				    Tint, vocabInt,
+				    gpuTransformerScratch->probsMtp.data());
+
+				// Host-side CE summation (mirrors Z-loss host-side pattern):
+				// download probsMtp, compute CE against hostTargetsMtp.
+				std::vector<float> hostProbsMtp(static_cast<size_t>(Tint) * vocabInt);
+				gpu::recordEvent(gpuComputeReadyEvent, gpu::computeStream());
+				gpu::streamWaitEvent(gpu::transferStream(), gpuComputeReadyEvent);
+				gpuTransformerScratch->probsMtp.downloadAsync(
+				    &hostProbsMtp[0], hostProbsMtp.size());
+				gpu::synchronizeTransferStream();
+
+				float mtpLossSum = 0.0f;
+				int mtpCount = 0;
+				for (int t = 0; t < Tint; ++t)
+				{
+					const int tgt = hostTargetsMtp[static_cast<size_t>(t)];
+					if (tgt < 0 || tgt == ignoreLabel) continue;
+					const float p = hostProbsMtp[static_cast<size_t>(t) * vocabInt + tgt];
+					mtpLossSum += -logf(p > 1e-30f ? p : 1e-30f);
+					++mtpCount;
+				}
+				if (mtpCount > 0)
+				{
+					const float mtpLossMean = mtpLossSum / static_cast<float>(mtpCount);
+					tokenLmNllSum += static_cast<double>(
+					    trainingConfig.transformer.mtpCoef * mtpLossMean);
+				}
+			}
 
 			targetsProcessed += static_cast<unsigned long long>(gpuValidTargets);
 		}
@@ -11252,6 +11363,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			if (trainingConfig.mixedPrecision.gradStorageBf16Phase2)
 				gpu::zeroTransformerGradientsBf16(*gpuTransformerWeights);
 			timeStepsInBatch = 0u;
+			// Also zero host-side tt.gWmtp (accumulated per-seq D2H during backward).
+			if (!tt.gWmtp.empty())
+				std::fill(tt.gWmtp.begin(), tt.gWmtp.end(), 0.0f);
 		}
 		const bool useBf16GradsPh2_ = trainingConfig.mixedPrecision.gradStorageBf16Phase2;
 		glades::gpu::ScopedPerfTimerMs gpuBackwardStage(gpuPerf ? &gpuPerf->msBackward : NULL);
@@ -11364,6 +11478,102 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->dLogits.data(),
 			    static_cast<int>(T), static_cast<int>(vocabSize),
 			    1.0f, gpuTransformerWeights->gLmBias.data());
+
+			// === MTP GPU backward ===
+			// Runs only when mtpDepth > 0 AND MTP buffers are live (allocated
+			// in the forward block above).  At mtpDepth=0 fully skipped → bit-identical.
+			if (trainingConfig.transformer.mtpDepth > 0
+			    && gpuTransformerWeights->Wmtp.allocated()
+			    && gpuTransformerScratch->probsMtp.allocated())
+			{
+				const int Tint = static_cast<int>(T);
+				const int dModelInt = static_cast<int>(dModel);
+				const int vocabInt = static_cast<int>(vocabSize);
+
+				// 1. dLogitsMtp = probsMtp - one_hot(gpuTargetsMtp)
+				gpu::softmax_cross_entropy_bwd(
+				    gpuTransformerScratch->probsMtp.data(),
+				    gpuTransformerScratch->gpuTargetsMtp.data(),
+				    Tint, vocabInt,
+				    gpuTransformerScratch->dLogitsMtp.data());
+
+				// 2. Scale dLogitsMtp by mtpCoef / T (matches forward weighting).
+				//    softmax_cross_entropy_bwd produces a gradient of mean CE w.r.t.
+				//    the batch; we need mtpCoef * mean → multiply by mtpCoef.
+				//    The 1/T normalization will be applied by the global invBatch
+				//    at the optimizer step (same as main dLogits), so here we only
+				//    apply mtpCoef to weight the auxiliary head contribution.
+				const float mtpScale = trainingConfig.transformer.mtpCoef;
+				gpu::scale_array(
+				    gpuTransformerScratch->dLogitsMtp.data(),
+				    mtpScale,
+				    Tint * vocabInt);
+
+				// 3. dHmtp = dLogitsMtp @ tokE   (T, dModel)
+				//    dLogitsMtp: (T, V), tokE: (V, dModel) → dHmtp: (T, dModel)
+				gpu_gemm_mp(bf16Head,
+				    Tint, dModelInt, vocabInt, 1.0f,
+				    gpuTransformerScratch->dLogitsMtp.data(),
+				    gpuTransformerScratch->activationLowp.data(), vocabInt,
+				    gpuTransformerWeights->tokE.data(),
+				    gpuTransformerWeights->tokELowp.data(), dModelInt,
+				    0.0f, gpuTransformerScratch->dHmtp.data(), dModelInt);
+
+				// 4. gTokE += dLogitsMtp^T @ hMtp   (V, dModel) — accumulate
+				//    dLogitsMtp: (T, V), hMtp: (T, dModel) → gTokE: (V, dModel)
+				gpu_gemm_atb_mp(bf16Head,
+				    vocabInt, dModelInt, Tint, 1.0f,
+				    gpuTransformerScratch->dLogitsMtp.data(),
+				    gpuTransformerScratch->activationLowp.data(), vocabInt,
+				    gpuTransformerScratch->hMtp.data(),
+				    gpuTransformerScratch->activationLowp2.data(), dModelInt,
+				    1.0f, gpuTransformerWeights->gTokE.data(), dModelInt);
+
+				// 5. gWmtp += dHmtp^T @ hPostFinalLN   (dModel, dModel)
+				//    dHmtp: (T, dModel), hPostFinalLN: (T, dModel) → gWmtp: (dModel, dModel)
+				//    Always FP32 (gWmtp has no BF16 variant).
+				{
+					// Use activationLowp and activationLowp2 as BF16 scratch;
+					// gpu_gemm_atb_mp with useBf16=false falls through to FP32 SGEMM.
+					gpu_gemm_atb_mp(false /*gWmtp stays FP32*/,
+					    dModelInt, dModelInt, Tint, 1.0f,
+					    gpuTransformerScratch->dHmtp.data(),
+					    gpuTransformerScratch->activationLowp.data(), dModelInt,
+					    bwdPostFinalLN,
+					    gpuTransformerScratch->activationLowp2.data(), dModelInt,
+					    1.0f, gpuTransformerWeights->gWmtp.data(), dModelInt);
+				}
+
+				// 6. dH += dHmtp @ Wmtp^T   (T, dModel) — accumulate into existing grad
+				//    dHmtp: (T, dModel), Wmtp: (dModel, dModel) → (T, dModel)
+				//    useBf16=false: BF16 scratch pointers ignored by gpu_gemm_abt_mp.
+				gpu_gemm_abt_mp(false /*Wmtp always FP32*/,
+				    Tint, dModelInt, dModelInt, 1.0f,
+				    gpuTransformerScratch->dHmtp.data(),
+				    gpuTransformerScratch->activationLowp.data(), dModelInt,
+				    gpuTransformerWeights->Wmtp.data(),
+				    static_cast<const uint16_t*>(0) /*unused: useBf16=false*/, dModelInt,
+				    1.0f, gpuTransformerScratch->dH.data(), dModelInt);
+
+				// 7. D2H gWmtp → host tt.gWmtp for CPU Adam at optimizer step.
+				//    Sync compute stream first so GEMMs above have completed.
+				//    Accumulate (+=) into tt.gWmtp which was zero-initialized
+				//    at the start of the batch (sgd_transformer ~line 1154).
+				glades::gpu::synchronizeComputeStream();
+				const size_t wmtpN = static_cast<size_t>(dModelInt) * dModelInt;
+				std::vector<float> hostGWmtp(wmtpN);
+				glades::gpu::device_memcpy_d2h(
+				    &hostGWmtp[0],
+				    gpuTransformerWeights->gWmtp.data(),
+				    wmtpN * sizeof(float));
+				glades::gpu::synchronizeTransferStream();
+				for (size_t i = 0; i < wmtpN; ++i)
+					tt.gWmtp[i] += hostGWmtp[i];
+				// Zero the GPU accumulator for the next sequence
+				// (host tt.gWmtp accumulates across the batch; GPU side is per-seq).
+				glades::gpu::device_memset_bytes(
+				    gpuTransformerWeights->gWmtp.data(), 0, wmtpN * sizeof(float));
+			}
 
 			timeStepsInBatch += gpuValidTargets;
 		}
