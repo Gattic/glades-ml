@@ -578,9 +578,8 @@ struct GpuTransformerScratch
 	GpuBuffer<float> kInvNorm;       // [nLayers, T, nKVHeads]  (nKVHeads = nHeads in MHA)
 	GpuBuffer<float> qNorm;          // [nLayers, T, nHeads*dHead] post-norm Q copy
 	GpuBuffer<float> kNorm;          // [nLayers, T, nKVHeads*dHead] post-norm K copy
-	GpuBuffer<float> qPreNorm;       // [nLayers, T, nHeads*dHead] pre-norm Q copy
-	GpuBuffer<float> kPreNorm;       // [nLayers, T, nKVHeads*dHead] pre-norm K copy
 	GpuBuffer<float> qknormGammaScale; // [nHeads] γ·sqrt(dHead) per head
+	GpuBuffer<float> qknormDGammaTmp; // [nHeads] per-layer dγ scratch for backward
 
 	// Full attention scores matrix [nHeads, T, T] used by the
 	// cuBLAS-tiled flash_attention path (research/WMMA_ATTENTION_PLAN.md).

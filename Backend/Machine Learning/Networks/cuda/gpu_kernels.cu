@@ -9217,6 +9217,64 @@ bool scale_q_per_head(float* Q, const float* gammaScale,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// qknorm_gamma_grad: accumulate γ_h gradient from attention backward.
+// dγ_h = sqrt(dHead) · sum_{t,i} dQPost[t,h,i] · qNorm[t,h,i]
+// dQPost: [T, nHeads, dHead] — gradient at the post-γ-scale Q seen by attn.
+// qNorm:  [T, nHeads, dHead] — post-normalize Q (saved in forward).
+// dGamma: [nHeads] — output, one scalar per head.
+// One block per head; threads cooperatively reduce across (T * dHead) elements.
+// ---------------------------------------------------------------------------
+__global__ void qknorm_gamma_grad_kernel(const float* __restrict__ dQPost,
+                                         const float* __restrict__ qNorm,
+                                         float sqrtDh,
+                                         int T, int nHeads, int dHead,
+                                         float* __restrict__ dGamma)
+{
+	const int h = blockIdx.x;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float local = 0.0f;
+
+	for (int t = 0; t < T; ++t)
+	{
+		const size_t off = ((size_t)t * nHeads + h) * dHead;
+		for (int i = tid; i < dHead; i += block)
+			local += dQPost[off + i] * qNorm[off + i];
+	}
+	local *= sqrtDh;
+
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) dGamma[h] = s;
+	}
+}
+
+bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
+                       float sqrtDh, int T, int nHeads, int dHead,
+                       float* dGamma)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = 256;
+	qknorm_gamma_grad_kernel<<<nHeads, block, 0, computeStream()>>>(
+	    dQPost, qNorm, sqrtDh, T, nHeads, dHead, dGamma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

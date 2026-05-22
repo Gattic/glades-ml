@@ -9646,25 +9646,15 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 				gpuTransformerScratch->qNorm.allocate(qSize);
 			if (gpuTransformerScratch->kNorm.size() < kSize)
 				gpuTransformerScratch->kNorm.allocate(kSize);
-			if (gpuTransformerScratch->qPreNorm.size() < qSize)
-				gpuTransformerScratch->qPreNorm.allocate(qSize);
-			if (gpuTransformerScratch->kPreNorm.size() < kSize)
-				gpuTransformerScratch->kPreNorm.allocate(kSize);
 			if (gpuTransformerScratch->qknormGammaScale.size() < static_cast<size_t>(nHeadsInt))
 				gpuTransformerScratch->qknormGammaScale.allocate(static_cast<size_t>(nHeadsInt));
+			if (gpuTransformerScratch->qknormDGammaTmp.size() < static_cast<size_t>(nHeadsInt))
+				gpuTransformerScratch->qknormDGammaTmp.allocate(static_cast<size_t>(nHeadsInt));
 
 			const size_t qLayerOff  = static_cast<size_t>(li) * T * nHeads * dHead;
 			const size_t kLayerOff  = static_cast<size_t>(li) * T * nKVHeads * dHead;
 			const size_t qInvLayerOff = static_cast<size_t>(li) * T * nHeads;
 			const size_t kInvLayerOff = static_cast<size_t>(li) * T * nKVHeads;
-
-			// Save pre-norm Q and K (for γ-gradient in backward, Task 2.6).
-			glades::gpu::device_memcpy_d2d(
-			    gpuTransformerScratch->qPreNorm.data() + qLayerOff,
-			    Q_l, static_cast<size_t>(Tint) * nHeadsInt * dHeadInt * sizeof(float));
-			glades::gpu::device_memcpy_d2d(
-			    gpuTransformerScratch->kPreNorm.data() + kLayerOff,
-			    K_l, static_cast<size_t>(Tint) * nKVHeadsInt * dHeadInt * sizeof(float));
 
 			// L2-normalize Q and K in place; save invNorm for backward.
 			glades::gpu::qknorm_forward_gpu(
@@ -11758,6 +11748,78 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(T), static_cast<int>(nHeads),
 				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
 				    static_cast<int>(ropeHalfDim), true);
+			}
+
+			// --- QK-Norm backward (Task 2.6) ---
+			// Applies only when qkNormEnabled for this layer.  Undoes the two
+			// forward operations in reverse order:
+			//   A. dγ_h = sqrt(dHead) · Σ_{t,i} dQ_post[t,h,i] · qNorm[t,h,i]
+			//   B. dQ_norm = (γ·sqrt(dHead)) · dQ_post  (chain rule for fwd pre-scale)
+			//   C. dQ_orig = qknorm_backward_gpu(qNorm, qInvNorm, dQ_norm)  in-place
+			//   D. dK_orig = qknorm_backward_gpu(kNorm, kInvNorm, dK_post)  in-place
+			//   E. host-side accumulate dγ into tt.blocks[li].gQknormGamma for Adam
+			// When qkNormEnabled=false (qknormGamma empty), block is skipped entirely
+			// → bit-identical to baseline.
+			{
+				TensorTransformerState::Block& cpuBlockBwd = tt.blocks[static_cast<size_t>(li)];
+				if (!cpuBlockBwd.qknormGamma.empty())
+				{
+					const int Tint      = static_cast<int>(T);
+					const int nHi       = static_cast<int>(nHeads);
+					const int nKVHi     = static_cast<int>(nKVHeads);
+					const int dHi       = static_cast<int>(dHead);
+					const float sqrtDh  = sqrtf(static_cast<float>(dHead));
+
+					const size_t qLayerOff   = static_cast<size_t>(li) * T * nHeads * dHead;
+					const size_t kLayerOff   = static_cast<size_t>(li) * T * nKVHeads * dHead;
+					const size_t qInvLayerOff = static_cast<size_t>(li) * T * nHeads;
+					const size_t kInvLayerOff = static_cast<size_t>(li) * T * nKVHeads;
+
+					// A: accumulate γ_h gradient into per-layer scratch buffer.
+					glades::gpu::qknorm_gamma_grad(
+					    gpuTransformerScratch->dQfull.data(),
+					    gpuTransformerScratch->qNorm.data() + qLayerOff,
+					    sqrtDh, Tint, nHi, dHi,
+					    gpuTransformerScratch->qknormDGammaTmp.data());
+
+					// B: undo γ·sqrt(dHead) pre-scale on dQ (chain rule).
+					// scale_q_per_head multiplies each [t,h] row by gammaScale[h];
+					// qknormGammaScale holds γ·sqrt(dHead) from the forward pass
+					// (still valid — it's re-uploaded per forward step).
+					glades::gpu::scale_q_per_head(
+					    gpuTransformerScratch->dQfull.data(),
+					    gpuTransformerScratch->qknormGammaScale.data(),
+					    Tint, nHi, dHi);
+
+					// C: undo Q L2 normalize in-place on dQ.
+					glades::gpu::qknorm_backward_gpu(
+					    gpuTransformerScratch->qNorm.data()   + qLayerOff,
+					    gpuTransformerScratch->qInvNorm.data() + qInvLayerOff,
+					    gpuTransformerScratch->dQfull.data(),
+					    Tint, nHi, dHi,
+					    gpuTransformerScratch->dQfull.data());
+
+					// D: undo K L2 normalize in-place on dK.
+					glades::gpu::qknorm_backward_gpu(
+					    gpuTransformerScratch->kNorm.data()   + kLayerOff,
+					    gpuTransformerScratch->kInvNorm.data() + kInvLayerOff,
+					    gpuTransformerScratch->dKfull.data(),
+					    Tint, nKVHi, dHi,
+					    gpuTransformerScratch->dKfull.data());
+
+					// E: copy dγ_h back to host and accumulate into gQknormGamma.
+					// Sync compute stream so the qknorm_gamma_grad kernel has
+					// completed, then use a transfer-stream D2H copy + sync.
+					std::vector<float> hostDgamma(static_cast<size_t>(nHi), 0.0f);
+					glades::gpu::synchronizeComputeStream();
+					glades::gpu::device_memcpy_d2h(
+					    &hostDgamma[0],
+					    gpuTransformerScratch->qknormDGammaTmp.data(),
+					    static_cast<size_t>(nHi) * sizeof(float));
+					glades::gpu::synchronizeTransferStream();
+					for (int h = 0; h < nHi; ++h)
+						cpuBlockBwd.gQknormGamma[static_cast<size_t>(h)] += hostDgamma[static_cast<size_t>(h)];
+				}
 			}
 
 			// --- Q/K/V projection backward ---

@@ -1063,6 +1063,12 @@ bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
 bool scale_q_per_head(float* Q, const float* gammaScale,
                       int T, int nHeads, int dHead);
 
+// Accumulate γ_h gradient: dGamma[h] = sqrt(dHead) * sum_{t,i} dQPost[t,h,i]*qNorm[t,h,i].
+// dQPost, qNorm: [T, nHeads, dHead].  dGamma: [nHeads] (overwritten, not accumulated).
+bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
+                       float sqrtDh, int T, int nHeads, int dHead,
+                       float* dGamma);
+
 } // namespace gpu
 } // namespace glades
 
@@ -1270,6 +1276,7 @@ inline void device_memset_bytes(void*, int, size_t) {}
 inline bool qknorm_forward_gpu(float*, float*, int, int, int, float) { return false; }
 inline bool qknorm_backward_gpu(const float*, const float*, const float*, int, int, int, float*) { return false; }
 inline bool scale_q_per_head(float*, const float*, int, int, int) { return false; }
+inline bool qknorm_gamma_grad(const float*, const float*, float, int, int, int, float*) { return false; }
 
 } // namespace gpu
 } // namespace glades
