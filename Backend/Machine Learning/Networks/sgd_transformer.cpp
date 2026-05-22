@@ -7235,6 +7235,62 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					results.addFloat(static_cast<float>(yid));
 					results.addFloat(static_cast<float>(argm));
 				}
+
+				// === MTP auxiliary head (CPU forward, Task 3.4) ===
+				// When mtpDepth > 0 and Wmtp is allocated, project hPostFinalLN through
+				// Wmtp to get hMtp, route it through the tied readout, compute CE against
+				// +2-offset targets, and add mtpCoef * mean(MTP_CE) to tokenLmNllSum.
+				// Guard is doubly-redundant: Wmtp is only allocated when mtpDepth > 0.
+				// At mtpDepth == 0 (default) the block is fully skipped → bit-identical.
+				if (trainingConfig.transformer.mtpDepth > 0 && !tt.Wmtp.empty())
+				{
+					const int ignoreLabel = (padTokenId >= 0) ? padTokenId : -1;
+
+					// 1. Compute +2-offset targets.
+					glades::transformer_kernels::compute_mtp_targets(
+					    &targetIds[0], static_cast<int>(T), ignoreLabel,
+					    &transformerScratch.targetsMtp[0]);
+
+					// 2. hMtp[t] = Wmtp * hPostFinalLN[t]  (shape: T × dModel)
+					//    linear_forward_opt: Y[t,out] = sum_in W[out,in]*X[t,in]
+					//    Wmtp is stored [dModel, dModel] row-major (out × in).
+					const float* hPostFinalLNPtr = transformerScratch.hPostFinalLN.data();
+					glades::transformer_kernels::linear_forward_opt(
+					    hPostFinalLNPtr, T, dModel,
+					    tt.Wmtp, std::vector<float>(), /*b=empty*/
+					    dModel,
+					    transformerScratch.hMtp.data());
+
+					// 3. logitsMtp[t, v] = tokE @ hMtp[t]  (tied readout, no bias for MTP)
+					glades::transformer_kernels::tied_embedding_logits_forward_rows(
+					    transformerScratch.hMtp.data(), T, dModel,
+					    tt.tokE, /*lmBias=*/std::vector<float>() /*no bias*/, vocabSize,
+					    transformerScratch.logitsMtp.data());
+
+					// 4. Softmax-CE over MTP positions; skip ignore-label slots.
+					float mtpLossSum = 0.0f;
+					int mtpCount = 0;
+					for (unsigned int t = 0; t < T; ++t)
+					{
+						const int tgt = transformerScratch.targetsMtp[t];
+						if (tgt < 0 || static_cast<unsigned int>(tgt) >= vocabSize)
+							continue;
+						const float* row = &transformerScratch.logitsMtp[static_cast<size_t>(t) * static_cast<size_t>(vocabSize)];
+						float ceVal = 0.0f, zlossUnused = 0.0f;
+						glades::transformer_kernels::softmax_ce_with_zloss(
+						    row, static_cast<int>(vocabSize), tgt,
+						    0.0f, &ceVal, &zlossUnused);
+						mtpLossSum += ceVal;
+						++mtpCount;
+					}
+
+					// 5. Add weighted MTP mean CE to the running NLL sum.
+					if (mtpCount > 0)
+					{
+						const float mtpLossMean = mtpLossSum / static_cast<float>(mtpCount);
+						tokenLmNllSum += static_cast<double>(trainingConfig.transformer.mtpCoef * mtpLossMean);
+					}
+				}
 			}
 			else
 			{
@@ -11095,6 +11151,13 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			tokenLmTokenCount += static_cast<unsigned long long>(lossCountVal);
 			clsCorrect += static_cast<unsigned long long>(correctVal);
 			clsTotal += static_cast<unsigned long long>(validVal);
+
+			// TODO(Task 3.5): MTP GPU forward + backward not yet wired.
+			// mtpDepth > 0 runs MTP only on the CPU path (transformerCpuForwardPass/
+			// SGDHelper_TRANSFORMER metrics block). On this GPU training path, MTP
+			// contributes 0 to tokenLmNllSum until Task 3.5 lands the GPU
+			// forward+backward together (they share GPU scratch and are tightly coupled).
+			(void)trainingConfig.transformer.mtpDepth; // suppress unused-variable warning
 
 			targetsProcessed += static_cast<unsigned long long>(gpuValidTargets);
 		}
