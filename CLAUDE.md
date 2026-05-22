@@ -2,15 +2,77 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (v5+FP8 ship 2026-05-22)
+## Current Production Flagship — CHIRON 1B @ T=16384 (regstack Phase 2 ship 2026-05-22)
 
-The current production LLM flagship is **CHIRON 1B v5+FP8 stack**
-(checkpoint `chiron_1B_T16384_v5_fp8_phase2.final`):
+The current production LLM flagship is **CHIRON 1B regstack Phase 2**
+(checkpoint `chiron_1B_T16384_regstack_phase2.final`):
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context.
-- **Params**: 870.94M (~"1B").
+- **Params**: 870.94M (~"1B") + 384 QK-Norm γ scalars (16 heads × 24 layers).
+- **Stack**: v5+FP8 ship base (CUDA 13.2 + BF16 cast fix + FP8 readout —
+  see "Prior v5+FP8 flagship" below) **PLUS the regularization-stack landed
+  2026-05-22**:
+  - **`--qk-norm`** (DeepSeek-V3 / Llama-3 style): per-head L2-normalize Q
+    and K before attention, then replace `1/√d_h` with learnable per-head
+    `γ_h` (init = log₂(T) = 14). Inserted between projection and attention
+    core on both the FP32-inner and `--scfa-bf16-inner` BF16-TC paths via
+    a new `qknorm_forward_gpu` + `scale_q_per_head` + flash-attention
+    sequence. Backward recomputes qNorm/kNorm via BF16-TC projection
+    rather than saving to L·k·dModel scratch (saves 768 MB at production
+    shape).
+  - **`--zloss-coef 1e-4`** (PaLM / T5 style): add zlossCoef·mean(logZ²)
+    to the training loss plus 2·zlossCoef·logZ·probs in readout backward.
+    Wired through the `--bf16-logits-storage` path via new
+    `softmax_forward_bf16_with_lse` + `softmax_cross_entropy_bwd_bf16_zloss`
+    kernels.
+- **Perf**: **28,072 tok/s** @ T=16384 (was 28,887 at v5+FP8 ship,
+  **−2.82%** wall — within the 5% spec budget; the BF16-TC backward
+  recompute of qNorm/kNorm is the dominant cost). Same VRAM as v5+FP8
+  ship (~14.97 GB peak). **Final val NLL 3.5734 @ step 30000** (vs
+  v5+FP8 ship's 4.1717; Δ **−0.5983 nat BETTER**, ~30× the spec's 0.02
+  nat improvement target). Cumulative NLL improvement since v5+FP8:
+  **−0.5983 nat**.
+- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship
+  --zloss-coef 1e-4 --qk-norm`.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
+  (verify which checkpoint the runner script points to; may need to
+  update to `chiron_1B_T16384_regstack_phase2.final`).
+- **Full spec**: `research/REGSTACK_PHASE2_2026_05_22.md` (Phase 2 ship
+  doc with per-mechanism pilot deltas and B5 30k trajectory). Spec / plan
+  that drove the arc: `docs/superpowers/specs/2026-05-22-chiron-1b-regularization-stack-design.md`
+  and `docs/superpowers/plans/2026-05-22-chiron-1b-regularization-stack.md`.
+- **Phase 2 evidence**: `research/REGSTACK_PHASE2_2026_05_22.md` (full 30k
+  trajectory + position-stratified deltas + gate-by-gate evaluation).
+- **Pilot evidence** (single-seed 5k @ T=16384): B0 baseline val NLL
+  4.9140; B1 Z-loss 4.9207 (+0.007, noise); B2 QK-Norm 3.9412 (−0.97);
+  B4 stacked 3.9396 (−0.97). QK-Norm dominates; Z-loss is a no-op at
+  pilot scale but retained in B5 per §3.3 decision tree.
+- **MTP deferred**: the original Phase 2 spec called for a third
+  mechanism (MTP, B3). MTP scratch at production T·V (T=16384, V=32000)
+  requires ~2.6 GB on top of the flagship's 14.97 GB working set —
+  doesn't fit in the 15.6 GB ceiling without chunked-T or sparse-T
+  implementation. Library port (commits d8098ee9d, d5ba43752) tested at
+  small shape; production port deferred to follow-up arc.
+- **Phase-3 program** (improving CHIRON 1B via novel research, no external
+  libs / no external baselines): pre-registration in
+  `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
+  anchor on the regstack Phase 2 flagship as the baseline.
+
+**Prior v5+FP8 flagship** (`chiron_1B_T16384_v5_fp8_phase2.final`,
+28,887 tok/s, NLL 4.1717 @ 30k, CUDA 13.2 with FP8 readout) remains loadable
+into the regstack Phase 2 stack with `--zloss-coef 0` (no `--qk-norm`) — both
+flags default off; math bit-identical to v5+FP8 ship when off. For pure
+"v5+FP8 ship reproduction without regstack" runs, omit the regstack flags
+from `run.sh flagship`. The v5+FP8 ship was the CUDA 13.2 production
+flagship that the regstack Phase 2 ship builds on; details:
+
+## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
+
+The v5+FP8 flagship (predecessor):
+
+- **Shape**: same as above.
 - **Stack**: iter 116 ship 10-mechanism stack (see "Prior iter 116 flagship"
-  below for the full mechanism list) **PLUS two new layers landed 2026-05-21
+  below for the full mechanism list) **PLUS two layers landed 2026-05-21
   / 2026-05-22**:
   - **CUDA 13.2 toolchain** (was CUDA 12.0): cuBLAS 13.x BF16 GEMM dispatch.
   - **v5 BF16-cast fix** in `Backend/Machine Learning/Networks/cuda/gpu_blas.cu`:
@@ -34,13 +96,13 @@ The current production LLM flagship is **CHIRON 1B v5+FP8 stack**
   **−0.0266 nat BETTER**, far within strict ±0.02). Mean trajectory drift
   vs iter 116 ship across 10 val checkpoints: +0.00007 nat (essentially
   zero). Cumulative since pre-ralph-loop 15,200 tok/s: **1.90×**.
-- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship`
-  (10 iter 116 mechanisms default; **append `--fp8-readout-fwd`** until the
-  flag is added to the flagship recipe in run.sh — or invoke
-  `./build/glades_chiron_train` directly per the Reproduction block in
-  `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md`).
-- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
-- **Full spec**: `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md` (Phase 2
+- **Reproduce v5+FP8 (no regstack)**: `cd ~/dev/glades-trainer && sh run.sh flagship`
+  (regstack flags `--zloss-coef` and `--qk-norm` default off → bit-identical
+  to v5+FP8 ship). For the current regstack production flagship, see the
+  reproduce command at the top of this doc.
+- **Run inference (v5+FP8)**: load
+  `chiron_1B_T16384_v5_fp8_phase2.final` explicitly.
+- **Full spec**: `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md` (v5+FP8
   ship doc with full trajectory table) and `research/CUDA13_BF16_REGRESSION_FIX_2026_05_21.md`
   (diagnosis + fix details). Also see `research/FLAGSHIP_T16384_2026_05_14.md`
   for the iter 116 ship 10-mechanism details that v5+FP8 builds on.
@@ -53,10 +115,6 @@ The current production LLM flagship is **CHIRON 1B v5+FP8 stack**
   strict NLL parity).
 - **Per-mechanism evidence**: `research/ITER<N>_*.md` for N ∈ {97, 99, 100,
   101, 103, 106, 107, 109, 113, 115, 116} (the iter 116 ship's 10 mechanisms).
-- **Phase-3 program** (improving CHIRON 1B via novel research, no external
-  libs / no external baselines): pre-registration in
-  `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
-  anchor on the v5+FP8 flagship as the baseline.
 
 **Prior iter 116 ship** (`chiron_1B_T16384_iter116_treatment_phase2.final`,
 28,257 tok/s, NLL 4.2039 @ 30k, on CUDA 12.0) is archived at
