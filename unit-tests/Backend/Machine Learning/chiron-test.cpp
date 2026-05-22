@@ -11345,6 +11345,15 @@ void CHIRONUnitTest()
 	CHIRONOvfgTruncateFactorsQrParityTest();
 	CHIRONOvfgCompressionBenchmark();
 	CHIRONOvfgTruncateBenchmark();
+	// === REGSTACK tests (2026-05-22 spec) ===
+	// Run before the OVFG/Stiefel block — that test has a pre-existing
+	// assertion-abort that would prevent subsequent tests from running.
+	CHIRONZlossDisabledParityTest();
+	CHIRONZlossEnabledMathTest();
+	CHIRONQkNormDisabledParityTest();
+	CHIRONQkNormEnabledMathTest();
+	CHIRONMtpDisabledParityTest();
+	CHIRONMtpTargetShiftTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -11447,12 +11456,6 @@ void CHIRONUnitTest()
 	CHIRONCublasTiledAttentionBackwardParityTest();
 	CHIRONCublasTiledAttentionBf16ParityTest();
 	CHIRONProductionScaleMemoryTest();
-	CHIRONZlossDisabledParityTest();
-	CHIRONZlossEnabledMathTest();
-	CHIRONQkNormDisabledParityTest();
-	CHIRONQkNormEnabledMathTest();
-	CHIRONMtpDisabledParityTest();
-	CHIRONMtpTargetShiftTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
