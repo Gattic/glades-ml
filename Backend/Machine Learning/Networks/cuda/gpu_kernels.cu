@@ -3427,6 +3427,78 @@ __global__ void softmax_cross_entropy_backward_bf16(
 	}
 }
 
+// BF16-storage variant of softmax_stable_rows_with_lse.  Same 3-pass softmax
+// as softmax_stable_rows_bf16, plus a per-row logZ FP32 write
+// logZ[row] = rowMax + log(rowSum).  Required by the Z-loss path on the
+// --bf16-logits-storage trainer recipe.
+__global__ void softmax_stable_rows_bf16_with_lse(
+    const unsigned short* __restrict__ xb,
+    int cols,
+    unsigned short* __restrict__ ob,
+    float* __restrict__ logZ)
+{
+	int row = blockIdx.x;
+	const unsigned short* xRow = xb + (size_t)row * cols;
+	unsigned short*       oRow = ob + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, bf16_load(xRow[i]));
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localSum += expf(bf16_load(xRow[i]) - rowMax);
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = bf16_store(expf(bf16_load(xRow[i]) - rowMax) * invSum);
+	if (threadIdx.x == 0)
+		logZ[row] = rowMax + logf(sRowSum);
+}
+
+// BF16-storage Z-loss CE backward: dlogits[t, v] = (probs[t, v] - 1_{v==target})
+// + 2·zlossCoef·logZ[t]·probs[t, v]
+// Matches softmax_cross_entropy_backward_zloss but reads BF16 probs and writes
+// BF16 dlogits.  Required by the Z-loss backward on --bf16-logits-storage.
+__global__ void softmax_cross_entropy_backward_bf16_zloss(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    const float* __restrict__ logZ,
+    float zlossCoef,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float lz = logZ[row];
+	const float zterm = 2.0f * zlossCoef * lz;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = bf16_load(pRow[i]);
+		float v = (i == target) ? (p - 1.0f) : p;
+		v += zterm * p;
+		dRow[i] = bf16_store(v);
+	}
+}
+
 __global__ void scale_array_bf16_kernel(unsigned short* __restrict__ x,
                                          float scale, int n)
 {
@@ -3582,6 +3654,33 @@ bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
 	int block = rowBlockSize(cols);
 	softmax_cross_entropy_backward_bf16<<<rows, block, 0, computeStream()>>>(
 	    probs, targets, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_forward_bf16_with_lse(const unsigned short* x, int rows, int cols,
+                                    unsigned short* out, float* logZ)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows_bf16_with_lse<<<rows, block, smemBytes, computeStream()>>>(
+	    x, cols, out, logZ);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
+                                           const int* targets,
+                                           const float* logZ,
+                                           float zlossCoef,
+                                           int rows, int cols,
+                                           unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_bf16_zloss<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, cols, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

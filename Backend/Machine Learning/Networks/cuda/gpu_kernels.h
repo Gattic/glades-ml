@@ -75,10 +75,23 @@ bool softmax_cross_entropy_bwd_zloss(const float* probs, const int* targets,
 // 16 GB hardware (saves 3 × 2 GB = 3 GB net).
 bool softmax_forward_bf16(const unsigned short* x, int rows, int cols,
                            unsigned short* out);
+// BF16-storage variant of softmax_forward_with_lse: also writes per-row
+// logsumexp into a FP32 logZ buffer.  Required by the Z-loss path on the
+// --bf16-logits-storage trainer recipe.
+bool softmax_forward_bf16_with_lse(const unsigned short* x, int rows, int cols,
+                                    unsigned short* out, float* logZ);
 bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
                                      const int* targets,
                                      int rows, int cols,
                                      unsigned short* dlogits);
+// BF16-storage Z-loss CE backward: dlogits[t, v] = (probs[t, v] - 1_{v==target})
+// + 2·zlossCoef·logZ[t]·probs[t, v].  Required on --bf16-logits-storage.
+bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
+                                           const int* targets,
+                                           const float* logZ,
+                                           float zlossCoef,
+                                           int rows, int cols,
+                                           unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
@@ -1094,7 +1107,9 @@ inline bool softmax_forward_with_lse(const float*, int, int, float*, float*) { r
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_zloss(const float*, const int*, const float*, float, int, int, float*) { return false; }
 inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short*) { return false; }
+inline bool softmax_forward_bf16_with_lse(const unsigned short*, int, int, unsigned short*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
+inline bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short*, const int*, const float*, float, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
