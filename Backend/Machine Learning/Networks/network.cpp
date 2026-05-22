@@ -2631,6 +2631,16 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vTokE.assign(eN, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2TokE.assign(eN, 0.0f);
 			tensorTransformer.gTokE.assign(eN, 0.0f);
+			// MTP projection matrix: (dModel, dModel), Glorot-uniform init.
+			// Allocated only when mtpDepth > 0; empty vectors act as sentinels.
+			if (trainingConfig.transformer.mtpDepth > 0)
+			{
+				const size_t mtpSize = static_cast<size_t>(dModel) * static_cast<size_t>(dModel);
+				tensorTransformer.Wmtp.assign(mtpSize, 0.0f);
+				tensorTransformer.gWmtp.assign(mtpSize, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mWmtp.assign(mtpSize, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2Wmtp.assign(mtpSize, 0.0f);
+			}
 			tensorTransformer.lmBias.assign(vocabSize, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
@@ -2784,6 +2794,11 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				// Initialize embeddings with N(0, 0.02) (standard LLM practice).
 				for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
 					tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
+				// Initialize Wmtp with Glorot-uniform if enabled.
+				if (!tensorTransformer.Wmtp.empty())
+					InitGlorot::run(rngEngine, tensorTransformer.Wmtp,
+					                static_cast<unsigned int>(dModel),
+					                static_cast<unsigned int>(dModel));
 			}
 			for (int li = 0; li < H; ++li)
 			{

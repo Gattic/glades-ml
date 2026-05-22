@@ -1478,6 +1478,11 @@ private:
 		// zlossCoef so the backward kernel has access when coef > 0 at inference time.
 		std::vector<float> logZ; // [T]
 
+		// MTP (Multi-Token Prediction) scratch — allocated only when mtpDepth > 0.
+		std::vector<int>   targetsMtp;  // [T] — +2-offset targets for MTP head
+		std::vector<float> hMtp;        // [T * dModel] — Wmtp @ hPostFinalLN
+		std::vector<float> logitsMtp;   // [T * vocabSize] — readout from hMtp
+
 		// === Backward scratch (reused across sequences/layers; aligned) ===
 		// These buffers eliminate per-sequence/per-layer allocations in transformer backward.
 		std::vector<float, glades::AlignedAllocator<float, 64> > dLogits; // [T, outSize]
@@ -1542,7 +1547,9 @@ private:
 		            unsigned int newFF1Width,
 		            float embDropRate = 0.0f,
 		            float resDropRate = 0.0f,
-		            bool gradCheckpoint = false)
+		            bool gradCheckpoint = false,
+		            int mtpDepth = 0,
+		            unsigned int vocabSize = 0u)
 		{
 			T = newT;
 			inputSize = newInputSize;
@@ -1632,6 +1639,28 @@ private:
 			// paths (sampled-softmax, padded positions) that don't write per-position
 			// (code-review issue 3 fix).
 			std::fill(logZ.begin(), logZ.end(), 0.0f);
+
+			// MTP scratch: only allocate when mtpDepth > 0 (empty = disabled).
+			if (mtpDepth > 0)
+			{
+				if (targetsMtp.size() != static_cast<size_t>(T))
+					targetsMtp.assign(static_cast<size_t>(T), 0);
+				const size_t hMtpSz = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				if (hMtp.size() != hMtpSz)
+					hMtp.resize(hMtpSz, 0.0f);
+				if (vocabSize > 0u)
+				{
+					const size_t logitsMtpSz = static_cast<size_t>(T) * static_cast<size_t>(vocabSize);
+					if (logitsMtp.size() != logitsMtpSz)
+						logitsMtp.resize(logitsMtpSz, 0.0f);
+				}
+			}
+			else
+			{
+				targetsMtp.clear();
+				hMtp.clear();
+				logitsMtp.clear();
+			}
 
 			// Backward scratch (not per-layer; reused across the backward pass)
 			// Note: we do not rely on these being zeroed except where explicitly filled in the hot path.

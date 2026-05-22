@@ -50,6 +50,16 @@
 		std::vector<float> vTokE;
 		std::vector<float> v2TokE;
 		std::vector<float> gTokE;
+
+		// MTP (Multi-Token Prediction) — single linear projection for +2-offset
+		// auxiliary head (spec 2026-05-22 §2.3). Shape: (dModel, dModel). Empty
+		// when mtpDepth == 0 (sentinel for "MTP not in use"). Maps post-final-LN
+		// hidden vector to MTP hidden, which then goes through the tied readout.
+		std::vector<float> Wmtp;
+		std::vector<float> gWmtp;
+		std::vector<float> mWmtp;
+		std::vector<float> v2Wmtp;
+
 		// LM head bias: [vocabSize]
 		std::vector<float> lmBias;
 		std::vector<float> mLmBias;
@@ -744,6 +754,7 @@
 			mLnFinalBeta.clear(); v2LnFinalBeta.clear();
 			gLnFinalGamma.clear(); gLnFinalBeta.clear();
 			tokE.clear(); tokELowp.clear(); vTokE.clear(); v2TokE.clear(); gTokE.clear();
+			Wmtp.clear(); gWmtp.clear(); mWmtp.clear(); v2Wmtp.clear();
 			lmBias.clear(); mLmBias.clear(); v2LmBias.clear(); gLmBias.clear();
 			WIn.clear(); WInLowp.clear(); vWIn.clear(); v2WIn.clear(); gWIn.clear();
 			bIn.clear(); mBIn.clear(); v2BIn.clear(); gBIn.clear();

@@ -1150,6 +1150,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		void operator()() const
 		{
 			std::fill(tt.gTokE.begin(), tt.gTokE.end(), 0.0f);
+			if (!tt.gWmtp.empty())
+				std::fill(tt.gWmtp.begin(), tt.gWmtp.end(), 0.0f);
 			std::fill(tt.gLmBias.begin(), tt.gLmBias.end(), 0.0f);
 			std::fill(tt.gWIn.begin(), tt.gWIn.end(), 0.0f);
 			std::fill(tt.gBIn.begin(), tt.gBIn.end(), 0.0f);
@@ -4648,6 +4650,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (echoEnabled)
 					{
@@ -4674,6 +4680,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (bimapEnabled)
 					{
@@ -4699,6 +4709,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (pactEnabled)
 					{
@@ -4716,6 +4730,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (racerEnabled)
 					{
@@ -4733,6 +4751,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (kronEnabled)
 					{
@@ -4750,6 +4772,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (matraEnabled)
 					{
@@ -4767,6 +4793,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (argosEnabled)
 					{
@@ -4795,6 +4825,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (muonEnabled)
 					{
@@ -4812,6 +4846,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else if (auroraAdamwBackbone)
 					{
@@ -4821,6 +4859,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 					else
 					{
@@ -4845,6 +4887,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							net.storeRunningFlag(false);
 							return false;
 						}
+						// Wmtp: standard Adam (not ATLAS subspace) — dense (dModel,dModel) matrix.
+						if (!tt.Wmtp.empty())
+							Adam::update_param(tt.Wmtp, tt.mWmtp, tt.v2Wmtp, tt.gWmtp,
+							                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                   invBatch, gradScale);
 					}
 				}
 				const float transformerSparrowTrust =
@@ -7004,7 +7051,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		transformerScratch.ensure(T, inputSize, scratchOutSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width,
 		                         trainingConfig.transformer.embeddingDropoutRate,
 		                         trainingConfig.transformer.residualDropoutRate,
-		                         trainingConfig.gradientCheckpointing);
+		                         trainingConfig.gradientCheckpointing,
+		                         trainingConfig.transformer.mtpDepth,
+		                         vocabSize);
 
 		// Load x[t] for this sequence into scratch.x (non-tokenLM).
 		// In tokenLM mode, inputs are token ids (ints) and scratch.x is unused.
