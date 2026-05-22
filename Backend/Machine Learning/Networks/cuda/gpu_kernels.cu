@@ -9062,6 +9062,134 @@ bool scfa_dct_basis_init(float* B_flat, int T, int k)
 	return true;
 }
 
+// =========================================================================
+// QK-Norm: per-token, per-head L2 normalization.
+//
+// Used by attention to L2-normalize Q and K rows before the dot product,
+// replacing the fixed 1/sqrt(dHead) scale with a learnable per-head γ
+// (multiplied externally — this kernel only does the unit normalization).
+//
+// At the call site (Task 2.5), Q is normalized first, then pre-multiplied
+// by γ·sqrt(dHead) so the attention kernel's existing 1/sqrt(dHead) scale
+// recovers γ * (Q_norm · K_norm).
+//
+// Reduction: warp-shuffle for the ||x||² sum, then shared-mem combine
+// across warps. Deterministic within a warp (matches existing LayerNorm
+// reduction pattern).
+// =========================================================================
+
+__global__ void qknorm_forward_kernel(float* __restrict__ x,
+                                      float* __restrict__ invNorm,
+                                      int nHeads, int dHead, float eps)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float* row = x + ((size_t)t * nHeads + h) * dHead;
+
+	float local = 0.0f;
+	for (int i = tid; i < dHead; i += block) local += row[i] * row[i];
+
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) warpSums[0] = s;
+	}
+	__syncthreads();
+
+	const float ss = warpSums[0];
+	const float invN = rsqrtf(ss + eps);
+
+	if (tid == 0) invNorm[(size_t)t * nHeads + h] = invN;
+
+	for (int i = tid; i < dHead; i += block) row[i] *= invN;
+}
+
+bool qknorm_forward_gpu(float* x, float* invNorm,
+                        int T, int nHeads, int dHead, float eps)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	qknorm_forward_kernel<<<grid, block, 0, computeStream()>>>(
+	    x, invNorm, nHeads, dHead, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// QK-Norm backward.
+// xNorm, dxNorm, dxOrig: (T, nHeads * dHead).
+// invNorm: (T, nHeads).
+// dx = invN * (dxNorm - (xNorm · dxNorm) * xNorm)
+__global__ void qknorm_backward_kernel(const float* __restrict__ xNorm,
+                                       const float* __restrict__ invNorm,
+                                       const float* __restrict__ dxNorm,
+                                       int nHeads, int dHead,
+                                       float* __restrict__ dxOrig)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	const size_t off = ((size_t)t * nHeads + h) * dHead;
+	const float* xn = xNorm + off;
+	const float* dn = dxNorm + off;
+	float* dox = dxOrig + off;
+
+	float local = 0.0f;
+	for (int i = tid; i < dHead; i += block) local += xn[i] * dn[i];
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) warpSums[0] = s;
+	}
+	__syncthreads();
+
+	const float xnDotDn = warpSums[0];
+	const float ni = invNorm[(size_t)t * nHeads + h];
+
+	for (int i = tid; i < dHead; i += block)
+		dox[i] = ni * (dn[i] - xnDotDn * xn[i]);
+}
+
+bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
+                         const float* dxNorm, int T, int nHeads, int dHead,
+                         float* dxOrig)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	qknorm_backward_kernel<<<grid, block, 0, computeStream()>>>(
+	    xNorm, invNorm, dxNorm, nHeads, dHead, dxOrig);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

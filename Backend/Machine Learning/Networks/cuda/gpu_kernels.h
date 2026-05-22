@@ -1047,6 +1047,18 @@ void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spit
                            size_t width, size_t height);
 void device_memset_bytes(void* ptr, int value, size_t bytes);
 
+// ---------------------------------------------------------------------------
+// QK-Norm GPU kernels (Task 2.3). Forward: per-token, per-head L2 normalize
+// in place; writes invNorm[t,h] = 1/||x_orig|| for backward. Backward:
+// jacobian of the normalize step.
+// ---------------------------------------------------------------------------
+bool qknorm_forward_gpu(float* x, float* invNorm,
+                        int T, int nHeads, int dHead, float eps);
+
+bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
+                         const float* dxNorm, int T, int nHeads, int dHead,
+                         float* dxOrig);
+
 } // namespace gpu
 } // namespace glades
 
@@ -1250,6 +1262,9 @@ inline void device_memcpy_h2d(void*, const void*, size_t) {}
 inline void device_memcpy_d2h(void*, const void*, size_t) {}
 inline void device_memcpy_2d_d2d(void*, size_t, const void*, size_t, size_t, size_t) {}
 inline void device_memset_bytes(void*, int, size_t) {}
+
+inline bool qknorm_forward_gpu(float*, float*, int, int, int, float) { return false; }
+inline bool qknorm_backward_gpu(const float*, const float*, const float*, int, int, int, float*) { return false; }
 
 } // namespace gpu
 } // namespace glades
