@@ -10984,6 +10984,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			// H2D copy logZ for Z-loss backward (populated by CPU forward).
 			gpuTransformerScratch->logZ.uploadAsync(
 			    &transformerScratch.logZ[0], static_cast<size_t>(T));
+			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 			// dLogits = probs - one_hot(targets) [+ Z-loss gradient when zlossCoef > 0]
 			gpu::softmax_cross_entropy_bwd_zloss(
