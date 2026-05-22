@@ -5492,6 +5492,13 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 					sh.push_back(static_cast<uint64_t>(dModel));
 					tensorsToWrite.push_back(TensorWriteRef(oss.str(), &b.ln1Gamma, dt, sh));
 				}
+				if (!b.qknormGamma.empty())
+				{
+					std::ostringstream oss; oss << "tr.b" << li << ".qknormGamma";
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(nHeads));
+					tensorsToWrite.push_back(TensorWriteRef(oss.str(), &b.qknormGamma, dt, sh));
+				}
 				{
 					std::ostringstream oss; oss << "tr.b" << li << ".ln1Beta";
 					std::vector<uint64_t> sh;
@@ -6594,6 +6601,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				sh.push_back(static_cast<uint64_t>(dModel));
 				expected.push_back(TensorReadRef(oss.str(), &b.ln1Gamma, dt, sh));
 			}
+			if (!b.qknormGamma.empty())
+			{
+				std::ostringstream oss; oss << "tr.b" << li << ".qknormGamma";
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(nHeads));
+				expected.push_back(TensorReadRef(oss.str(), &b.qknormGamma, dt, sh));
+			}
 			{
 				std::ostringstream oss; oss << "tr.b" << li << ".ln1Beta";
 				std::vector<uint64_t> sh;
@@ -6982,6 +6996,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	optionalNames.insert("tr.v2LnFinalGamma");
 	optionalNames.insert("tr.mLnFinalBeta");
 	optionalNames.insert("tr.v2LnFinalBeta");
+	// QK-Norm gamma tensors are optional (old checkpoints won't have them).
+	for (size_t i = 0; i < expected.size(); ++i)
+	{
+		if (expected[i].name.find(".qknormGamma") != std::string::npos)
+			optionalNames.insert(expected[i].name);
+	}
 	// ATLAS tensors are optional (old checkpoints won't have them).
 	for (size_t i = 0; i < expected.size(); ++i)
 	{

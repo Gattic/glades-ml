@@ -2671,6 +2671,20 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Beta.assign(dModel, 0.0f);
 			b.gLn1Gamma.assign(dModel, 0.0f);
 			b.gLn1Beta.assign(dModel, 0.0f);
+			// QK-Norm γ init: log2(T) per DeepSeek-V3, or qkNormGammaInit override.
+			// T is not directly in scope here; use 14.0f = log2(16384) as the
+			// CHIRON 1B-appropriate default (qkNormGammaInit overrides this).
+			if (trainingConfig.transformer.qkNormEnabled)
+			{
+				const float gammaInit = (trainingConfig.transformer.qkNormGammaInit > 0.0f)
+				                          ? trainingConfig.transformer.qkNormGammaInit
+				                          : 14.0f; // log2(16384), CHIRON 1B flagship T
+				b.qknormGamma.assign(nHeads, gammaInit);
+				b.gQknormGamma.assign(nHeads, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) b.mQknormGamma.assign(nHeads, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) b.v2QknormGamma.assign(nHeads, 0.0f);
+			}
+			// When qkNormEnabled is false, vectors stay empty — sentinel for "not in use".
 			b.ln2Gamma.assign(dModel, 1.0f);
 			b.ln2Beta.assign(dModel, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) b.mLn2Gamma.assign(dModel, 0.0f);

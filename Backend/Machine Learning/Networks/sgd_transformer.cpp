@@ -1162,6 +1162,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				TensorTransformerState::Block& b = tt.blocks[l];
 				std::fill(b.gLn1Gamma.begin(), b.gLn1Gamma.end(), 0.0f);
 				std::fill(b.gLn1Beta.begin(), b.gLn1Beta.end(), 0.0f);
+				if (!b.gQknormGamma.empty())
+					std::fill(b.gQknormGamma.begin(), b.gQknormGamma.end(), 0.0f);
 				std::fill(b.gWq.begin(), b.gWq.end(), 0.0f);
 				std::fill(b.gWk.begin(), b.gWk.end(), 0.0f);
 				std::fill(b.gWv.begin(), b.gWv.end(), 0.0f);
@@ -5151,6 +5153,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5206,6 +5214,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5256,6 +5270,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5293,6 +5313,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5330,6 +5356,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5367,6 +5399,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5404,6 +5442,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5453,6 +5497,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5490,6 +5540,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5509,6 +5565,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						if (!b.qknormGamma.empty())
+						{
+							Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+							                   b.gQknormGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t,
+							                   eps, invBatch, gradScale);
+						}
 						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5556,6 +5618,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								"SGDHelper_Transformer: ATLAS block bias/LN update produced NaN/Inf");
 							net.storeRunningFlag(false);
 							return false;
+						}
+						if (!b.qknormGamma.empty())
+						{
+							if (!atlas::updateBias(&b.qknormGamma[0], &b.gQknormGamma[0],
+							                       static_cast<unsigned int>(b.qknormGamma.size()),
+							                       invBatch, lr, gradScale))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ATLAS qknormGamma update produced NaN/Inf");
+								net.storeRunningFlag(false);
+								return false;
+							}
 						}
 					}
 				}
@@ -5987,6 +6061,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						net.storeRunningFlag(false);
 						return false;
 					}
+					if (!b.qknormGamma.empty())
+					{
+						if (!atlas::updateBias(&b.qknormGamma[0], &b.gQknormGamma[0],
+						                       static_cast<unsigned int>(b.qknormGamma.size()),
+						                       invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: VESTA qknormGamma update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
+					}
 				}
 
 				// Final LayerNorm (block-0 LR, no weight decay)
@@ -6147,6 +6233,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							"SGDHelper_Transformer: HELIOS block bias/LN update produced NaN/Inf");
 						net.storeRunningFlag(false);
 						return false;
+					}
+					if (!b.qknormGamma.empty())
+					{
+						if (!atlas::updateBias(&b.qknormGamma[0], &b.gQknormGamma[0],
+						                       static_cast<unsigned int>(b.qknormGamma.size()),
+						                       invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: HELIOS qknormGamma update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
 					}
 				}
 
@@ -6329,6 +6427,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lrBase * groupScaleCursor.next(b.b1, b.mB1, b.v2B1, b.gB1), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lrBase * groupScaleCursor.next(b.b2, b.mB2, b.v2B2, b.gB2), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lrBase * groupScaleCursor.next(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					if (!b.qknormGamma.empty())
+					{
+						Adam::update_param(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma,
+						                   b.gQknormGamma, lrBase * groupScaleCursor.next(b.qknormGamma, b.mQknormGamma, b.v2QknormGamma, b.gQknormGamma),
+						                   beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lrBase * groupScaleCursor.next(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lrBase * groupScaleCursor.next(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lrBase * groupScaleCursor.next(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);

@@ -94,6 +94,16 @@
 			std::vector<float> gLn1Gamma;
 			std::vector<float> gLn1Beta;
 
+			// QK-Norm: per-head learnable scalar replacing 1/sqrt(dHead).
+			// Size = nHeads when qkNormEnabled at init time; otherwise empty.
+			// Empty vectors are the sentinel for "QK-Norm not in use" — every
+			// optimizer/gradient-zero site checks .empty() and short-circuits,
+			// preserving bit-identical baseline behavior.
+			std::vector<float> qknormGamma;
+			std::vector<float> gQknormGamma;
+			std::vector<float> mQknormGamma;
+			std::vector<float> v2QknormGamma;
+
 			// Self-attention linear projections (packed as [dModel, dModel])
 			std::vector<float> Wq, Wk, Wv, Wo;
 			// Low-precision copies (optional; used when TrainingConfig::mixedPrecision.enable).
