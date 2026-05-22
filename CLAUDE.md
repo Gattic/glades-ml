@@ -2,57 +2,73 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (iter 116 10-mechanism ship 2026-05-21)
+## Current Production Flagship — CHIRON 1B @ T=16384 (v5+FP8 ship 2026-05-22)
 
-The current production LLM flagship is **CHIRON 1B iter 116 stack**
-(checkpoint `chiron_1B_T16384_iter116_treatment_phase2.final`):
+The current production LLM flagship is **CHIRON 1B v5+FP8 stack**
+(checkpoint `chiron_1B_T16384_v5_fp8_phase2.final`):
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context.
 - **Params**: 870.94M (~"1B").
-- **Stack**: iter 94 triple-stack (SCFA + BF16-everywhere + int8-Adam +
-  fuse-attn-reln + iter70-fused-axpy2-dual-p + iter73-dwconv-fwd-tiled +
-  scfa-checkpoint-inner-bf16 + conv-w=4) PLUS **10 mechanisms from the
-  iter 95-117 ralph-loop session**:
-  - **iter 97**: smem-load arith (fused scfa_sub into fwd dwconv tile)
-  - **iter 99**: dual-output writes (bwd dwconv dx + axpy fold)
-  - **iter 101**: dual-output side-write (bwd recompute fused sub)
-  - **iter 103**: bwd dy memcpy skip (3.2 GB/step buffer rename)
-  - **iter 106**: bwd yperp.zero() skip (3.2 GB/step pre-zero redundant)
-  - **iter 107**: cuBLAS beta=0 + 3 caller memsets (unconditional library)
-  - **iter 109**: bwd dq_buf.zero() skip (3.2 GB/step pre-zero redundant)
-  - **iter 113**: Plan A buffer alternation (3.2 GB/step memcpy elimination)
-  - **iter 115**: bwd softmax + softmax_backward_attn fusion (unconditional library)
-  - **iter 116**: chiron_scfa_scaled_copy elimination (sign=1 buffer aliasing)
-
-  All 10 mechanisms are NOW DEFAULTS in `chiron_main.cpp` (8 trainer flags
-  default ON, 2 unconditional library changes in glades-ml gpu_kernels.cu +
-  gpu_chiron.cu). Mechanism class: "eliminate redundant memory ops".
-- **Perf**: **28,257 tok/s** @ T=16384 (was 25,103 at iter 94 ship,
-  **+12.56%**; 13.22/15.56 GB VRAM same), **final val NLL 4.2039 @ step
-  30000** (iter 94 baseline at same recipe gives 4.1983; Δ +0.0056 nat,
-  well within strict ±0.02). Cumulative since pre-ralph-loop 15,200 tok/s:
-  **1.86×**.
+- **Stack**: iter 116 ship 10-mechanism stack (see "Prior iter 116 flagship"
+  below for the full mechanism list) **PLUS two new layers landed 2026-05-21
+  / 2026-05-22**:
+  - **CUDA 13.2 toolchain** (was CUDA 12.0): cuBLAS 13.x BF16 GEMM dispatch.
+  - **v5 BF16-cast fix** in `Backend/Machine Learning/Networks/cuda/gpu_blas.cu`:
+    `sgemm_rowmajor_fast16bf_impl` pre-casts FP32 inputs to BF16 scratch +
+    dispatches `cublasGemmEx` with `CUDA_R_16BF` inputs. Forces cuBLAS 13's
+    `ampere_s1688gemm_bf16_*` fast path on Ada (without this, cuBLAS 13's
+    heuristic for FP32-input FAST_16BF dispatches a non-BF16-specialized
+    kernel ~1.82× slower per call on iter 116 ship shapes — a -15.18%
+    regression vs CUDA 12.0 if unfixed).
+  - **`scfa_B` constant cache**: trainer pre-casts the DCT-II basis to BF16
+    once at SCFA init and registers it via the new `register_fast16bf_constant`
+    API. The 216 SCFA outer GEMMs/step skip the per-call A-side cast.
+  - **`--fp8-readout-fwd` enabled**: 3 readout GEMMs/step route through
+    cuBLASLt FP8 (E4M3) at shape (T=16384, V=32000, m=2048) ≈ 1 TFLOP each.
+    Adds +1.59% wall on top of v5 fix at strict NLL parity. Unblocked by
+    CUDA 13.2 cuBLASLt FP8 algo coverage on Ada (was blocked on CUDA 12.0
+    per `ITER62_FP8_READOUT_NULL.md`).
+- **Perf**: **28,887 tok/s** @ T=16384 (was 28,257 at iter 116 ship,
+  **+2.23%**; 14.97/15.56 GB VRAM, same as iter 116 ship), **final val NLL
+  4.1717 @ step 30000** (iter 94 baseline at same recipe gives 4.1983; Δ
+  **−0.0266 nat BETTER**, far within strict ±0.02). Mean trajectory drift
+  vs iter 116 ship across 10 val checkpoints: +0.00007 nat (essentially
+  zero). Cumulative since pre-ralph-loop 15,200 tok/s: **1.90×**.
 - **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship`
-  (no extra flags needed — 10 mechanisms are now defaults).
+  (10 iter 116 mechanisms default; **append `--fp8-readout-fwd`** until the
+  flag is added to the flagship recipe in run.sh — or invoke
+  `./build/glades_chiron_train` directly per the Reproduction block in
+  `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md`).
 - **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
-- **Full spec**: `research/FLAGSHIP_T16384_2026_05_14.md` (see "iter 116
-  ship" section at bottom for the 10-mechanism stack details).
-- **Phase 2 evidence**: `research/ITER116_30K_PHASE2_PASS.md` (apples-to-apples
-  30k retrain vs iter 94 triple-stack baseline; ship-clean PASS at
-  +12.52% wall + 0.0056 nat strict NLL parity).
+- **Full spec**: `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md` (Phase 2
+  ship doc with full trajectory table) and `research/CUDA13_BF16_REGRESSION_FIX_2026_05_21.md`
+  (diagnosis + fix details). Also see `research/FLAGSHIP_T16384_2026_05_14.md`
+  for the iter 116 ship 10-mechanism details that v5+FP8 builds on.
+- **Phase 2 evidence**: `research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md`
+  (apples-to-apples 30k retrain vs iter 116 ship & iter 94 triple-stack
+  baselines; ship-clean PASS at +2.23% wall + −0.0322 nat NLL improvement
+  vs iter 116 ship).
+- **FP8 path evidence**: `research/FP8_READOUT_CUDA13_REVAL_2026_05_21.md`
+  (n=3 multi-seed at 200 steps showing +1.38% standalone wall on CUDA 13.2,
+  strict NLL parity).
 - **Per-mechanism evidence**: `research/ITER<N>_*.md` for N ∈ {97, 99, 100,
-  101, 103, 106, 107, 109, 113, 115, 116} (8 PASS realizations + 2
-  unconditional library + 2 multi-seed validations).
+  101, 103, 106, 107, 109, 113, 115, 116} (the iter 116 ship's 10 mechanisms).
 - **Phase-3 program** (improving CHIRON 1B via novel research, no external
   libs / no external baselines): pre-registration in
   `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
-  anchor on the iter 116 ship flagship as the baseline.
+  anchor on the v5+FP8 flagship as the baseline.
+
+**Prior iter 116 ship** (`chiron_1B_T16384_iter116_treatment_phase2.final`,
+28,257 tok/s, NLL 4.2039 @ 30k, on CUDA 12.0) is archived at
+`database/checkpoints/chiron_1B_T16384_iter116_treatment_phase2/` and remains
+loadable into the v5+FP8 flagship (math is bit-identical at single-element
+FP32 between iter 116 ship and v5; v5+FP8 adds a bounded FP8 readout drift
+of ~0.005-0.007 nat per iter 62 design). The iter 116 ship was the CUDA 12.0
+production flagship; v5+FP8 ships the CUDA 13.2 equivalent + FP8 readout.
 
 **Prior iter 94 flagship** (`chiron_1B_T16384_triple_phase2.final`, 25,103
 tok/s, NLL 4.1983) is archived at `database/checkpoints/chiron_1B_T16384_triple_phase2/`
-and remains loadable into the new flagship (math is bit-identical at
-single-element FP32; iter 116 ship is purely memory-op elimination
-with sub-ULP cuBLAS-scheduling drift only). The iter 94 baseline
+and remains loadable. The iter 94 baseline
 `chiron_1B_T16384_baseline_phase2.final` (24,246 tok/s, NLL 4.2228) is
 the pre-w=4 archive at `database/checkpoints/chiron_1B_T16384_baseline_phase2/`.
 
