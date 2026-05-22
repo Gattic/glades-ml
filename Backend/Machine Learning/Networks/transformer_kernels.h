@@ -1131,12 +1131,14 @@ inline void softmax_stable_into(const float* logits, size_t n, float* probsOut)
 inline void softmax_ce_with_zloss(const float* logits, int cols, int target,
                                   float zlossCoef, float* ceOut, float* zlossOut)
 {
-	// Compute logsumexp in a numerically stable way.
+	// Compute logsumexp in a numerically stable way, accumulating into a
+	// double to match the project's softmax_stable_into pattern (FP32
+	// accumulation across V=32000 introduces meaningful rounding error).
 	float maxLogit = logits[0];
 	for (int i = 1; i < cols; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
-	float sumExp = 0.0f;
-	for (int i = 0; i < cols; ++i) sumExp += expf(logits[i] - maxLogit);
-	const float lse = maxLogit + logf(sumExp);
+	double sumExp = 0.0;
+	for (int i = 0; i < cols; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+	const float lse = maxLogit + static_cast<float>(log(sumExp));
 
 	// Main CE: -log(softmax(logits)[target]) = lse - logits[target].
 	*ceOut = lse - logits[target];

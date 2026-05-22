@@ -16350,14 +16350,15 @@ void CHIRONZlossDisabledParityTest()
 	const float logits[4] = {1.0f, 0.5f, -0.5f, 0.0f};
 	const int target = 0;
 
-	// Compute reference CE = -log(softmax[target]).
+	// Compute reference CE = -log(softmax[target]) using the SAME double
+	// accumulator pattern as softmax_ce_with_zloss (matches softmax_stable_into).
 	float lse = 0.0f;
 	{
 		float maxLogit = logits[0];
 		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
-		float sumExp = 0.0f;
-		for (int i = 0; i < 4; ++i) sumExp += expf(logits[i] - maxLogit);
-		lse = maxLogit + logf(sumExp);
+		double sumExp = 0.0;
+		for (int i = 0; i < 4; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+		lse = maxLogit + static_cast<float>(log(sumExp));
 	}
 	const float refCE = lse - logits[target];
 
@@ -16378,9 +16379,9 @@ void CHIRONZlossDisabledParityTest()
 	{
 		float maxLogit = logits[0];
 		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
-		float sumExp = 0.0f;
-		for (int i = 0; i < 4; ++i) sumExp += expf(logits[i] - maxLogit);
-		for (int i = 0; i < 4; ++i) probs[i] = expf(logits[i] - maxLogit) / sumExp;
+		double sumExp = 0.0;
+		for (int i = 0; i < 4; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+		for (int i = 0; i < 4; ++i) probs[i] = expf(logits[i] - maxLogit) / static_cast<float>(sumExp);
 	}
 	float refGrad[4];
 	for (int i = 0; i < 4; ++i) refGrad[i] = probs[i] - (i == target ? 1.0f : 0.0f);
