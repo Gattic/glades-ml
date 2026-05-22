@@ -7053,6 +7053,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					const float py = clamp_prob01(transformerScratch.probs[off + static_cast<unsigned int>(yid)]);
 					tokenLmNllSum += -log(static_cast<double>(py));
+					// Z-loss contribution: λ_z * lse². lse is cached in logZ by transformerCpuForwardPass.
+					// Guarded by coef check so coef==0 is bit-identical to baseline (no FP ops affect runLoss).
+					if (trainingConfig.transformer.zlossCoef != 0.0f)
+						tokenLmNllSum += static_cast<double>(trainingConfig.transformer.zlossCoef * (transformerScratch.logZ[static_cast<size_t>(t)] * transformerScratch.logZ[static_cast<size_t>(t)]));
 					++tokenLmTokenCount;
 					if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
 					{
@@ -7990,11 +7994,35 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 	// Softmax / sigmoid / identity
 	if (tokenLM)
 	{
+		const bool fullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
 		for (unsigned int t = 0; t < T; ++t)
 		{
 			const size_t off = static_cast<size_t>(t) * static_cast<size_t>(scratchOutSize);
 			glades::transformer_kernels::softmax_stable_into(&transformerScratch.logits[off], static_cast<size_t>(scratchOutSize),
 			                                                &transformerScratch.probs[off]);
+			// Z-loss: cache per-position logsumexp (lse) for the backward pass (Task 1.4).
+			// Only the full-softmax path exposes the full vocab logit row.
+			// lse is reconstructed as: softmax_ce_with_zloss gives ceVal = lse - logits[target],
+			// so lse = ceVal + logits[target].
+			// At zlossCoef == 0 the helper still computes lse (cheap); the caller decides
+			// whether to add the Z-loss term to runLoss (see the metrics block below).
+			if (fullSoftmax)
+			{
+				const int yid = targetIds[static_cast<size_t>(t)];
+				const int safeTarget = (yid >= 0 && static_cast<unsigned int>(yid) < vocabSize) ? yid : 0;
+				const int cols = static_cast<int>(scratchOutSize);
+				float ceVal = 0.0f;
+				float zlossValUnused = 0.0f;
+				// Pass zlossCoef=0: we only need lse (ceVal = lse - logits[target]).
+				// The Z-loss term is accumulated in the metrics loop below where tokenLmNllSum
+				// is accessible. zlossValUnused is written by the helper but not read here.
+				glades::transformer_kernels::softmax_ce_with_zloss(
+				    &transformerScratch.logits[off], cols, safeTarget,
+				    0.0f, &ceVal, &zlossValUnused);
+				// lse = ceVal + logits[safeTarget]
+				transformerScratch.logZ[static_cast<size_t>(t)] =
+				    ceVal + transformerScratch.logits[off + static_cast<size_t>(safeTarget)];
+			}
 		}
 	}
 	else if (((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL)) && (outSize > 1u))

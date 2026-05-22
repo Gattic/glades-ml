@@ -1472,6 +1472,11 @@ private:
 		// When sampled-softmax is enabled, logits/probs are sized [T, (1+K)] and tokenLmSampleIds
 		// holds the vocabulary indices for each sampled column (col 0 is always the target id).
 		std::vector<int> tokenLmSampleIds; // [T, outSize] (only used for token LM sampled-softmax)
+		// Z-loss scratch: per-position logsumexp(logits) over full vocab.
+		// Populated by transformerCpuForwardPass (full-softmax tokenLM path) and read by the
+		// backward pass (Task 1.4 GPU kernel). Sized [T]. Always populated regardless of
+		// zlossCoef so the backward kernel has access when coef > 0 at inference time.
+		std::vector<float> logZ; // [T]
 
 		// === Backward scratch (reused across sequences/layers; aligned) ===
 		// These buffers eliminate per-sequence/per-layer allocations in transformer backward.
@@ -1620,6 +1625,9 @@ private:
 			if (tokenLmSampleIds.size() != static_cast<size_t>(T) * static_cast<size_t>(outSize))
 				tokenLmSampleIds.resize(static_cast<size_t>(T) * static_cast<size_t>(outSize));
 			std::fill(tokenLmSampleIds.begin(), tokenLmSampleIds.end(), 0);
+			// logZ: one logsumexp per position; always allocated for the backward kernel.
+			if (logZ.size() != static_cast<size_t>(T))
+				logZ.resize(static_cast<size_t>(T), 0.0f);
 
 			// Backward scratch (not per-layer; reused across the backward pass)
 			// Note: we do not rely on these being zeroed except where explicitly filled in the hot path.
