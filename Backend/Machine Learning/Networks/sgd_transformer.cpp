@@ -10981,20 +10981,34 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 		if (tokenLM)
 		{
-			// H2D copy logZ for Z-loss backward (populated by CPU forward).
-			gpuTransformerScratch->logZ.uploadAsync(
-			    &transformerScratch.logZ[0], static_cast<size_t>(T));
-			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
-			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
+			const float zlossCoefLocal = trainingConfig.transformer.zlossCoef;
+			if (zlossCoefLocal != 0.0f)
+			{
+				// Z-loss path: upload logZ (64 KB H2D), sync, dispatch zloss-aware kernel.
+				gpuTransformerScratch->logZ.uploadAsync(
+				    &transformerScratch.logZ[0], static_cast<size_t>(T));
+				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
-			// dLogits = probs - one_hot(targets) [+ Z-loss gradient when zlossCoef > 0]
-			gpu::softmax_cross_entropy_bwd_zloss(
-			    gpuTransformerScratch->probs.data(),
-			    gpuTransformerScratch->gpuTargetsT.data(),
-			    gpuTransformerScratch->logZ.data(),
-			    trainingConfig.transformer.zlossCoef,
-			    static_cast<int>(T), static_cast<int>(vocabSize),
-			    gpuTransformerScratch->dLogits.data());
+				// dLogits = probs - one_hot(targets) + Z-loss gradient
+				gpu::softmax_cross_entropy_bwd_zloss(
+				    gpuTransformerScratch->probs.data(),
+				    gpuTransformerScratch->gpuTargetsT.data(),
+				    gpuTransformerScratch->logZ.data(),
+				    zlossCoefLocal,
+				    static_cast<int>(T), static_cast<int>(vocabSize),
+				    gpuTransformerScratch->dLogits.data());
+			}
+			else
+			{
+				// Default (no Z-loss) path: skip H2D upload + stream sync overhead.
+				// dLogits = probs - one_hot(targets)
+				gpu::softmax_cross_entropy_bwd(
+				    gpuTransformerScratch->probs.data(),
+				    gpuTransformerScratch->gpuTargetsT.data(),
+				    static_cast<int>(T), static_cast<int>(vocabSize),
+				    gpuTransformerScratch->dLogits.data());
+			}
 
 			// Backprop tied LM head: logits = hPostFinalLN * E^T + lmBias
 			// dH (w.r.t. hPostFinalLN) = dLogits * E

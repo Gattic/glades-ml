@@ -49,7 +49,9 @@ bool rmsnorm_backward(const float* dout, const float* x,
 // Numerically-stable row-wise softmax.
 bool softmax_forward(const float* x, int rows, int cols, float* out);
 
-// Fused softmax-cross-entropy backward: dlogits = probs - one_hot(targets).
+// Standard softmax-CE backward. The trainer dispatches this when
+// zlossCoef == 0.0f; otherwise it dispatches softmax_cross_entropy_bwd_zloss.
+// Both produce bit-identical output at zlossCoef == 0.0f.
 bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
                                int rows, int cols, float* dlogits);
 
