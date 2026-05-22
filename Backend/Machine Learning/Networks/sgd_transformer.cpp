@@ -7757,6 +7757,32 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		linear_forward_maybe_lowp(x1, T, dModel, kProj, dModelKV, K);
 		linear_forward_maybe_lowp(x1, T, dModel, vProj, dModelKV, V);
 
+		// QK-Norm forward (when enabled): L2-normalize Q and K per head per token,
+		// then pre-multiply Q by γ_h · sqrt(dHead) so the attention kernel's
+		// existing 1/sqrt(dHead) scale recovers γ_h · (Q_norm · K_norm^T).
+		// V is not normalized.
+		if (!b.qknormGamma.empty())
+		{
+			const float sqrtDh = sqrtf(static_cast<float>(dHead));
+
+			// L2 normalize Q and K in place.
+			glades::transformer_kernels::qknorm_forward(
+				Q, static_cast<int>(T), static_cast<int>(nHeads), static_cast<int>(dHead), 1e-6f);
+			glades::transformer_kernels::qknorm_forward(
+				K, static_cast<int>(T), static_cast<int>(nKVHeads), static_cast<int>(dHead), 1e-6f);
+
+			// Pre-multiply Q by γ_h · sqrt(dHead) per head.
+			for (unsigned int t2 = 0; t2 < T; ++t2)
+			{
+				for (unsigned int h2 = 0; h2 < nHeads; ++h2)
+				{
+					float* qRow = Q + ((size_t)t2 * nHeads + h2) * dHead;
+					const float scale = b.qknormGamma[h2] * sqrtDh;
+					for (unsigned int i = 0; i < dHead; ++i) qRow[i] *= scale;
+				}
+			}
+		}
+
 		// RoPE
 		if (useRope && ropeInvFreq)
 		{
