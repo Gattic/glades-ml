@@ -16545,6 +16545,27 @@ void CHIRONMtpDisabledParityTest()
 // TDD placeholder — implementation in Task 3.2
 void CHIRONMtpTargetShiftTest()
 {
-	std::printf("  [mtp target shift] TDD placeholder — not yet implemented\n");
+	// Verify: targetsMtp[t] = targetIds[t+1] for t in [0, T-1),
+	// and targetsMtp[T-1] = ignoreLabel (-1).
+	const int T = 8;
+	std::vector<int> targetIds(T);
+	for (int t = 0; t < T; ++t) targetIds[t] = 100 + t;  // synthetic IDs
+
+	std::vector<int> targetsMtp(T, -999);
+	glades::transformer_kernels::compute_mtp_targets(
+	    &targetIds[0], T, /*ignoreLabel=*/-1, &targetsMtp[0]);
+
+	for (int t = 0; t < T - 1; ++t)
+	{
+		ASSERT("mtp_target: shift +1 matches", targetsMtp[t] == 100 + t + 1);
+	}
+	ASSERT("mtp_target: last position is ignore label", targetsMtp[T - 1] == -1);
+
+	// Edge case: T=1 (should set only the ignore label, no shift).
+	std::vector<int> targetsMtpT1(1, -999);
+	const int single = 42;
+	glades::transformer_kernels::compute_mtp_targets(
+	    &single, 1, /*ignoreLabel=*/-1, &targetsMtpT1[0]);
+	ASSERT("mtp_target: T=1 sets ignore label", targetsMtpT1[0] == -1);
 }
 

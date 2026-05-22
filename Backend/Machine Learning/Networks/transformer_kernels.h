@@ -1628,5 +1628,16 @@ inline void gelu_backward_buf(const float* x, float* dAct, size_t n)
 		}
 	}
 
+	// Compute MTP +2-offset target IDs from a sequence of +1-offset targets.
+	// targetIds[t] is the token at position t+1 (standard next-token target).
+	// targetsMtp[t] = targetIds[t+1] for t < T-1; targetsMtp[T-1] = ignoreLabel.
+	// Used by the MTP auxiliary head to predict the token 2 positions ahead.
+	inline void compute_mtp_targets(const int* targetIds, int T, int ignoreLabel,
+	                                int* targetsMtp)
+	{
+		for (int t = 0; t < T - 1; ++t) targetsMtp[t] = targetIds[t + 1];
+		if (T > 0) targetsMtp[T - 1] = ignoreLabel;
+	}
+
 } // namespace transformer_kernels
 } // namespace glades
