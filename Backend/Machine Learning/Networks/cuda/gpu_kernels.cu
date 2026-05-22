@@ -634,6 +634,55 @@ __global__ void softmax_stable_rows(const float* __restrict__ x,
 		oRow[i] *= invSum;
 }
 
+// softmax_stable_rows_with_lse: same as softmax_stable_rows but also writes
+// logZ[row] = log(sum_i exp(x[row,i])) = rowMax + log(rowSum).
+// Used by the Z-loss path so the backward can add 2*zlossCoef*logZ[t] to the
+// CE gradient without re-reading logits.
+__global__ void softmax_stable_rows_with_lse(const float* __restrict__ x,
+                                              int cols,
+                                              float* __restrict__ out,
+                                              float* __restrict__ logZ)
+{
+	int row = blockIdx.x;
+	const float* xRow = x + (size_t)row * cols;
+	float* oRow       = out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	// Pass 1: row max.
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, xRow[i]);
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	// Pass 2: sum of exp(x - max).
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float e = expf(xRow[i] - rowMax);
+		oRow[i] = e;
+		localSum += e;
+	}
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	// Pass 3: normalize and write logZ.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] *= invSum;
+	if (threadIdx.x == 0)
+		logZ[row] = rowMax + logf(sRowSum);
+}
+
 } // anonymous namespace
 
 bool softmax_forward(const float* x, int rows, int cols, float* out)
@@ -642,6 +691,19 @@ bool softmax_forward(const float* x, int rows, int cols, float* out)
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
 	softmax_stable_rows<<<rows, block, smemBytes, computeStream()>>>(x, cols, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// softmax_forward_with_lse: identical to softmax_forward but also writes
+// logZ[rows] = log-sum-exp per row.  Required by the Z-loss backward path.
+bool softmax_forward_with_lse(const float* x, int rows, int cols,
+                               float* out, float* logZ)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows_with_lse<<<rows, block, smemBytes, computeStream()>>>(x, cols, out, logZ);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

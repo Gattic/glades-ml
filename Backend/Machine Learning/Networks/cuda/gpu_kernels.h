@@ -49,6 +49,12 @@ bool rmsnorm_backward(const float* dout, const float* x,
 // Numerically-stable row-wise softmax.
 bool softmax_forward(const float* x, int rows, int cols, float* out);
 
+// Same as softmax_forward but also writes logZ[rows] = log(sum_i exp(x[row,i])).
+// Required by the Z-loss backward path — logZ must be a device buffer of
+// length rows.
+bool softmax_forward_with_lse(const float* x, int rows, int cols,
+                               float* out, float* logZ);
+
 // Standard softmax-CE backward. The trainer dispatches this when
 // zlossCoef == 0.0f; otherwise it dispatches softmax_cross_entropy_bwd_zloss.
 // Both produce bit-identical output at zlossCoef == 0.0f.
@@ -1084,6 +1090,7 @@ inline bool rmsnorm_forward(const float*, const float*, float, int, int, float*,
 inline bool rmsnorm_backward(const float*, const float*, const float*, const float*, int, int, float*, float*) { return false; }
 
 inline bool softmax_forward(const float*, int, int, float*) { return false; }
+inline bool softmax_forward_with_lse(const float*, int, int, float*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_zloss(const float*, const int*, const float*, float, int, int, float*) { return false; }
 inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short*) { return false; }
