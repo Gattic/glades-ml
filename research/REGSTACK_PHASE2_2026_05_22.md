@@ -96,30 +96,72 @@ All four configs: no NaN/inf, no OOM, tok/s within 2% of baseline.
 
 ## 5k Pilot Results
 
-**Status: pending (in flight at ~$(date))**
+Pilots ran 2026-05-22 11:32 → 14:46 EDT (3h 14m total) via
+`run_regstack_pilots.sh`. Sequential single-seed on flagship recipe.
+Logs at `~/dev/glades-trainer/logs/regstack_b{0,1,2,4}.log`.
 
-Pilots launched via `run_regstack_pilots.sh` (sequential single-seed
-flagship recipe). Save scratch under `/tmp/regstack_b{0,1,2,4}_*`;
-logs in `logs/regstack_b{0,1,2,4}.log`.
+### Aggregate val NLL + Δ vs B0
 
-| ID | Steps | Config | Val NLL @ 5k | Δ vs B0 | tok/s | Peak VRAM |
-|---|---:|---|---:|---:|---:|---:|
-| B0 | 5000 | baseline | TBD | 0 | TBD | TBD |
-| B1 | 5000 | --zloss-coef 1e-4 | TBD | TBD | TBD | TBD |
-| B2 | 5000 | --qk-norm | TBD | TBD | TBD | TBD |
-| B4 | 5000 | B1 + B2 | TBD | TBD | TBD | TBD |
+| ID | Config | Val NLL @ 5k | Δ vs B0 | acc1 | acc5 | acc10 |
+|---|---|---:|---:|---:|---:|---:|
+| B0 | baseline | 4.9140 | 0 | 0.1204 | 0.4645 | 0.6850 |
+| B1 | --zloss-coef 1e-4 | 4.9207 | **+0.0067** | 0.1206 | 0.4624 | 0.6832 |
+| B2 | --qk-norm (γ=log₂T=14) | 3.9412 | **−0.9728** | 0.1258 | 0.5025 | 0.7766 |
+| B4 | B1 + B2 stacked | 3.9396 | **−0.9744** | 0.1263 | 0.5029 | 0.7775 |
 
-### Per-mechanism 5k gate evaluation
+### Position-stratified val NLL (8 buckets across T=16384)
 
-(filled in once pilots complete)
+| Bucket | Positions | B0 | B1 | B2 | B4 | Δ B2 vs B0 |
+|---:|---|---:|---:|---:|---:|---:|
+| 0 | 0–2047 | 4.89 | 4.89 | 3.81 | 3.81 | −1.08 |
+| 1 | 2048–4095 | 4.85 | 4.88 | 3.84 | 3.84 | −1.01 |
+| 2 | 4096–6143 | 4.92 | 4.98 | 3.92 | 3.92 | −1.00 |
+| 3 | 6144–8191 | 4.85 | 4.85 | 3.93 | 3.93 | −0.92 |
+| 4 | 8192–10239 | 4.87 | 4.87 | 3.93 | 3.94 | −0.94 |
+| 5 | 10240–12287 | 4.85 | 4.84 | 4.00 | 4.00 | −0.85 |
+| 6 | 12288–14335 | 4.96 | 4.96 | 4.07 | 4.07 | −0.89 |
+| 7 | 14336–16383 | 5.12 | 5.10 | 4.02 | 4.02 | **−1.10** |
 
-- **B1 (Z-loss)**: TBD
-- **B2 (QK-Norm)**: TBD
-- **B4 (stacked)**: TBD
+B0 shows the characteristic late-T degradation (4.85 plateau → 5.12 at
+bucket 7), the failure mode QK-Norm targets. B2 flattens this and shifts
+the entire profile down by ~1 nat, with deepest gains at the two extremes
+(bucket 0 and bucket 7). B4 is bit-similar to B2 (≤ 0.01 nat per bucket).
 
-### Decision tree application
+### Per-mechanism 5k gate evaluation (spec §3.2)
 
-(filled in once pilots complete)
+- **B1 (Z-loss 1e-4): PASS.** Δ = +0.0067 nat. Within the ±0.02 nat
+  "no regression" gate. Effectively no signal at 5k single-seed —
+  consistent with the spec's R-RegStack-1 risk note (Z-loss at 1e-4
+  is below the 5k noise floor, mechanism shows up at longer training).
+  Propagation verified: 20-step smoke showed +0.011 nat training-loss
+  shift matching `zlossCoef · log²(V)`.
+- **B2 (QK-Norm γ=14): PASS by huge margin.** Δ = −0.9728 nat. This is
+  ~10× the literature-reported QK-Norm gain at standard-T (typically
+  −0.03 to −0.08 nat). All metrics improve in lockstep: acc1 +0.54pp,
+  acc5 +3.8pp, acc10 +9.16pp. Position-stratified read confirms both
+  the long-context fix (bucket 7: −1.10) and a broad training-dynamics
+  improvement at all positions.
+- **B4 (stacked): PASS, additive at the QK-Norm level.** Δ = −0.9744 nat.
+  Z-loss contributes ~−0.0016 nat additional, essentially noise. The
+  spec's "Δ4 ≥ max(Δ1, Δ2)" condition holds, just barely.
+
+### Decision tree application (spec §3.3)
+
+Computing Δi = main-head val NLL improvement vs B0:
+- Δ1 = −0.0067 (Z-loss; technically negative but within ±0.02 noise)
+- Δ2 = +0.9728 (QK-Norm; massive)
+- Δ4 = +0.9744
+
+Test: Δ4 ≥ max(Δ1, Δ2)?
+  max(−0.0067, +0.9728) = +0.9728; Δ4 = +0.9744 ≥ +0.9728 ✓
+
+→ **B5 := B4 (stacked Z-loss + QK-Norm).**
+
+Note on the decision: B4 wins B2 by only 0.0016 nat (noise-level).
+Picking B5 := B4 retains Z-loss for the 30k retrain on the assumption
+that it may grow past noise at longer training. If B5 fails the 30k
+gate while B2-only would have passed, a follow-up 30k retrain at the
+B2-only config may be needed (acknowledged as an arc extension).
 
 ## B5 — 30k Phase 2 Retrain
 
