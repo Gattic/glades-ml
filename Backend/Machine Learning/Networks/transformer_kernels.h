@@ -1577,5 +1577,56 @@ inline void gelu_backward_buf(const float* x, float* dAct, size_t n)
 	}
 }
 
+	// QK-Norm forward: L2-normalize each row (per-head, per-token) in place.
+	// Input/output: x has shape (T, nHeads * dHead). Normalization is over
+	// dHead within each head, per token. Adds eps inside the norm for
+	// numerical safety.
+	inline void qknorm_forward(float* x, int T, int nHeads, int dHead, float eps)
+	{
+		for (int t = 0; t < T; ++t)
+		{
+			for (int h = 0; h < nHeads; ++h)
+			{
+				float* row = x + (size_t)t * nHeads * dHead + (size_t)h * dHead;
+				double ss = 0.0;
+				for (int i = 0; i < dHead; ++i)
+					ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+				const float invNorm = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+				for (int i = 0; i < dHead; ++i) row[i] *= invNorm;
+			}
+		}
+	}
+
+	// QK-Norm backward: given xNorm (post-norm), normInv = 1/||x_orig|| per
+	// (token, head), and dxNorm (gradient at normalized output), compute
+	// gradient at x_orig:
+	//   dx = normInv * (dxNorm - (xNorm · dxNorm) * xNorm)
+	// Operates per-token, per-head. xNorm, dxNorm, dxOrig all have shape
+	// (T, nHeads * dHead); normInv has shape (T, nHeads).
+	inline void qknorm_backward(const float* xNorm, const float* normInv,
+	                            const float* dxNorm, int T, int nHeads, int dHead,
+	                            float* dxOrig)
+	{
+		for (int t = 0; t < T; ++t)
+		{
+			for (int h = 0; h < nHeads; ++h)
+			{
+				const size_t off = (size_t)t * nHeads * dHead + (size_t)h * dHead;
+				const float* xn = xNorm + off;
+				const float* dn = dxNorm + off;
+				const float ni = normInv[(size_t)t * nHeads + h];
+
+				double xnDotDn = 0.0;
+				for (int i = 0; i < dHead; ++i)
+					xnDotDn += static_cast<double>(xn[i]) * static_cast<double>(dn[i]);
+
+				float* dox = dxOrig + off;
+				const float xnDotDnF = static_cast<float>(xnDotDn);
+				for (int i = 0; i < dHead; ++i)
+					dox[i] = ni * (dn[i] - xnDotDnF * xn[i]);
+			}
+		}
+	}
+
 } // namespace transformer_kernels
 } // namespace glades

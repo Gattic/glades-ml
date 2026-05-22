@@ -16458,7 +16458,82 @@ void CHIRONQkNormDisabledParityTest()
 // TDD placeholder — implementation in Task 2.2
 void CHIRONQkNormEnabledMathTest()
 {
-	std::printf("  [qknorm enabled math] TDD placeholder — not yet implemented\n");
+	// Tiny shape: T=2, nHeads=2, dHead=4.
+	const int T = 2;
+	const int nHeads = 2;
+	const int dHead = 4;
+	const float eps = 1e-6f;
+	std::vector<float> x(T * nHeads * dHead);
+	for (int i = 0; i < (int)x.size(); ++i) x[i] = (float)(i + 1);
+
+	// Reference: per (t, h) row, normalize by L2 norm using the SAME double
+	// accumulator pattern as qknorm_forward.
+	std::vector<float> ref(x);
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			float* row = &ref[(t * nHeads + h) * dHead];
+			double ss = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+			const float invN = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+			for (int i = 0; i < dHead; ++i) row[i] *= invN;
+		}
+	}
+
+	std::vector<float> got(x);
+	glades::transformer_kernels::qknorm_forward(&got[0], T, nHeads, dHead, eps);
+
+	float worst = max_abs_diff(got, ref);
+	ASSERT("qknorm_enabled: forward matches reference within 1e-6", worst < 1e-6f);
+
+	// Now verify backward: take a random-ish dxNorm and check the formula.
+	// Reference: dx = (1/||x_orig||) * (dxNorm - (x_norm · dxNorm) * x_norm).
+	// We use the post-norm `got` (which is x_norm) and a hand-set dxNorm.
+	std::vector<float> dxNorm(x.size());
+	for (size_t i = 0; i < dxNorm.size(); ++i)
+		dxNorm[i] = 0.1f * (float)(i + 1);
+
+	// Compute reference invNorm = 1 / ||x_orig|| per (t, h).
+	std::vector<float> invNorm(T * nHeads);
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			const float* row = &x[(t * nHeads + h) * dHead];
+			double ss = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+			invNorm[t * nHeads + h] = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+		}
+	}
+
+	// Reference backward computation.
+	std::vector<float> refDx(x.size());
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			const float* xn = &got[(t * nHeads + h) * dHead];
+			const float* dn = &dxNorm[(t * nHeads + h) * dHead];
+			const float ni = invNorm[t * nHeads + h];
+			double xnDotDn = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				xnDotDn += static_cast<double>(xn[i]) * static_cast<double>(dn[i]);
+			const float xnDotDnF = static_cast<float>(xnDotDn);
+			float* dox = &refDx[(t * nHeads + h) * dHead];
+			for (int i = 0; i < dHead; ++i)
+				dox[i] = ni * (dn[i] - xnDotDnF * xn[i]);
+		}
+	}
+
+	std::vector<float> gotDx(x.size());
+	glades::transformer_kernels::qknorm_backward(
+		&got[0], &invNorm[0], &dxNorm[0], T, nHeads, dHead, &gotDx[0]);
+
+	float worstBwd = max_abs_diff(gotDx, refDx);
+	ASSERT("qknorm_enabled: backward matches reference within 1e-6", worstBwd < 1e-6f);
 }
 
 // TDD placeholder — implementation in Task 3.1
