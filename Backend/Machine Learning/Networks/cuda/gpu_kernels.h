@@ -53,6 +53,13 @@ bool softmax_forward(const float* x, int rows, int cols, float* out);
 bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
                                int rows, int cols, float* dlogits);
 
+// Z-loss-aware variant: adds (2 * zlossCoef * logZ[row]) * probs[row, i]
+// on top of the standard CE gradient. At zlossCoef == 0.0f the output is
+// bit-identical to softmax_cross_entropy_bwd.
+bool softmax_cross_entropy_bwd_zloss(const float* probs, const int* targets,
+                                     const float* logZ, float zlossCoef,
+                                     int rows, int cols, float* dlogits);
+
 // ralph-loop iter 10 (2026-05-14) BF16-storage variants — backing the
 // --bf16-logits-storage flag.  Same math as the FP32 paths, BF16 on
 // load/store (uint16_t bit-pattern), FP32 in registers.  Used to
@@ -1054,6 +1061,7 @@ inline bool rmsnorm_backward(const float*, const float*, const float*, const flo
 
 inline bool softmax_forward(const float*, int, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
+inline bool softmax_cross_entropy_bwd_zloss(const float*, const int*, const float*, float, int, int, float*) { return false; }
 inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }

@@ -682,6 +682,55 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 }
 
 // ===========================================================================
+//  6a. Z-loss-aware variant of softmax cross-entropy backward
+// ===========================================================================
+//
+// Adds (2 * zlossCoef * logZ[row]) * probs[row, i] to the standard
+// softmax-CE gradient per element. At zlossCoef == 0.0f the kernel
+// produces bit-identical output to softmax_cross_entropy_backward
+// (the multiply is short-circuited).
+
+namespace {
+
+__global__ void softmax_cross_entropy_backward_zloss(const float* __restrict__ probs,
+                                                     const int* __restrict__ targets,
+                                                     const float* __restrict__ logZ,
+                                                     float zlossCoef,
+                                                     int cols,
+                                                     float* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const float* pRow = probs   + (size_t)row * cols;
+	float* dRow       = dlogits + (size_t)row * cols;
+	const float zScale = (zlossCoef == 0.0f)
+	                       ? 0.0f
+	                       : (2.0f * zlossCoef * logZ[row]);
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = pRow[i];
+		float g = (i == target) ? (p - 1.0f) : p;
+		if (zScale != 0.0f) g += zScale * p;
+		dRow[i] = g;
+	}
+}
+
+} // anonymous namespace
+
+bool softmax_cross_entropy_bwd_zloss(const float* probs, const int* targets,
+                                     const float* logZ, float zlossCoef,
+                                     int rows, int cols, float* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_zloss<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  6b. DISTILL-FORWARD (paradigm shift #56) — KL + CE combined loss
 // ===========================================================================
 //

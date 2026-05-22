@@ -885,6 +885,7 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!lnFinalInvStd.allocate(sT)) return false;
 	if (!logits.allocate(sT * sos)) return false;
 	if (!probs.allocate(sT * sos)) return false;
+	if (!logZ.allocate(sT)) return false;
 
 	// Backward
 	if (!dLogits.allocate(sT * sos)) return false;

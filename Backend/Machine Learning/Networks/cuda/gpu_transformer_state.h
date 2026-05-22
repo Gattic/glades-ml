@@ -530,6 +530,7 @@ struct GpuTransformerScratch
 	GpuBuffer<float> lnFinalInvStd; // [T]
 	GpuBuffer<float> logits;     // [T, outSize]
 	GpuBuffer<float> probs;      // [T, outSize]
+	GpuBuffer<float> logZ;       // [T]  logsumexp per position for Z-loss backward
 
 	// Backward scratch
 	GpuBuffer<float> dLogits;    // [T, outSize]

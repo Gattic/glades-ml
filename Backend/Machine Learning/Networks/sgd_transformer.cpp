@@ -10981,10 +10981,16 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 		if (tokenLM)
 		{
-			// dLogits = probs - one_hot(targets)
-			gpu::softmax_cross_entropy_bwd(
+			// H2D copy logZ for Z-loss backward (populated by CPU forward).
+			gpuTransformerScratch->logZ.uploadAsync(
+			    &transformerScratch.logZ[0], static_cast<size_t>(T));
+
+			// dLogits = probs - one_hot(targets) [+ Z-loss gradient when zlossCoef > 0]
+			gpu::softmax_cross_entropy_bwd_zloss(
 			    gpuTransformerScratch->probs.data(),
 			    gpuTransformerScratch->gpuTargetsT.data(),
+			    gpuTransformerScratch->logZ.data(),
+			    trainingConfig.transformer.zlossCoef,
 			    static_cast<int>(T), static_cast<int>(vocabSize),
 			    gpuTransformerScratch->dLogits.data());
 
