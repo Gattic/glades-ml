@@ -1059,6 +1059,10 @@ bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
                          const float* dxNorm, int T, int nHeads, int dHead,
                          float* dxOrig);
 
+// Multiply each [t,h] row of Q by gammaScale[h].  Q: [T, nHeads, dHead].
+bool scale_q_per_head(float* Q, const float* gammaScale,
+                      int T, int nHeads, int dHead);
+
 } // namespace gpu
 } // namespace glades
 
@@ -1265,6 +1269,7 @@ inline void device_memset_bytes(void*, int, size_t) {}
 
 inline bool qknorm_forward_gpu(float*, float*, int, int, int, float) { return false; }
 inline bool qknorm_backward_gpu(const float*, const float*, const float*, int, int, int, float*) { return false; }
+inline bool scale_q_per_head(float*, const float*, int, int, int) { return false; }
 
 } // namespace gpu
 } // namespace glades

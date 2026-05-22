@@ -9190,6 +9190,33 @@ bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
 	return true;
 }
 
+// scale_q_per_head: multiply each [t, h] row of Q by gammaScale[h].
+// Q layout: [T, nHeads, dHead] (row = Q + (t*nHeads + h)*dHead).
+__global__ void scale_q_per_head_kernel(float* __restrict__ Q,
+                                        const float* __restrict__ gammaScale,
+                                        int nHeads, int dHead)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float* row = Q + ((size_t)t * nHeads + h) * dHead;
+	const float s = gammaScale[h];
+	for (int i = tid; i < dHead; i += block) row[i] *= s;
+}
+
+bool scale_q_per_head(float* Q, const float* gammaScale,
+                      int T, int nHeads, int dHead)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	scale_q_per_head_kernel<<<grid, block, 0, computeStream()>>>(
+	    Q, gammaScale, nHeads, dHead);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

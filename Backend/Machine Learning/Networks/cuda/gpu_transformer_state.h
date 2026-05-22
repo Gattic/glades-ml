@@ -571,6 +571,17 @@ struct GpuTransformerScratch
 	GpuBuffer<uint16_t> kLowp;
 	GpuBuffer<uint16_t> vLowp;
 
+	// QK-Norm GPU scratch (Task 2.5).  Allocated lazily on first forward
+	// pass when qknormGamma is non-empty.  Sized to [nLayers, T, ...].
+	// qknormGammaScale: [nHeads] — per-step γ·sqrt(dHead) upload scratch.
+	GpuBuffer<float> qInvNorm;       // [nLayers, T, nHeads]
+	GpuBuffer<float> kInvNorm;       // [nLayers, T, nKVHeads]  (nKVHeads = nHeads in MHA)
+	GpuBuffer<float> qNorm;          // [nLayers, T, nHeads*dHead] post-norm Q copy
+	GpuBuffer<float> kNorm;          // [nLayers, T, nKVHeads*dHead] post-norm K copy
+	GpuBuffer<float> qPreNorm;       // [nLayers, T, nHeads*dHead] pre-norm Q copy
+	GpuBuffer<float> kPreNorm;       // [nLayers, T, nKVHeads*dHead] pre-norm K copy
+	GpuBuffer<float> qknormGammaScale; // [nHeads] γ·sqrt(dHead) per head
+
 	// Full attention scores matrix [nHeads, T, T] used by the
 	// cuBLAS-tiled flash_attention path (research/WMMA_ATTENTION_PLAN.md).
 	// Trades O(nH*T^2) memory for tensor-core throughput.  Allocated

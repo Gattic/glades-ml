@@ -9622,6 +9622,92 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			                   static_cast<int>(rd / 2u));
 		}
 
+		// QK-Norm GPU forward dispatch (Task 2.5).
+		// Skipped entirely when qknormGamma is empty (qkNormEnabled=false) —
+		// bit-identical to baseline.
+		const TensorTransformerState::Block& cpuBlock = tensorTransformer.blocks[li];
+		if (!cpuBlock.qknormGamma.empty())
+		{
+			const int Tint = static_cast<int>(T);
+			const int nHeadsInt = static_cast<int>(nHeads);
+			const int nKVHeadsInt = static_cast<int>(nKVHeads);
+			const int dHeadInt = static_cast<int>(dHead);
+			const size_t qSize  = static_cast<size_t>(nLayers) * T * nHeads * dHead;
+			const size_t kSize  = static_cast<size_t>(nLayers) * T * nKVHeads * dHead;
+			const size_t qInvSz = static_cast<size_t>(nLayers) * T * nHeads;
+			const size_t kInvSz = static_cast<size_t>(nLayers) * T * nKVHeads;
+
+			// Lazy-allocate QK-Norm scratch buffers on first layer that needs them.
+			if (gpuTransformerScratch->qInvNorm.size() < qInvSz)
+				gpuTransformerScratch->qInvNorm.allocate(qInvSz);
+			if (gpuTransformerScratch->kInvNorm.size() < kInvSz)
+				gpuTransformerScratch->kInvNorm.allocate(kInvSz);
+			if (gpuTransformerScratch->qNorm.size() < qSize)
+				gpuTransformerScratch->qNorm.allocate(qSize);
+			if (gpuTransformerScratch->kNorm.size() < kSize)
+				gpuTransformerScratch->kNorm.allocate(kSize);
+			if (gpuTransformerScratch->qPreNorm.size() < qSize)
+				gpuTransformerScratch->qPreNorm.allocate(qSize);
+			if (gpuTransformerScratch->kPreNorm.size() < kSize)
+				gpuTransformerScratch->kPreNorm.allocate(kSize);
+			if (gpuTransformerScratch->qknormGammaScale.size() < static_cast<size_t>(nHeadsInt))
+				gpuTransformerScratch->qknormGammaScale.allocate(static_cast<size_t>(nHeadsInt));
+
+			const size_t qLayerOff  = static_cast<size_t>(li) * T * nHeads * dHead;
+			const size_t kLayerOff  = static_cast<size_t>(li) * T * nKVHeads * dHead;
+			const size_t qInvLayerOff = static_cast<size_t>(li) * T * nHeads;
+			const size_t kInvLayerOff = static_cast<size_t>(li) * T * nKVHeads;
+
+			// Save pre-norm Q and K (for γ-gradient in backward, Task 2.6).
+			glades::gpu::device_memcpy_d2d(
+			    gpuTransformerScratch->qPreNorm.data() + qLayerOff,
+			    Q_l, static_cast<size_t>(Tint) * nHeadsInt * dHeadInt * sizeof(float));
+			glades::gpu::device_memcpy_d2d(
+			    gpuTransformerScratch->kPreNorm.data() + kLayerOff,
+			    K_l, static_cast<size_t>(Tint) * nKVHeadsInt * dHeadInt * sizeof(float));
+
+			// L2-normalize Q and K in place; save invNorm for backward.
+			glades::gpu::qknorm_forward_gpu(
+			    Q_l,
+			    gpuTransformerScratch->qInvNorm.data() + qInvLayerOff,
+			    Tint, nHeadsInt, dHeadInt, 1e-6f);
+			glades::gpu::qknorm_forward_gpu(
+			    K_l,
+			    gpuTransformerScratch->kInvNorm.data() + kInvLayerOff,
+			    Tint, nKVHeadsInt, dHeadInt, 1e-6f);
+
+			// Save post-norm Q and K (for backward, Task 2.6).
+			glades::gpu::device_memcpy_d2d(
+			    gpuTransformerScratch->qNorm.data() + qLayerOff,
+			    Q_l, static_cast<size_t>(Tint) * nHeadsInt * dHeadInt * sizeof(float));
+			glades::gpu::device_memcpy_d2d(
+			    gpuTransformerScratch->kNorm.data() + kLayerOff,
+			    K_l, static_cast<size_t>(Tint) * nKVHeadsInt * dHeadInt * sizeof(float));
+
+			// Upload γ·sqrt(dHead) per head to GPU scratch via transfer stream,
+			// then synchronize with compute stream before the scale kernel.
+			const float sqrtDh = sqrtf(static_cast<float>(dHead));
+			std::vector<float> hostGammaScale(static_cast<size_t>(nHeadsInt));
+			for (int h = 0; h < nHeadsInt; ++h)
+				hostGammaScale[static_cast<size_t>(h)] =
+				    cpuBlock.qknormGamma[static_cast<size_t>(h)] * sqrtDh;
+			glades::gpu::device_memcpy_h2d(
+			    gpuTransformerScratch->qknormGammaScale.data(),
+			    &hostGammaScale[0], static_cast<size_t>(nHeadsInt) * sizeof(float));
+			{
+				cudaEvent_t ev = glades::gpu::createEvent(false);
+				glades::gpu::recordEvent(ev, glades::gpu::transferStream());
+				glades::gpu::streamWaitEvent(glades::gpu::computeStream(), ev);
+				glades::gpu::destroyEvent(ev);
+			}
+
+			// Pre-multiply Q by γ·sqrt(dHead) per head so the attention kernel's
+			// existing 1/sqrt(dHead) recovers γ·(Q_norm·K_norm^T).
+			glades::gpu::scale_q_per_head(
+			    Q_l, gpuTransformerScratch->qknormGammaScale.data(),
+			    Tint, nHeadsInt, dHeadInt);
+		}
+
 		float* attnConcat_l = gpuTransformerScratch->attnConcat.data()
 		                      + slot * T * dModel;
 		if (useBf16)
