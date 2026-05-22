@@ -1116,6 +1116,70 @@ inline void softmax_stable_into(const float* logits, size_t n, float* probsOut)
 		probsOut[i] *= inv;
 }
 
+// Fused softmax-CE forward with Z-loss auxiliary term.
+// Inputs:
+//   logits[cols]   — pre-softmax FP32 logits for a single position.
+//   cols           — vocab size.
+//   target         — ground-truth token id (in [0, cols)).
+//   zlossCoef      — auxiliary loss coefficient λ_z. At 0.0f, *zlossOut
+//                    is exactly 0 and *ceOut is bit-identical to the
+//                    standalone softmax-CE.
+// Outputs:
+//   *ceOut         — -log(softmax(logits)[target]).
+//   *zlossOut      — zlossCoef * (logsumexp(logits))^2.
+// Note: total loss is ceOut + zlossOut. Caller sums across positions.
+inline void softmax_ce_with_zloss(const float* logits, int cols, int target,
+                                  float zlossCoef, float* ceOut, float* zlossOut)
+{
+	// Compute logsumexp in a numerically stable way.
+	float maxLogit = logits[0];
+	for (int i = 1; i < cols; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+	float sumExp = 0.0f;
+	for (int i = 0; i < cols; ++i) sumExp += expf(logits[i] - maxLogit);
+	const float lse = maxLogit + logf(sumExp);
+
+	// Main CE: -log(softmax(logits)[target]) = lse - logits[target].
+	*ceOut = lse - logits[target];
+
+	// Z-loss: λ_z * log²(Z) = λ_z * lse².
+	// At λ_z == 0 this returns exactly 0.0f (no FP rounding from multiply
+	// since the result IS the constant 0).
+	if (zlossCoef == 0.0f)
+		*zlossOut = 0.0f;
+	else
+		*zlossOut = zlossCoef * (lse * lse);
+}
+
+// Fused softmax-CE backward with Z-loss gradient contribution.
+// Inputs:
+//   probs[cols]    — softmax(logits) (computed earlier).
+//   cols, target   — as above.
+//   lse            — logsumexp(logits) (precomputed; reuses the value
+//                    from softmax_ce_with_zloss for free).
+//   zlossCoef      — auxiliary loss coefficient λ_z.
+// Output:
+//   gradOut[cols]  — d(L_main + L_zloss)/d(logit_i)
+//                  = (probs[i] - (i==target)) + 2*λ_z*lse*probs[i].
+// At zlossCoef = 0.0f, gradOut is bit-identical to the standalone
+// softmax-CE gradient.
+inline void softmax_ce_with_zloss_grad(const float* probs, int cols, int target,
+                                       float lse, float zlossCoef,
+                                       float* gradOut)
+{
+	// Main CE grad: probs - one_hot(target).
+	// Z-loss grad: 2 * λ_z * lse * probs.
+	// At λ_z == 0 the Z-loss contribution is skipped entirely → bit-identical
+	// to the standalone CE grad.
+	const float zlossScale = (zlossCoef == 0.0f) ? 0.0f
+	                                              : (2.0f * zlossCoef * lse);
+	for (int i = 0; i < cols; ++i)
+	{
+		float g = probs[i] - (i == target ? 1.0f : 0.0f);
+		if (zlossScale != 0.0f) g += zlossScale * probs[i];
+		gradOut[i] = g;
+	}
+}
+
 // === Normalization backward kernels (training) ===
 //
 // These are kept in this shared header so training and inference use the same

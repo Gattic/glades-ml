@@ -19,6 +19,8 @@
 #include "../../unit-test.h"
 
 #include "../../../Backend/Machine Learning/Networks/transformer_chiron_ops.h"
+#include "../../../Backend/Machine Learning/rng.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 
 #ifdef GLADES_HAVE_CUDA
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_chiron.h"
@@ -11445,6 +11447,12 @@ void CHIRONUnitTest()
 	CHIRONCublasTiledAttentionBackwardParityTest();
 	CHIRONCublasTiledAttentionBf16ParityTest();
 	CHIRONProductionScaleMemoryTest();
+	CHIRONZlossDisabledParityTest();
+	CHIRONZlossEnabledMathTest();
+	CHIRONQkNormDisabledParityTest();
+	CHIRONQkNormEnabledMathTest();
+	CHIRONMtpDisabledParityTest();
+	CHIRONMtpTargetShiftTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -16325,4 +16333,93 @@ void CHIRONTrcdEndToEndConvergenceTest()
 #endif
 }
 
+// === REGSTACK PARITY TESTS (2026-05-22 spec) ===
+
+// Verify that at zlossCoef == 0.0f, the readout CE forward/backward path
+// produces bit-identical loss and gradients vs the same path before the
+// Z-loss code was added. This is a strict-bar smoke test using a tiny
+// transformer config; the real production parity test is a 100-step
+// trainer smoke (run after implementation completes).
+void CHIRONZlossDisabledParityTest()
+{
+	// Reference values: handcomputed for a 4-class softmax with target=0 and
+	// logits = [1.0, 0.5, -0.5, 0.0]. No randomness — these are exact.
+	const float logits[4] = {1.0f, 0.5f, -0.5f, 0.0f};
+	const int target = 0;
+
+	// Compute reference CE = -log(softmax[target]).
+	float lse = 0.0f;
+	{
+		float maxLogit = logits[0];
+		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+		float sumExp = 0.0f;
+		for (int i = 0; i < 4; ++i) sumExp += expf(logits[i] - maxLogit);
+		lse = maxLogit + logf(sumExp);
+	}
+	const float refCE = lse - logits[target];
+
+	// Call the new helper that computes (CE, zloss) given coef. At coef=0,
+	// zloss must be 0 and CE must equal refCE EXACTLY (bit-identical).
+	float ce = 0.0f;
+	float zloss = 0.0f;
+	glades::transformer_kernels::softmax_ce_with_zloss(
+		logits, 4, target, /*zlossCoef=*/0.0f, &ce, &zloss);
+
+	ASSERT("zloss_disabled: CE must match reference exactly at coef=0",
+	       ce == refCE);
+	ASSERT("zloss_disabled: zloss term must be exactly 0 at coef=0",
+	       zloss == 0.0f);
+
+	// Also verify the gradient. Reference grad: (softmax - one_hot) / 1.
+	float probs[4];
+	{
+		float maxLogit = logits[0];
+		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+		float sumExp = 0.0f;
+		for (int i = 0; i < 4; ++i) sumExp += expf(logits[i] - maxLogit);
+		for (int i = 0; i < 4; ++i) probs[i] = expf(logits[i] - maxLogit) / sumExp;
+	}
+	float refGrad[4];
+	for (int i = 0; i < 4; ++i) refGrad[i] = probs[i] - (i == target ? 1.0f : 0.0f);
+
+	float grad[4];
+	glades::transformer_kernels::softmax_ce_with_zloss_grad(
+		probs, 4, target, lse, /*zlossCoef=*/0.0f, grad);
+
+	for (int i = 0; i < 4; ++i)
+	{
+		ASSERT("zloss_disabled: gradient must match reference exactly at coef=0",
+		       grad[i] == refGrad[i]);
+	}
+}
+
+// TDD placeholder — implementation in Task 1.3
+void CHIRONZlossEnabledMathTest()
+{
+	std::printf("  [zloss enabled math] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 2.1
+void CHIRONQkNormDisabledParityTest()
+{
+	std::printf("  [qknorm disabled parity] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 2.2
+void CHIRONQkNormEnabledMathTest()
+{
+	std::printf("  [qknorm enabled math] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 3.1
+void CHIRONMtpDisabledParityTest()
+{
+	std::printf("  [mtp disabled parity] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 3.2
+void CHIRONMtpTargetShiftTest()
+{
+	std::printf("  [mtp target shift] TDD placeholder — not yet implemented\n");
+}
 

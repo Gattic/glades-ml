@@ -73,6 +73,12 @@ void CHIRONLcpIbgradCompositionTest();
 void CHIRONEdtEnergyDistilledTest();
 void CHIRONTrcdRoutingThroughputBenchmark();
 void CHIRONTrcdEndToEndConvergenceTest();
+void CHIRONZlossDisabledParityTest();
+void CHIRONZlossEnabledMathTest();
+void CHIRONQkNormDisabledParityTest();
+void CHIRONQkNormEnabledMathTest();
+void CHIRONMtpDisabledParityTest();
+void CHIRONMtpTargetShiftTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
