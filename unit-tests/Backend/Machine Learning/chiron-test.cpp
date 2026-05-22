@@ -16397,10 +16397,56 @@ void CHIRONZlossDisabledParityTest()
 	}
 }
 
-// TDD placeholder — implementation in Task 1.3
 void CHIRONZlossEnabledMathTest()
 {
-	std::printf("  [zloss enabled math] TDD placeholder — not yet implemented\n");
+	// Verify that at zlossCoef > 0, the loss and gradient include the
+	// expected Z-loss contribution.
+	const float logits[4] = {2.0f, 0.0f, -1.0f, 0.5f};
+	const int target = 2;
+	const float lambdaZ = 0.1f;  // larger than production to make signal obvious
+
+	// Reference: compute by hand using the SAME double accumulator pattern
+	// as softmax_ce_with_zloss (matches softmax_stable_into convention).
+	float maxLogit = logits[0];
+	for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+	double sumExp = 0.0;
+	for (int i = 0; i < 4; ++i)
+		sumExp += exp(static_cast<double>(logits[i] - maxLogit));
+	const float lse = maxLogit + static_cast<float>(log(sumExp));
+	const float refCE = lse - logits[target];
+	const float refZloss = lambdaZ * lse * lse;
+
+	float probs[4];
+	for (int i = 0; i < 4; ++i)
+		probs[i] = static_cast<float>(
+			exp(static_cast<double>(logits[i] - maxLogit)) / sumExp);
+
+	float refGrad[4];
+	const float zScale = 2.0f * lambdaZ * lse;
+	for (int i = 0; i < 4; ++i)
+	{
+		refGrad[i] = probs[i] - (i == target ? 1.0f : 0.0f);
+		refGrad[i] += zScale * probs[i];
+	}
+
+	// Call our helpers.
+	float ce = 0.0f, zloss = 0.0f, lseOut = 0.0f;
+	glades::transformer_kernels::softmax_ce_with_zloss(
+		logits, 4, target, lambdaZ, &ce, &zloss, &lseOut);
+	float grad[4];
+	glades::transformer_kernels::softmax_ce_with_zloss_grad(
+		probs, 4, target, lseOut, lambdaZ, grad);
+
+	// Math tolerance: 1e-5 (FP32 round-off across the chain).
+	const float ceErr = fabsf(ce - refCE);
+	const float zErr = fabsf(zloss - refZloss);
+	ASSERT("zloss_enabled: CE matches reference", ceErr < 1e-5f);
+	ASSERT("zloss_enabled: zloss term matches reference", zErr < 1e-5f);
+	for (int i = 0; i < 4; ++i)
+	{
+		const float gErr = fabsf(grad[i] - refGrad[i]);
+		ASSERT("zloss_enabled: gradient matches reference", gErr < 1e-5f);
+	}
 }
 
 // TDD placeholder — implementation in Task 2.1
