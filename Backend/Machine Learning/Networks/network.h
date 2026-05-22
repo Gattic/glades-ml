@@ -1628,6 +1628,10 @@ private:
 			// logZ: one logsumexp per position; always allocated for the backward kernel.
 			if (logZ.size() != static_cast<size_t>(T))
 				logZ.resize(static_cast<size_t>(T), 0.0f);
+			// Zero logZ each step so the GPU backward kernel reads clean data even on
+			// paths (sampled-softmax, padded positions) that don't write per-position
+			// (code-review issue 3 fix).
+			std::fill(logZ.begin(), logZ.end(), 0.0f);
 
 			// Backward scratch (not per-layer; reused across the backward pass)
 			// Note: we do not rely on these being zeroed except where explicitly filled in the hot path.

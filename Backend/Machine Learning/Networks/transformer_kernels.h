@@ -1127,9 +1127,14 @@ inline void softmax_stable_into(const float* logits, size_t n, float* probsOut)
 // Outputs:
 //   *ceOut         — -log(softmax(logits)[target]).
 //   *zlossOut      — zlossCoef * (logsumexp(logits))^2.
+//   *lseOut        — logsumexp(logits) (optional, NULL to skip). Use this
+//                    to avoid reconstructing lse via the lossy round-trip
+//                    (ceOut + logits[target]) at the call site, which sheds
+//                    ~2 ULP of precision at FP32.
 // Note: total loss is ceOut + zlossOut. Caller sums across positions.
 inline void softmax_ce_with_zloss(const float* logits, int cols, int target,
-                                  float zlossCoef, float* ceOut, float* zlossOut)
+                                  float zlossCoef, float* ceOut, float* zlossOut,
+                                  float* lseOut = NULL)
 {
 	// Compute logsumexp in a numerically stable way, accumulating into a
 	// double to match the project's softmax_stable_into pattern (FP32
@@ -1150,6 +1155,11 @@ inline void softmax_ce_with_zloss(const float* logits, int cols, int target,
 		*zlossOut = 0.0f;
 	else
 		*zlossOut = zlossCoef * (lse * lse);
+
+	// Direct lse output avoids the lossy round-trip (ceOut + logits[target])
+	// that sheds ~2 ULP at FP32, compounding to ~3 ULP of gradient error in
+	// the Task 1.4 backward kernel (2 * λ_z * lse * probs[i]).
+	if (lseOut != NULL) *lseOut = lse;
 }
 
 // Fused softmax-CE backward with Z-loss gradient contribution.

@@ -8013,15 +8013,19 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 				const int cols = static_cast<int>(scratchOutSize);
 				float ceVal = 0.0f;
 				float zlossValUnused = 0.0f;
-				// Pass zlossCoef=0: we only need lse (ceVal = lse - logits[target]).
-				// The Z-loss term is accumulated in the metrics loop below where tokenLmNllSum
-				// is accessible. zlossValUnused is written by the helper but not read here.
+				float lseVal = 0.0f;
+				// Pass zlossCoef=0: we only need lse. The Z-loss term is accumulated
+				// in the metrics loop below where tokenLmNllSum is accessible.
+				// lseOut param avoids the lossy round-trip (ceVal + logits[safeTarget])
+				// that sheds ~2 ULP at FP32 (code-review issue 1 fix).
+				// TODO(issue2): softmax_stable_into above already scanned this row;
+				// softmax_ce_with_zloss rescans it for lse. This is a redundant O(V)
+				// CPU scan (~1 GFLOP/step at T=16384, V=32000). Will be eliminated
+				// naturally when the GPU backward kernel computes lse alongside softmax.
 				glades::transformer_kernels::softmax_ce_with_zloss(
 				    &transformerScratch.logits[off], cols, safeTarget,
-				    0.0f, &ceVal, &zlossValUnused);
-				// lse = ceVal + logits[safeTarget]
-				transformerScratch.logZ[static_cast<size_t>(t)] =
-				    ceVal + transformerScratch.logits[off + static_cast<size_t>(safeTarget)];
+				    0.0f, &ceVal, &zlossValUnused, &lseVal);
+				transformerScratch.logZ[static_cast<size_t>(t)] = lseVal;
 			}
 		}
 	}
