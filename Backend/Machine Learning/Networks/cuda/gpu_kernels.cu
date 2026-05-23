@@ -1360,6 +1360,28 @@ bool add_two(float* out, const float* a, const float* b, int n)
 }
 
 namespace {
+// add_two_scaled: out[i] = a[i] + beta * b[i]
+__global__ void add_two_scaled_kernel(float* __restrict__ out,
+                                      const float* __restrict__ a,
+                                      const float* __restrict__ b,
+                                      float beta, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] = a[idx] + beta * b[idx];
+}
+} // anonymous namespace
+
+bool add_two_scaled(float* out, const float* a, const float* b, float beta, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	add_two_scaled_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, a, b, beta, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
 __global__ void scale_array_kernel(float* __restrict__ x, float scale, int n)
 {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;

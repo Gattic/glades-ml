@@ -382,6 +382,8 @@ bool add_residual(float* out, const float* residual, int n);
 
 // out[n] = a[n] + b[n]
 bool add_two(float* out, const float* a, const float* b, int n);
+// out[n] = a[n] + beta * b[n]
+bool add_two_scaled(float* out, const float* a, const float* b, float beta, int n);
 
 // y[n] += alpha * x[n]
 bool axpy(float alpha, const float* x, float* y, int n);
@@ -1165,6 +1167,7 @@ inline bool rope_apply_qk(float*, float*, const float*, int, int, int, int, int 
 inline bool add_bias(float*, const float*, int, int) { return false; }
 inline bool add_residual(float*, const float*, int) { return false; }
 inline bool add_two(float*, const float*, const float*, int) { return false; }
+inline bool add_two_scaled(float*, const float*, const float*, float, int) { return false; }
 inline bool axpy(float, const float*, float*, int) { return false; }
 inline bool scale_array(float*, float, int) { return false; }
 

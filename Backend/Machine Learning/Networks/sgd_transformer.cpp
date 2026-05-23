@@ -9743,6 +9743,33 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		    : (gpuTransformerScratch->hAfterFF.data()
 		       + prevSlot * T * dModel);
 
+		// === LayerDrop mask read (GPU fwd-only path — use persisted, do NOT redraw) ===
+		float layerDropPL = 0.0f;
+		float layerDropScale = 1.0f;
+		bool layerDropKeepThisLayer = true;
+		if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+		    !transformerScratch.layerDropKept.empty())
+		{
+			layerDropKeepThisLayer =
+			    transformerScratch.layerDropKept[li] != 0u;
+			layerDropPL = glades::transformer_kernels::layer_drop_p_l(
+			    li, nLayers, trainingConfig.transformer.layerDropPMax,
+			    trainingConfig.transformer.layerDropLinearSchedule);
+			layerDropScale = (layerDropPL > 0.0f && layerDropPL < 1.0f)
+			    ? (1.0f / (1.0f - layerDropPL))
+			    : 1.0f;
+		}
+
+		if (!layerDropKeepThisLayer)
+		{
+			float* hAfterFF_l_skip = gpuTransformerScratch->hAfterFF.data()
+			    + slot * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			glades::gpu::device_memcpy_d2d(hAfterFF_l_skip, layerIn,
+			    static_cast<size_t>(T) * static_cast<size_t>(dModel)
+			        * sizeof(float));
+			continue;
+		}
+
 		float* x1_l = gpuTransformerScratch->x1.data()
 		              + slot * T * dModel;
 		float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
@@ -9981,8 +10008,8 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 
 		float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data()
 		                      + slot * T * dModel;
-		gpu::add_two(hAfterAttn_l, layerIn, attnOut_l,
-		             static_cast<int>(T * dModel));
+		glades::gpu::add_two_scaled(hAfterAttn_l, layerIn, attnOut_l,
+		    layerDropScale, static_cast<int>(T * dModel));
 
 		float* x2_l = gpuTransformerScratch->x2.data()
 		              + slot * T * dModel;
@@ -10110,8 +10137,8 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 
 		float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data()
 		                    + slot * T * dModel;
-		gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l,
-		             static_cast<int>(T * dModel));
+		glades::gpu::add_two_scaled(hAfterFF_l, hAfterAttn_l, ffOut_l,
+		    layerDropScale, static_cast<int>(T * dModel));
 	}
 
 	// Final LayerNorm.  In activation-checkpoint mode the last layer's hAfterFF
@@ -10233,6 +10260,33 @@ bool glades::NNetwork::transformerGpuLayerRangeForward(
 		else
 			layerIn = gpuTransformerScratch->hAfterFF.data()
 			          + prevSlot * T * dModel;
+
+		// === LayerDrop mask read (GPU re-fwd path — use persisted, do NOT redraw) ===
+		float layerDropPL = 0.0f;
+		float layerDropScale = 1.0f;
+		bool layerDropKeepThisLayer = true;
+		if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+		    !transformerScratch.layerDropKept.empty())
+		{
+			layerDropKeepThisLayer =
+			    transformerScratch.layerDropKept[li] != 0u;
+			layerDropPL = glades::transformer_kernels::layer_drop_p_l(
+			    li, nLayers, trainingConfig.transformer.layerDropPMax,
+			    trainingConfig.transformer.layerDropLinearSchedule);
+			layerDropScale = (layerDropPL > 0.0f && layerDropPL < 1.0f)
+			    ? (1.0f / (1.0f - layerDropPL))
+			    : 1.0f;
+		}
+
+		if (!layerDropKeepThisLayer)
+		{
+			float* hAfterFF_l_skip = gpuTransformerScratch->hAfterFF.data()
+			    + slot * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			glades::gpu::device_memcpy_d2d(hAfterFF_l_skip, layerIn,
+			    static_cast<size_t>(T) * static_cast<size_t>(dModel)
+			        * sizeof(float));
+			continue;
+		}
 
 		float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
 		float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
@@ -10378,8 +10432,8 @@ bool glades::NNetwork::transformerGpuLayerRangeForward(
 		              static_cast<int>(T), static_cast<int>(dModel));
 
 		float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + slot * T * dModel;
-		gpu::add_two(hAfterAttn_l, layerIn, attnOut_l,
-		             static_cast<int>(T * dModel));
+		glades::gpu::add_two_scaled(hAfterAttn_l, layerIn, attnOut_l,
+		    layerDropScale, static_cast<int>(T * dModel));
 
 		float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
 		float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
@@ -10492,8 +10546,8 @@ bool glades::NNetwork::transformerGpuLayerRangeForward(
 		              static_cast<int>(T), static_cast<int>(dModel));
 
 		float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + slot * T * dModel;
-		gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l,
-		             static_cast<int>(T * dModel));
+		glades::gpu::add_two_scaled(hAfterFF_l, hAfterAttn_l, ffOut_l,
+		    layerDropScale, static_cast<int>(T * dModel));
 	}
 	return true;
 }
@@ -10801,6 +10855,40 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
 			                                 : (gpuTransformerScratch->hAfterFF.data() + prevSlot * T * dModel);
 
+			// === LayerDrop mask draw (GPU primary fwd path) ===
+			// Draw mask, persist to transformerScratch.layerDropKept[li]. The
+			// activation-checkpoint re-fwd loop and any other fwd variants
+			// MUST read this persisted mask (do NOT redraw); see Task 3.1.
+			float layerDropPL = 0.0f;
+			float layerDropScale = 1.0f;
+			bool layerDropKeepThisLayer = true;
+			if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+			    !transformerScratch.layerDropKept.empty())
+			{
+				layerDropPL = glades::transformer_kernels::layer_drop_p_l(
+				    li, nLayers, trainingConfig.transformer.layerDropPMax,
+				    trainingConfig.transformer.layerDropLinearSchedule);
+				layerDropKeepThisLayer = glades::transformer_kernels::layer_drop_keep(
+				    rngEngine, layerDropPL);
+				layerDropScale = (layerDropPL > 0.0f && layerDropPL < 1.0f)
+				    ? (1.0f / (1.0f - layerDropPL))
+				    : 1.0f;
+				transformerScratch.layerDropKept[li] =
+				    layerDropKeepThisLayer ? 1u : 0u;
+			}
+
+			if (!layerDropKeepThisLayer)
+			{
+				// Block dropped. Copy device-side layerIn -> hAfterFF_l (the
+				// per-layer output slot) and skip the rest of this layer.
+				float* hAfterFF_l_skip = gpuTransformerScratch->hAfterFF.data()
+				    + slot * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				glades::gpu::device_memcpy_d2d(hAfterFF_l_skip, layerIn,
+				    static_cast<size_t>(T) * static_cast<size_t>(dModel)
+				        * sizeof(float));
+				continue;
+			}
+
 			float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
 			float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
 			float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
@@ -11066,9 +11154,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, attnOut_l, static_cast<int>(dModel));
 			gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-			// Residual 1: hAfterAttn = layerIn + attnOut
+			// Residual 1: hAfterAttn = layerIn + layerDropScale * attnOut
 			float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + slot * T * dModel;
-			gpu::add_two(hAfterAttn_l, layerIn, attnOut_l, static_cast<int>(T * dModel));
+			glades::gpu::add_two_scaled(hAfterAttn_l, layerIn, attnOut_l,
+			    layerDropScale, static_cast<int>(T * dModel));
 
 			// Pre-LN 2
 			float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
@@ -11123,9 +11212,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, ffOut_l, static_cast<int>(dModel));
 			gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-			// Residual 2: hAfterFF = hAfterAttn + ffOut
+			// Residual 2: hAfterFF = hAfterAttn + layerDropScale * ffOut
 			float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + slot * T * dModel;
-			gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
+			glades::gpu::add_two_scaled(hAfterFF_l, hAfterAttn_l, ffOut_l,
+			    layerDropScale, static_cast<int>(T * dModel));
 
 			// Activation-checkpoint: stash hAfterFF at every Kth layer boundary
 			// (except the very last layer, whose output feeds final LN directly).
