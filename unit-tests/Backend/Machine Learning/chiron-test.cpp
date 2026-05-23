@@ -16695,6 +16695,61 @@ void CHIRONLayerDropDisabledParityTest()
 
 void CHIRONLayerDropDeterministicMasksTest()
 {
-	// Implemented in Task 2.3 below.
+	// Two engine instantiations with the same seed must produce the same
+	// 100-step × 24-layer mask trace at layerDropPMax = 0.1, linear schedule.
+	const unsigned int L = 24;
+	const unsigned int steps = 100;
+	const float pMax = 0.1f;
+	const unsigned int seed = 1337u;
+
+	std::vector<unsigned char> trace_a(steps * L, 0u);
+	std::vector<unsigned char> trace_b(steps * L, 0u);
+
+	for (int run = 0; run < 2; ++run)
+	{
+		std::vector<unsigned char>& trace = (run == 0) ? trace_a : trace_b;
+
+		// Construct a fresh RNG engine at the same seed. Use glades::rng::Engine
+		// (the project's C++98-compatible PRNG per DETERMINISM_AND_CONCURRENCY.md
+		// and Task 2.4).
+		glades::rng::Engine eng;
+		glades::rng::seed_engine(eng, seed);
+
+		for (unsigned int s = 0; s < steps; ++s)
+		{
+			for (unsigned int li = 0; li < L; ++li)
+			{
+				const float p_l = glades::transformer_kernels::layer_drop_p_l(
+				    li, L, pMax, true);
+				const bool keep = glades::transformer_kernels::layer_drop_keep(
+				    eng, p_l);
+				trace[s * L + li] = keep ? 1u : 0u;
+			}
+		}
+	}
+
+	// Traces must be byte-identical.
+	bool allEqual = true;
+	for (size_t i = 0; i < trace_a.size(); ++i)
+	{
+		if (trace_a[i] != trace_b[i])
+		{
+			allEqual = false;
+			break;
+		}
+	}
+	ASSERT("CHIRONLayerDropDeterministicMasks: same seed must give identical 100-step trace",
+	       allEqual);
+
+	// Also verify the mean keep-rate matches the expected (sum p_l / L) = 0.05 → mean keep = 0.95.
+	size_t keepCount = 0;
+	for (size_t i = 0; i < trace_a.size(); ++i)
+		if (trace_a[i] != 0u)
+			++keepCount;
+	const float keepRate = static_cast<float>(keepCount) / static_cast<float>(trace_a.size());
+	// At pMax=0.1, mean p_l = 0.05, expected keep rate = 0.95. 100*24 = 2400 draws,
+	// standard deviation ≈ sqrt(0.95*0.05/2400) ≈ 0.0045. Allow ±0.02 tolerance (~4σ).
+	ASSERT("CHIRONLayerDropDeterministicMasks: keep rate within tolerance of 0.95",
+	       fabsf(keepRate - 0.95f) < 0.02f);
 }
 
