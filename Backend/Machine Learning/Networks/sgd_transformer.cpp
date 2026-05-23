@@ -11913,6 +11913,37 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    : 0u;
 			const size_t layerOff = slot * static_cast<size_t>(T);
 
+			// === LayerDrop bwd skip branch (GPU bwd path) ===
+			// If this layer was dropped on fwd (transformerScratch.layerDropKept[li]
+			// == 0), the block's bwd contributes zero to weight grads and the
+			// residual-stream gradient `dH` (device-side) flows directly to the
+			// previous layer.
+			float layerDropPL_bwd = 0.0f;
+			float layerDropScale_bwd = 1.0f;
+			bool layerDropKeptThisLayer_bwd = true;
+			if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+			    !transformerScratch.layerDropKept.empty())
+			{
+				layerDropKeptThisLayer_bwd =
+				    transformerScratch.layerDropKept[static_cast<size_t>(li)] != 0u;
+				layerDropPL_bwd = glades::transformer_kernels::layer_drop_p_l(
+				    static_cast<unsigned int>(li), nLayers,
+				    trainingConfig.transformer.layerDropPMax,
+				    trainingConfig.transformer.layerDropLinearSchedule);
+				layerDropScale_bwd =
+				    (layerDropPL_bwd > 0.0f && layerDropPL_bwd < 1.0f)
+				        ? (1.0f / (1.0f - layerDropPL_bwd))
+				        : 1.0f;
+			}
+
+			if (!layerDropKeptThisLayer_bwd)
+			{
+				// Block was dropped on fwd. Device-side dH already represents
+				// ∂L/∂hIn[li] = ∂L/∂hAfterFF[li] (identity path). No weight-grad
+				// accumulation, no attn/FFN bwd kernels. Skip to next iter.
+				continue;
+			}
+
 			// layerIn = input to forward layer li.  Three cases:
 			//   (1) li == 0: embedding output `h`.
 			//   (2) li == segStart and seg > 0 (activation-checkpoint mode):
@@ -11938,6 +11969,21 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			// dH is gradient w.r.t. hAfterFF[li].
 			// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
+
+			// LayerDrop bwd: scale dH by layerDropScale_bwd BEFORE the FFN bwd
+			// consumes it as ∂L/∂ffOut (= s·∂L/∂hAfterFF = s·dH).  The scaled
+			// value also propagates through dX2 → LN2-bwd so that
+			// dHAfterAttnFromLN = s · original_dHAfterAttnFromLN.  Both the
+			// first combine (add_two_scaled) and the second combine
+			// (add_two_scaled with 1/s) then reconstruct the correct chain-rule
+			// values — see combine sites below.
+			// At layerDropScale_bwd == 1.0f (default, p_max = 0) this call is
+			// skipped → bit-identical to the no-LayerDrop path.
+			if (layerDropScale_bwd != 1.0f)
+				gpu::scale_array(gpuTransformerScratch->dH.data(),
+				    layerDropScale_bwd,
+				    static_cast<int>(T * dModel));
+
 			// --- FFN backward ---
 			// ffOut = W2 * ff1Act + b2  =>  dFF1Act = dH * W2^T, gW2 += dH^T * ff1Act
 			gpu_gemm_mp(bf16W2,
@@ -12087,10 +12133,25 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// Combine: dHAfterAttn = dH (residual) + dHAfterAttnFromLN
-			gpu::add_two(gpuTransformerScratch->dH2.data(),
-			    gpuTransformerScratch->dH.data(),
-			    gpuTransformerScratch->dHAfterAttnFromLN.data(),
-			    static_cast<int>(T * dModel));
+			// LayerDrop: dH was pre-scaled by s before FFN bwd, so
+			//   dH = s·dH_orig  and  dHAfterAttnFromLN = s·orig_dHAttnFromLN.
+			// We need dH2 = s·dH_orig + s²·orig_dHAttnFromLN for the Wo bwd
+			// (= s · ∂L/∂hAfterAttn, the correctly scaled attn-bwd input).
+			// add_two_scaled(out, a, b, beta) = a + beta·b gives:
+			//   dH2 = dH + s · dHAfterAttnFromLN
+			//       = s·dH_orig + s · s·orig_dHAttnFromLN  ✓
+			// At layerDropScale_bwd == 1.0f this is the same as add_two.
+			if (layerDropScale_bwd != 1.0f)
+				gpu::add_two_scaled(gpuTransformerScratch->dH2.data(),
+				    gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+				    layerDropScale_bwd,
+				    static_cast<int>(T * dModel));
+			else
+				gpu::add_two(gpuTransformerScratch->dH2.data(),
+				    gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+				    static_cast<int>(T * dModel));
 
 			// --- Wo backward ---
 			// attnOut = Wo * attnConcat + bo  =>  dAttnConcat, gWo
@@ -12494,10 +12555,26 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// Combine into dH: dH = dH2 + dHInFromLN
-			gpu::add_two(gpuTransformerScratch->dH.data(),
-			    gpuTransformerScratch->dH2.data(),
-			    gpuTransformerScratch->dHInFromLN.data(),
-			    static_cast<int>(T * dModel));
+			// LayerDrop: dH2 = s·dH_orig + s²·orig_dHAttnFromLN = s·∂L/∂hAfterAttn.
+			// dHInFromLN was produced from the scaled attn bwd, so it carries
+			// factor s:  dHInFromLN = s · orig_dHInFromLN.
+			// Correct ∂L/∂hIn = ∂L/∂hAfterAttn + s·orig_dHInFromLN
+			//                  = (1/s)·dH2 + dHInFromLN.
+			// add_two_scaled(out, a, b, beta) = a + beta·b gives:
+			//   dH = dHInFromLN + (1/s) · dH2
+			//      = s·orig_dHInFromLN + dH_orig + s·orig_dHAttnFromLN  ✓
+			// At layerDropScale_bwd == 1.0f this is the same as add_two.
+			if (layerDropScale_bwd != 1.0f)
+				gpu::add_two_scaled(gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->dHInFromLN.data(),
+				    gpuTransformerScratch->dH2.data(),
+				    1.0f / layerDropScale_bwd,
+				    static_cast<int>(T * dModel));
+			else
+				gpu::add_two(gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->dH2.data(),
+				    gpuTransformerScratch->dHInFromLN.data(),
+				    static_cast<int>(T * dModel));
 		} // layers backward (within segment)
 		} // activation-checkpoint segments backward
 
