@@ -252,6 +252,21 @@ struct TransformerRunConfig
 	// 0.1 after a brief warmup at 0.3. Default 0.1f.
 	float mtpCoef;
 
+	// LayerDrop / stochastic depth (paradigm shift: Fan 2019 / Huang 2016 /
+	// timm). When > 0, each transformer block l ∈ {0..L-1} is dropped with
+	// probability p_l. Linear-rising schedule: p_l = (l/(L-1)) · layerDropPMax,
+	// so layer 0 never drops and the deepest layer drops with probability
+	// layerDropPMax. Kept layers' sub-residuals are scaled by 1/(1-p_l)
+	// (inverted-dropout convention). Default 0.0f = disabled, math
+	// bit-identical to baseline. Recommended for CHIRON 1B: 0.1.
+	float layerDropPMax;
+
+	// LayerDrop schedule type. true = linear-rising (p_l = (l/(L-1)) · pMax,
+	// timm convention). false = constant (p_l = pMax for all l). Default
+	// true. The constant variant is reserved for a possible future arc; this
+	// arc uses linear-rising exclusively.
+	bool layerDropLinearSchedule;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -289,7 +304,9 @@ struct TransformerRunConfig
 	      qkNormEnabled(false),
 	      qkNormGammaInit(0.0f),
 	      mtpDepth(0),
-	      mtpCoef(0.1f)
+	      mtpCoef(0.1f),
+	      layerDropPMax(0.0f),
+	      layerDropLinearSchedule(true)
 	{
 	}
 };

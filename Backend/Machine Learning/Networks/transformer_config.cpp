@@ -49,6 +49,9 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 	if (runtimeCfg.residualDropoutRate < 0.0f || runtimeCfg.residualDropoutRate >= 1.0f)
 		return invalid_argument(where, "residualDropoutRate must be in [0,1)");
 
+	if (runtimeCfg.layerDropPMax < 0.0f || runtimeCfg.layerDropPMax >= 1.0f)
+		return invalid_argument(where, "layerDropPMax must be in [0,1)");
+
 	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 
