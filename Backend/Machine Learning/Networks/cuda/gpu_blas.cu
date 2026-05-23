@@ -152,42 +152,19 @@ static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
 	if (!g_initialized && !blasInit())
 		return false;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	// Two-handle dispatch: pick the handle whose math mode matches the
+	// caller's request.  No state toggling, no cublasSet/GetMathMode in
+	// the hot path — capture-compatible (paradigm #51 ATLAS-COMPILE).
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemm(g_handle,
-	                 transa, transb,
-	                 N, M, K,
-	                 &alpha,
-	                 B, ldb,
-	                 A, lda,
-	                 &beta,
-	                 C, ldc);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemm(h,
+	                                transa, transb,
+	                                N, M, K,
+	                                &alpha,
+	                                B, ldb,
+	                                A, lda,
+	                                &beta,
+	                                C, ldc);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
