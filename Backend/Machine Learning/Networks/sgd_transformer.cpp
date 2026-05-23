@@ -7053,7 +7053,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		                         trainingConfig.transformer.residualDropoutRate,
 		                         trainingConfig.gradientCheckpointing,
 		                         trainingConfig.transformer.mtpDepth,
-		                         vocabSize);
+		                         vocabSize,
+		                         trainingConfig.transformer.layerDropPMax);
 
 		// Load x[t] for this sequence into scratch.x (non-tokenLM).
 		// In tokenLM mode, inputs are token ids (ints) and scratch.x is unused.

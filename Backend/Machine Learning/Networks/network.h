@@ -1455,6 +1455,11 @@ private:
 		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResAttn;  // [nLayers*T*dModel]
 		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResFF;    // [nLayers*T*dModel]
 
+		// LayerDrop per-step per-layer keep mask. Indexed by `li` (layer index).
+		// Value 1 = block kept (executed); 0 = block dropped (skipped fwd+bwd).
+		// Sized to nLayers when layerDropPMax > 0, empty otherwise.
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > layerDropKept;
+
 		// Gradient checkpointing recompute buffers (only allocated when enabled)
 		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_x1;        // [T, dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_Q;         // [T, dModel]
@@ -1549,7 +1554,8 @@ private:
 		            float resDropRate = 0.0f,
 		            bool gradCheckpoint = false,
 		            int mtpDepth = 0,
-		            unsigned int vocabSize = 0u)
+		            unsigned int vocabSize = 0u,
+		            float layerDropPMax = 0.0f)
 		{
 			T = newT;
 			inputSize = newInputSize;
@@ -1608,6 +1614,17 @@ private:
 				dropoutMaskResAttn.clear();
 				dropoutMaskResFF.clear();
 			}
+
+			// LayerDrop per-layer keep mask (only allocated if layerDropPMax > 0)
+			if (layerDropPMax > 0.0f)
+			{
+				if (layerDropKept.size() != static_cast<size_t>(nLayers))
+					layerDropKept.assign(static_cast<size_t>(nLayers), 1u);  // default kept
+				else
+					std::fill(layerDropKept.begin(), layerDropKept.end(), 1u);  // reset to kept
+			}
+			else if (!layerDropKept.empty())
+				layerDropKept.clear();
 
 			// Gradient checkpointing recompute buffers
 			if (gradCheckpoint)
