@@ -117,10 +117,11 @@ static bool ensureSideHandle()
 		return false;
 	}
 	cublasSetStream(g_handleSide, g_sideStream);
+	// Side handle follows the same two-handle invariant: set to native mode
+	// at init, never toggled afterwards. Callers dispatch via mathMode arg.
 	if (computeCapabilityMajor() >= 8)
 	{
-		cublasSetMathMode(g_handleSide,
-		    g_tf32_enabled ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+		cublasSetMathMode(g_handleSide, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
 	g_sideInitialized = true;
 	return true;
@@ -220,14 +221,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 __attribute__((used, visibility("default")))
 void set_tf32_enabled(bool enabled)
 {
+	// Flag-only API.  The two-handle design (Task 1.1) means callers
+	// explicitly request TF32 or strict via the mathMode arg per call;
+	// this flag is read by callers that want to HONOR the user's global
+	// toggle.
+	//
+	// IMPORTANT for cuda-graphs compatibility: NO cublasSetMathMode
+	// happens here.  The handles' math modes are set ONCE at blasInit()
+	// and never toggled afterwards.  This preserves the two-handle
+	// invariant (g_handleStrict always DEFAULT, g_handleTf32 always
+	// TF32 on CC>=8) which is required for capture-compatible dispatch.
 	g_tf32_enabled = enabled;
-	// Update the TF32 handle (g_handle is an alias to g_handleTf32 at this point).
-	// g_handleStrict is always CUBLAS_DEFAULT_MATH and does not need updating.
-	if (g_initialized && g_handleTf32)
-	{
-		cublasSetMathMode(g_handleTf32, enabled ? CUBLAS_TF32_TENSOR_OP_MATH
-		                                         : CUBLAS_DEFAULT_MATH);
-	}
 }
 
 __attribute__((used, visibility("default")))
@@ -268,9 +272,6 @@ bool blasInit()
 		// Pre-Ampere: no TF32; both handles use CUBLAS_DEFAULT_MATH.
 		cublasSetMathMode(g_handleTf32, CUBLAS_DEFAULT_MATH);
 	}
-	// Honor any prior set_tf32_enabled(false) call.  No-op if g_tf32_enabled is true.
-	if (!g_tf32_enabled)
-		cublasSetMathMode(g_handleTf32, CUBLAS_DEFAULT_MATH);
 
 	// Maintain g_handle as an alias to g_handleTf32 for backward compatibility
 	// with code paths that haven't been updated yet.  Will be removed in
