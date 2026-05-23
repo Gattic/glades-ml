@@ -1,7 +1,30 @@
 # CHIRON 1B UL2 (Mixture-of-Denoisers) — Design
 
 **Date:** 2026-05-23
-**Status:** Pre-registered design (no code yet)
+**Status:** Pre-registered design + implementation-time addendum (2026-05-23)
+
+> **Implementation addendum (2026-05-23, post-Task-2.6 / final-reviewer):**
+> R-UL2-3 (MASK token embedding init instability under high X-denoiser
+> mask density) materialized at implementation time. Zero-init of the
+> MASK row at row V (the MEDAL convention) triggers a NaN at step 1
+> under UL2 because UL2 has no `α` parameter and so skips MEDAL's
+> sinusoidal `φ(α)` broadcast embedding that breaks the all-zero
+> degeneracy at MASK positions. At X-denoiser ~50% mask density, the
+> all-zero MASK embedding causes LayerNorm denominators to collapse
+> and gradients explode. Per spec §4 R-UL2-3 explicit contingency
+> ("switch to small-Gaussian init σ=0.02 matching the rest of the
+> embedding table"), UL2 leaves the MASK row at the default Box-Muller
+> init path (std ≈ 0.005, clamped ±0.1). The spec's §2.6 reference to
+> "zero-init per MEDAL" is replaced by this small-Gaussian convention
+> for UL2 specifically; MEDAL itself still zero-inits (its `φ(α)`
+> broadcast protects against the degeneracy).
+>
+> All other implementation-time decisions matched the spec faithfully.
+> Implementation commits on glades-trainer: e44f451, 9fb9f44, 3f83b5b,
+> f511aea, 97420c8, 575b4d2, fa7e5d1, ac68907 (Fix 2 CUDA graphs guard),
+> and the Fix-1 revert (commit hash assigned at commit time). Library
+> commits on glades-ml/chiron2: 85513cddb, e5262dc6d. Validation arc
+> (U0/U1/U2) and gate thresholds in §3 are unchanged.
 **Program scope:** Phase-3 of CHIRON 1B production line. Adds the
 **objective-side** regularization arc — UL2 mixture-of-denoisers
 (Tay et al. 2022) — after the depth-noise arc (LayerDrop)
