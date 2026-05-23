@@ -9037,9 +9037,48 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		const float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
 		const float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
 
+		// === LayerDrop bwd skip branch ===
+		// If this layer was dropped on fwd (transformerScratch.layerDropKept[li]
+		// == 0), the block's bwd contributes zero to weight grads and the
+		// residual-stream gradient `dH` flows directly to the previous layer.
+		float layerDropPL_bwd = 0.0f;
+		float layerDropScale_bwd = 1.0f;
+		bool layerDropKeptThisLayer = true;
+		if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+		    !transformerScratch.layerDropKept.empty())
+		{
+			layerDropKeptThisLayer =
+			    transformerScratch.layerDropKept[static_cast<size_t>(li)] != 0u;
+			layerDropPL_bwd = glades::transformer_kernels::layer_drop_p_l(
+			    static_cast<unsigned int>(li), nLayers,
+			    trainingConfig.transformer.layerDropPMax,
+			    trainingConfig.transformer.layerDropLinearSchedule);
+			layerDropScale_bwd =
+			    (layerDropPL_bwd > 0.0f && layerDropPL_bwd < 1.0f)
+			        ? (1.0f / (1.0f - layerDropPL_bwd))
+			        : 1.0f;
+		}
+
+		if (!layerDropKeptThisLayer)
+		{
+			// Block was dropped on fwd. dH is already ∂L/∂hAfterFF[li] =
+			// ∂L/∂hIn[li] (identity path). No weight-grad accumulation, no
+			// LN1/LN2 bwd, no FFN bwd, no attn bwd. Skip to next iter.
+			continue;
+		}
+
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dHAfterAttn = transformerScratch.dH2;
 		if (dHAfterAttn.size() != dH.size()) dHAfterAttn.resize(dH.size());
 		std::copy(dH.begin(), dH.end(), dHAfterAttn.begin());
+
+		// LayerDrop bwd: scale dH by layerDropScale_bwd before the FFN bwd
+		// consumes it as ∂L/∂ffOut. dHAfterAttn already captured the
+		// unscaled identity-path gradient above, so this does not double-scale.
+		if (layerDropScale_bwd != 1.0f)
+		{
+			for (size_t i = 0; i < dH.size(); ++i)
+				dH[i] *= layerDropScale_bwd;
+		}
 
 		// FFN residual dropout backward
 		{
@@ -9150,6 +9189,16 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 
 		const float* attnConcat = transformerScratch.attnConcat.data() +
 		                          (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+		// LayerDrop bwd: scale dHAfterAttn by layerDropScale_bwd before the
+		// attn bwd consumes it as ∂L/∂attnOut. This is placed after the LN2-bwd
+		// accumulation and after the attn resDropoutBwd, so neither is
+		// double-scaled. When layerDropScale_bwd == 1.0f → bit-identical.
+		if (layerDropScale_bwd != 1.0f)
+		{
+			for (size_t i = 0; i < dHAfterAttn.size(); ++i)
+				dHAfterAttn[i] *= layerDropScale_bwd;
+		}
 
 		// Backprop Wo
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dAttnConcat = transformerScratch.dAttnConcat;
