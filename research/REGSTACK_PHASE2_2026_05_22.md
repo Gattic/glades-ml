@@ -262,13 +262,74 @@ Three plausible explanations, in order of likelihood:
 
 - **MTP code stays in `chiron_main` (committed glades-trainer 9dd167e).**
   Default off (`mtpDepth=0` is bit-identical to baseline).  Available
-  via `--mtp-depth 1 --mtp-coef <c>` for future investigation.
+  via `--mtp-depth 1 --mtp-coef <c>` (plus `--mtp-target-offset N` and
+  `--mtp-late-positions-only` per the follow-up sweep below) for
+  future investigation.
 - **MTP does NOT ship in the production flagship.**
 - **Honest negative result published here** per spec P6 (no silent
-  re-targeting).  Future follow-ups can revisit MTP after addressing
-  the three failure modes above — but this Phase 2 arc closes with
-  MTP as confirmed-negative at 5k single-seed at the current
-  λ=0.1 / depth=1 configuration.
+  re-targeting).
+
+### Follow-up sweeps (2026-05-23): λ, offset, late-positions
+
+After the initial MTP arc, two follow-up 5k pilots tested whether the
+three hypothesized failure modes could be addressed:
+
+**Sweep 1: λ_mtp = 0.01 (10× weaker coefficient).**
+
+| Config | Val NLL @ 5k | Δ vs B0 | Δ vs no-MTP counterpart |
+|---|---:|---:|---:|
+| B3_01 (MTP only, λ=0.01) | 4.8979 | −0.016 | (vs B0: −0.016) |
+| B4-full_01 (Z+QKN+MTP λ=0.01) | 3.9343 | −0.980 | (vs B4: −0.005) |
+
+Lower λ flipped the sign vs λ=0.1 (B3 went from +0.010 to −0.016;
+B4-full went from +0.043 regression to −0.005 marginal help).  Both
+within noise (±0.05 nat floor) but moving in the right direction.
+Doesn't justify the −15% wall regression.
+
+**Sweep 2: target offset = 3 + late-positions-only mask, at λ=0.01
+(recommendations 3 + 4 combined).**
+
+| Config | Val NLL @ 5k | Verdict |
+|---|---:|---|
+| B3_combined_01 (MTP-only, offset=3 + late + λ=0.01) | 4.9041 | stable; mild +0.010 vs B0 (noise) |
+| B4-full_combined_01 (Z+QKN+MTP combined) | **8.8989** | **TRAINING DIVERGED** |
+
+B3_combined_01 trained stably, confirming the masking implementation
+is mathematically correct.  B4-full_combined_01 (combined MTP stacked
+with Z-loss + QK-Norm) **diverged around step 1800**: ‖g‖ climbed
+from ~2.5 to >60, val NLL went from a healthy 5.37 to 8.90 by step
+5000.  Trajectory:
+
+| Step | Train ema | ‖g‖ | Val NLL |
+|---:|---:|---:|---:|
+| 1495 | 5.72 | 2.5 | 5.37 (best) |
+| 1827 | 6.11 | 5.3 | (turning point) |
+| 1993 | 6.39 | 14.5 | — |
+| 2491 | 7.07 | 17.9 | 6.93 |
+| 5000 | 9.36 | 27.1 | 8.90 |
+
+The interaction (offset=3 + late-positions-only mask) + QK-Norm γ_init=14
++ Z-loss is unstable when stacked.  Likely mechanism: QK-Norm
+γ=14 dramatically sharpens attention at init; combined with the more
+concentrated (half-positions-only, deeper target) MTP gradient signal,
+the loss landscape pushes toward an unstable basin once warmup ends
+and lr hits 1e-4.
+
+### Closing the MTP investigation
+
+Across all five tested MTP variants, none cleared a ship gate.  The
+best-case B4-full_01 (λ=0.01 only) delivered +0.005 nat at 5k —
+indistinguishable from noise — at a 15% wall cost.  Per the spec §3.2
+gate "≥0.02 nat improvement at ≤5% wall", MTP at depth=1 doesn't ship
+on this codebase at this design point.
+
+Future MTP work (NOT scoped to this Phase 2) could try:
+- True depth=2 (two-head DeepSeek-V3 style, ~200 LOC + 2× MTP compute)
+- MTP at 30k+ training scale (where literature gains surface)
+- Bisecting the divergence in B4-full_combined_01 (offset alone vs
+  mask alone) to identify which feature breaks the stack
+- Re-running multi-seed (n=3) at λ=0.01 to confirm the −0.005 nat
+  signal is real rather than noise
 
 ## B5 — 30k Phase 2 Retrain
 
