@@ -1,7 +1,46 @@
 # CHIRON 1B LayerDrop (Stochastic Depth) — Design
 
 **Date:** 2026-05-23
-**Status:** Pre-registered design (no code yet)
+**Status:** Pre-registered design + implementation-time addendum (2026-05-23)
+
+> **Implementation addendum (2026-05-23, post-Task-4.3):** A material
+> deviation from §2.1's inverted-dropout convention was made at the
+> production-trainer wiring layer. The library (`glades-ml`
+> `sgd_transformer.cpp`) implements the spec's inverted-dropout
+> faithfully (mathematically clean, train≡inference). However, the
+> production training binary `glades_chiron_train` (from
+> `glades-trainer/chiron_main.cpp`, used by `sh run.sh flagship`) uses
+> CHIRON's symplectic update structure `(p, q) → (p + shear(q),
+> reln(q))`, not the standard residual transformer update
+> `x_{l+1} = x_l + F(x_l)`. The `q = reln(q)` step is a
+> non-linear *transformation*, not a residual add — it has no clean
+> `1/(1-p_l)` scaling interpretation. To match the existing SAS
+> paradigm #40 (which already skips layers in CHIRON without
+> rescaling) and avoid contrived rescaling on `reln`, the production
+> wiring uses **hard-drop semantics**: when `mask_l = 0`, both `shear`
+> and `reln` are fully skipped (the layer is a no-op on both `p` and
+> `q`); when `mask_l = 1`, `shear` and `reln` run UNSCALED. The
+> resulting train/inference contribution gap (~5% of layer-stack
+> output on average at `p_max = 0.1`, `L = 24`) is the intentional
+> cost; the regularization effect is qualitatively similar to Fan
+> 2019's original LayerDrop convention (which also did not rescale).
+>
+> **Two divergent LayerDrop implementations now coexist:**
+> 1. **Library** (`sgd_transformer.cpp`): inverted-dropout per §2.1
+>    of this spec. Used by unit tests and any future standard-residual
+>    transformer training path. Math-verified bit-identical at
+>    `p_max = 0`.
+> 2. **Production trainer** (`chiron_main.cpp`): hard-drop semantics
+>    adapted for CHIRON's symplectic structure. Used by
+>    `sh run.sh flagship`. Math-verified at smoke shape: `p_max=0.0`
+>    bit-identical to baseline; `p_max=0.33` produces a different
+>    (lower) step-1 loss and gradient norm.
+>
+> §3.2 gate criteria (5k pilot main-head NLL parity ≤ +0.02 nat;
+> 30k Phase-2 NLL improvement target ≥ +0.02 nat vs regstack ship)
+> are unchanged — the regularization signal we're testing is
+> CHIRON-LayerDrop, just with hard-drop semantics. Throughput budget
+> (≤5% wall regression) is also unchanged.
 **Program scope:** Phase-3 of CHIRON 1B production line. Adds the first
 architecture-side stochastic-regularization mechanism to the stack —
 layer-level Bernoulli skip (a.k.a. stochastic depth, Fan et al. 2019 /
