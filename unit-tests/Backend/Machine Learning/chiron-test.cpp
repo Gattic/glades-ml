@@ -16856,6 +16856,48 @@ void CHIRONUL2SpanSamplerRateTest()
 // Disabled-parity test is a stub for Phase 2; implemented in Task 2.6 below.
 void CHIRONUL2DisabledParityTest()
 {
-	// Implemented in Task 2.6.
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At p_target=0.0, ul2_sample_span_mask must return 0 corrupted and
+	// leave the mask all-zero.  RNG state must not advance.
+	glades::rng::Engine eng_a;
+	glades::rng::seed_engine(eng_a, 12345u);
+	glades::rng::Engine eng_b;
+	glades::rng::seed_engine(eng_b, 12345u);
+
+	const unsigned int T = 4096;
+	std::vector<unsigned char> mask(T, 0u);
+
+	const unsigned int corrupted_a = ul2_sample_span_mask(
+	    eng_a, T, 0.0f, 3, mask.data());
+
+	ASSERT("CHIRONUL2DisabledParity: ul2_sample_span_mask at p=0 returns 0 corrupted",
+	       corrupted_a == 0u);
+
+	// Mask must be all zeros.
+	bool all_zero = true;
+	for (unsigned int i = 0; i < T; ++i)
+		if (mask[i] != 0u) { all_zero = false; break; }
+	ASSERT("CHIRONUL2DisabledParity: mask is all zeros at p=0", all_zero);
+
+	// RNG state of eng_a must equal eng_b (no draws).
+	const uint64_t next_a = glades::rng::next_u64(eng_a);
+	const uint64_t next_b = glades::rng::next_u64(eng_b);
+	ASSERT("CHIRONUL2DisabledParity: RNG state must NOT advance at p=0",
+	       next_a == next_b);
+
+	// At mu < 1 (invalid), also returns 0 without RNG draws.
+	glades::rng::Engine eng_c;
+	glades::rng::seed_engine(eng_c, 9999u);
+	glades::rng::Engine eng_d;
+	glades::rng::seed_engine(eng_d, 9999u);
+	const unsigned int corrupted_c = ul2_sample_span_mask(
+	    eng_c, T, 0.15f, 0, mask.data());  // mu=0 invalid
+	ASSERT("CHIRONUL2DisabledParity: ul2_sample_span_mask at mu=0 returns 0",
+	       corrupted_c == 0u);
+	const uint64_t next_c = glades::rng::next_u64(eng_c);
+	const uint64_t next_d = glades::rng::next_u64(eng_d);
+	ASSERT("CHIRONUL2DisabledParity: RNG state must NOT advance at mu=0",
+	       next_c == next_d);
 }
 
