@@ -1542,6 +1542,80 @@ inline bool layer_drop_keep(EngineT& eng, float p_l)
 	return mask != 0u;
 }
 
+// === UL2 span-mask sampler (Tay et al. 2022 mixture-of-denoisers) ===
+//
+// Samples a per-position bit-mask of length T indicating which positions
+// will be corrupted.  Span lengths are drawn from Poisson(mu); spans are
+// placed at uniformly random start indices; corruption continues until
+// the total corrupted positions reach floor(p_target * T) OR the rejection
+// attempt budget (T/2) is exhausted.
+//
+// Args:
+//   eng        — random engine (templated; uses next_u64 / portable next).
+//   T          — sequence length.
+//   p_target   — target corruption rate in [0, 1).
+//   mu         — Poisson mean for span length (>= 1).
+//   mask_out   — output buffer of length T; written entirely.
+//
+// Returns:
+//   actual_corrupted — number of positions actually corrupted (≤ floor(p_target*T)).
+//                       May be slightly below target if span overlap saturates
+//                       the rejection budget.
+template <typename EngineT>
+inline unsigned int ul2_sample_span_mask(EngineT& eng, unsigned int T,
+                                         float p_target, int mu,
+                                         unsigned char* mask_out)
+{
+	if (!mask_out || T == 0u) return 0u;
+	// Initialize mask to 0.
+	for (unsigned int i = 0; i < T; ++i) mask_out[i] = 0u;
+	if (p_target <= 0.0f || mu < 1) return 0u;
+	const unsigned int target_corrupted =
+	    (unsigned int)((float)T * p_target);
+	if (target_corrupted == 0u) return 0u;
+	unsigned int corrupted_so_far = 0u;
+	const unsigned int max_attempts = (T / 2u) + 1u;  // +1 ensures >=1 attempt at small T
+	for (unsigned int attempt = 0u; attempt < max_attempts; ++attempt)
+	{
+		// Sample Poisson span length using Knuth's method with native u64 draws.
+		// At mu in [1, 64], Knuth is exact and fast.  Each iteration draws
+		// a uniform [0, 1) by mapping (u64 >> 40) / 2^24.
+		unsigned int span_len = 0u;
+		{
+			const float L_thresh = expf(-(float)mu);
+			float p_cum = 1.0f;
+			unsigned int knuth_iters = 0u;
+			while (p_cum > L_thresh && knuth_iters < 256u)
+			{
+				const uint64_t r = glades::rng::next_u64(eng);
+				const float u = (float)((r >> 40) & 0xFFFFFFull) / 16777216.0f;
+				p_cum *= u;
+				++span_len;
+				++knuth_iters;
+			}
+			// Knuth's algorithm counts the number of uniform draws k;
+			// the Poisson sample is k-1.  Subtract one before clamping.
+			if (span_len > 0u) span_len -= 1u;
+			if (span_len == 0u) span_len = 1u;  // min span length 1
+		}
+		// Sample uniform start in [0, T) from one u64 draw.
+		const uint64_t r_start = glades::rng::next_u64(eng);
+		const unsigned int start = (unsigned int)((r_start >> 32) % (uint64_t)T);
+		const unsigned int end = (start + span_len > T) ? T : (start + span_len);
+		for (unsigned int i = start; i < end; ++i)
+		{
+			if (mask_out[i] == 0u)
+			{
+				mask_out[i] = 1u;
+				++corrupted_so_far;
+				if (corrupted_so_far >= target_corrupted) break;
+			}
+		}
+		if (corrupted_so_far >= target_corrupted) break;
+	}
+	return corrupted_so_far;
+}
+
 // Apply dropout mask in-place: x[i] *= mask[i] * scale
 inline void apply_dropout_mask_inplace(float* x, const unsigned char* mask, float scale, size_t n)
 {

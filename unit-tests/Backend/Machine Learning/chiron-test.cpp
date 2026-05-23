@@ -11357,6 +11357,9 @@ void CHIRONUnitTest()
 	CHIRONLayerDropScheduleMathTest();
 	CHIRONLayerDropDisabledParityTest();
 	CHIRONLayerDropDeterministicMasksTest();
+	CHIRONUL2SpanSamplerMeanSpanTest();
+	CHIRONUL2SpanSamplerRateTest();
+	CHIRONUL2DisabledParityTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -16751,5 +16754,108 @@ void CHIRONLayerDropDeterministicMasksTest()
 	// standard deviation ≈ sqrt(0.95*0.05/2400) ≈ 0.0045. Allow ±0.02 tolerance (~4σ).
 	ASSERT("CHIRONLayerDropDeterministicMasks: keep rate within tolerance of 0.95",
 	       fabsf(keepRate - 0.95f) < 0.02f);
+}
+
+// === UL2 TESTS (2026-05-23 spec) ===
+
+void CHIRONUL2SpanSamplerMeanSpanTest()
+{
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At mu=3, p=0.15, T=4096: total corrupted ≈ 614.  Mean span length
+	// derived from contiguous 1-runs in mask should be close to mu.
+	// We measure the mean run-length and check it is within ±20% of mu=3
+	// over n=100 trials.
+	const unsigned int T = 4096;
+	const float p_target = 0.15f;
+	const int mu = 3;
+	const unsigned int n_trials = 100;
+
+	std::vector<unsigned char> mask(T, 0u);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 1337u);
+
+	double total_runs = 0.0;
+	double total_corrupted = 0.0;
+	for (unsigned int trial = 0; trial < n_trials; ++trial)
+	{
+		std::fill(mask.begin(), mask.end(), 0u);
+		const unsigned int corrupted = ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+		// Count contiguous runs of 1s.
+		unsigned int runs = 0;
+		bool in_run = false;
+		for (unsigned int i = 0; i < T; ++i)
+		{
+			if (mask[i] == 1u && !in_run) { ++runs; in_run = true; }
+			else if (mask[i] == 0u) in_run = false;
+		}
+		total_runs += (double)runs;
+		total_corrupted += (double)corrupted;
+	}
+	const double mean_run_len = (total_runs > 0.0)
+	    ? (total_corrupted / total_runs) : 0.0;
+	// Expected mean run length is mu=3.  Allow ±20% tolerance for
+	// overlap effects (Knuth Poisson + uniform-start placement clamping).
+	ASSERT("CHIRONUL2SpanSamplerMeanSpan: mean run length within ±20% of mu=3",
+	       (mean_run_len >= 0.8 * (double)mu) && (mean_run_len <= 1.2 * (double)mu));
+}
+
+void CHIRONUL2SpanSamplerRateTest()
+{
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At mu=3, p=0.15, T=4096: target corrupted = 614.  Actual should be
+	// 614 ± 3.  At mu=32, p=0.50, T=16384: target = 8192.  Actual within
+	// ±0.03 of 0.50 over n=100 trials.
+	const unsigned int n_trials = 100;
+	std::vector<unsigned char> mask;
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 4242u);
+
+	// R-denoiser: mu=3, p=0.15, T=4096
+	{
+		const unsigned int T = 4096;
+		const float p_target = 0.15f;
+		const int mu = 3;
+		mask.assign(T, 0u);
+		double total_rate = 0.0;
+		for (unsigned int trial = 0; trial < n_trials; ++trial)
+		{
+			std::fill(mask.begin(), mask.end(), 0u);
+			ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+			unsigned int corrupted = 0;
+			for (unsigned int i = 0; i < T; ++i) if (mask[i] == 1u) ++corrupted;
+			total_rate += (double)corrupted / (double)T;
+		}
+		const double mean_rate = total_rate / (double)n_trials;
+		ASSERT("CHIRONUL2SpanSamplerRate (R): mean rate within ±0.03 of 0.15",
+		       fabs(mean_rate - 0.15) < 0.03);
+	}
+
+	// X-denoiser: mu=32, p=0.50, T=16384
+	{
+		const unsigned int T = 16384;
+		const float p_target = 0.50f;
+		const int mu = 32;
+		mask.assign(T, 0u);
+		double total_rate = 0.0;
+		for (unsigned int trial = 0; trial < n_trials; ++trial)
+		{
+			std::fill(mask.begin(), mask.end(), 0u);
+			ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+			unsigned int corrupted = 0;
+			for (unsigned int i = 0; i < T; ++i) if (mask[i] == 1u) ++corrupted;
+			total_rate += (double)corrupted / (double)T;
+		}
+		const double mean_rate = total_rate / (double)n_trials;
+		ASSERT("CHIRONUL2SpanSamplerRate (X): mean rate within ±0.03 of 0.50",
+		       fabs(mean_rate - 0.50) < 0.03);
+	}
+}
+
+// Disabled-parity test is a stub for Phase 2; implemented in Task 2.6 below.
+void CHIRONUL2DisabledParityTest()
+{
+	// Implemented in Task 2.6.
 }
 
