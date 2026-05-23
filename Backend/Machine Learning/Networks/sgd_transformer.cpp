@@ -7817,6 +7817,46 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		const float* hIn = (li == 0u) ? transformerScratch.h.data()
 		                              : (transformerScratch.hAfterFF.data() + (static_cast<size_t>(li - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel)));
 
+		// === LayerDrop mask draw (paradigm shift: Fan 2019 / Huang 2016) ===
+		// Decide per-step whether to drop this entire block. When dropped,
+		// final residual stream = hIn (no attn/FFN contribution). Mask is
+		// persisted to transformerScratch.layerDropKept[li] for the bwd
+		// pass to read.
+		float layerDropPL = 0.0f;
+		float layerDropScale = 1.0f;
+		bool layerDropKeepThisLayer = true;
+		if (trainingConfig.transformer.layerDropPMax > 0.0f &&
+		    !transformerScratch.layerDropKept.empty())
+		{
+			layerDropPL = glades::transformer_kernels::layer_drop_p_l(
+			    li, nLayers, trainingConfig.transformer.layerDropPMax,
+			    trainingConfig.transformer.layerDropLinearSchedule);
+			layerDropKeepThisLayer = glades::transformer_kernels::layer_drop_keep(
+			    rngEngine, layerDropPL);
+			layerDropScale = (layerDropPL > 0.0f && layerDropPL < 1.0f)
+			    ? (1.0f / (1.0f - layerDropPL))
+			    : 1.0f;
+			transformerScratch.layerDropKept[li] =
+			    layerDropKeepThisLayer ? 1u : 0u;
+		}
+
+		if (!layerDropKeepThisLayer)
+		{
+			// Block dropped. Final residual stream for this layer equals hIn.
+			// Copy hIn into this layer's hAfterFF slot so downstream layers
+			// and the bwd pass see a populated buffer (= hIn).
+			// Do NOT touch ffOut / attnOut / Q/K/V scratch — those stay
+			// uninitialized; the bwd pass also takes the skip branch and
+			// never reads them.
+			float* hAfterFF_li = transformerScratch.hAfterFF.data()
+			    + (static_cast<size_t>(li) * static_cast<size_t>(T)
+			       * static_cast<size_t>(dModel));
+			std::memcpy(hAfterFF_li, hIn,
+			    sizeof(float) * static_cast<size_t>(T)
+			    * static_cast<size_t>(dModel));
+			continue;
+		}
+
 		float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 		float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
 		float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
@@ -7999,7 +8039,7 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		// Residual add
 		float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 		for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
-			hAfterAttn[i] = hIn[i] + attnOut[i];
+			hAfterAttn[i] = hIn[i] + layerDropScale * attnOut[i];
 
 		// LN2 forward
 		float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -8088,7 +8128,7 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		// Residual add
 		float* hAfterFF = transformerScratch.hAfterFF.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 		for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
-			hAfterFF[i] = hAfterAttn[i] + ffOut[i];
+			hAfterFF[i] = hAfterAttn[i] + layerDropScale * ffOut[i];
 
 		// Per-layer NaN detection: check hidden state after each layer and abort early.
 		{
