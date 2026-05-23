@@ -17,27 +17,35 @@ This doc reports the regularization-stack validation arc per
 (spec) and `docs/superpowers/plans/2026-05-22-chiron-1b-regularization-stack.md`
 (plan).
 
-## Scope Note: MTP Deferred
+## Scope Note: MTP — initial deferral, then follow-up arc (NEGATIVE)
 
 The original spec called for B3 (MTP, depth=1, λ_mtp=0.1) as a third
-per-mechanism pilot and B4 as the three-way stack. **MTP was deferred
-from this arc** because at the production shape (T=16384, V=32000,
-m=2048, L=24) the MTP scratch buffers (`logitsMtp`, `probsMtp`,
-`dLogitsMtp` at T·V FP32 ≈ 2 GB each, plus `hMtp`/`dHmtp` at T·dModel
-≈ 256 MB each) total ~2.6 GB on top of the v5+FP8 ship's 14.97 GB
-working-set, which exceeds the 15.6 GB available on the RTX 4080
-SUPER. A chunked-T or sparse-T MTP implementation is needed for
-production-shape inclusion; that's a follow-up arc, not part of this
-Phase 2.
+per-mechanism pilot and B4 as the three-way stack. **MTP was initially
+deferred** from this arc because at the production shape (T=16384, V=32000,
+m=2048, L=24) the naive MTP scratch buffers (`logitsMtp`, `probsMtp`,
+`dLogitsMtp` at T·V FP32 ≈ 2 GB each, plus `hMtp`/`dHmtp` at T·m ≈ 128 MB
+each) total ~2.6 GB on top of the v5+FP8 ship's 14.97 GB working-set,
+which exceeds the 15.6 GB available on the RTX 4080 SUPER.
 
-Pilot arc therefore runs **B0 / B1 / B2 / B4 only**, with B4 testing
-Z-loss + QK-Norm stacked (the two-way stack, not three-way).
+A **chunked-T BF16-explicit MTP port** landed 2026-05-23 (glades-trainer
+commit `9dd167e`) that fits production VRAM by:
+- chunking T into 16 chunks of T_chunk=1024 (logitsMtp_chunk_bf at
+  T_chunk·V BF16 = 64 MB instead of T·V FP32 = 2 GB),
+- using BF16-explicit GEMMs (`sgemm_rowmajor_*_bf16`) reusing the existing
+  `q_L_bf` and `E_bf_cache` from `--bf16-logits-storage` (avoids the
+  FAST_16BF runtime cast-scratch realloc that OOMs at production shape),
+- persisting `hMtp_bf` [T, m] BF16 across forward → backward,
+- recomputing logits/probs per chunk in backward (1 extra tied-readout
+  GEMM per chunk; total ~15% wall regression).
 
-The decision tree at spec §3.3 is adapted accordingly:
-- if Δ4 ≥ max(Δ1, Δ2): B5 := B4 (stacked, additive or super-additive)
-- elif Δ4 ≥ 0.02: B5 := B4 (sub-additive but clears gate)
-- elif max(Δ1, Δ2) ≥ 0.02: B5 := single best
-- else: no B5 — publish negative result and close.
+The initial pilot arc therefore ran **B0 / B1 / B2 / B4 only**, with B4
+testing Z-loss + QK-Norm stacked (two-way).  A **follow-up MTP arc** ran
+2026-05-23 02:46 → 03:05 EDT after the port landed, adding:
+- **B3** (MTP only: `--mtp-depth 1 --mtp-coef 0.1`)
+- **B4-full** (all three: Z-loss + QK-Norm + MTP)
+
+The decision tree at spec §3.3 is applied to the combined B0/B1/B2/B3/B4/B4-full
+evidence (see §"Follow-up MTP Arc" below).
 
 ## Trainer Wiring Fixes (Pre-Arc)
 
@@ -170,6 +178,97 @@ Picking B5 := B4 retains Z-loss for the 30k retrain on the assumption
 that it may grow past noise at longer training. If B5 fails the 30k
 gate while B2-only would have passed, a follow-up 30k retrain at the
 B2-only config may be needed (acknowledged as an arc extension).
+
+## Follow-up MTP Arc (2026-05-23) — NEGATIVE
+
+After the chunked-T MTP port to `chiron_main` (glades-trainer commit
+`9dd167e`), two additional 5k pilots ran on the flagship recipe
+seed=1337:
+
+| ID | Config | Val NLL @ 5k | Δ vs B0 | tok/s |
+|---|---|---:|---:|---:|
+| B3 | `--mtp-depth 1 --mtp-coef 0.1` | 4.9244 | +0.0104 | ~24,500 |
+| B4-full | Z-loss + QK-Norm + MTP | 3.9822 | −0.9318 | ~23,898 |
+
+### Position-stratified comparison
+
+| Bucket | B0 | B3 | B4 (Z+QKN) | B4-full (all 3) |
+|---:|---:|---:|---:|---:|
+| 0 | 4.89 | 4.87 | 3.81 | 3.85 |
+| 1 | 4.85 | 4.86 | 3.84 | 3.86 |
+| 2 | 4.92 | 4.94 | 3.92 | 4.00 |
+| 3 | 4.85 | 4.85 | 3.93 | 3.94 |
+| 4 | 4.87 | 4.88 | 3.93 | 4.02 |
+| 5 | 4.85 | 4.84 | 4.00 | 4.05 |
+| 6 | 4.96 | 4.99 | 4.07 | 4.11 |
+| 7 | 5.12 | 5.15 | 4.02 | 4.03 |
+| agg | 4.91 | 4.92 | 3.94 | 3.98 |
+
+B3 (MTP only) is virtually identical to B0 — same flat profile, no
+late-T improvement.  B4-full is uniformly **+0.04 nat worse** than B4
+(regstack only) at every bucket — MTP shifts the whole profile up.
+
+### Per-mechanism gate evaluation (spec §3.2)
+
+- **B3 (MTP only): PASS** the "no regression > 0.02" gate (Δ3 = +0.010
+  nat, well within ±0.02), but **null signal at 5k single-seed**.
+  Same pattern as B1 (Z-loss at 1e-4) — mechanism propagates
+  correctly (smoke confirmed +1.04 nat training loss shift = mtpCoef ·
+  log V), but doesn't move val NLL at this scale.  Possible
+  interpretation: at 5k steps the auxiliary head is competing for
+  capacity rather than providing useful regularization.
+- **B4-full (all three stacked): FAIL** the spec's "Δ4 ≥ max(Δi)"
+  condition.  Δ4_full = +0.9318 < max(Δ1, Δ2, Δ3) = Δ2 = +0.9728.
+  MTP actively *hurts* the stack by 0.0426 nat vs Z+QKN.
+
+### Decision tree application (spec §3.3, updated for MTP arc)
+
+- Δ1 = +0.0067 (Z-loss, noise)
+- Δ2 = +0.9728 (QK-Norm, dominant)
+- Δ3 = +0.0104 (MTP, noise)
+- Δ4 = +0.9744 (Z+QKN, additive)
+- Δ4_full = +0.9318 (Z+QKN+MTP, sub-max)
+
+Δ4_full < max(Δ1, Δ2, Δ3, Δ4) — falls through to:
+- "elif max(Δ1, Δ2, Δ3) ≥ 0.02: B5 := single best Bi (drop interactions)"
+- Best individual is B2 (QK-Norm).  But the existing shipped Phase 2
+  retrain used B4 (= Z+QKN ≈ B2 within noise) — both stay equivalent.
+
+**No new 30k retrain.  Current regstack Phase 2 (Z-loss + QK-Norm)
+remains the production flagship.**
+
+### Why MTP failed at this scale
+
+Three plausible explanations, in order of likelihood:
+
+1. **5k is too early for auxiliary-loss benefit.**  MTP's published
+   gains (DeepSeek-V3 et al.) are at multi-hundred-billion-token training
+   scale.  At 5k × 16,384 = 82M tokens, the model is still learning
+   basic next-token prediction; spending capacity on a competing t+2
+   prediction objective subtracts from the main task.  A 30k retrain
+   (per-mechanism B3 → B5) might surface positive signal, but the
+   ~15% wall regression would need to be justified by ≥0.05 nat NLL
+   gain to clear the spec's net-positive bar.
+2. **λ_mtp = 0.1 may be miscalibrated.**  The spec's value comes from
+   DeepSeek-V3; CHIRON 1B's loss landscape (with SCFA-compressed
+   attention and FP8 readout) may require different weighting.  A
+   sweep at {0.01, 0.05, 0.1, 0.2} would be the next investigation if
+   pursued.
+3. **The +2 target shift may be too short at T=16384.**  DeepSeek-V3
+   uses depth=2 (predict t+2 AND t+3).  At long context, t+2 prediction
+   is closer to the main t+1 task than at typical training contexts.
+
+### What ships, what doesn't
+
+- **MTP code stays in `chiron_main` (committed glades-trainer 9dd167e).**
+  Default off (`mtpDepth=0` is bit-identical to baseline).  Available
+  via `--mtp-depth 1 --mtp-coef <c>` for future investigation.
+- **MTP does NOT ship in the production flagship.**
+- **Honest negative result published here** per spec P6 (no silent
+  re-targeting).  Future follow-ups can revisit MTP after addressing
+  the three failure modes above — but this Phase 2 arc closes with
+  MTP as confirmed-negative at 5k single-seed at the current
+  λ=0.1 / depth=1 configuration.
 
 ## B5 — 30k Phase 2 Retrain
 
