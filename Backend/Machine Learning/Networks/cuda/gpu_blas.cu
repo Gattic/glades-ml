@@ -192,43 +192,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 	if (!Aarray || !Barray || !Carray || batchCount <= 0)
 		return true;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemmBatched(g_handle,
-	                        transa, transb,
-	                        N, M, K,
-	                        &alpha,
-	                        reinterpret_cast<const float* const*>(Barray), ldb,
-	                        reinterpret_cast<const float* const*>(Aarray), lda,
-	                        &beta,
-	                        Carray, ldc,
-	                        batchCount);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemmBatched(h,
+	                                       transa, transb,
+	                                       N, M, K,
+	                                       &alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       &beta,
+	                                       Carray, ldc,
+	                                       batchCount);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
