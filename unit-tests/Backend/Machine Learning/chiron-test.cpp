@@ -16644,7 +16644,53 @@ void CHIRONLayerDropScheduleMathTest()
 
 void CHIRONLayerDropDisabledParityTest()
 {
-	// Implemented in Task 1.3 below.
+	using glades::transformer_kernels::layer_drop_keep;
+	using glades::transformer_kernels::layer_drop_p_l;
+
+	// At p_l = 0, layer_drop_keep MUST return true unconditionally and MUST
+	// NOT advance the RNG state (the helper takes the early-return path).
+	glades::rng::Engine eng_a;
+	glades::rng::Engine eng_b;
+	glades::rng::seed_engine(eng_a, 7777ULL);
+	glades::rng::seed_engine(eng_b, 7777ULL);
+
+	// On engine A: 24 calls to layer_drop_keep at p_l = 0 (mimicking a full
+	// L=24 layer pass at p_max = 0).
+	for (unsigned int li = 0; li < 24u; ++li)
+	{
+		const float p_l = layer_drop_p_l(li, 24u, 0.0f, true);
+		ASSERT("CHIRONLayerDropDisabledParity: p_l must be 0 at p_max=0",
+		       p_l == 0.0f);
+		const bool keep = layer_drop_keep(eng_a, p_l);
+		ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep must return true at p_l=0",
+		       keep == true);
+	}
+
+	// Engine A and engine B started at the same seed and engine B has NOT
+	// been called yet. After A's 24 no-op calls, both engines must produce
+	// the same next 64-bit draw — i.e., the no-op calls did not perturb the
+	// RNG state.
+	const uint64_t next_a = glades::rng::next_u64(eng_a);
+	const uint64_t next_b = glades::rng::next_u64(eng_b);
+	ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep at p_l=0 must NOT advance RNG state",
+	       next_a == next_b);
+
+	// Also: at p_l = 1.0 (drop always), layer_drop_keep must return false
+	// and MUST NOT consume RNG state (early-return path).
+	glades::rng::Engine eng_c;
+	glades::rng::Engine eng_d;
+	glades::rng::seed_engine(eng_c, 8888ULL);
+	glades::rng::seed_engine(eng_d, 8888ULL);
+	for (int i = 0; i < 10; ++i)
+	{
+		const bool keep = layer_drop_keep(eng_c, 1.0f);
+		ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep must return false at p_l=1.0",
+		       keep == false);
+	}
+	const uint64_t next_c = glades::rng::next_u64(eng_c);
+	const uint64_t next_d = glades::rng::next_u64(eng_d);
+	ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep at p_l=1.0 must NOT advance RNG state",
+	       next_c == next_d);
 }
 
 void CHIRONLayerDropDeterministicMasksTest()
