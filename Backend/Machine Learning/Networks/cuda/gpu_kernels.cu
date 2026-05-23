@@ -3722,8 +3722,8 @@ bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   float* loss_sum, int* valid_count)
 {
 	if (T <= 0 || vocabSize <= 0) return true;
-	GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
-	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
 	int block = 256;
 	int grid = 1;
 	if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
@@ -3740,8 +3740,8 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
                                 int* correct_count, int* valid_count)
 {
 	if (T <= 0 || vocabSize <= 0) return true;
-	GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
-	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
 	// Iter 56/60: warp-parallel argmax (1 warp per row).  Block = 1024 threads
 	// = 32 warps = 32 rows per block.  Replaces the legacy 1-thread-per-row
 	// V-loop pattern.

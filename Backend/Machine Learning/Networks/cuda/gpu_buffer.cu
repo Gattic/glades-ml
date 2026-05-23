@@ -140,9 +140,7 @@ bool GpuBuffer<float>::zero()
 {
 	if (!d_ptr)
 		return false;
-	if (!syncBlockingBufferOp())
-		return false;
-	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(float));
+	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(float), computeStream());
 	return err == cudaSuccess;
 }
 
@@ -252,9 +250,7 @@ bool GpuBuffer<int>::zero()
 {
 	if (!d_ptr)
 		return false;
-	if (!syncBlockingBufferOp())
-		return false;
-	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(int));
+	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(int), computeStream());
 	return err == cudaSuccess;
 }
 
@@ -364,9 +360,7 @@ bool GpuBuffer<uint16_t>::zero()
 {
 	if (!d_ptr)
 		return false;
-	if (!syncBlockingBufferOp())
-		return false;
-	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(uint16_t));
+	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(uint16_t), computeStream());
 	return err == cudaSuccess;
 }
 
@@ -476,9 +470,7 @@ bool GpuBuffer<unsigned int>::zero()
 {
 	if (!d_ptr)
 		return false;
-	if (!syncBlockingBufferOp())
-		return false;
-	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(unsigned int));
+	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(unsigned int), computeStream());
 	return err == cudaSuccess;
 }
 
@@ -588,9 +580,7 @@ bool GpuBuffer<unsigned char>::zero()
 {
 	if (!d_ptr)
 		return false;
-	if (!syncBlockingBufferOp())
-		return false;
-	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(unsigned char));
+	cudaError_t err = cudaMemsetAsync(d_ptr, 0, n * sizeof(unsigned char), computeStream());
 	return err == cudaSuccess;
 }
 
@@ -672,8 +662,7 @@ template <>
 bool GpuBuffer<int8_t>::zero()
 {
 	if (!d_ptr) return false;
-	if (!syncBlockingBufferOp()) return false;
-	return cudaMemset(d_ptr, 0, n * sizeof(int8_t)) == cudaSuccess;
+	return cudaMemsetAsync(d_ptr, 0, n * sizeof(int8_t), computeStream()) == cudaSuccess;
 }
 
 template <>
