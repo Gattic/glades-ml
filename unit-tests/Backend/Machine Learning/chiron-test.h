@@ -79,6 +79,9 @@ void CHIRONQkNormDisabledParityTest();
 void CHIRONQkNormEnabledMathTest();
 void CHIRONMtpDisabledParityTest();
 void CHIRONMtpTargetShiftTest();
+void CHIRONLayerDropScheduleMathTest();
+void CHIRONLayerDropDisabledParityTest();
+void CHIRONLayerDropDeterministicMasksTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

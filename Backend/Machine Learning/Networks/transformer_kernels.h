@@ -1510,6 +1510,38 @@ inline void generate_dropout_mask(EngineT& eng, unsigned char* mask, size_t n, f
 	}
 }
 
+// === LayerDrop schedule helper ===
+//
+// Linear-rising stochastic-depth schedule:
+//   p_l = (l / (L - 1)) * pMax,    l ∈ {0, 1, ..., L-1}
+// So p_0 = 0 (layer 0 never drops; protects embedding-adjacent state),
+// p_{L-1} = pMax (deepest layer drops with probability pMax).
+// When L == 1, returns 0 (the only layer is never dropped).
+inline float layer_drop_p_l(unsigned int l, unsigned int L, float pMax, bool linearSchedule)
+{
+	if (pMax <= 0.0f || L == 0u)
+		return 0.0f;
+	if (!linearSchedule)
+		return pMax;
+	if (L == 1u)
+		return 0.0f;
+	return (static_cast<float>(l) / static_cast<float>(L - 1u)) * pMax;
+}
+
+// Single-Bernoulli draw helper (returns true = "keep this layer", false = "drop").
+// Reuses generate_dropout_mask with n=1 to share the determinism path.
+template <typename EngineT>
+inline bool layer_drop_keep(EngineT& eng, float p_l)
+{
+	if (p_l <= 0.0f)
+		return true;
+	if (p_l >= 1.0f)
+		return false;
+	unsigned char mask = 1;
+	generate_dropout_mask(eng, &mask, 1u, p_l);
+	return mask != 0u;
+}
+
 // Apply dropout mask in-place: x[i] *= mask[i] * scale
 inline void apply_dropout_mask_inplace(float* x, const unsigned char* mask, float scale, size_t n)
 {

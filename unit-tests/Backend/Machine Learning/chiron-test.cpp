@@ -11354,6 +11354,9 @@ void CHIRONUnitTest()
 	CHIRONQkNormEnabledMathTest();
 	CHIRONMtpDisabledParityTest();
 	CHIRONMtpTargetShiftTest();
+	CHIRONLayerDropScheduleMathTest();
+	CHIRONLayerDropDisabledParityTest();
+	CHIRONLayerDropDeterministicMasksTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -16567,5 +16570,85 @@ void CHIRONMtpTargetShiftTest()
 	glades::transformer_kernels::compute_mtp_targets(
 	    &single, 1, /*ignoreLabel=*/-1, &targetsMtpT1[0]);
 	ASSERT("mtp_target: T=1 sets ignore label", targetsMtpT1[0] == -1);
+}
+
+// === LAYERDROP TESTS (2026-05-23 spec) ===
+
+// Verify that layer_drop_p_l(l, L=24, pMax=0.1, linear=true) gives
+// p_0 = 0, p_{23} = 0.1, p_{12} ≈ 0.0522..., and the sum over l matches
+// the expected (pMax * L / 2) = 1.2.
+void CHIRONLayerDropScheduleMathTest()
+{
+	using glades::transformer_kernels::layer_drop_p_l;
+
+	const unsigned int L = 24;
+	const float pMax = 0.1f;
+
+	// p_0 = 0
+	{
+		const float p0 = layer_drop_p_l(0u, L, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: p_0 must be 0", p0 == 0.0f);
+	}
+
+	// p_{L-1} = pMax
+	{
+		const float pLast = layer_drop_p_l(L - 1u, L, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: p_{L-1} must equal pMax",
+		       fabsf(pLast - pMax) < 1e-7f);
+	}
+
+	// p_{12} = (12/23) * 0.1 ≈ 0.0521739
+	{
+		const float pMid = layer_drop_p_l(12u, L, pMax, true);
+		const float expected = (12.0f / 23.0f) * 0.1f;
+		ASSERT("CHIRONLayerDropSchedule: p_{12} must match (12/23) * pMax",
+		       fabsf(pMid - expected) < 1e-6f);
+	}
+
+	// Sum over l ∈ {0..L-1} = pMax * sum(0..L-1) / (L-1) = pMax * (L*(L-1)/2) / (L-1) = pMax * L / 2 = 1.2
+	{
+		float sum = 0.0f;
+		for (unsigned int l = 0u; l < L; ++l)
+			sum += layer_drop_p_l(l, L, pMax, true);
+		const float expected = pMax * static_cast<float>(L) / 2.0f;  // 1.2
+		ASSERT("CHIRONLayerDropSchedule: sum p_l must equal pMax*L/2 = 1.2",
+		       fabsf(sum - expected) < 1e-5f);
+	}
+
+	// Constant schedule: all layers get pMax.
+	{
+		for (unsigned int l = 0u; l < L; ++l)
+		{
+			const float p = layer_drop_p_l(l, L, pMax, false);
+			ASSERT("CHIRONLayerDropSchedule: constant schedule gives pMax",
+			       fabsf(p - pMax) < 1e-7f);
+		}
+	}
+
+	// L == 1: p_0 = 0 regardless of pMax.
+	{
+		const float p = layer_drop_p_l(0u, 1u, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: L=1 must give p_0 = 0", p == 0.0f);
+	}
+
+	// pMax = 0: all p_l = 0.
+	{
+		for (unsigned int l = 0u; l < L; ++l)
+		{
+			const float p = layer_drop_p_l(l, L, 0.0f, true);
+			ASSERT("CHIRONLayerDropSchedule: pMax=0 must give all p_l = 0",
+			       p == 0.0f);
+		}
+	}
+}
+
+void CHIRONLayerDropDisabledParityTest()
+{
+	// Implemented in Task 1.3 below.
+}
+
+void CHIRONLayerDropDeterministicMasksTest()
+{
+	// Implemented in Task 2.3 below.
 }
 
