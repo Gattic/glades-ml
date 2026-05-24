@@ -9458,6 +9458,39 @@ bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// qknorm_gamma_scale_gpu: compute gamma_scale[h] = gamma[h] * sqrtDh
+// on the GPU (cuda-graphs capture-safe).
+//
+// Replaces the prior CPU-host round-trip (download gamma, CPU multiply,
+// upload gamma_scale) that was a CUDA Graph capture blocker.  Called once
+// per layer per forward step; nH=16 on the flagship so this is trivially
+// cheap (one kernel launch covering 16 elements).
+// ---------------------------------------------------------------------------
+__global__ void qknorm_gamma_scale_kernel(const float* __restrict__ gamma,
+                                          float sqrtDh,
+                                          float* __restrict__ gamma_scale,
+                                          int nH)
+{
+	int h = blockIdx.x * blockDim.x + threadIdx.x;
+	if (h < nH)
+		gamma_scale[h] = gamma[h] * sqrtDh;
+}
+
+bool qknorm_gamma_scale_gpu(const float* gamma_d,
+                            float sqrtDh,
+                            float* gamma_scale_d,
+                            int nH)
+{
+	if (!gamma_d || !gamma_scale_d || nH <= 0) return false;
+	const int block = 32;
+	const int grid = (nH + block - 1) / block;
+	qknorm_gamma_scale_kernel<<<grid, block, 0, computeStream()>>>(
+	    gamma_d, sqrtDh, gamma_scale_d, nH);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

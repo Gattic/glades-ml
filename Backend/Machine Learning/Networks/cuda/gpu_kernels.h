@@ -1090,6 +1090,14 @@ bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
                        float sqrtDh, int T, int nHeads, int dHead,
                        float* dGamma);
 
+// Compute gamma_scale[h] = gamma[h] * sqrtDh element-wise on the GPU.
+// Replaces the prior D2H-CPU-H2D round-trip; cuda-graphs capture-safe.
+// gamma_d, gamma_scale_d: device pointers of length nH.
+bool qknorm_gamma_scale_gpu(const float* gamma_d,
+                            float sqrtDh,
+                            float* gamma_scale_d,
+                            int nH);
+
 } // namespace gpu
 } // namespace glades
 
@@ -1302,6 +1310,7 @@ inline bool qknorm_forward_gpu(float*, float*, int, int, int, float) { return fa
 inline bool qknorm_backward_gpu(const float*, const float*, const float*, int, int, int, float*) { return false; }
 inline bool scale_q_per_head(float*, const float*, int, int, int) { return false; }
 inline bool qknorm_gamma_grad(const float*, const float*, float, int, int, int, float*) { return false; }
+inline bool qknorm_gamma_scale_gpu(const float*, float, float*, int) { return false; }
 
 } // namespace gpu
 } // namespace glades
