@@ -443,7 +443,17 @@ void TransformerServingLayerUnitTest()
 	}
 
 	// --------
-	// Case 1: start() config validation
+	// Case 1: safe resource defaults
+	// --------
+	{
+		glades::TransformerServingLayer::Config cfg;
+		ASSERT("==============ServingLayer: DefaultPendingBounded Failed==============", cfg.maxPendingRequests > 0u);
+		ASSERT("==============ServingLayer: DefaultCompletedSnapshotsBounded Failed==============", cfg.maxCompletedSnapshots > 0u);
+		ASSERT("==============ServingLayer: DefaultWipeKvEnabled Failed==============", cfg.wipeKvOnRemove);
+	}
+
+	// --------
+	// Case 2: start() config validation
 	// --------
 	{
 		glades::TransformerServingLayer layer;
@@ -454,7 +464,7 @@ void TransformerServingLayerUnitTest()
 	}
 
 	// --------
-	// Case 2: backpressure on pending queue (no stepping)
+	// Case 3: backpressure on pending queue (no stepping)
 	// --------
 	{
 		glades::TransformerServingLayer layer;
@@ -482,7 +492,52 @@ void TransformerServingLayerUnitTest()
 	}
 
 	// --------
-	// Case 3: cancel() pending request is immediate and does not require step()
+	// Case 4: completed snapshot retention is bounded
+	// --------
+	{
+		glades::TransformerServingLayer layer;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
+		cfg.maxCompletedSnapshots = 1u;
+		ASSERT("==============ServingLayer: StartSnapshotCap Failed==============", layer.start(*m.net, cfg).ok());
+
+		std::vector<unsigned int> prompt;
+		prompt.push_back(1u);
+
+		uint64_t id0 = 0ULL;
+		ASSERT("==============ServingLayer: SubmitSnapshotCap0 Failed==============", layer.submit(make_req(prompt, 0u, false, 0u, 1u), id0).ok());
+		glades::TransformerServingLayer::RequestSnapshot snap0;
+		step_until_done(layer, id0, 4u,
+		                "==============ServingLayer: StepSnapshotCap0 Failed==============",
+		                "==============ServingLayer: SnapshotCap0 Missing Failed==============",
+		                snap0);
+		ASSERT("==============ServingLayer: SnapshotCap0 Retained Failed==============", layer.getSnapshot(id0, snap0));
+		ASSERT("==============ServingLayer: SnapshotCap0 Done Failed==============", snap0.done);
+
+		uint64_t id1 = 0ULL;
+		ASSERT("==============ServingLayer: SubmitSnapshotCap1 Failed==============", layer.submit(make_req(prompt, 0u, false, 0u, 1u), id1).ok());
+		glades::TransformerServingLayer::RequestSnapshot snap1;
+		step_until_done(layer, id1, 4u,
+		                "==============ServingLayer: StepSnapshotCap1 Failed==============",
+		                "==============ServingLayer: SnapshotCap1 Missing Failed==============",
+		                snap1);
+
+		glades::TransformerServingLayer::RequestSnapshot evicted;
+		ASSERT("==============ServingLayer: SnapshotCapOldestEvicted Failed==============", !layer.getSnapshot(id0, evicted));
+		ASSERT("==============ServingLayer: SnapshotCapNewestRetained Failed==============", layer.getSnapshot(id1, snap1));
+		ASSERT("==============ServingLayer: SnapshotCapNewestDone Failed==============", snap1.done);
+
+		glades::TransformerServingLayer::Diagnostics diag;
+		ASSERT("==============ServingLayer: SnapshotCapDiagnostics Failed==============", layer.getDiagnostics(diag));
+		ASSERT("==============ServingLayer: SnapshotCapDiagCount Failed==============",
+		       diag.maxCompletedSnapshots == 1u &&
+		       diag.doneSnapshots == 1u &&
+		       diag.snapshotCount == 1u &&
+		       diag.totalSnapshotEvictions == 1ULL);
+		layer.stop();
+	}
+
+	// --------
+	// Case 5: cancel() pending request is immediate and does not require step()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
