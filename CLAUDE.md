@@ -83,9 +83,21 @@ Strong evidence accumulated:
 1. **Symplectic architecture incompatibility:** port-style mechanisms
    from standard residual transformers don't translate to CHIRON's
    `(p, q) → (p + shear(q), reln(q))` update.
-2. **Hardware-feature absence:** CUDA 13.2 dropped
-   `AUTO_PARALLELISM` (a CUDA 12.3 feature) that's needed for graph-
-   replay to match direct-emission throughput.
+2. **Workload-size mismatch with CUDA Graphs** (diagnosis corrected
+   2026-05-24 via nsys): graphs help when host dispatch is the
+   bottleneck. At CHIRON 1B / T=16384, ~580 ms/step of GPU work
+   already overlaps with ~500 ms/step of host `cudaLaunchKernel`
+   dispatch in direct mode. Collapsing dispatch to ~5 ms via
+   `cudaGraphLaunch` leaves the host nothing to do during GPU work,
+   so the subsequent blocking `cudaStreamSynchronize` sees the full
+   GPU latency instead of the residual it saw under overlap. Not
+   fixable by per-layer zero extraction (kernel counts + per-call
+   times verified identical between modes via nsys) and not fixable
+   by `AUTO_PARALLELISM` (which addresses GPU-side node concurrency,
+   not CPU-GPU overlap). The earlier "CUDA 13.2 dropped
+   AUTO_PARALLELISM" framing is retracted. See
+   `research/CUDA_GRAPHS_PARTIAL_PROGRESS_2026_05_24.md` for the
+   amended diagnosis.
 
 **Codebase improvements that DID land** (benefit ALL training paths,
 not just the failed arcs):

@@ -103,14 +103,27 @@ math-mode dispatch, GpuBuffer::zero now async/stream-tagged,
 qknorm_gamma_scale GPU kernel, narrower auto-disable list).
 `--cuda-graphs` flag is now functional but documented as research-only.
 Production unchanged.
-**Lesson:** CUDA 13.2 dropped `AUTO_PARALLELISM` (a CUDA 12.3 feature)
-that would have auto-fixed the captured-memset-node serialization.
-Without it, ~1.5 GB of per-step + per-layer `cudaMemsetAsync` nodes
-serialize in the graph DAG and lose the copy-engine/SM-engine overlap
-that direct emission exploits. Plus cuBLAS algorithm-selection drift
-between capture mode and direct emission accumulates ULP-level
-differences into nat-level NLL drift.
-See `research/CUDA_GRAPHS_PARTIAL_PROGRESS_2026_05_24.md`.
+**Lesson (corrected 2026-05-24 post-closure nsys investigation):**
+the real cause is **CPU-GPU overlap loss**, not captured-memset
+serialization and not cuBLAS algorithm regression. Direct emission's
+~500 ms/step of host `cudaLaunchKernel` dispatch was running in
+parallel with the GPU's ~580 ms/step of work; graph replay collapses
+host dispatch to ~5 ms (one `cudaGraphLaunch`), leaving the host
+nothing to do during GPU execution. The host then hits a blocking
+`cudaStreamSynchronize` that sees the full GPU work (~558 ms) instead
+of the ~180 ms residual it saw in direct mode. This is a structural
+property of CUDA Graphs at workload sizes where GPU is the long pole
+and dispatch fits comfortably inside GPU work — exactly CHIRON 1B's
+regime at T=16384. Not fixable by per-layer zero extraction (kernel
+counts and per-call times were verified identical between modes via
+nsys). Not fixable by AUTO_PARALLELISM (which would address GPU-side
+node concurrency, not CPU-GPU overlap). The NLL drift mechanism is
+still unexplained — possibly stochastic-rounding seed perturbation,
+possibly an actual race exposed when capture-mode neutralizes
+`cudaStreamSynchronize` calls inside the captured region. See the
+"Root cause" + "Lessons learned" sections of
+`research/CUDA_GRAPHS_PARTIAL_PROGRESS_2026_05_24.md` for the full
+amended diagnosis.
 
 ---
 
@@ -134,12 +147,19 @@ gate. Two distinct failure modes:
    information flow tuned for next-token prediction don't generalize
    to skip-deeper-layers or predict-same-position mechanisms.
 
-2. **Hardware-feature absence** (CUDA Graphs): the necessary CUDA
-   toolkit feature (`AUTO_PARALLELISM` for graph-node concurrency)
-   was dropped between CUDA 12.3 and CUDA 13.2. Without manual graph
-   construction (5-10× engineering effort), the per-step + per-layer
-   captured memset nodes serialize in the graph DAG, eliminating the
-   compute/copy-engine overlap that direct emission exploits.
+2. **Workload-size mismatch with CUDA Graphs** (CUDA Graphs arc;
+   diagnosis corrected 2026-05-24): graphs help when host dispatch
+   is the bottleneck (small kernels, high launch rate, GPU idle
+   between launches). At CHIRON 1B at T=16384, the per-step workload
+   is dominated by ~580 ms of dense GPU work that comfortably
+   overlaps with ~500 ms of host `cudaLaunchKernel` dispatch in
+   direct mode. Collapsing dispatch to ~5 ms via a single
+   `cudaGraphLaunch` doesn't help (GPU was the long pole) and breaks
+   the overlap that was hiding the GPU work behind dispatch. This is
+   a workload-regime mismatch, not a hardware-feature absence — the
+   original closure-doc claim that "CUDA 13.2 dropped AUTO_PARALLELISM"
+   was the structural blocker is **retracted**. `AUTO_PARALLELISM`
+   addresses GPU-side node concurrency, which is not the cause here.
 
 ---
 

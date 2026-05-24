@@ -1,5 +1,20 @@
 # CHIRON 1B CUDA Graphs Arc — PARTIAL_PROGRESS (2026-05-23/24)
 
+> **AMENDMENT 2026-05-24 (post-closure nsys investigation):** the
+> diagnosis below originally attributed the −54% wall to (a) captured
+> `cudaMemsetAsync` nodes serializing in the graph DAG and (b) cuBLAS
+> algorithm regression in capture mode, with CUDA 13.2 dropping the
+> `AUTO_PARALLELISM` flag as the structural blocker. **Subsequent
+> nsys profile comparison falsified both of those theories.** The
+> actual cause is **CPU-GPU overlap loss** — a structural property
+> of CUDA Graphs at large per-step workloads, not a hardware-feature
+> absence or algorithm regression. The corrected diagnosis is the
+> "Root cause" section below; the original (incorrect) text is
+> preserved in italics as "_Original (incorrect) diagnosis_" for
+> historical accuracy. The CLOSURE DECISION is unchanged (replay is
+> ~2× slower than direct emission, both spec gates fail, arc closes
+> as PARTIAL_PROGRESS) — only the WHY is amended.
+
 **Status:** ARC CLOSED as PARTIAL_PROGRESS. Capture is functional but
 replay is ~2× slower than direct emission; spec gates not met.
 **Spec:** `docs/superpowers/specs/2026-05-23-chiron-1b-cuda-graphs-design.md`
@@ -148,54 +163,135 @@ visible nat-level loss values.
 
 ---
 
-## Root cause of the replay slowdown
+## Root cause of the replay slowdown (CORRECTED 2026-05-24)
 
-Per the holistic post-fix investigation (subagent dispatch, 2026-05-24):
+The corrected diagnosis is based on nsys profile comparison of
+4-step direct emission vs 4-step graph replay runs on the flagship
+recipe.
 
-**Primary cause:** ~512 MB of `cudaMemsetAsync` nodes captured into
-the graph (per-step zeros from Task 1.9, plus per-layer zeros that
-were NOT extracted: `s.scfa_inner_p`, `s.dq_buf`, `W.dWq_scratch` ×
-24 layers ≈ ~1 GB additional). In direct emission, these memsets run
-on the GPU's copy engine concurrently with SM-engine compute kernels.
-In graph replay, the captured nodes form a linear dependency chain on
-a single stream, eliminating the compute/copy overlap. The CUDA 13.2
-`USE_NODE_PRIORITY` flag does not address this; the
-`AUTO_PARALLELISM` flag that would address it was not carried into
-the 13.x release.
+### Empirical evidence from nsys
 
-**Secondary cause:** Large graph node count (~2,000-4,000) introduces
-per-launch overhead and internal runtime bookkeeping memsets.
+**Kernel-level comparison (identical kernels, identical per-call times):**
 
-**Contributing cause:** cuBLASLt FP8 readout algorithm selection
-locked at capture time (workspace=NULL forces non-optimal algo).
+| Kernel | Direct avg | Graphs avg | Δ |
+|---|---:|---:|---:|
+| `ampere_s1688gemm_bf16_128x128_ldg8_stages_32x1_nn` | 519.8 µs | 496.1 µs | graphs slightly faster |
+| `ampere_s1688gemm_bf16_128x128_ldg8_stages_32x1_nt` | 665.5 µs | 665.0 µs | identical |
+| `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize128x128x64...` (FP8 readout) | 9.85 ms | 9.82 ms | identical |
+| `cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_nn_align8` | 206.2 µs | 206.1 µs | identical |
+
+cuBLAS picks the **same algorithms** under capture mode as under
+direct emission, and each kernel runs at the **same speed**. The
+"cuBLAS algo regression" hypothesis from the original closure draft
+is falsified.
+
+**Total GPU active time:**
+- Direct: 5.81 sec across 25,978 kernel instances.
+- Graphs: 3.60 sec across 16,958 kernel instances.
+
+**Graphs has LESS total GPU work but LONGER wall.** Memset
+serialization (the original hypothesis) would have predicted the
+opposite — more GPU work in graphs mode. The "captured memsets
+serialize" hypothesis is also falsified as a meaningful contributor
+to the slowdown. (The serialization claim was factually true at the
+~0.6 ms scale but three orders of magnitude smaller than the
+observed +700 ms/step regression.)
+
+**CUDA API time breakdown:**
+
+| API | Direct total | Graphs total | Δ |
+|---|---:|---:|---:|
+| `cudaStreamSynchronize` | 4.22 sec (2270 calls) | 5.17 sec (2268 calls) | **+0.95 sec** |
+| `cudaLaunchKernel` | 1.12 sec (22594 calls) | 0.064 sec (16912 calls) | **−1.06 sec** |
+| `cudaGraphLaunch` | — | 0.005 sec (3 calls) | +0.005 sec |
+| `cudaMemcpy` | 0.64 sec | 0.66 sec | +0.02 sec |
+
+**Single largest `cudaStreamSynchronize` call:** 180 ms (direct) → 558
+ms (graphs). The max sync ballooned by 378 ms — that single delta,
+multiplied across replay steps, accounts for most of the wall
+regression.
+
+### The actual mechanism: CPU-GPU overlap loss
+
+**Direct emission per-step timeline:**
+
+```
+Host: [dispatch step N+1 kernels (~500 ms of cudaLaunchKernel)] [sync ~180 ms]
+GPU:                          [running step N kernels for ~580 ms]
+Wall ≈ max(host_dispatch, gpu_work) ≈ 600 ms
+```
+
+The ~500 ms of cudaLaunchKernel API time happens **while the GPU is
+executing the prior step's kernels**. By the time the host hits a
+blocking sync, the GPU is ~80% done; the sync waits only the residual
+~180 ms.
+
+**Graph replay per-step timeline:**
+
+```
+Host: [cudaGraphLaunch 1.7 ms] [nothing to do] [sync ~558 ms]
+GPU:                          [running graph for ~580 ms]
+Wall ≈ graph_launch + sync_wait ≈ 580 ms + post-graph host work
+```
+
+The cudaGraphLaunch call returns in ~1.7 ms. The host immediately
+runs out of work to dispatch and hits a blocking sync. That sync now
+sees the **full** ~580 ms of GPU work because nothing on the host
+side was overlapping with it.
+
+The net effect: graphs eliminates the per-kernel launch overhead
+(saves ~1.06 sec), but loses the dispatch/GPU overlap that was
+hiding ~500 ms of GPU work per step. Net change is unfavorable
+because at CHIRON 1B at T=16384, the GPU work (~580 ms/step) is
+comfortably larger than the host dispatch (~500 ms/step) — direct
+emission was running with the GPU as the long pole and dispatch
+hidden behind it; graphs collapses dispatch but exposes GPU work in
+full.
+
+### Why this is not fixable by per-layer zero extraction
+
+The original closure draft suggested Task 1.10 (per-layer zero
+extraction) as future work. The nsys data shows this would not help:
+
+- Graphs already has LESS GPU active time than direct. Moving more
+  memsets out of capture would further reduce graph-mode GPU work,
+  but wouldn't reduce wall, because wall is bounded below by
+  cudaStreamSynchronize + the GPU work the graph still has to do.
+- The 700 ms/step regression is from lost CPU-GPU overlap, not
+  GPU-side serialization. Per-layer extraction does not address
+  CPU-GPU overlap.
+
+### Why this is not fixable by `AUTO_PARALLELISM`
+
+The original closure draft suggested CUDA 13.2 dropping
+`AUTO_PARALLELISM` was the structural blocker. That diagnosis was
+also wrong: `AUTO_PARALLELISM` addresses **graph-node concurrency
+on the GPU** (running independent nodes in parallel where the DAG
+allows). It cannot address CPU-GPU overlap loss, because the host
+has nothing to do during graph execution regardless of intra-graph
+node concurrency.
+
+### Why CUDA Graphs are structurally a bad fit at this workload size
+
+CUDA Graphs help most when **CPU dispatch is the bottleneck**: small
+kernels, high launch rate, GPU sits idle between launches waiting
+for the next one. In that regime, eliminating launch overhead wins.
+
+CUDA Graphs hurt when **GPU work is the bottleneck and dispatch
+fits inside it**. CHIRON 1B at T=16384 has ~580 ms of dense GPU
+work per training step (24 layers × dozens of large GEMMs +
+SCFA inner attention + readout). The ~500 ms of host dispatch
+overlaps cleanly with that GPU work. Collapsing dispatch to ~5 ms
+via graphs doesn't help (GPU was already the long pole) and removes
+the overlap that hid the GPU work behind dispatch.
+
+This is the workload-size-dependent inversion of the CUDA Graphs
+benefit, documented in NVIDIA's own performance guides under
+"when not to use graphs." We discovered it the hard way.
 
 ---
 
-## Why Task 1.10 (per-layer zero extraction) was deferred
-
-Even if all per-layer zeros were extracted (an estimated 300-500 LOC
-additional refactor), the cuBLAS algo selection drift would remain.
-NLL drift > 0.0001 nat is a hard spec gate; per-layer extraction
-addresses wall but not NLL. The arc's spec required BOTH gates to
-PASS. Pursuing per-layer extraction without a path to NLL parity is
-not productive.
-
-A future arc could pursue:
-1. **Capture window narrowing**: capture only forward+backward, exclude
-   `launch_loss_scalars`. May reduce algo-selection drift if the loss
-   path is the dominant source.
-2. **cuBLAS workspace allocation for graph capture**: provide a
-   pre-allocated workspace so cuBLASLt can select the same algorithms
-   in capture mode as direct emission.
-3. **Wait for `cudaGraphInstantiateFlagAutoParallelism`** to return
-   in a future CUDA toolkit version (13.x dropped it from 12.3).
-4. **Manual graph construction** (build nodes explicitly with known
-   dependencies) rather than stream-capture. ~5-10× engineering effort
-   but full control over scheduling.
-
----
-
-## Lessons learned
+## Lessons learned (CORRECTED 2026-05-24)
 
 1. **The original iter 55 META was right.** `--cuda-graphs` × `--scfa`
    compatibility was correctly identified as "not iter-scale work" in
@@ -203,22 +299,41 @@ A future arc could pursue:
    originally-identified 3 (math-mode toggle, scfaFuseStreams,
    fp8-attn fallback). Each iteration found more.
 
-2. **CUDA 13.2 lost `AUTO_PARALLELISM`** (a CUDA 12.3 feature). This
-   feature gap is precisely what's needed to make the
-   captured-memset-serialization problem auto-solve. Without it,
-   manual graph construction or per-layer code refactoring is the
-   only path forward.
+2. **CUDA Graphs are workload-size-dependent.** At small per-step
+   workloads (where host dispatch is the bottleneck), graphs save
+   wall by eliminating launch overhead. At large per-step workloads
+   (where GPU is the long pole and dispatch fits inside GPU work),
+   graphs are net-negative because they collapse host dispatch (was
+   overlapping with GPU work) without reducing GPU work. CHIRON 1B
+   at T=16384 falls in the latter regime: ~580 ms/step of dense GPU
+   work, ~500 ms/step of host dispatch that was hidden behind it.
+   See "The actual mechanism: CPU-GPU overlap loss" above.
 
-3. **Stream-capture mode's algorithm-selection drift** is a real
-   gotcha. Even when the captured graph contains the "right" kernels,
-   cuBLAS may pick different algorithms during capture than during
-   direct emission, producing FP32-noise-level NLL differences that
-   accumulate across 24-layer models into visible drift.
+3. **Verify before attributing.** The original closure draft
+   attributed the slowdown to "captured memset nodes serialize" +
+   "cuBLAS algo regression in capture mode" + "CUDA 13.2 dropped
+   AUTO_PARALLELISM." All three were falsified by nsys profile
+   comparison after closure. The memset-serialization claim was
+   factually true but quantitatively trivial (~0.6 ms vs the
+   observed ~700 ms/step regression). The cuBLAS algo claim was
+   simply wrong — kernel names + per-call times are identical
+   between modes. The `AUTO_PARALLELISM` claim was conceptually
+   wrong — that flag addresses GPU-side node concurrency, not
+   CPU-GPU overlap. Demand nsys data BEFORE writing root-cause
+   sections in result docs.
 
-4. **Pure-infra arcs aren't always smaller than NLL arcs.** This arc
-   was estimated at 150-200 LOC; final landed scope was ~600 LOC
-   across both repos. Each "I found another blocker" cycle was real
-   engineering work.
+4. **Pure-infra arcs aren't always smaller than NLL arcs.** This
+   arc was estimated at 150-200 LOC; final landed scope was ~600
+   LOC across both repos. Each "I found another blocker" cycle was
+   real engineering work. The post-closure nsys investigation
+   (which surfaced the corrected diagnosis) was another ~30
+   minutes that should have been part of the arc, not post-mortem.
+
+5. **`USE_NODE_PRIORITY` flag (Task 1.8) was not useful.** It
+   addresses node-priority ordering inside the graph, but the
+   slowdown was never about node ordering inside the graph — it
+   was about CPU-GPU overlap outside the graph. The Task 1.8
+   commit (`71686ef6e`) modernized the API but did not help wall.
 
 ---
 
@@ -229,8 +344,10 @@ PARTIAL_PROGRESS (CUDA Graphs), the Phase-3 session has accumulated
 strong evidence that:
 - CHIRON's symplectic update structure resists most regularization
   ports from standard residual transformers.
-- Hardware-feature-dependent wall arcs need careful empirical
-  scoping; iter-level audits are not sufficient.
+- CUDA Graphs is structurally a bad fit for CHIRON 1B's workload
+  size — not a fixable bug but a workload-regime mismatch. The
+  ~580 ms/step GPU work is the long pole; collapsing host dispatch
+  loses the overlap that hid it.
 
 Possible next directions (NOT a recommendation — purely the option
 set):
@@ -245,12 +362,21 @@ set):
    standard transformers. Would require theoretical work + small-scale
    validation before committing to a 1B-scale pilot.
 
-3. **A pure-infra arc with explicit success-criteria revision**:
-   target ≥+0.5% wall improvement instead of ≥+2%, allow NLL drift up
-   to 0.001 nat instead of 0.0001 nat. Lowers the bar but at least
-   permits incremental wins.
+3. **A wall arc that targets host-side prefetch overlap with the
+   graph launch** — the right way to make `--cuda-graphs` profitable
+   is to ensure the host has substantial work to do during graph
+   execution (e.g., async dataset prefetch for the next batch,
+   batched async logging, deferred loss readback). This would
+   restore the CPU-GPU overlap that direct emission gets for free.
+   Estimated ~500-1000 LOC trainer-loop refactor. Outcome uncertain
+   but addresses the actual root cause.
 
 4. **Take a break** and revisit with fresh perspective.
+
+The "Task 1.10 per-layer zero extraction" suggestion that appeared
+in the original closure draft is **withdrawn** — the nsys data shows
+it would not have helped. Per-layer zeros are not the dominant cost;
+CPU-GPU overlap loss is.
 
 ---
 
