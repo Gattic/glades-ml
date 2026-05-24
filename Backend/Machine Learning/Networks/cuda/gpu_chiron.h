@@ -215,6 +215,42 @@ bool chiron_sketch_lift_add(float* X, const float* R, const float* S,
                              int T, int Ntok, int r);
 
 // ---------------------------------------------------------------------------
+// SIRA terminal phase loss — active training-path primitive.
+//
+// Computes the low-overhead final-state SIRA loss from q_L/p_L.  `stats3`
+// stores {sum(p^2), sum(q^2), sum(p*q)} and `loss1[0]` receives the scalar
+// contribution.  The disabled path (coef <= 0) is a strict no-op: no pointers
+// are read and no buffers are written.
+//
+// `chiron_sira_terminal_add_grad` adds gradScale * d(loss)/d(q,p) into the
+// caller-owned dq/dp accumulators; it expects stats3 from the matching forward
+// call.  Passing dq or dp as null skips that accumulator.
+// ---------------------------------------------------------------------------
+bool chiron_sira_terminal_forward(const float* q, const float* p,
+                                  int n,
+                                  float coef,
+                                  float energyWeight,
+                                  float balanceWeight,
+                                  float actionWeight,
+                                  float huberTau,
+                                  float eps,
+                                  float* stats3,
+                                  float* loss1);
+
+bool chiron_sira_terminal_add_grad(const float* q, const float* p,
+                                   int n,
+                                   float coef,
+                                   float energyWeight,
+                                   float balanceWeight,
+                                   float actionWeight,
+                                   float huberTau,
+                                   float eps,
+                                   const float* stats3,
+                                   float gradScale,
+                                   float* dq,
+                                   float* dp);
+
+// ---------------------------------------------------------------------------
 // Symplectic attention shear (framework §3.2) — composition wrapper.
 //
 // Computes  p += Wo^T · Attention(Q=q·Wq, K=q·Wk, V=q·Wv)  on GPU, reusing
@@ -607,6 +643,13 @@ inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,
                                     int, int, int) { return false; }
+inline bool chiron_sira_terminal_forward(const float*, const float*, int,
+                                          float, float, float, float, float, float,
+                                          float*, float*) { return false; }
+inline bool chiron_sira_terminal_add_grad(const float*, const float*, int,
+                                           float, float, float, float, float, float,
+                                           const float*, float,
+                                           float*, float*) { return false; }
 inline bool chiron_attention_shear(const float*, float*,
                                     const float*, const float*, const float*,
                                     const float*,

@@ -931,6 +931,220 @@ bool chiron_sketch_lift_add(float* X, const float* R, const float* S,
 }
 
 // ===========================================================================
+//  5b. SIRA terminal phase loss — final-state active loss + gradient.
+// ===========================================================================
+
+namespace {
+
+__device__ __forceinline__ float sira_safe_positive_d(float x, float eps)
+{
+	const float e = (eps > 0.0f) ? eps : 1e-12f;
+	return (x > e) ? x : e;
+}
+
+__device__ __forceinline__ float sira_pseudo_huber_d(float z, float tau)
+{
+	const float t = (tau > 0.0f) ? tau : 0.2f;
+	const float r = z / t;
+	return t * t * (sqrtf(1.0f + r * r) - 1.0f);
+}
+
+__device__ __forceinline__ float sira_pseudo_huber_grad_d(float z, float tau)
+{
+	const float t = (tau > 0.0f) ? tau : 0.2f;
+	const float r = z / t;
+	return z / sqrtf(1.0f + r * r);
+}
+
+__global__ void chiron_sira_terminal_stats_kernel(const float* __restrict__ q,
+                                                  const float* __restrict__ p,
+                                                  int n,
+                                                  float* __restrict__ stats3)
+{
+	extern __shared__ float smem[];
+	float sp = 0.0f;
+	float sq = 0.0f;
+	float sd = 0.0f;
+	const int stride = gridDim.x * blockDim.x;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+	{
+		const float pv = p[i];
+		const float qv = q[i];
+		sp += pv * pv;
+		sq += qv * qv;
+		sd += pv * qv;
+	}
+
+	const float bp = blockReduceSum(sp, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 0, bp);
+	__syncthreads();
+	const float bq = blockReduceSum(sq, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 1, bq);
+	__syncthreads();
+	const float bd = blockReduceSum(sd, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 2, bd);
+}
+
+__global__ void chiron_sira_terminal_loss_kernel(const float* __restrict__ stats3,
+                                                 int n,
+                                                 float coef,
+                                                 float energyWeight,
+                                                 float balanceWeight,
+                                                 float actionWeight,
+                                                 float huberTau,
+                                                 float eps,
+                                                 float* __restrict__ loss1)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0) return;
+	const float invN = 1.0f / static_cast<float>(n);
+	const float p2MeanRaw = stats3[0] * invN;
+	const float q2MeanRaw = stats3[1] * invN;
+	const float pqMean    = stats3[2] * invN;
+	const float p2 = sira_safe_positive_d(p2MeanRaw, eps);
+	const float q2 = sira_safe_positive_d(q2MeanRaw, eps);
+	const float energyZ = logf(sira_safe_positive_d(0.5f * (p2MeanRaw + q2MeanRaw), eps));
+	const float balanceZ = 0.5f * (logf(p2) - logf(q2));
+	const float actionDenom = sqrtf(p2 * q2);
+	const float actionZ = (actionDenom > eps) ? (pqMean / actionDenom) : 0.0f;
+
+	float loss = 0.0f;
+	if (energyWeight > 0.0f)
+		loss += energyWeight * sira_pseudo_huber_d(energyZ, huberTau);
+	if (balanceWeight > 0.0f)
+		loss += balanceWeight * sira_pseudo_huber_d(balanceZ, huberTau);
+	if (actionWeight > 0.0f)
+		loss += actionWeight * sira_pseudo_huber_d(actionZ, huberTau);
+	loss1[0] = coef * loss;
+}
+
+__global__ void chiron_sira_terminal_grad_kernel(const float* __restrict__ q,
+                                                 const float* __restrict__ p,
+                                                 int n,
+                                                 float coef,
+                                                 float energyWeight,
+                                                 float balanceWeight,
+                                                 float actionWeight,
+                                                 float huberTau,
+                                                 float eps,
+                                                 const float* __restrict__ stats3,
+                                                 float gradScale,
+                                                 float* __restrict__ dq,
+                                                 float* __restrict__ dp)
+{
+	const float invN = 1.0f / static_cast<float>(n);
+	const float p2MeanRaw = stats3[0] * invN;
+	const float q2MeanRaw = stats3[1] * invN;
+	const float pqMean    = stats3[2] * invN;
+	const float p2 = sira_safe_positive_d(p2MeanRaw, eps);
+	const float q2 = sira_safe_positive_d(q2MeanRaw, eps);
+	const float energy = sira_safe_positive_d(0.5f * (p2MeanRaw + q2MeanRaw), eps);
+	const float energyZ = logf(energy);
+	const float balanceZ = 0.5f * (logf(p2) - logf(q2));
+	const float actionDenom = sqrtf(p2 * q2);
+	const float invActionDenom = (actionDenom > eps) ? (1.0f / actionDenom) : 0.0f;
+	const float actionZ = (actionDenom > eps) ? (pqMean * invActionDenom) : 0.0f;
+
+	const float energyCoeff = (energyWeight > 0.0f)
+	    ? (coef * energyWeight * sira_pseudo_huber_grad_d(energyZ, huberTau))
+	    : 0.0f;
+	const float balanceCoeff = (balanceWeight > 0.0f)
+	    ? (coef * balanceWeight * sira_pseudo_huber_grad_d(balanceZ, huberTau))
+	    : 0.0f;
+	const float actionCoeff = (actionWeight > 0.0f)
+	    ? (coef * actionWeight * sira_pseudo_huber_grad_d(actionZ, huberTau))
+	    : 0.0f;
+
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+	{
+		const float pv = p[i];
+		const float qv = q[i];
+		float gp = 0.0f;
+		float gq = 0.0f;
+		if (energyCoeff != 0.0f)
+		{
+			const float c = energyCoeff * invN / energy;
+			gp += c * pv;
+			gq += c * qv;
+		}
+		if (balanceCoeff != 0.0f)
+		{
+			gp += balanceCoeff * invN * pv / p2;
+			gq -= balanceCoeff * invN * qv / q2;
+		}
+		if (actionCoeff != 0.0f && invActionDenom > 0.0f)
+		{
+			gp += actionCoeff * invN * (qv * invActionDenom - actionZ * pv / p2);
+			gq += actionCoeff * invN * (pv * invActionDenom - actionZ * qv / q2);
+		}
+		if (dp) dp[i] += gradScale * gp;
+		if (dq) dq[i] += gradScale * gq;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_sira_terminal_forward(const float* q, const float* p,
+                                  int n,
+                                  float coef,
+                                  float energyWeight,
+                                  float balanceWeight,
+                                  float actionWeight,
+                                  float huberTau,
+                                  float eps,
+                                  float* stats3,
+                                  float* loss1)
+{
+	if (coef <= 0.0f) return true;
+	if (n <= 0) return true;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f)
+	{
+		if (loss1) GLADES_CUDA_CHECK(cudaMemsetAsync(loss1, 0, sizeof(float), computeStream()));
+		return true;
+	}
+	if (!q || !p || !stats3 || !loss1) return false;
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(stats3, 0, sizeof(float) * 3u, computeStream()));
+	const int gridRaw = (n + kBlockElem - 1) / kBlockElem;
+	const int grid = (gridRaw > 4096) ? 4096 : gridRaw;
+	const int smemBytes = ((kBlockElem + 31) / 32) * sizeof(float);
+	chiron_sira_terminal_stats_kernel<<<grid, kBlockElem, smemBytes, computeStream()>>>(
+	    q, p, n, stats3);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	chiron_sira_terminal_loss_kernel<<<1, 1, 0, computeStream()>>>(
+	    stats3, n, coef, energyWeight, balanceWeight, actionWeight,
+	    huberTau, safeEps, loss1);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_sira_terminal_add_grad(const float* q, const float* p,
+                                   int n,
+                                   float coef,
+                                   float energyWeight,
+                                   float balanceWeight,
+                                   float actionWeight,
+                                   float huberTau,
+                                   float eps,
+                                   const float* stats3,
+                                   float gradScale,
+                                   float* dq,
+                                   float* dp)
+{
+	if (coef <= 0.0f) return true;
+	if (n <= 0 || gradScale == 0.0f) return true;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f) return true;
+	if (!q || !p || !stats3 || (!dq && !dp)) return false;
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	const int gridRaw = (n + kBlockElem - 1) / kBlockElem;
+	const int grid = (gridRaw > 4096) ? 4096 : gridRaw;
+	chiron_sira_terminal_grad_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    q, p, n, coef, energyWeight, balanceWeight, actionWeight,
+	    huberTau, safeEps, stats3, gradScale, dq, dp);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  6. Symplectic attention shear — composition wrapper.
 // ===========================================================================
 //

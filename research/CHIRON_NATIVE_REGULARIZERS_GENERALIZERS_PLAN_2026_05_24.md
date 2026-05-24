@@ -1,6 +1,8 @@
 # CHIRON-Native Regularizers and Generalizers — Research Plan (2026-05-24)
 
-**Status:** research plan / pre-registration seed. No production behavior change.
+**Status:** research plan / pre-registration seed. Default-off SIRA training-loss
+integration now exists as a terminal phase-state port behind `siraCoef`; the
+full layer/bucket trajectory objective below remains a research plan.
 **Baseline:** CHIRON 1B regstack Phase 2, checkpoint
 `chiron_1B_T16384_regstack_phase2.final`.
 **Recipe:** `cd ~/dev/glades-trainer && sh run.sh flagship --zloss-coef 1e-4 --qk-norm`.
@@ -10,7 +12,9 @@
 ## Implementation status as of 2026-05-24
 
 This document is a research plan plus pre-registration seed. It should not be
-read as claiming an active production-loss integration for SIRA.
+read as claiming that the full trajectory/bucket SIRA objective has shipped.
+A later implementation added a default-off terminal phase-state SIRA loss in
+`glades-trainer`; it is a scoped first training-path port, not the full plan.
 
 Implemented and verified so far:
 
@@ -18,11 +22,13 @@ Implemented and verified so far:
   `TrainingConfig`, with config validation and CPU reference helpers for the
   proposed phase/action loss terms.
 - `glades-ml` unit tests cover SIRA defaults, disabled parity, enabled math,
-  and edge cases for energy-only and action-weight paths.
+  terminal training-loss gating/math, GPU loss/gradient smoke behavior, and
+  edge cases for energy-only and action-weight paths.
 - `glades-ml` has targeted unit-test selectors `chiron-sira` / `sira`.
-- `glades-trainer` accepts SIRA CLI/config flags and has `--sira-config-smoke`
+- `glades-trainer` accepts SIRA CLI/config flags, has `--sira-config-smoke`
   paths proving flag propagation into `glades::TrainingConfig` without
-  starting training.
+  starting training, and has `--sira-loss-smoke` for terminal-loss
+  disabled/warmup/enabled checks.
 - Verified commands included `./build/glades-unit-tests chiron-sira`,
   trainer `scripts/sira_config_smoke.sh`, direct `glades_pile_train` and
   `glades_chiron_train` config-smoke invocations, and the aggregate
@@ -31,11 +37,11 @@ Implemented and verified so far:
 
 Not implemented yet / still speculative:
 
-- SIRA is not added to the production training objective; `siraCoef > 0` does
-  not yet affect CE training loss in the trainer.
-- No CUDA production kernels, analytic gradient injection, persistent phase
-  diagnostics, probe-layer schedule, or position-bucket instrumentation exist
-  yet for SIRA.
+- The full trajectory/bucket SIRA objective from §5 is not added to the
+  production training objective.  The active port currently regularizes only
+  the terminal CHIRON phase state `(p_L, q_L)`.
+- Persistent phase diagnostics, probe-layer schedule, and position-bucket
+  instrumentation do not exist yet for SIRA.
 - `--sira-probe-layers`, `--sira-position-buckets`, PHS, and PTOC remain
   research proposals in this document, not runnable features.
 - No 1B SIRA pilot has been run, and there is no NLL/throughput result to

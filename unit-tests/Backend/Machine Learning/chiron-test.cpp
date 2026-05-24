@@ -11373,6 +11373,7 @@ void CHIRONUnitTest()
 	CHIRONSiraDisabledParityTest();
 	CHIRONSiraDiagnosticsTest();
 	CHIRONSiraEnabledMathTest();
+	CHIRONSiraTrainingLossTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -17098,5 +17099,108 @@ void CHIRONSiraEnabledMathTest()
 	    tau, /*eps=*/1e-12f);
 	ASSERT("CHIRONSiraEnabledMath: energy-only trajectory works without shear buffer",
 	       trajEnergyOnly > 0.0f);
+}
+
+void CHIRONSiraTrainingLossTest()
+{
+	// The first active training-path port uses a terminal CHIRON phase-state
+	// loss over final (p_L, q_L).  Verify the disabled/warmup gates keep it out
+	// of the loss, and that enabling it adds the exact expected contribution.
+	const float p[2] = { 2.0f, -2.0f };
+	const float q[2] = { 1.0f, -1.0f };
+	const unsigned int n = 2u;
+	const float coef = 0.5f;
+	const float wE = 1.0f;
+	const float wB = 0.25f;
+	const float wA = 0.5f;
+	const float tau = 0.2f;
+	const float eps = 1e-12f;
+
+	const float disabled = glades::chiron::sira_terminal_phase_loss(
+	    NULL, NULL, n,
+	    /*coef=*/0.0f, wE, wB, wA, tau, eps);
+	ASSERT("CHIRONSiraTrainingLoss: coef=0 is exact no-op before reading p/q",
+	       disabled == 0.0f);
+
+	const float preWarmup = glades::chiron::sira_should_apply(coef, 9LL, 10)
+	    ? glades::chiron::sira_terminal_phase_loss(p, q, n, coef, wE, wB, wA, tau, eps)
+	    : 0.0f;
+	ASSERT("CHIRONSiraTrainingLoss: positive coef before warmup is loss-noop",
+	       preWarmup == 0.0f);
+
+	// p2=4, q2=1, pq=2 => energy=2.5, balance=log(2), action=1.
+	const float expected = coef * (
+	    wE * glades::chiron::sira_pseudo_huber(logf(2.5f), tau) +
+	    wB * glades::chiron::sira_pseudo_huber(logf(2.0f), tau) +
+	    wA * glades::chiron::sira_pseudo_huber(1.0f, tau));
+	const float got = glades::chiron::sira_terminal_phase_loss(
+	    p, q, n, coef, wE, wB, wA, tau, eps);
+	ASSERT("CHIRONSiraTrainingLoss: enabled terminal loss matches reference",
+	       fabsf(got - expected) < 1e-7f && got > 0.0f);
+
+	const float zeroWeights = glades::chiron::sira_terminal_phase_loss(
+	    NULL, NULL, n,
+	    coef, /*energyWeight=*/0.0f, /*balanceWeight=*/0.0f, /*actionWeight=*/0.0f,
+	    tau, eps);
+	ASSERT("CHIRONSiraTrainingLoss: zero SIRA weights are loss-noop without p/q",
+	       zeroWeights == 0.0f);
+
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [SIRA training loss GPU] no CUDA device — skipped\n");
+		return;
+	}
+
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_stats, d_loss, d_dq, d_dp;
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_q", d_q.allocate(n));
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_p", d_p.allocate(n));
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_stats", d_stats.allocate(3u));
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_loss", d_loss.allocate(1u));
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_dq", d_dq.allocate(n));
+	ASSERT("CHIRONSiraTrainingLoss: allocate d_dp", d_dp.allocate(n));
+	ASSERT("CHIRONSiraTrainingLoss: upload q", d_q.upload(q, n));
+	ASSERT("CHIRONSiraTrainingLoss: upload p", d_p.upload(p, n));
+
+	float sentinel = -7.0f;
+	ASSERT("CHIRONSiraTrainingLoss: upload sentinel", d_loss.upload(&sentinel, 1u));
+	ASSERT("CHIRONSiraTrainingLoss: GPU coef=0 no-op call",
+	       glades::gpu::chiron_sira_terminal_forward(
+	           NULL, NULL, static_cast<int>(n),
+	           /*coef=*/0.0f, wE, wB, wA, tau, eps,
+	           d_stats.data(), d_loss.data()));
+	float disabledGpu = 0.0f;
+	ASSERT("CHIRONSiraTrainingLoss: download disabled GPU loss", d_loss.download(&disabledGpu, 1u));
+	ASSERT("CHIRONSiraTrainingLoss: GPU coef=0 leaves loss buffer untouched",
+	       disabledGpu == sentinel);
+
+	ASSERT("CHIRONSiraTrainingLoss: GPU enabled forward",
+	       glades::gpu::chiron_sira_terminal_forward(
+	           d_q.data(), d_p.data(), static_cast<int>(n),
+	           coef, wE, wB, wA, tau, eps,
+	           d_stats.data(), d_loss.data()));
+	float enabledGpu = 0.0f;
+	ASSERT("CHIRONSiraTrainingLoss: download enabled GPU loss", d_loss.download(&enabledGpu, 1u));
+	ASSERT("CHIRONSiraTrainingLoss: GPU enabled loss matches CPU",
+	       fabsf(enabledGpu - expected) < 1e-6f);
+
+	ASSERT("CHIRONSiraTrainingLoss: zero d_dq", d_dq.zero());
+	ASSERT("CHIRONSiraTrainingLoss: zero d_dp", d_dp.zero());
+	ASSERT("CHIRONSiraTrainingLoss: GPU enabled backward gradient",
+	       glades::gpu::chiron_sira_terminal_add_grad(
+	           d_q.data(), d_p.data(), static_cast<int>(n),
+	           coef, wE, wB, wA, tau, eps,
+	           d_stats.data(), /*gradScale=*/1.0f,
+	           d_dq.data(), d_dp.data()));
+	float hDq[2] = { 0.0f, 0.0f };
+	float hDp[2] = { 0.0f, 0.0f };
+	ASSERT("CHIRONSiraTrainingLoss: download dq", d_dq.download(hDq, n));
+	ASSERT("CHIRONSiraTrainingLoss: download dp", d_dp.download(hDp, n));
+	const float gradAbs = fabsf(hDq[0]) + fabsf(hDq[1]) + fabsf(hDp[0]) + fabsf(hDp[1]);
+	ASSERT("CHIRONSiraTrainingLoss: enabled GPU path injects non-zero gradients",
+	       gradAbs > 0.0f);
+#else
+	std::printf("  [SIRA training loss GPU] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
 

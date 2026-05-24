@@ -429,6 +429,97 @@ inline float sira_safe_positive(float x, float eps)
 	return (x > e) ? x : e;
 }
 
+inline float sira_pseudo_huber_grad(float z, float tau)
+{
+	const float t = (tau > 0.0f) ? tau : 0.2f;
+	const float r = z / t;
+	return z / sqrtf(1.0f + r * r);
+}
+
+// Terminal phase-state SIRA loss used by the first active training-path port.
+//
+// This low-overhead CHIRON-native objective can be evaluated from the final
+// paired state (p_L, q_L) already resident in the O(1)-activation trainer.  It
+// is intentionally default-off and returns exactly 0 at coef <= 0 before
+// reading p/q.  The richer trajectory SIRA objective below remains the
+// reference target for later ports that stage per-layer/bucket terms.
+//
+// p2Mean/q2Mean/pqMean are means over all T*m coordinates.  The terms are:
+//   energy:  pseudo-Huber(log(0.5*(E[p^2]+E[q^2])))
+//   balance: pseudo-Huber(0.5*log(E[p^2]/E[q^2]))
+//   action:  pseudo-Huber(E[p*q]/sqrt(E[p^2]*E[q^2]))
+inline float sira_terminal_phase_loss_from_stats(float p2Mean,
+                                                  float q2Mean,
+                                                  float pqMean,
+                                                  float coef,
+                                                  float energyWeight,
+                                                  float balanceWeight,
+                                                  float actionWeight,
+                                                  float huberTau,
+                                                  float eps)
+{
+	if (coef <= 0.0f)
+		return 0.0f;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f)
+		return 0.0f;
+
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	const float p2 = sira_safe_positive(p2Mean, safeEps);
+	const float q2 = sira_safe_positive(q2Mean, safeEps);
+	const float energyZ = logf(sira_safe_positive(0.5f * (p2Mean + q2Mean), safeEps));
+	const float balanceZ = 0.5f * (logf(p2) - logf(q2));
+	const float actionDenom = sqrtf(p2 * q2);
+	const float actionZ = (actionDenom > safeEps) ? (pqMean / actionDenom) : 0.0f;
+
+	double total = 0.0;
+	if (energyWeight > 0.0f)
+		total += static_cast<double>(energyWeight) *
+		         static_cast<double>(sira_pseudo_huber(energyZ, huberTau));
+	if (balanceWeight > 0.0f)
+		total += static_cast<double>(balanceWeight) *
+		         static_cast<double>(sira_pseudo_huber(balanceZ, huberTau));
+	if (actionWeight > 0.0f)
+		total += static_cast<double>(actionWeight) *
+		         static_cast<double>(sira_pseudo_huber(actionZ, huberTau));
+	return static_cast<float>(static_cast<double>(coef) * total);
+}
+
+inline float sira_terminal_phase_loss(const float* p,
+                                       const float* q,
+                                       unsigned int n,
+                                       float coef,
+                                       float energyWeight,
+                                       float balanceWeight,
+                                       float actionWeight,
+                                       float huberTau,
+                                       float eps)
+{
+	if (coef <= 0.0f)
+		return 0.0f;
+	if (n == 0u)
+		return 0.0f;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f)
+		return 0.0f;
+	if (!p || !q)
+		return 0.0f;
+
+	double p2 = 0.0;
+	double q2 = 0.0;
+	double pq = 0.0;
+	for (unsigned int i = 0u; i < n; ++i)
+	{
+		p2 += static_cast<double>(p[i]) * static_cast<double>(p[i]);
+		q2 += static_cast<double>(q[i]) * static_cast<double>(q[i]);
+		pq += static_cast<double>(p[i]) * static_cast<double>(q[i]);
+	}
+	const double denom = static_cast<double>(n);
+	return sira_terminal_phase_loss_from_stats(static_cast<float>(p2 / denom),
+	                                           static_cast<float>(q2 / denom),
+	                                           static_cast<float>(pq / denom),
+	                                           coef, energyWeight, balanceWeight,
+	                                           actionWeight, huberTau, eps);
+}
+
 // Phase-0 SIRA diagnostics from a CHIRON phase trajectory.
 //
 // pStates/qStates: [nTransitions+1, T, m] state boundaries.

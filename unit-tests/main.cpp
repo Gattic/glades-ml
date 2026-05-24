@@ -213,6 +213,7 @@ int main(int argc, char* argv[])
 		CHIRONSiraDisabledParityTest();
 		CHIRONSiraDiagnosticsTest();
 		CHIRONSiraEnabledMathTest();
+		CHIRONSiraTrainingLossTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();
