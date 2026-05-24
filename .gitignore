@@ -14,6 +14,7 @@ alpaca.key
 logs/
 artifacts/
 .codegraph/
+.pi/
 
 # Training run output: large logs and model checkpoints.  Specific
 # benches we want in git (e.g. the ralph-loop iter dirs referenced in
