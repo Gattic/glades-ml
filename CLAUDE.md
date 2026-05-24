@@ -66,6 +66,59 @@ flags default off; math bit-identical to v5+FP8 ship when off. For pure
 from `run.sh flagship`. The v5+FP8 ship was the CUDA 13.2 production
 flagship that the regstack Phase 2 ship builds on; details:
 
+### Phase-3 regularization sub-program — CLOSED 2026-05-24
+
+The regstack Phase 2 ship is the **stable terminus** of the Phase-3
+regularization sub-program. Four mechanism arcs investigated; zero
+shipped:
+
+| Arc | Class | Result | Δ |
+|---|---|---|---|
+| MTP (multi-token prediction) | aux-objective | NEGATIVE | +0.04 nat |
+| LayerDrop (stochastic depth) | architecture-side | FAIL | +0.073 nat |
+| UL2 (mixture-of-denoisers) | objective-side | FAIL | **+2.33 nat** |
+| CUDA Graphs production-readiness | wall/infra | PARTIAL_PROGRESS | −54% wall, +0.2 nat drift |
+
+Strong evidence accumulated:
+1. **Symplectic architecture incompatibility:** port-style mechanisms
+   from standard residual transformers don't translate to CHIRON's
+   `(p, q) → (p + shear(q), reln(q))` update.
+2. **Hardware-feature absence:** CUDA 13.2 dropped
+   `AUTO_PARALLELISM` (a CUDA 12.3 feature) that's needed for graph-
+   replay to match direct-emission throughput.
+
+**Codebase improvements that DID land** (benefit ALL training paths,
+not just the failed arcs):
+- `forward()` now takes `bool isTraining = true` parameter (val-mode
+  gating primitive; LayerDrop arc).
+- `gpu_blas.cu` two-handle dispatch removes hot-path
+  `cublasGet/SetMathMode` toggle (saves 2 cuBLAS API calls per GEMM;
+  CUDA Graphs arc).
+- `GpuBuffer::zero()` is now `cudaMemsetAsync` on computeStream
+  (faster AND capture-safe; CUDA Graphs arc).
+- `qknorm_gamma_scale_gpu` GPU kernel eliminates per-layer
+  D2H/CPU/H2D round-trip for QK-Norm's γ·sqrt(dHead) scale (saves
+  ~120 µs/step on ALL paths; CUDA Graphs arc).
+- `--cuda-graphs` flag is now functional (research-only;
+  not for production).
+- `ul2_sample_span_mask` + `layer_drop_p_l` / `layer_drop_keep`
+  template helpers in `transformer_kernels.h` (general-purpose
+  primitives for any future mechanism that needs them).
+
+**Full closure record:** `research/PHASE3_CLOSURE_2026_05_24.md`. See
+also `research/LAYERDROP_5K_FAIL_2026_05_23.md`,
+`research/UL2_5K_FAIL_2026_05_23.md`,
+`research/CUDA_GRAPHS_PARTIAL_PROGRESS_2026_05_24.md`.
+
+**Direction-setting:** future research arcs at CHIRON 1B should
+consider architecture-specific mechanisms (designed for the symplectic
+update, not ported from standard transformers) OR data-side work
+(curriculum, composition, quality filters — orthogonal to the
+architectural ceiling). Iter-style wall mining (per the iter 117 META)
+remains tractable but increasingly diminishing returns; multi-iter
+scope items like reln-fusion and FlashAttention-fused SCFA inner are
+still open.
+
 ## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
 
 The v5+FP8 flagship (predecessor):
