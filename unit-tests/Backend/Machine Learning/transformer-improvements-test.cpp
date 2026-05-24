@@ -16,6 +16,7 @@
 #include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_train_detail.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
@@ -741,7 +742,84 @@ void TransformerImprovementsUnitTest()
 		delete info;
 	}
 
-	// ===== 9. Training with dropout > 0 still converges =====
+	// ===== 9. Final LN CPU/GPU KV-cache parity =====
+	printf("-----------------------------------\n");
+	printf("Final LN: CPU/GPU KV-cache parity\n");
+	printf("-----------------------------------\n");
+	{
+#ifdef GLADES_HAVE_CUDA
+		if (!glades::gpu::initDevice())
+		{
+			printf("    no CUDA device — skipped\n");
+		}
+		else
+		{
+			const std::string modelName = "ut_finln_cpu_gpu_parity";
+			const unsigned int vocab = 19u;
+			const unsigned int T = 4u;
+			std::vector<unsigned int> toks;
+			toks.push_back(1u);
+			toks.push_back(5u);
+			toks.push_back(7u);
+			toks.push_back(3u);
+
+			SmallTransformerSetup cpu(vocab, 16u, 4u, 32u, 9090u);
+			SmallTransformerSetup gpu(vocab, 16u, 4u, 32u, 123u);
+			cpu.di->setTrainTokens(toks, static_cast<int>(vocab - 1u));
+			cpu.di->mirrorTrainToTest();
+			gpu.di->setTrainTokens(toks, static_cast<int>(vocab - 1u));
+			gpu.di->mirrorTrainToTest();
+
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: cpu init failed==============", cpu.net->test(cpu.di).ok());
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: save failed==============", cpu.net->saveModel(modelName).ok());
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu load preinit failed==============", gpu.net->test(gpu.di).ok());
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu load failed==============", gpu.net->loadModel(modelName, gpu.di).ok());
+
+			glades::TrainingConfig gpuCfg = gpu.net->getTrainingConfig();
+			gpuCfg.gpu.enable = true;
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: set gpu cfg failed==============", gpu.net->setTrainingConfig(gpuCfg).ok());
+			glades::NNetwork::TransformerMetricsConfig metricsCfg = gpu.net->getTransformerMetricsConfig();
+			metricsCfg.enable = true;
+			metricsCfg.enableGpuPerf = true;
+			metricsCfg.logGpuInferSummary = false;
+			gpu.net->setTransformerMetricsConfig(metricsCfg);
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu init failed==============", gpu.net->test(gpu.di).ok());
+
+			glades::NNetwork::TransformerLmSession cpuSession;
+			glades::NNetwork::TransformerLmSession gpuSession;
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: cpu reset failed==============", cpu.net->transformerLmSessionReset(cpuSession, T).ok());
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu reset failed==============", gpu.net->transformerLmSessionReset(gpuSession, T).ok());
+
+			std::vector<float> cpuLogits;
+			std::vector<float> gpuLogits;
+			for (unsigned int t = 0u; t < T; ++t)
+			{
+				G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: cpu append failed==============",
+				         cpu.net->transformerLmSessionAppend(cpuSession, toks[t], &cpuLogits).ok());
+				G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu append failed==============",
+				         gpu.net->transformerLmSessionAppend(gpuSession, toks[t], &gpuLogits).ok());
+				G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: logits size mismatch==============",
+				         cpuLogits.size() == vocab && gpuLogits.size() == vocab);
+				double maxAbs = 0.0;
+				for (unsigned int i = 0u; i < vocab; ++i)
+				{
+					G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: non-finite logit==============",
+					         std::isfinite(cpuLogits[i]) && std::isfinite(gpuLogits[i]));
+					const double d = fabs(static_cast<double>(cpuLogits[i]) - static_cast<double>(gpuLogits[i]));
+					if (d > maxAbs)
+						maxAbs = d;
+				}
+				G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: logits diverge==============", maxAbs < 1e-2);
+			}
+			G_assert(__FILE__, __LINE__, "==============FinalLN CpuGpuParity: gpu path not exercised==============",
+			         gpu.net->getLastTransformerInferGpuPerf().counters.kernelLaunches > 0ULL);
+		}
+#else
+		printf("    CUDA not compiled — skipped\n");
+#endif
+	}
+
+	// ===== 10. Training with dropout > 0 still converges =====
 	printf("-----------------------------------\n");
 	printf("Dropout integration: training with dropout rates > 0\n");
 	printf("-----------------------------------\n");

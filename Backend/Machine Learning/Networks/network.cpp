@@ -2631,6 +2631,16 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vTokE.assign(eN, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2TokE.assign(eN, 0.0f);
 			tensorTransformer.gTokE.assign(eN, 0.0f);
+			// MTP projection matrix: (dModel, dModel), Glorot-uniform init.
+			// Allocated only when mtpDepth > 0; empty vectors act as sentinels.
+			if (trainingConfig.transformer.mtpDepth > 0)
+			{
+				const size_t mtpSize = static_cast<size_t>(dModel) * static_cast<size_t>(dModel);
+				tensorTransformer.Wmtp.assign(mtpSize, 0.0f);
+				tensorTransformer.gWmtp.assign(mtpSize, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mWmtp.assign(mtpSize, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2Wmtp.assign(mtpSize, 0.0f);
+			}
 			tensorTransformer.lmBias.assign(vocabSize, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
@@ -2671,6 +2681,20 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Beta.assign(dModel, 0.0f);
 			b.gLn1Gamma.assign(dModel, 0.0f);
 			b.gLn1Beta.assign(dModel, 0.0f);
+			// QK-Norm γ init: log2(T) per DeepSeek-V3, or qkNormGammaInit override.
+			// T is not directly in scope here; use 14.0f = log2(16384) as the
+			// CHIRON 1B-appropriate default (qkNormGammaInit overrides this).
+			if (trainingConfig.transformer.qkNormEnabled)
+			{
+				const float gammaInit = (trainingConfig.transformer.qkNormGammaInit > 0.0f)
+				                          ? trainingConfig.transformer.qkNormGammaInit
+				                          : 14.0f; // log2(16384), CHIRON 1B flagship T
+				b.qknormGamma.assign(nHeads, gammaInit);
+				b.gQknormGamma.assign(nHeads, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) b.mQknormGamma.assign(nHeads, 0.0f);
+				if (needAdamMoments && !skipHostAdamMV) b.v2QknormGamma.assign(nHeads, 0.0f);
+			}
+			// When qkNormEnabled is false, vectors stay empty — sentinel for "not in use".
 			b.ln2Gamma.assign(dModel, 1.0f);
 			b.ln2Beta.assign(dModel, 0.0f);
 			if (needAdamMoments && !skipHostAdamMV) b.mLn2Gamma.assign(dModel, 0.0f);
@@ -2770,6 +2794,11 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				// Initialize embeddings with N(0, 0.02) (standard LLM practice).
 				for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
 					tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
+				// Initialize Wmtp with Glorot-uniform if enabled.
+				if (!tensorTransformer.Wmtp.empty())
+					InitGlorot::run(rngEngine, tensorTransformer.Wmtp,
+					                static_cast<unsigned int>(dModel),
+					                static_cast<unsigned int>(dModel));
 			}
 			for (int li = 0; li < H; ++li)
 			{
@@ -4767,6 +4796,22 @@ bool glades::NNetwork::ensureGpuState()
 		if (!ts.v2LnFinalGamma.empty()) gpuTransformerWeights->v2LnFinalGamma.upload(&ts.v2LnFinalGamma[0], ts.v2LnFinalGamma.size());
 		if (!ts.mLnFinalBeta.empty()) gpuTransformerWeights->mLnFinalBeta.upload(&ts.mLnFinalBeta[0], ts.mLnFinalBeta.size());
 		if (!ts.v2LnFinalBeta.empty()) gpuTransformerWeights->v2LnFinalBeta.upload(&ts.v2LnFinalBeta[0], ts.v2LnFinalBeta.size());
+
+		// MTP auxiliary head: lazily allocate Wmtp/gWmtp on GPU and upload
+		// Wmtp from host.  Guarded on mtpDepth > 0 AND non-empty host Wmtp
+		// (Wmtp is empty at mtpDepth=0 — see sgd_transformer.cpp Task 3.4).
+		if (trainingConfig.transformer.mtpDepth > 0 && !ts.Wmtp.empty())
+		{
+			const size_t wmtpN = static_cast<size_t>(ts.dModel) * static_cast<size_t>(ts.dModel);
+			if (!gpuTransformerWeights->Wmtp.allocated())
+				if (!gpuTransformerWeights->Wmtp.allocate(wmtpN)) return false;
+			if (!gpuTransformerWeights->gWmtp.allocated())
+				if (!gpuTransformerWeights->gWmtp.allocate(wmtpN)) return false;
+			gpuTransformerWeights->Wmtp.upload(&ts.Wmtp[0], wmtpN);
+			// gWmtp starts at zero each time ensureGpuState runs (fresh training
+			// start or resume); the per-step Adam zero-out in sgd_transformer.cpp
+			// handles accumulator reset per optimizer step.
+		}
 
 		// === GPU-side weight init (curand) ===
 		//

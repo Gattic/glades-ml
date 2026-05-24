@@ -19,6 +19,8 @@
 #include "../../unit-test.h"
 
 #include "../../../Backend/Machine Learning/Networks/transformer_chiron_ops.h"
+#include "../../../Backend/Machine Learning/rng.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 
 #ifdef GLADES_HAVE_CUDA
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_chiron.h"
@@ -11343,6 +11345,21 @@ void CHIRONUnitTest()
 	CHIRONOvfgTruncateFactorsQrParityTest();
 	CHIRONOvfgCompressionBenchmark();
 	CHIRONOvfgTruncateBenchmark();
+	// === REGSTACK tests (2026-05-22 spec) ===
+	// Run before the OVFG/Stiefel block — that test has a pre-existing
+	// assertion-abort that would prevent subsequent tests from running.
+	CHIRONZlossDisabledParityTest();
+	CHIRONZlossEnabledMathTest();
+	CHIRONQkNormDisabledParityTest();
+	CHIRONQkNormEnabledMathTest();
+	CHIRONMtpDisabledParityTest();
+	CHIRONMtpTargetShiftTest();
+	CHIRONLayerDropScheduleMathTest();
+	CHIRONLayerDropDisabledParityTest();
+	CHIRONLayerDropDeterministicMasksTest();
+	CHIRONUL2SpanSamplerMeanSpanTest();
+	CHIRONUL2SpanSamplerRateTest();
+	CHIRONUL2DisabledParityTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -16325,4 +16342,562 @@ void CHIRONTrcdEndToEndConvergenceTest()
 #endif
 }
 
+// === REGSTACK PARITY TESTS (2026-05-22 spec) ===
+
+// Verify that at zlossCoef == 0.0f, the readout CE forward/backward path
+// produces bit-identical loss and gradients vs the same path before the
+// Z-loss code was added. This is a strict-bar smoke test using a tiny
+// transformer config; the real production parity test is a 100-step
+// trainer smoke (run after implementation completes).
+void CHIRONZlossDisabledParityTest()
+{
+	// Reference values: handcomputed for a 4-class softmax with target=0 and
+	// logits = [1.0, 0.5, -0.5, 0.0]. No randomness — these are exact.
+	const float logits[4] = {1.0f, 0.5f, -0.5f, 0.0f};
+	const int target = 0;
+
+	// Compute reference CE = -log(softmax[target]) using the SAME double
+	// accumulator pattern as softmax_ce_with_zloss (matches softmax_stable_into).
+	float lse = 0.0f;
+	{
+		float maxLogit = logits[0];
+		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+		double sumExp = 0.0;
+		for (int i = 0; i < 4; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+		lse = maxLogit + static_cast<float>(log(sumExp));
+	}
+	const float refCE = lse - logits[target];
+
+	// Call the new helper that computes (CE, zloss) given coef. At coef=0,
+	// zloss must be 0 and CE must equal refCE EXACTLY (bit-identical).
+	float ce = 0.0f;
+	float zloss = 0.0f;
+	glades::transformer_kernels::softmax_ce_with_zloss(
+		logits, 4, target, /*zlossCoef=*/0.0f, &ce, &zloss);
+
+	ASSERT("zloss_disabled: CE must match reference exactly at coef=0",
+	       ce == refCE);
+	ASSERT("zloss_disabled: zloss term must be exactly 0 at coef=0",
+	       zloss == 0.0f);
+
+	// Also verify the gradient. Reference grad: (softmax - one_hot) / 1.
+	float probs[4];
+	{
+		float maxLogit = logits[0];
+		for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+		double sumExp = 0.0;
+		for (int i = 0; i < 4; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+		for (int i = 0; i < 4; ++i) probs[i] = expf(logits[i] - maxLogit) / static_cast<float>(sumExp);
+	}
+	float refGrad[4];
+	for (int i = 0; i < 4; ++i) refGrad[i] = probs[i] - (i == target ? 1.0f : 0.0f);
+
+	float grad[4];
+	glades::transformer_kernels::softmax_ce_with_zloss_grad(
+		probs, 4, target, lse, /*zlossCoef=*/0.0f, grad);
+
+	for (int i = 0; i < 4; ++i)
+	{
+		ASSERT("zloss_disabled: gradient must match reference exactly at coef=0",
+		       grad[i] == refGrad[i]);
+	}
+}
+
+void CHIRONZlossEnabledMathTest()
+{
+	// Verify that at zlossCoef > 0, the loss and gradient include the
+	// expected Z-loss contribution.
+	const float logits[4] = {2.0f, 0.0f, -1.0f, 0.5f};
+	const int target = 2;
+	const float lambdaZ = 0.1f;  // larger than production to make signal obvious
+
+	// Reference: compute by hand using the SAME double accumulator pattern
+	// as softmax_ce_with_zloss (matches softmax_stable_into convention).
+	float maxLogit = logits[0];
+	for (int i = 1; i < 4; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+	double sumExp = 0.0;
+	for (int i = 0; i < 4; ++i)
+		sumExp += exp(static_cast<double>(logits[i] - maxLogit));
+	const float lse = maxLogit + static_cast<float>(log(sumExp));
+	const float refCE = lse - logits[target];
+	const float refZloss = lambdaZ * lse * lse;
+
+	float probs[4];
+	for (int i = 0; i < 4; ++i)
+		probs[i] = static_cast<float>(
+			exp(static_cast<double>(logits[i] - maxLogit)) / sumExp);
+
+	float refGrad[4];
+	const float zScale = 2.0f * lambdaZ * lse;
+	for (int i = 0; i < 4; ++i)
+	{
+		refGrad[i] = probs[i] - (i == target ? 1.0f : 0.0f);
+		refGrad[i] += zScale * probs[i];
+	}
+
+	// Call our helpers.
+	float ce = 0.0f, zloss = 0.0f, lseOut = 0.0f;
+	glades::transformer_kernels::softmax_ce_with_zloss(
+		logits, 4, target, lambdaZ, &ce, &zloss, &lseOut);
+	float grad[4];
+	glades::transformer_kernels::softmax_ce_with_zloss_grad(
+		probs, 4, target, lseOut, lambdaZ, grad);
+
+	// Math tolerance: 1e-5 (FP32 round-off across the chain).
+	const float ceErr = fabsf(ce - refCE);
+	const float zErr = fabsf(zloss - refZloss);
+	ASSERT("zloss_enabled: CE matches reference", ceErr < 1e-5f);
+	ASSERT("zloss_enabled: zloss term matches reference", zErr < 1e-5f);
+	for (int i = 0; i < 4; ++i)
+	{
+		const float gErr = fabsf(grad[i] - refGrad[i]);
+		ASSERT("zloss_enabled: gradient matches reference", gErr < 1e-5f);
+	}
+}
+
+// TDD placeholder — implementation in Task 2.1
+void CHIRONQkNormDisabledParityTest()
+{
+	std::printf("  [qknorm disabled parity] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 2.2
+void CHIRONQkNormEnabledMathTest()
+{
+	// Tiny shape: T=2, nHeads=2, dHead=4.
+	const int T = 2;
+	const int nHeads = 2;
+	const int dHead = 4;
+	const float eps = 1e-6f;
+	std::vector<float> x(T * nHeads * dHead);
+	for (int i = 0; i < (int)x.size(); ++i) x[i] = (float)(i + 1);
+
+	// Reference: per (t, h) row, normalize by L2 norm using the SAME double
+	// accumulator pattern as qknorm_forward.
+	std::vector<float> ref(x);
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			float* row = &ref[(t * nHeads + h) * dHead];
+			double ss = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+			const float invN = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+			for (int i = 0; i < dHead; ++i) row[i] *= invN;
+		}
+	}
+
+	std::vector<float> got(x);
+	glades::transformer_kernels::qknorm_forward(&got[0], T, nHeads, dHead, eps);
+
+	float worst = max_abs_diff(got, ref);
+	ASSERT("qknorm_enabled: forward matches reference within 1e-6", worst < 1e-6f);
+
+	// Now verify backward: take a random-ish dxNorm and check the formula.
+	// Reference: dx = (1/||x_orig||) * (dxNorm - (x_norm · dxNorm) * x_norm).
+	// We use the post-norm `got` (which is x_norm) and a hand-set dxNorm.
+	std::vector<float> dxNorm(x.size());
+	for (size_t i = 0; i < dxNorm.size(); ++i)
+		dxNorm[i] = 0.1f * (float)(i + 1);
+
+	// Compute reference invNorm = 1 / ||x_orig|| per (t, h).
+	std::vector<float> invNorm(T * nHeads);
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			const float* row = &x[(t * nHeads + h) * dHead];
+			double ss = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+			invNorm[t * nHeads + h] = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+		}
+	}
+
+	// Reference backward computation.
+	std::vector<float> refDx(x.size());
+	for (int t = 0; t < T; ++t)
+	{
+		for (int h = 0; h < nHeads; ++h)
+		{
+			const float* xn = &got[(t * nHeads + h) * dHead];
+			const float* dn = &dxNorm[(t * nHeads + h) * dHead];
+			const float ni = invNorm[t * nHeads + h];
+			double xnDotDn = 0.0;
+			for (int i = 0; i < dHead; ++i)
+				xnDotDn += static_cast<double>(xn[i]) * static_cast<double>(dn[i]);
+			const float xnDotDnF = static_cast<float>(xnDotDn);
+			float* dox = &refDx[(t * nHeads + h) * dHead];
+			for (int i = 0; i < dHead; ++i)
+				dox[i] = ni * (dn[i] - xnDotDnF * xn[i]);
+		}
+	}
+
+	std::vector<float> gotDx(x.size());
+	glades::transformer_kernels::qknorm_backward(
+		&got[0], &invNorm[0], &dxNorm[0], T, nHeads, dHead, &gotDx[0]);
+
+	float worstBwd = max_abs_diff(gotDx, refDx);
+	ASSERT("qknorm_enabled: backward matches reference within 1e-6", worstBwd < 1e-6f);
+}
+
+// TDD placeholder — implementation in Task 3.1
+void CHIRONMtpDisabledParityTest()
+{
+	std::printf("  [mtp disabled parity] TDD placeholder — not yet implemented\n");
+}
+
+// TDD placeholder — implementation in Task 3.2
+void CHIRONMtpTargetShiftTest()
+{
+	// Verify: targetsMtp[t] = targetIds[t+1] for t in [0, T-1),
+	// and targetsMtp[T-1] = ignoreLabel (-1).
+	const int T = 8;
+	std::vector<int> targetIds(T);
+	for (int t = 0; t < T; ++t) targetIds[t] = 100 + t;  // synthetic IDs
+
+	std::vector<int> targetsMtp(T, -999);
+	glades::transformer_kernels::compute_mtp_targets(
+	    &targetIds[0], T, /*ignoreLabel=*/-1, &targetsMtp[0]);
+
+	for (int t = 0; t < T - 1; ++t)
+	{
+		ASSERT("mtp_target: shift +1 matches", targetsMtp[t] == 100 + t + 1);
+	}
+	ASSERT("mtp_target: last position is ignore label", targetsMtp[T - 1] == -1);
+
+	// Edge case: T=1 (should set only the ignore label, no shift).
+	std::vector<int> targetsMtpT1(1, -999);
+	const int single = 42;
+	glades::transformer_kernels::compute_mtp_targets(
+	    &single, 1, /*ignoreLabel=*/-1, &targetsMtpT1[0]);
+	ASSERT("mtp_target: T=1 sets ignore label", targetsMtpT1[0] == -1);
+}
+
+// === LAYERDROP TESTS (2026-05-23 spec) ===
+
+// Verify that layer_drop_p_l(l, L=24, pMax=0.1, linear=true) gives
+// p_0 = 0, p_{23} = 0.1, p_{12} ≈ 0.0522..., and the sum over l matches
+// the expected (pMax * L / 2) = 1.2.
+void CHIRONLayerDropScheduleMathTest()
+{
+	using glades::transformer_kernels::layer_drop_p_l;
+
+	const unsigned int L = 24;
+	const float pMax = 0.1f;
+
+	// p_0 = 0
+	{
+		const float p0 = layer_drop_p_l(0u, L, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: p_0 must be 0", p0 == 0.0f);
+	}
+
+	// p_{L-1} = pMax
+	{
+		const float pLast = layer_drop_p_l(L - 1u, L, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: p_{L-1} must equal pMax",
+		       fabsf(pLast - pMax) < 1e-7f);
+	}
+
+	// p_{12} = (12/23) * 0.1 ≈ 0.0521739
+	{
+		const float pMid = layer_drop_p_l(12u, L, pMax, true);
+		const float expected = (12.0f / 23.0f) * 0.1f;
+		ASSERT("CHIRONLayerDropSchedule: p_{12} must match (12/23) * pMax",
+		       fabsf(pMid - expected) < 1e-6f);
+	}
+
+	// Sum over l ∈ {0..L-1} = pMax * sum(0..L-1) / (L-1) = pMax * (L*(L-1)/2) / (L-1) = pMax * L / 2 = 1.2
+	{
+		float sum = 0.0f;
+		for (unsigned int l = 0u; l < L; ++l)
+			sum += layer_drop_p_l(l, L, pMax, true);
+		const float expected = pMax * static_cast<float>(L) / 2.0f;  // 1.2
+		ASSERT("CHIRONLayerDropSchedule: sum p_l must equal pMax*L/2 = 1.2",
+		       fabsf(sum - expected) < 1e-5f);
+	}
+
+	// Constant schedule: all layers get pMax.
+	{
+		for (unsigned int l = 0u; l < L; ++l)
+		{
+			const float p = layer_drop_p_l(l, L, pMax, false);
+			ASSERT("CHIRONLayerDropSchedule: constant schedule gives pMax",
+			       fabsf(p - pMax) < 1e-7f);
+		}
+	}
+
+	// L == 1: p_0 = 0 regardless of pMax.
+	{
+		const float p = layer_drop_p_l(0u, 1u, pMax, true);
+		ASSERT("CHIRONLayerDropSchedule: L=1 must give p_0 = 0", p == 0.0f);
+	}
+
+	// pMax = 0: all p_l = 0.
+	{
+		for (unsigned int l = 0u; l < L; ++l)
+		{
+			const float p = layer_drop_p_l(l, L, 0.0f, true);
+			ASSERT("CHIRONLayerDropSchedule: pMax=0 must give all p_l = 0",
+			       p == 0.0f);
+		}
+	}
+}
+
+void CHIRONLayerDropDisabledParityTest()
+{
+	using glades::transformer_kernels::layer_drop_keep;
+	using glades::transformer_kernels::layer_drop_p_l;
+
+	// At p_l = 0, layer_drop_keep MUST return true unconditionally and MUST
+	// NOT advance the RNG state (the helper takes the early-return path).
+	glades::rng::Engine eng_a;
+	glades::rng::Engine eng_b;
+	glades::rng::seed_engine(eng_a, 7777ULL);
+	glades::rng::seed_engine(eng_b, 7777ULL);
+
+	// On engine A: 24 calls to layer_drop_keep at p_l = 0 (mimicking a full
+	// L=24 layer pass at p_max = 0).
+	for (unsigned int li = 0; li < 24u; ++li)
+	{
+		const float p_l = layer_drop_p_l(li, 24u, 0.0f, true);
+		ASSERT("CHIRONLayerDropDisabledParity: p_l must be 0 at p_max=0",
+		       p_l == 0.0f);
+		const bool keep = layer_drop_keep(eng_a, p_l);
+		ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep must return true at p_l=0",
+		       keep == true);
+	}
+
+	// Engine A and engine B started at the same seed and engine B has NOT
+	// been called yet. After A's 24 no-op calls, both engines must produce
+	// the same next 64-bit draw — i.e., the no-op calls did not perturb the
+	// RNG state.
+	const uint64_t next_a = glades::rng::next_u64(eng_a);
+	const uint64_t next_b = glades::rng::next_u64(eng_b);
+	ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep at p_l=0 must NOT advance RNG state",
+	       next_a == next_b);
+
+	// Also: at p_l = 1.0 (drop always), layer_drop_keep must return false
+	// and MUST NOT consume RNG state (early-return path).
+	glades::rng::Engine eng_c;
+	glades::rng::Engine eng_d;
+	glades::rng::seed_engine(eng_c, 8888ULL);
+	glades::rng::seed_engine(eng_d, 8888ULL);
+	for (int i = 0; i < 10; ++i)
+	{
+		const bool keep = layer_drop_keep(eng_c, 1.0f);
+		ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep must return false at p_l=1.0",
+		       keep == false);
+	}
+	const uint64_t next_c = glades::rng::next_u64(eng_c);
+	const uint64_t next_d = glades::rng::next_u64(eng_d);
+	ASSERT("CHIRONLayerDropDisabledParity: layer_drop_keep at p_l=1.0 must NOT advance RNG state",
+	       next_c == next_d);
+}
+
+void CHIRONLayerDropDeterministicMasksTest()
+{
+	// Two engine instantiations with the same seed must produce the same
+	// 100-step × 24-layer mask trace at layerDropPMax = 0.1, linear schedule.
+	const unsigned int L = 24;
+	const unsigned int steps = 100;
+	const float pMax = 0.1f;
+	const unsigned int seed = 1337u;
+
+	std::vector<unsigned char> trace_a(steps * L, 0u);
+	std::vector<unsigned char> trace_b(steps * L, 0u);
+
+	for (int run = 0; run < 2; ++run)
+	{
+		std::vector<unsigned char>& trace = (run == 0) ? trace_a : trace_b;
+
+		// Construct a fresh RNG engine at the same seed. Use glades::rng::Engine
+		// (the project's C++98-compatible PRNG per DETERMINISM_AND_CONCURRENCY.md
+		// and Task 2.4).
+		glades::rng::Engine eng;
+		glades::rng::seed_engine(eng, seed);
+
+		for (unsigned int s = 0; s < steps; ++s)
+		{
+			for (unsigned int li = 0; li < L; ++li)
+			{
+				const float p_l = glades::transformer_kernels::layer_drop_p_l(
+				    li, L, pMax, true);
+				const bool keep = glades::transformer_kernels::layer_drop_keep(
+				    eng, p_l);
+				trace[s * L + li] = keep ? 1u : 0u;
+			}
+		}
+	}
+
+	// Traces must be byte-identical.
+	bool allEqual = true;
+	for (size_t i = 0; i < trace_a.size(); ++i)
+	{
+		if (trace_a[i] != trace_b[i])
+		{
+			allEqual = false;
+			break;
+		}
+	}
+	ASSERT("CHIRONLayerDropDeterministicMasks: same seed must give identical 100-step trace",
+	       allEqual);
+
+	// Also verify the mean keep-rate matches the expected (sum p_l / L) = 0.05 → mean keep = 0.95.
+	size_t keepCount = 0;
+	for (size_t i = 0; i < trace_a.size(); ++i)
+		if (trace_a[i] != 0u)
+			++keepCount;
+	const float keepRate = static_cast<float>(keepCount) / static_cast<float>(trace_a.size());
+	// At pMax=0.1, mean p_l = 0.05, expected keep rate = 0.95. 100*24 = 2400 draws,
+	// standard deviation ≈ sqrt(0.95*0.05/2400) ≈ 0.0045. Allow ±0.02 tolerance (~4σ).
+	ASSERT("CHIRONLayerDropDeterministicMasks: keep rate within tolerance of 0.95",
+	       fabsf(keepRate - 0.95f) < 0.02f);
+}
+
+// === UL2 TESTS (2026-05-23 spec) ===
+
+void CHIRONUL2SpanSamplerMeanSpanTest()
+{
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At mu=3, p=0.15, T=4096: total corrupted ≈ 614.  Mean span length
+	// derived from contiguous 1-runs in mask should be close to mu.
+	// We measure the mean run-length and check it is within ±20% of mu=3
+	// over n=100 trials.
+	const unsigned int T = 4096;
+	const float p_target = 0.15f;
+	const int mu = 3;
+	const unsigned int n_trials = 100;
+
+	std::vector<unsigned char> mask(T, 0u);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 1337u);
+
+	double total_runs = 0.0;
+	double total_corrupted = 0.0;
+	for (unsigned int trial = 0; trial < n_trials; ++trial)
+	{
+		std::fill(mask.begin(), mask.end(), 0u);
+		const unsigned int corrupted = ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+		// Count contiguous runs of 1s.
+		unsigned int runs = 0;
+		bool in_run = false;
+		for (unsigned int i = 0; i < T; ++i)
+		{
+			if (mask[i] == 1u && !in_run) { ++runs; in_run = true; }
+			else if (mask[i] == 0u) in_run = false;
+		}
+		total_runs += (double)runs;
+		total_corrupted += (double)corrupted;
+	}
+	const double mean_run_len = (total_runs > 0.0)
+	    ? (total_corrupted / total_runs) : 0.0;
+	// Expected mean run length is mu=3.  Allow ±20% tolerance for
+	// overlap effects (Knuth Poisson + uniform-start placement clamping).
+	ASSERT("CHIRONUL2SpanSamplerMeanSpan: mean run length within ±20% of mu=3",
+	       (mean_run_len >= 0.8 * (double)mu) && (mean_run_len <= 1.2 * (double)mu));
+}
+
+void CHIRONUL2SpanSamplerRateTest()
+{
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At mu=3, p=0.15, T=4096: target corrupted = 614.  Actual should be
+	// 614 ± 3.  At mu=32, p=0.50, T=16384: target = 8192.  Actual within
+	// ±0.03 of 0.50 over n=100 trials.
+	const unsigned int n_trials = 100;
+	std::vector<unsigned char> mask;
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 4242u);
+
+	// R-denoiser: mu=3, p=0.15, T=4096
+	{
+		const unsigned int T = 4096;
+		const float p_target = 0.15f;
+		const int mu = 3;
+		mask.assign(T, 0u);
+		double total_rate = 0.0;
+		for (unsigned int trial = 0; trial < n_trials; ++trial)
+		{
+			std::fill(mask.begin(), mask.end(), 0u);
+			ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+			unsigned int corrupted = 0;
+			for (unsigned int i = 0; i < T; ++i) if (mask[i] == 1u) ++corrupted;
+			total_rate += (double)corrupted / (double)T;
+		}
+		const double mean_rate = total_rate / (double)n_trials;
+		ASSERT("CHIRONUL2SpanSamplerRate (R): mean rate within ±0.03 of 0.15",
+		       fabs(mean_rate - 0.15) < 0.03);
+	}
+
+	// X-denoiser: mu=32, p=0.50, T=16384
+	{
+		const unsigned int T = 16384;
+		const float p_target = 0.50f;
+		const int mu = 32;
+		mask.assign(T, 0u);
+		double total_rate = 0.0;
+		for (unsigned int trial = 0; trial < n_trials; ++trial)
+		{
+			std::fill(mask.begin(), mask.end(), 0u);
+			ul2_sample_span_mask(eng, T, p_target, mu, mask.data());
+			unsigned int corrupted = 0;
+			for (unsigned int i = 0; i < T; ++i) if (mask[i] == 1u) ++corrupted;
+			total_rate += (double)corrupted / (double)T;
+		}
+		const double mean_rate = total_rate / (double)n_trials;
+		ASSERT("CHIRONUL2SpanSamplerRate (X): mean rate within ±0.03 of 0.50",
+		       fabs(mean_rate - 0.50) < 0.03);
+	}
+}
+
+// Disabled-parity test is a stub for Phase 2; implemented in Task 2.6 below.
+void CHIRONUL2DisabledParityTest()
+{
+	using glades::transformer_kernels::ul2_sample_span_mask;
+
+	// At p_target=0.0, ul2_sample_span_mask must return 0 corrupted and
+	// leave the mask all-zero.  RNG state must not advance.
+	glades::rng::Engine eng_a;
+	glades::rng::seed_engine(eng_a, 12345u);
+	glades::rng::Engine eng_b;
+	glades::rng::seed_engine(eng_b, 12345u);
+
+	const unsigned int T = 4096;
+	std::vector<unsigned char> mask(T, 0u);
+
+	const unsigned int corrupted_a = ul2_sample_span_mask(
+	    eng_a, T, 0.0f, 3, mask.data());
+
+	ASSERT("CHIRONUL2DisabledParity: ul2_sample_span_mask at p=0 returns 0 corrupted",
+	       corrupted_a == 0u);
+
+	// Mask must be all zeros.
+	bool all_zero = true;
+	for (unsigned int i = 0; i < T; ++i)
+		if (mask[i] != 0u) { all_zero = false; break; }
+	ASSERT("CHIRONUL2DisabledParity: mask is all zeros at p=0", all_zero);
+
+	// RNG state of eng_a must equal eng_b (no draws).
+	const uint64_t next_a = glades::rng::next_u64(eng_a);
+	const uint64_t next_b = glades::rng::next_u64(eng_b);
+	ASSERT("CHIRONUL2DisabledParity: RNG state must NOT advance at p=0",
+	       next_a == next_b);
+
+	// At mu < 1 (invalid), also returns 0 without RNG draws.
+	glades::rng::Engine eng_c;
+	glades::rng::seed_engine(eng_c, 9999u);
+	glades::rng::Engine eng_d;
+	glades::rng::seed_engine(eng_d, 9999u);
+	const unsigned int corrupted_c = ul2_sample_span_mask(
+	    eng_c, T, 0.15f, 0, mask.data());  // mu=0 invalid
+	ASSERT("CHIRONUL2DisabledParity: ul2_sample_span_mask at mu=0 returns 0",
+	       corrupted_c == 0u);
+	const uint64_t next_c = glades::rng::next_u64(eng_c);
+	const uint64_t next_d = glades::rng::next_u64(eng_d);
+	ASSERT("CHIRONUL2DisabledParity: RNG state must NOT advance at mu=0",
+	       next_c == next_d);
+}
 

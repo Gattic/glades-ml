@@ -15,6 +15,14 @@ namespace gpu {
 
 namespace {
 static cublasHandle_t g_handle = 0;
+// Two-handle dispatch design for CUDA Graphs compatibility:
+// g_handleStrict is always set to CUBLAS_DEFAULT_MATH (strict FP32).
+// g_handleTf32 is always set to CUBLAS_TF32_TENSOR_OP_MATH (when CC >= 8.0).
+// Per-call mathMode picks the appropriate handle WITHOUT toggling state.
+// This eliminates cublasSet/GetMathMode calls inside the hot path, which
+// are not capture-compatible (paradigm #51 ATLAS-COMPILE).
+static cublasHandle_t g_handleStrict = NULL;
+static cublasHandle_t g_handleTf32   = NULL;
 static bool g_initialized = false;
 // iter 180: when false, all wrappers below select CUBLAS_DEFAULT_MATH (no TF32).
 static bool g_tf32_enabled = true;
@@ -109,13 +117,26 @@ static bool ensureSideHandle()
 		return false;
 	}
 	cublasSetStream(g_handleSide, g_sideStream);
+	// Side handle follows the same two-handle invariant: set to native mode
+	// at init, never toggled afterwards. Callers dispatch via mathMode arg.
 	if (computeCapabilityMajor() >= 8)
 	{
-		cublasSetMathMode(g_handleSide,
-		    g_tf32_enabled ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+		cublasSetMathMode(g_handleSide, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
 	g_sideInitialized = true;
 	return true;
+}
+
+// Pick the appropriate handle for the requested mathMode.
+// At init, g_handleTf32 is always TF32 (CC>=8) or DEFAULT (CC<8);
+// g_handleStrict is always DEFAULT.  This dispatcher eliminates
+// per-call cublasSet/GetMathMode, making the call sequence
+// graph-captureable.
+static inline cublasHandle_t pick_handle(cublasMath_t mathMode)
+{
+	if (mathMode == CUBLAS_TF32_TENSOR_OP_MATH)
+		return g_handleTf32;
+	return g_handleStrict;
 }
 
 static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
@@ -132,42 +153,19 @@ static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
 	if (!g_initialized && !blasInit())
 		return false;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	// Two-handle dispatch: pick the handle whose math mode matches the
+	// caller's request.  No state toggling, no cublasSet/GetMathMode in
+	// the hot path — capture-compatible (paradigm #51 ATLAS-COMPILE).
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemm(g_handle,
-	                 transa, transb,
-	                 N, M, K,
-	                 &alpha,
-	                 B, ldb,
-	                 A, lda,
-	                 &beta,
-	                 C, ldc);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemm(h,
+	                                transa, transb,
+	                                N, M, K,
+	                                &alpha,
+	                                B, ldb,
+	                                A, lda,
+	                                &beta,
+	                                C, ldc);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
@@ -195,43 +193,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 	if (!Aarray || !Barray || !Carray || batchCount <= 0)
 		return true;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemmBatched(g_handle,
-	                        transa, transb,
-	                        N, M, K,
-	                        &alpha,
-	                        reinterpret_cast<const float* const*>(Barray), ldb,
-	                        reinterpret_cast<const float* const*>(Aarray), lda,
-	                        &beta,
-	                        Carray, ldc,
-	                        batchCount);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemmBatched(h,
+	                                       transa, transb,
+	                                       N, M, K,
+	                                       &alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       &beta,
+	                                       Carray, ldc,
+	                                       batchCount);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
@@ -249,12 +221,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 __attribute__((used, visibility("default")))
 void set_tf32_enabled(bool enabled)
 {
+	// Flag-only API.  The two-handle design (Task 1.1) means callers
+	// explicitly request TF32 or strict via the mathMode arg per call;
+	// this flag is read by callers that want to HONOR the user's global
+	// toggle.
+	//
+	// IMPORTANT for cuda-graphs compatibility: NO cublasSetMathMode
+	// happens here.  The handles' math modes are set ONCE at blasInit()
+	// and never toggled afterwards.  This preserves the two-handle
+	// invariant (g_handleStrict always DEFAULT, g_handleTf32 always
+	// TF32 on CC>=8) which is required for capture-compatible dispatch.
 	g_tf32_enabled = enabled;
-	if (g_initialized && g_handle)
-	{
-		cublasSetMathMode(g_handle, enabled ? CUBLAS_TF32_TENSOR_OP_MATH
-		                                     : CUBLAS_DEFAULT_MATH);
-	}
 }
 
 __attribute__((used, visibility("default")))
@@ -265,27 +242,51 @@ bool blasInit()
 	if (g_initialized)
 		return true;
 
-	cublasStatus_t st = cublasCreate(&g_handle);
+	// Create the strict-FP32 handle.
+	cublasStatus_t st = cublasCreate(&g_handleStrict);
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
-		fprintf(stderr, "[glades-cuda] cublasCreate failed: %d\n", static_cast<int>(st));
+		fprintf(stderr, "[glades-cuda] cublasCreate (strict) failed: %d\n", static_cast<int>(st));
 		return false;
 	}
-	cublasSetStream(g_handle, computeStream());
+	cublasSetStream(g_handleStrict, computeStream());
+	cublasSetMathMode(g_handleStrict, CUBLAS_DEFAULT_MATH);
+
+	// Create the TF32 handle.
+	st = cublasCreate(&g_handleTf32);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasCreate (tf32) failed: %d\n", static_cast<int>(st));
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
+		return false;
+	}
+	cublasSetStream(g_handleTf32, computeStream());
 	// Enable TF32 tensor core math on Ampere+ (SM 8.0+) for ~2x SGEMM speedup.
 	if (computeCapabilityMajor() >= 8)
 	{
-		cublasSetMathMode(g_handle, CUBLAS_TF32_TENSOR_OP_MATH);
+		cublasSetMathMode(g_handleTf32, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
-	// Honor any prior set_tf32_enabled(false) call.  No-op if g_tf32_enabled is true.
-	if (!g_tf32_enabled)
-		cublasSetMathMode(g_handle, CUBLAS_DEFAULT_MATH);
+	else
+	{
+		// Pre-Ampere: no TF32; both handles use CUBLAS_DEFAULT_MATH.
+		cublasSetMathMode(g_handleTf32, CUBLAS_DEFAULT_MATH);
+	}
+
+	// Maintain g_handle as an alias to g_handleTf32 for backward compatibility
+	// with code paths that haven't been updated yet.  Will be removed in
+	// Task 1.4 once all callers route through the two-handle dispatch.
+	g_handle = g_handleTf32;
+
 	float hostOne = 1.0f;
 	cudaError_t e = cudaMalloc(&g_deviceOne, sizeof(float));
 	if (e != cudaSuccess)
 	{
 		fprintf(stderr, "[glades-cuda] cudaMalloc for BLAS scalar failed: %d\n", static_cast<int>(e));
-		cublasDestroy(g_handle);
+		cublasDestroy(g_handleTf32);
+		g_handleTf32 = NULL;
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
 		g_handle = 0;
 		return false;
 	}
@@ -295,7 +296,10 @@ bool blasInit()
 		fprintf(stderr, "[glades-cuda] cudaMemcpy for BLAS scalar failed: %d\n", static_cast<int>(e));
 		cudaFree(g_deviceOne);
 		g_deviceOne = 0;
-		cublasDestroy(g_handle);
+		cublasDestroy(g_handleTf32);
+		g_handleTf32 = NULL;
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
 		g_handle = 0;
 		return false;
 	}
@@ -313,14 +317,17 @@ void blasDestroy()
 		if (g_sideStream) { cudaStreamDestroy(g_sideStream); g_sideStream = 0; }
 		g_sideInitialized = false;
 	}
-	if (g_initialized && g_handle)
+	if (g_initialized)
 	{
 		if (g_deviceOne)
 		{
 			cudaFree(g_deviceOne);
 			g_deviceOne = 0;
 		}
-		cublasDestroy(g_handle);
+		// Tear down both handles; g_handle is an alias to g_handleTf32 so
+		// destroy through the canonical pointers to avoid double-free.
+		if (g_handleStrict) { cublasDestroy(g_handleStrict); g_handleStrict = NULL; }
+		if (g_handleTf32)   { cublasDestroy(g_handleTf32);   g_handleTf32   = NULL; }
 		g_handle = 0;
 		g_initialized = false;
 	}

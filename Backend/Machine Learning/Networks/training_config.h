@@ -222,6 +222,51 @@ struct TransformerRunConfig
 	// has non-zero norm. Default 0 = disabled (all layers Glorot-init).
 	int rlgInitialLayers;
 
+	// Z-loss auxiliary objective (paradigm shift: PaLM/T5/Gemini-style logit
+	// regularization). When > 0, adds zlossCoef * mean_t(log²(Z_t)) to the
+	// readout loss, where Z_t = sum_v exp(logit_{t,v}). Default 0.0f =
+	// disabled, math bit-identical to baseline. Recommended: 1e-4 (PaLM
+	// default). Improves training stability under FP8 readout by bounding
+	// logit magnitudes.
+	float zlossCoef;
+
+	// QK-Norm (paradigm shift: DeepSeek-V3 / modern Llama). When true, Q and
+	// K are L2-normalized per-head before the attention dot product, and the
+	// constant `1/sqrt(dHead)` scale is replaced by a learnable per-head
+	// scalar γ. Default false = disabled, math bit-identical to baseline.
+	bool qkNormEnabled;
+
+	// Initial value for the QK-Norm γ scalar (per-head, shared across all
+	// blocks at init). When <= 0 (default), initialized to log2(T) at first
+	// forward pass per DeepSeek-V3 init. Set explicitly to override.
+	float qkNormGammaInit;
+
+	// Multi-token prediction depth (paradigm shift: DeepSeek-V3). When > 0,
+	// adds N auxiliary heads each predicting the token at offset +k for
+	// k in {2, ..., N+1}. The current implementation supports depth = 1 (a
+	// single +2-offset head). Default 0 = disabled, math bit-identical.
+	int mtpDepth;
+
+	// MTP auxiliary loss coefficient. Each MTP head's CE is weighted by
+	// (mtpCoef / mtpDepth) and added to the main CE loss. DeepSeek-V3 uses
+	// 0.1 after a brief warmup at 0.3. Default 0.1f.
+	float mtpCoef;
+
+	// LayerDrop / stochastic depth (paradigm shift: Fan 2019 / Huang 2016 /
+	// timm). When > 0, each transformer block l ∈ {0..L-1} is dropped with
+	// probability p_l. Linear-rising schedule: p_l = (l/(L-1)) · layerDropPMax,
+	// so layer 0 never drops and the deepest layer drops with probability
+	// layerDropPMax. Kept layers' sub-residuals are scaled by 1/(1-p_l)
+	// (inverted-dropout convention). Default 0.0f = disabled, math
+	// bit-identical to baseline. Recommended for CHIRON 1B: 0.1.
+	float layerDropPMax;
+
+	// LayerDrop schedule type. true = linear-rising (p_l = (l/(L-1)) · pMax,
+	// timm convention). false = constant (p_l = pMax for all l). Default
+	// true. The constant variant is reserved for a possible future arc; this
+	// arc uses linear-rising exclusively.
+	bool layerDropLinearSchedule;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -254,7 +299,14 @@ struct TransformerRunConfig
 	      faceBetaRow(0.98f),
 	      faceBetaCol(0.95f),
 	      faceEps(1e-8f),
-	      rlgInitialLayers(0)
+	      rlgInitialLayers(0),
+	      zlossCoef(0.0f),
+	      qkNormEnabled(false),
+	      qkNormGammaInit(0.0f),
+	      mtpDepth(0),
+	      mtpCoef(0.1f),
+	      layerDropPMax(0.0f),
+	      layerDropLinearSchedule(true)
 	{
 	}
 };

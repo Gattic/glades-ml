@@ -5423,6 +5423,20 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 				tensorsToWrite.push_back(TensorWriteRef("tr.lnFinalBeta", &tt.lnFinalBeta, dt, sh));
 			}
 
+			// MTP projection (optional: only when mtpDepth > 0 / Wmtp non-empty)
+			if (!tt.Wmtp.empty())
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(dModel));
+				sh.push_back(static_cast<uint64_t>(dModel));
+				tensorsToWrite.push_back(TensorWriteRef("tr.Wmtp", &tt.Wmtp, dt, sh));
+				if (includeOpt && !tt.mWmtp.empty())
+				{
+					tensorsToWrite.push_back(TensorWriteRef("tr.mWmtp", &tt.mWmtp, dt, sh));
+					tensorsToWrite.push_back(TensorWriteRef("tr.v2Wmtp", &tt.v2Wmtp, dt, sh));
+				}
+			}
+
 			if (includeOpt)
 			{
 				{
@@ -5491,6 +5505,13 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 					std::vector<uint64_t> sh;
 					sh.push_back(static_cast<uint64_t>(dModel));
 					tensorsToWrite.push_back(TensorWriteRef(oss.str(), &b.ln1Gamma, dt, sh));
+				}
+				if (!b.qknormGamma.empty())
+				{
+					std::ostringstream oss; oss << "tr.b" << li << ".qknormGamma";
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(nHeads));
+					tensorsToWrite.push_back(TensorWriteRef(oss.str(), &b.qknormGamma, dt, sh));
 				}
 				{
 					std::ostringstream oss; oss << "tr.b" << li << ".ln1Beta";
@@ -6526,6 +6547,19 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			expected.push_back(TensorReadRef("tr.lnFinalGamma", &tt.lnFinalGamma, dt, sh));
 			expected.push_back(TensorReadRef("tr.lnFinalBeta", &tt.lnFinalBeta, dt, sh));
 		}
+		// MTP projection (optional: only present in checkpoints trained with mtpDepth > 0)
+		if (!tt.Wmtp.empty())
+		{
+			std::vector<uint64_t> sh;
+			sh.push_back(static_cast<uint64_t>(dModel));
+			sh.push_back(static_cast<uint64_t>(dModel));
+			expected.push_back(TensorReadRef("tr.Wmtp", &tt.Wmtp, dt, sh));
+			if (includeOpt && !tt.mWmtp.empty())
+			{
+				expected.push_back(TensorReadRef("tr.mWmtp", &tt.mWmtp, dt, sh));
+				expected.push_back(TensorReadRef("tr.v2Wmtp", &tt.v2Wmtp, dt, sh));
+			}
+		}
 		if (includeOpt)
 		{
 			{
@@ -6593,6 +6627,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				std::vector<uint64_t> sh;
 				sh.push_back(static_cast<uint64_t>(dModel));
 				expected.push_back(TensorReadRef(oss.str(), &b.ln1Gamma, dt, sh));
+			}
+			if (!b.qknormGamma.empty())
+			{
+				std::ostringstream oss; oss << "tr.b" << li << ".qknormGamma";
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(nHeads));
+				expected.push_back(TensorReadRef(oss.str(), &b.qknormGamma, dt, sh));
 			}
 			{
 				std::ostringstream oss; oss << "tr.b" << li << ".ln1Beta";
@@ -6982,6 +7023,16 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	optionalNames.insert("tr.v2LnFinalGamma");
 	optionalNames.insert("tr.mLnFinalBeta");
 	optionalNames.insert("tr.v2LnFinalBeta");
+	// QK-Norm gamma tensors are optional (old checkpoints won't have them).
+	for (size_t i = 0; i < expected.size(); ++i)
+	{
+		if (expected[i].name.find(".qknormGamma") != std::string::npos)
+			optionalNames.insert(expected[i].name);
+	}
+	// MTP tensors are optional (old checkpoints without mtpDepth > 0 won't have them).
+	optionalNames.insert("tr.Wmtp");
+	optionalNames.insert("tr.mWmtp");
+	optionalNames.insert("tr.v2Wmtp");
 	// ATLAS tensors are optional (old checkpoints won't have them).
 	for (size_t i = 0; i < expected.size(); ++i)
 	{

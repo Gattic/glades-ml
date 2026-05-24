@@ -50,6 +50,16 @@
 		std::vector<float> vTokE;
 		std::vector<float> v2TokE;
 		std::vector<float> gTokE;
+
+		// MTP (Multi-Token Prediction) — single linear projection for +2-offset
+		// auxiliary head (spec 2026-05-22 §2.3). Shape: (dModel, dModel). Empty
+		// when mtpDepth == 0 (sentinel for "MTP not in use"). Maps post-final-LN
+		// hidden vector to MTP hidden, which then goes through the tied readout.
+		std::vector<float> Wmtp;
+		std::vector<float> gWmtp;
+		std::vector<float> mWmtp;
+		std::vector<float> v2Wmtp;
+
 		// LM head bias: [vocabSize]
 		std::vector<float> lmBias;
 		std::vector<float> mLmBias;
@@ -93,6 +103,16 @@
 			std::vector<float> v2Ln1Beta;
 			std::vector<float> gLn1Gamma;
 			std::vector<float> gLn1Beta;
+
+			// QK-Norm: per-head learnable scalar replacing 1/sqrt(dHead).
+			// Size = nHeads when qkNormEnabled at init time; otherwise empty.
+			// Empty vectors are the sentinel for "QK-Norm not in use" — every
+			// optimizer/gradient-zero site checks .empty() and short-circuits,
+			// preserving bit-identical baseline behavior.
+			std::vector<float> qknormGamma;
+			std::vector<float> gQknormGamma;
+			std::vector<float> mQknormGamma;
+			std::vector<float> v2QknormGamma;
 
 			// Self-attention linear projections (packed as [dModel, dModel])
 			std::vector<float> Wq, Wk, Wv, Wo;
@@ -734,6 +754,7 @@
 			mLnFinalBeta.clear(); v2LnFinalBeta.clear();
 			gLnFinalGamma.clear(); gLnFinalBeta.clear();
 			tokE.clear(); tokELowp.clear(); vTokE.clear(); v2TokE.clear(); gTokE.clear();
+			Wmtp.clear(); gWmtp.clear(); mWmtp.clear(); v2Wmtp.clear();
 			lmBias.clear(); mLmBias.clear(); v2LmBias.clear(); gLmBias.clear();
 			WIn.clear(); WInLowp.clear(); vWIn.clear(); v2WIn.clear(); gWIn.clear();
 			bIn.clear(); mBIn.clear(); v2BIn.clear(); gBIn.clear();
