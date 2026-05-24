@@ -52,6 +52,15 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 	if (runtimeCfg.layerDropPMax < 0.0f || runtimeCfg.layerDropPMax >= 1.0f)
 		return invalid_argument(where, "layerDropPMax must be in [0,1)");
 
+	if (runtimeCfg.siraCoef < 0.0f)
+		return invalid_argument(where, "siraCoef must be >= 0");
+	if (runtimeCfg.siraEnergyWeight < 0.0f || runtimeCfg.siraBalanceWeight < 0.0f || runtimeCfg.siraActionWeight < 0.0f)
+		return invalid_argument(where, "SIRA weights must be >= 0");
+	if (runtimeCfg.siraHuberTau <= 0.0f)
+		return invalid_argument(where, "siraHuberTau must be > 0");
+	if (runtimeCfg.siraWarmupSteps < 0)
+		return invalid_argument(where, "siraWarmupSteps must be >= 0");
+
 	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 

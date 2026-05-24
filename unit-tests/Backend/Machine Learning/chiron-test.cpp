@@ -19,6 +19,7 @@
 #include "../../unit-test.h"
 
 #include "../../../Backend/Machine Learning/Networks/transformer_chiron_ops.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_config.h"
 #include "../../../Backend/Machine Learning/rng.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 
@@ -11360,6 +11361,9 @@ void CHIRONUnitTest()
 	CHIRONUL2SpanSamplerMeanSpanTest();
 	CHIRONUL2SpanSamplerRateTest();
 	CHIRONUL2DisabledParityTest();
+	CHIRONSiraConfigDefaultsTest();
+	CHIRONSiraDisabledParityTest();
+	CHIRONSiraEnabledMathTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -16899,5 +16903,141 @@ void CHIRONUL2DisabledParityTest()
 	const uint64_t next_d = glades::rng::next_u64(eng_d);
 	ASSERT("CHIRONUL2DisabledParity: RNG state must NOT advance at mu=0",
 	       next_c == next_d);
+}
+
+// === SIRA TESTS (2026-05-24 CHIRON-native regularizer) ===
+
+void CHIRONSiraConfigDefaultsTest()
+{
+	glades::TransformerRunConfig rc;
+	ASSERT("CHIRONSiraConfigDefaults: siraCoef defaults to disabled",
+	       rc.siraCoef == 0.0f);
+	ASSERT("CHIRONSiraConfigDefaults: energy weight default",
+	       rc.siraEnergyWeight == 1.0f);
+	ASSERT("CHIRONSiraConfigDefaults: balance weight default",
+	       rc.siraBalanceWeight == 0.25f);
+	ASSERT("CHIRONSiraConfigDefaults: action weight default",
+	       rc.siraActionWeight == 0.5f);
+	ASSERT("CHIRONSiraConfigDefaults: Huber tau default",
+	       rc.siraHuberTau == 0.2f);
+	ASSERT("CHIRONSiraConfigDefaults: warmup default",
+	       rc.siraWarmupSteps == 1000);
+	ASSERT("CHIRONSiraConfigDefaults: default should not apply",
+	       glades::chiron::sira_should_apply(rc.siraCoef, 100000LL, rc.siraWarmupSteps) == false);
+
+	glades::TrainingConfig cfg;
+	glades::NNetworkStatus st = glades::validateTransformerTrainingConfig("sira-defaults", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: default training config validates", st.ok());
+
+	cfg.transformer.siraCoef = -1.0f;
+	st = glades::validateTransformerTrainingConfig("sira-negative-coef", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: negative siraCoef rejected", !st.ok());
+	cfg.transformer.siraCoef = 0.0f;
+
+	cfg.transformer.siraEnergyWeight = -0.1f;
+	st = glades::validateTransformerTrainingConfig("sira-negative-weight", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: negative SIRA weight rejected", !st.ok());
+	cfg.transformer.siraEnergyWeight = 1.0f;
+
+	cfg.transformer.siraHuberTau = 0.0f;
+	st = glades::validateTransformerTrainingConfig("sira-bad-tau", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: non-positive Huber tau rejected", !st.ok());
+	cfg.transformer.siraHuberTau = 0.2f;
+
+	cfg.transformer.siraWarmupSteps = -1;
+	st = glades::validateTransformerTrainingConfig("sira-bad-warmup", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: negative warmup rejected", !st.ok());
+}
+
+void CHIRONSiraDisabledParityTest()
+{
+	// At coef=0, SIRA must be a strict no-op.  The helpers are deliberately
+	// tested with NULL pointers and non-zero dimensions: if the disabled path
+	// read any trajectory data, this would crash instead of returning 0.
+	const float lossTerms = glades::chiron::sira_loss_from_terms(
+	    NULL, NULL, NULL,
+	    /*nStates=*/5u, /*nBuckets=*/8u,
+	    /*coef=*/0.0f,
+	    /*energyWeight=*/1.0f, /*balanceWeight=*/0.25f, /*actionWeight=*/0.5f,
+	    /*huberTau=*/0.2f, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraDisabledParity: terms loss is exactly zero at coef=0",
+	       lossTerms == 0.0f);
+
+	const float lossTrajectory = glades::chiron::sira_loss_from_phase_trajectory(
+	    NULL, NULL, NULL,
+	    /*nTransitions=*/4u, /*T=*/16u, /*m=*/8u, /*nBuckets=*/4u,
+	    /*coef=*/0.0f,
+	    /*energyWeight=*/1.0f, /*balanceWeight=*/0.25f, /*actionWeight=*/0.5f,
+	    /*huberTau=*/0.2f, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraDisabledParity: trajectory loss is exactly zero at coef=0",
+	       lossTrajectory == 0.0f);
+
+	// Warmup gate: even a positive coefficient should not apply before warmup.
+	ASSERT("CHIRONSiraDisabledParity: positive coef before warmup is disabled",
+	       glades::chiron::sira_should_apply(3e-4f, 999LL, 1000) == false);
+	ASSERT("CHIRONSiraDisabledParity: positive coef at warmup applies",
+	       glades::chiron::sira_should_apply(3e-4f, 1000LL, 1000) == true);
+}
+
+void CHIRONSiraEnabledMathTest()
+{
+	// Pre-reduced terms with 3 state boundaries and 2 buckets.  Energy drift
+	// from state0->state1 is [log 2, log 8], whose centered residuals are
+	// [-log 2, +log 2].  state1->state2 is uniform drift [log 2, log 2], so
+	// its centered residual is zero.  Balance/action weights are zero here.
+	const unsigned int nStates = 3u;
+	const unsigned int nBuckets = 2u;
+	const float energy[6] = {
+		1.0f, 1.0f,
+		2.0f, 8.0f,
+		4.0f, 16.0f
+	};
+	const float coef = 0.5f;
+	const float tau = 0.2f;
+	const float h = glades::chiron::sira_pseudo_huber(logf(2.0f), tau);
+	const float expected = coef * ((h + h + 0.0f + 0.0f) / 4.0f);
+
+	const float got = glades::chiron::sira_loss_from_terms(
+	    energy, NULL, NULL, nStates, nBuckets,
+	    coef, /*energyWeight=*/1.0f, /*balanceWeight=*/0.0f, /*actionWeight=*/0.0f,
+	    tau, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraEnabledMath: centered energy-drift loss matches reference",
+	       fabsf(got - expected) < 1e-7f);
+
+	// With fewer than 4 state boundaries, action curvature has no samples.
+	// A positive action weight must not force an action buffer or erase the
+	// valid energy/balance terms.
+	const float gotNoActionSamples = glades::chiron::sira_loss_from_terms(
+	    energy, NULL, NULL, nStates, nBuckets,
+	    coef, /*energyWeight=*/1.0f, /*balanceWeight=*/0.0f, /*actionWeight=*/0.5f,
+	    tau, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraEnabledMath: no action samples does not require action buffer",
+	       fabsf(gotNoActionSamples - expected) < 1e-7f);
+
+	// Uniform phase trajectory should have zero centered energy/balance drift.
+	const float uniformEnergy[6] = {
+		1.0f, 2.0f,
+		2.0f, 4.0f,
+		4.0f, 8.0f
+	};
+	const float zero = glades::chiron::sira_loss_from_terms(
+	    uniformEnergy, NULL, NULL, nStates, nBuckets,
+	    coef, /*energyWeight=*/1.0f, /*balanceWeight=*/0.0f, /*actionWeight=*/0.0f,
+	    tau, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraEnabledMath: uniform bucket drift has zero centered penalty",
+	       zero == 0.0f);
+
+	// Energy/balance-only trajectory evaluation must not require shear/action
+	// buffers.  This protects ports that stage SIRA terms incrementally: turning
+	// actionWeight off should not accidentally disable energy regularization.
+	const float pStates[4] = { 1.0f, 1.0f, 1.0f, 3.0f };
+	const float qStates[4] = { 1.0f, 1.0f, 1.0f, 3.0f };
+	const float trajEnergyOnly = glades::chiron::sira_loss_from_phase_trajectory(
+	    pStates, qStates, NULL,
+	    /*nTransitions=*/1u, /*T=*/2u, /*m=*/1u, /*nBuckets=*/2u,
+	    coef, /*energyWeight=*/1.0f, /*balanceWeight=*/0.0f, /*actionWeight=*/0.0f,
+	    tau, /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraEnabledMath: energy-only trajectory works without shear buffer",
+	       trajEnergyOnly > 0.0f);
 }
 

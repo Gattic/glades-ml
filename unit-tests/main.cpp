@@ -207,6 +207,12 @@ int main(int argc, char* argv[])
 		HELIOSUnitTest();
 	    else if (strcmp(argv[1], "chiron") == 0)
 		CHIRONUnitTest();
+	    else if (strcmp(argv[1], "chiron-sira") == 0 || strcmp(argv[1], "sira") == 0)
+	    {
+		CHIRONSiraConfigDefaultsTest();
+		CHIRONSiraDisabledParityTest();
+		CHIRONSiraEnabledMathTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();
 	    else if (strcmp(argv[1], "vesta-sweep") == 0)

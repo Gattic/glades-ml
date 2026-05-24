@@ -267,6 +267,19 @@ struct TransformerRunConfig
 	// arc uses linear-rising exclusively.
 	bool layerDropLinearSchedule;
 
+	// SIRA (Symplectic-Invariant Regularized Action) — CHIRON-native
+	// phase-space regularizer.  When siraCoef > 0, a training caller may add
+	// lambda * [w_E * energy-drift + w_B * p/q-balance-drift + w_A *
+	// action-curvature] computed from CHIRON's paired (p, q) trajectory.
+	// Default 0.0f = disabled; helpers take an early return at coef <= 0 so
+	// disabled mode performs no reads, writes, RNG draws, or FP work.
+	float siraCoef;
+	float siraEnergyWeight;
+	float siraBalanceWeight;
+	float siraActionWeight;
+	float siraHuberTau;
+	int siraWarmupSteps;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -306,7 +319,13 @@ struct TransformerRunConfig
 	      mtpDepth(0),
 	      mtpCoef(0.1f),
 	      layerDropPMax(0.0f),
-	      layerDropLinearSchedule(true)
+	      layerDropLinearSchedule(true),
+	      siraCoef(0.0f),
+	      siraEnergyWeight(1.0f),
+	      siraBalanceWeight(0.25f),
+	      siraActionWeight(0.5f),
+	      siraHuberTau(0.2f),
+	      siraWarmupSteps(1000)
 	{
 	}
 };
