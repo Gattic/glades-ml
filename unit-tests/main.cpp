@@ -211,6 +211,7 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONSiraConfigDefaultsTest();
 		CHIRONSiraDisabledParityTest();
+		CHIRONSiraDiagnosticsTest();
 		CHIRONSiraEnabledMathTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)

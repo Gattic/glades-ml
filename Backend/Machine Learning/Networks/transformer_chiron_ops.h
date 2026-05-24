@@ -429,6 +429,194 @@ inline float sira_safe_positive(float x, float eps)
 	return (x > e) ? x : e;
 }
 
+// Phase-0 SIRA diagnostics from a CHIRON phase trajectory.
+//
+// pStates/qStates: [nTransitions+1, T, m] state boundaries.
+// shearStates:     [nTransitions, T, m] q-driven shears added to p.
+//
+// Optional state outputs are [nTransitions+1, nBuckets]:
+//   rmsP, rmsQ:  raw bucket RMS for p/q.
+//   energy:      normalized 0.5 * (||p||^2/sigma_p^2 + ||q||^2/sigma_q^2).
+//   balance:     normalized 0.5 * log((||p||^2/sigma_p^2)/(||q||^2/sigma_q^2)).
+// Optional transition outputs are [nTransitions, nBuckets]:
+//   rmsShear:    raw bucket RMS of q-driven shear S_l(q_l).
+//   action:      normalized midpoint-action proxy used by SIRA.
+//
+// This helper performs detached reductions only; it does not add a loss or
+// affect production training unless a caller explicitly invokes it.
+inline bool sira_phase_diagnostics_from_trajectory(const float* pStates,
+                                                    const float* qStates,
+                                                    const float* shearStates,
+                                                    unsigned int nTransitions,
+                                                    unsigned int T,
+                                                    unsigned int m,
+                                                    unsigned int nBuckets,
+                                                    float* rmsP,
+                                                    float* rmsQ,
+                                                    float* rmsShear,
+                                                    float* energy,
+                                                    float* balance,
+                                                    float* action,
+                                                    float eps)
+{
+	if (T == 0u || m == 0u || nBuckets == 0u)
+		return false;
+
+	const unsigned int nStates = nTransitions + 1u;
+	const bool needEnergyBalance = (energy != NULL) || (balance != NULL);
+	const bool needP = (rmsP != NULL) || needEnergyBalance || (action != NULL);
+	const bool needQ = (rmsQ != NULL) || needEnergyBalance || (action != NULL);
+	const bool needShear = (rmsShear != NULL) || (action != NULL);
+	if (!needP && !needQ && !needShear)
+		return true;
+	if (needP && pStates == NULL)
+		return false;
+	if (needQ && qStates == NULL)
+		return false;
+	if (needShear && shearStates == NULL)
+		return false;
+
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	const size_t stateStride = static_cast<size_t>(T) * static_cast<size_t>(m);
+	const size_t stateDiagCount = static_cast<size_t>(nStates) * nBuckets;
+	const size_t transDiagCount = static_cast<size_t>(nTransitions) * nBuckets;
+	for (size_t i = 0u; i < stateDiagCount; ++i)
+	{
+		if (rmsP) rmsP[i] = 0.0f;
+		if (rmsQ) rmsQ[i] = 0.0f;
+		if (energy) energy[i] = 0.0f;
+		if (balance) balance[i] = 0.0f;
+	}
+	for (size_t i = 0u; i < transDiagCount; ++i)
+	{
+		if (rmsShear) rmsShear[i] = 0.0f;
+		if (action) action[i] = 0.0f;
+	}
+
+	std::vector<float> sigmaP2;
+	std::vector<float> sigmaQ2;
+	if (needEnergyBalance)
+	{
+		sigmaP2.assign(nStates, 0.0f);
+		sigmaQ2.assign(nStates, 0.0f);
+		for (unsigned int l = 0u; l < nStates; ++l)
+		{
+			double p2 = 0.0;
+			double q2 = 0.0;
+			const float* p = pStates + static_cast<size_t>(l) * stateStride;
+			const float* q = qStates + static_cast<size_t>(l) * stateStride;
+			for (size_t i = 0u; i < stateStride; ++i)
+			{
+				p2 += static_cast<double>(p[i]) * static_cast<double>(p[i]);
+				q2 += static_cast<double>(q[i]) * static_cast<double>(q[i]);
+			}
+			const double denom = (stateStride > 0u) ? static_cast<double>(stateStride) : 1.0;
+			sigmaP2[l] = sira_safe_positive(static_cast<float>(p2 / denom), safeEps);
+			sigmaQ2[l] = sira_safe_positive(static_cast<float>(q2 / denom), safeEps);
+		}
+	}
+
+	if ((rmsP != NULL) || (rmsQ != NULL) || needEnergyBalance)
+	{
+		for (unsigned int l = 0u; l < nStates; ++l)
+		{
+			const float* p = pStates ? (pStates + static_cast<size_t>(l) * stateStride) : NULL;
+			const float* q = qStates ? (qStates + static_cast<size_t>(l) * stateStride) : NULL;
+			for (unsigned int b = 0u; b < nBuckets; ++b)
+			{
+				const unsigned int tb = static_cast<unsigned int>((static_cast<size_t>(b) * T) / nBuckets);
+				const unsigned int te = static_cast<unsigned int>((static_cast<size_t>(b + 1u) * T) / nBuckets);
+				if (te <= tb)
+					continue;
+				double p2 = 0.0;
+				double q2 = 0.0;
+				for (unsigned int t = tb; t < te; ++t)
+				{
+					const size_t row = static_cast<size_t>(t) * m;
+					for (unsigned int j = 0u; j < m; ++j)
+					{
+						if (p)
+						{
+							const float pv = p[row + j];
+							p2 += static_cast<double>(pv) * static_cast<double>(pv);
+						}
+						if (q)
+						{
+							const float qv = q[row + j];
+							q2 += static_cast<double>(qv) * static_cast<double>(qv);
+						}
+					}
+				}
+				const double count = static_cast<double>(te - tb) * static_cast<double>(m);
+				const size_t idx = static_cast<size_t>(l) * nBuckets + b;
+				if (rmsP)
+					rmsP[idx] = sqrtf(static_cast<float>(p2 / count));
+				if (rmsQ)
+					rmsQ[idx] = sqrtf(static_cast<float>(q2 / count));
+				if (needEnergyBalance)
+				{
+					const float pNorm = sira_safe_positive(static_cast<float>(p2 / (count * sigmaP2[l])), safeEps);
+					const float qNorm = sira_safe_positive(static_cast<float>(q2 / (count * sigmaQ2[l])), safeEps);
+					if (energy)
+						energy[idx] = 0.5f * (pNorm + qNorm);
+					if (balance)
+						balance[idx] = 0.5f * (logf(pNorm) - logf(qNorm));
+				}
+			}
+		}
+	}
+
+	if ((rmsShear != NULL) || (action != NULL))
+	{
+		for (unsigned int l = 0u; l < nTransitions; ++l)
+		{
+			const float* p0 = pStates ? (pStates + static_cast<size_t>(l) * stateStride) : NULL;
+			const float* q0 = qStates ? (qStates + static_cast<size_t>(l) * stateStride) : NULL;
+			const float* q1 = qStates ? (qStates + static_cast<size_t>(l + 1u) * stateStride) : NULL;
+			const float* sh = shearStates + static_cast<size_t>(l) * stateStride;
+			for (unsigned int b = 0u; b < nBuckets; ++b)
+			{
+				const unsigned int tb = static_cast<unsigned int>((static_cast<size_t>(b) * T) / nBuckets);
+				const unsigned int te = static_cast<unsigned int>((static_cast<size_t>(b + 1u) * T) / nBuckets);
+				if (te <= tb)
+					continue;
+				double sh2 = 0.0;
+				double dot = 0.0;
+				double pbar2 = 0.0;
+				double dq2 = 0.0;
+				for (unsigned int t = tb; t < te; ++t)
+				{
+					const size_t row = static_cast<size_t>(t) * m;
+					for (unsigned int j = 0u; j < m; ++j)
+					{
+						const float sv = sh[row + j];
+						sh2 += static_cast<double>(sv) * static_cast<double>(sv);
+						if (action)
+						{
+							const float pbar = p0[row + j] + 0.5f * sv;
+							const float dq = q1[row + j] - q0[row + j];
+							dot += static_cast<double>(pbar) * static_cast<double>(dq);
+							pbar2 += static_cast<double>(pbar) * static_cast<double>(pbar);
+							dq2 += static_cast<double>(dq) * static_cast<double>(dq);
+						}
+					}
+				}
+				const double count = static_cast<double>(te - tb) * static_cast<double>(m);
+				const size_t idx = static_cast<size_t>(l) * nBuckets + b;
+				if (rmsShear)
+					rmsShear[idx] = sqrtf(static_cast<float>(sh2 / count));
+				if (action)
+				{
+					const float denom = sqrtf(static_cast<float>(pbar2 * dq2)) + safeEps;
+					action[idx] = (denom > safeEps) ? static_cast<float>(dot) / denom : 0.0f;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
 // SIRA loss from pre-reduced layer/bucket terms.
 //
 // energy, balance: [nStates, nBuckets] for state boundaries l=0..nStates-1.

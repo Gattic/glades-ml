@@ -11371,6 +11371,7 @@ void CHIRONUnitTest()
 	CHIRONUL2DisabledParityTest();
 	CHIRONSiraConfigDefaultsTest();
 	CHIRONSiraDisabledParityTest();
+	CHIRONSiraDiagnosticsTest();
 	CHIRONSiraEnabledMathTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
@@ -16985,6 +16986,56 @@ void CHIRONSiraDisabledParityTest()
 	       glades::chiron::sira_should_apply(3e-4f, 999LL, 1000) == false);
 	ASSERT("CHIRONSiraDisabledParity: positive coef at warmup applies",
 	       glades::chiron::sira_should_apply(3e-4f, 1000LL, 1000) == true);
+}
+
+void CHIRONSiraDiagnosticsTest()
+{
+	// Phase-0 diagnostic reductions are detached/reference-only: they expose
+	// bucketed phase trajectory signals without adding a training loss.
+	const unsigned int nTransitions = 1u;
+	const unsigned int T = 2u;
+	const unsigned int m = 1u;
+	const unsigned int nBuckets = 2u;
+	const float pStates[4] = { 3.0f, 4.0f, 6.0f, 8.0f };
+	const float qStates[4] = { 4.0f, 3.0f, 8.0f, 6.0f };
+	const float shearStates[2] = { 1.0f, 2.0f };
+
+	std::vector<float> rmsP(4u), rmsQ(4u), energy(4u), balance(4u);
+	std::vector<float> rmsShear(2u), action(2u);
+	const bool ok = glades::chiron::sira_phase_diagnostics_from_trajectory(
+	    pStates, qStates, shearStates,
+	    nTransitions, T, m, nBuckets,
+	    &rmsP[0], &rmsQ[0], &rmsShear[0],
+	    &energy[0], &balance[0], &action[0],
+	    /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraDiagnostics: helper accepts complete phase trajectory", ok);
+
+	ASSERT("CHIRONSiraDiagnostics: rmsP bucket 0", fabsf(rmsP[0] - 3.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: rmsP bucket 1", fabsf(rmsP[1] - 4.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: rmsQ bucket 0", fabsf(rmsQ[0] - 4.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: rmsQ bucket 1", fabsf(rmsQ[1] - 3.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: energy is normalized to one for symmetric buckets",
+	       fabsf(energy[0] - 1.0f) < 1e-6f && fabsf(energy[1] - 1.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: balance bucket 0", fabsf(balance[0] - logf(0.75f)) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: balance bucket 1", fabsf(balance[1] - logf(4.0f / 3.0f)) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: shear RMS buckets",
+	       fabsf(rmsShear[0] - 1.0f) < 1e-6f && fabsf(rmsShear[1] - 2.0f) < 1e-6f);
+	ASSERT("CHIRONSiraDiagnostics: action proxy buckets",
+	       fabsf(action[0] - 1.0f) < 1e-6f && fabsf(action[1] - 1.0f) < 1e-6f);
+
+	const bool noOutputs = glades::chiron::sira_phase_diagnostics_from_trajectory(
+	    NULL, NULL, NULL,
+	    nTransitions, T, m, nBuckets,
+	    NULL, NULL, NULL, NULL, NULL, NULL,
+	    /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraDiagnostics: no-output call is a no-read no-op", noOutputs);
+
+	const bool missingP = glades::chiron::sira_phase_diagnostics_from_trajectory(
+	    NULL, qStates, shearStates,
+	    nTransitions, T, m, nBuckets,
+	    &rmsP[0], NULL, NULL, NULL, NULL, NULL,
+	    /*eps=*/1e-12f);
+	ASSERT("CHIRONSiraDiagnostics: requested p diagnostic requires pStates", !missingP);
 }
 
 void CHIRONSiraEnabledMathTest()
