@@ -9,7 +9,7 @@ full layer/bucket trajectory objective below remains a research plan.
 **Baseline metrics:** val NLL **3.5734** @ 30k, ~**28,072 tok/s** @ T=16384,
 ~14.97 GB VRAM.
 
-## Implementation status as of 2026-05-24
+## Implementation status as of 2026-05-27
 
 This document is a research plan plus pre-registration seed. It should not be
 read as claiming that the full trajectory/bucket SIRA objective has shipped.
@@ -27,17 +27,22 @@ Implemented and verified so far:
 - `glades-ml` has targeted unit-test selectors `chiron-sira` / `sira`.
 - `glades-ml` has default-off PHS shadow-diagnostics configuration fields,
   detached CPU helper reductions, EMA helpers, and targeted `chiron-phs` /
-  `phs` tests.  This is logging-only infrastructure: no trainer-side runtime
-  logging, sample/crop weighting, token-loss weighting, or hidden-state
-  gradient path is enabled.
+  `phs` tests.  This is logging-only infrastructure: no sample/crop weighting,
+  token-loss weighting, or hidden-state gradient path is enabled.
 - `glades-trainer` accepts SIRA CLI/config flags, has `--sira-config-smoke`
   paths proving flag propagation into `glades::TrainingConfig` without
   starting training, and has `--sira-loss-smoke` for terminal-loss
   disabled/warmup/enabled checks.
+- `glades-trainer` now has default-off PHS terminal shadow logging via
+  `--phs-shadow-diagnostics --phs-log-every N`, with target-token group /
+  position-bucket reductions over detached terminal `(q_L,p_L)`, per-cell
+  EMAs, and a `scripts/phs_shadow_smoke.sh` smoke.  It is diagnostics-only;
+  it does not change the training objective or inject gradients.
 - Verified commands included `./build/glades-unit-tests chiron-sira`,
-  trainer `scripts/sira_config_smoke.sh`, direct `glades_pile_train` and
-  `glades_chiron_train` config-smoke invocations, and the aggregate
-  `./build/glades-unit-tests chiron` after independent CHIRON test
+  `./build/glades-unit-tests chiron-phs`, trainer
+  `scripts/sira_config_smoke.sh`, `scripts/sira_training_loss_smoke.sh`,
+  `scripts/phs_shadow_smoke.sh`, direct config-smoke invocations, and the
+  aggregate `./build/glades-unit-tests chiron` after independent CHIRON test
   stabilization.
 
 Not implemented yet / still speculative:
@@ -47,11 +52,12 @@ Not implemented yet / still speculative:
   the terminal CHIRON phase state `(p_L, q_L)`.
 - Persistent phase diagnostics, probe-layer schedule, and position-bucket
   instrumentation do not exist yet for SIRA.
-- Trainer-side PHS shadow logging is not wired yet; the current PHS state is
-  config + detached helper/test infrastructure only.
+- PHS logging currently observes the terminal state only and uses `p_L` as a
+  detached terminal shear proxy because the trainer does not yet retain
+  per-layer shear buffers for logging.
 - `--sira-probe-layers`, `--sira-position-buckets`, active PHS
-  controller/curriculum weighting, and PTOC remain research proposals in this
-  document, not runnable training features.
+  controller/curriculum weighting, token/sample weighting, and PTOC remain
+  research proposals in this document, not runnable training features.
 - No 1B SIRA pilot has been run, and there is no NLL/throughput result to
   compare against `chiron_1B_T16384_regstack_phase2.final`.
 
