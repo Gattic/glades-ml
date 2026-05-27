@@ -34,10 +34,11 @@ Implemented and verified so far:
   starting training, and has `--sira-loss-smoke` for terminal-loss
   disabled/warmup/enabled checks.
 - `glades-trainer` now has default-off PHS terminal shadow logging via
-  `--phs-shadow-diagnostics --phs-log-every N`, with target-token group /
-  position-bucket reductions over detached terminal `(q_L,p_L)`, per-cell
-  EMAs, and a `scripts/phs_shadow_smoke.sh` smoke.  It is diagnostics-only;
-  it does not change the training objective or inject gradients.
+  `--phs-shadow-diagnostics --phs-log-every N`, with batch-quantile target-token
+  groups by default (`--phs-group-mode id` preserves the legacy raw-ID bins),
+  position-bucket reductions over detached terminal `(q_L,p_L)`, per-cell EMAs,
+  and a `scripts/phs_shadow_smoke.sh` smoke.  It is diagnostics-only; it does
+  not change the training objective or inject gradients.
 - Verified commands included `./build/glades-unit-tests chiron-sira`,
   `./build/glades-unit-tests chiron-phs`, trainer
   `scripts/sira_config_smoke.sh`, `scripts/sira_training_loss_smoke.sh`,
@@ -54,7 +55,10 @@ Not implemented yet / still speculative:
   instrumentation do not exist yet for SIRA.
 - PHS logging currently observes the terminal state only and uses `p_L` as a
   detached terminal shear proxy because the trainer does not yet retain
-  per-layer shear buffers for logging.
+  per-layer shear buffers for logging.  A 3-seed 2000-step grouping ablation
+  selected batch-quantile target-token groups as the diagnostic default because
+  it removes raw-ID count skew without measurable loss/throughput impact; see
+  `research/PHS_GROUPING_3SEED_ABLATION_2026_05_27.md`.
 - `--sira-probe-layers`, `--sira-position-buckets`, active PHS
   controller/curriculum weighting, token/sample weighting, and PTOC remain
   research proposals in this document, not runnable training features.
