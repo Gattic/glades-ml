@@ -61,6 +61,17 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 	if (runtimeCfg.siraWarmupSteps < 0)
 		return invalid_argument(where, "siraWarmupSteps must be >= 0");
 
+	if (runtimeCfg.phsDataGroups <= 0)
+		return invalid_argument(where, "phsDataGroups must be > 0");
+	if (runtimeCfg.phsPositionBuckets <= 0)
+		return invalid_argument(where, "phsPositionBuckets must be > 0");
+	if (runtimeCfg.phsLogEverySteps < 0)
+		return invalid_argument(where, "phsLogEverySteps must be >= 0");
+	if (runtimeCfg.phsShadowDiagnostics && runtimeCfg.phsLogEverySteps <= 0)
+		return invalid_argument(where, "phsLogEverySteps must be > 0 when PHS diagnostics are enabled");
+	if (runtimeCfg.phsEmaDecay < 0.0f || runtimeCfg.phsEmaDecay >= 1.0f)
+		return invalid_argument(where, "phsEmaDecay must be in [0,1)");
+
 	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 

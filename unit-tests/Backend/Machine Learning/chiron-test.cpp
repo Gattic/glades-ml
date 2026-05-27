@@ -11374,6 +11374,10 @@ void CHIRONUnitTest()
 	CHIRONSiraDiagnosticsTest();
 	CHIRONSiraEnabledMathTest();
 	CHIRONSiraTrainingLossTest();
+	CHIRONPhsConfigDefaultsTest();
+	CHIRONPhsDisabledParityTest();
+	CHIRONPhsDiagnosticsMathTest();
+	CHIRONPhsEmaTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -17202,5 +17206,165 @@ void CHIRONSiraTrainingLossTest()
 #else
 	std::printf("  [SIRA training loss GPU] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
+}
+
+// === PHS TESTS (2026-05-27 default-off shadow diagnostics) ===
+
+void CHIRONPhsConfigDefaultsTest()
+{
+	glades::TransformerRunConfig rc;
+	ASSERT("CHIRONPhsConfigDefaults: PHS shadow diagnostics default off",
+	       rc.phsShadowDiagnostics == false);
+	ASSERT("CHIRONPhsConfigDefaults: group default",
+	       rc.phsDataGroups == 1);
+	ASSERT("CHIRONPhsConfigDefaults: position bucket default",
+	       rc.phsPositionBuckets == 8);
+	ASSERT("CHIRONPhsConfigDefaults: log cadence default disabled",
+	       rc.phsLogEverySteps == 0);
+	ASSERT("CHIRONPhsConfigDefaults: EMA decay default",
+	       fabsf(rc.phsEmaDecay - 0.95f) < 1e-7f);
+	ASSERT("CHIRONPhsConfigDefaults: default should not log",
+	       glades::chiron::phs_should_log(rc.phsShadowDiagnostics, 100LL, rc.phsLogEverySteps) == false);
+	ASSERT("CHIRONPhsConfigDefaults: enabled cadence logs exactly on cadence",
+	       glades::chiron::phs_should_log(true, 100LL, 50) == true &&
+	       glades::chiron::phs_should_log(true, 101LL, 50) == false);
+
+	glades::TrainingConfig cfg;
+	glades::NNetworkStatus st = glades::validateTransformerTrainingConfig("phs-defaults", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: default training config validates", st.ok());
+
+	cfg.transformer.phsPositionBuckets = 0;
+	st = glades::validateTransformerTrainingConfig("phs-bad-buckets", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: non-positive PHS buckets rejected", !st.ok());
+	cfg.transformer.phsPositionBuckets = 8;
+
+	cfg.transformer.phsDataGroups = 0;
+	st = glades::validateTransformerTrainingConfig("phs-bad-groups", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: non-positive PHS groups rejected", !st.ok());
+	cfg.transformer.phsDataGroups = 1;
+
+	cfg.transformer.phsLogEverySteps = -1;
+	st = glades::validateTransformerTrainingConfig("phs-bad-log-every", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: negative PHS log cadence rejected", !st.ok());
+	cfg.transformer.phsLogEverySteps = 0;
+
+	cfg.transformer.phsShadowDiagnostics = true;
+	st = glades::validateTransformerTrainingConfig("phs-enabled-zero-cadence", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: enabled PHS requires positive cadence", !st.ok());
+	cfg.transformer.phsLogEverySteps = 100;
+	st = glades::validateTransformerTrainingConfig("phs-enabled-valid", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: enabled PHS config validates", st.ok());
+	cfg.transformer.phsShadowDiagnostics = false;
+	cfg.transformer.phsLogEverySteps = 0;
+
+	cfg.transformer.phsEmaDecay = -0.1f;
+	st = glades::validateTransformerTrainingConfig("phs-bad-ema-low", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: negative PHS EMA decay rejected", !st.ok());
+	cfg.transformer.phsEmaDecay = 1.0f;
+	st = glades::validateTransformerTrainingConfig("phs-bad-ema-high", cfg);
+	ASSERT("CHIRONPhsConfigDefaults: PHS EMA decay >= 1 rejected", !st.ok());
+}
+
+void CHIRONPhsDisabledParityTest()
+{
+	float counts[4] = { -7.0f, -7.0f, -7.0f, -7.0f };
+	float rmsP[4] = { -7.0f, -7.0f, -7.0f, -7.0f };
+	float meanNll[4] = { -7.0f, -7.0f, -7.0f, -7.0f };
+	const bool ok = glades::chiron::phs_detached_diagnostics_from_phase(
+	    /*enabled=*/false,
+	    NULL, NULL, NULL, NULL, NULL, NULL,
+	    /*T=*/4u, /*m=*/2u, /*nGroups=*/2u, /*nBuckets=*/2u,
+	    counts, rmsP, NULL, NULL, NULL, NULL, NULL, NULL, meanNll, NULL,
+	    /*eps=*/1e-12f);
+	ASSERT("CHIRONPhsDisabledParity: disabled helper returns success", ok);
+	for (unsigned int i = 0u; i < 4u; ++i)
+	{
+		ASSERT("CHIRONPhsDisabledParity: disabled helper does not write counts", counts[i] == -7.0f);
+		ASSERT("CHIRONPhsDisabledParity: disabled helper does not write rmsP", rmsP[i] == -7.0f);
+		ASSERT("CHIRONPhsDisabledParity: disabled helper does not write meanNll", meanNll[i] == -7.0f);
+	}
+
+	float ema[2] = { 3.0f, 5.0f };
+	const bool emaOk = glades::chiron::phs_update_ema(
+	    /*enabled=*/false, NULL, 2u, 0.95f, true, ema);
+	ASSERT("CHIRONPhsDisabledParity: disabled EMA update returns success", emaOk);
+	ASSERT("CHIRONPhsDisabledParity: disabled EMA update does not write",
+	       ema[0] == 3.0f && ema[1] == 5.0f);
+}
+
+void CHIRONPhsDiagnosticsMathTest()
+{
+	const unsigned int T = 4u;
+	const unsigned int m = 1u;
+	const unsigned int nGroups = 2u;
+	const unsigned int nBuckets = 2u;
+	const float p[4] = { 2.0f, 4.0f, 6.0f, 8.0f };
+	const float q[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+	const float shear[4] = { 1.0f, 4.0f, -6.0f, 0.0f };
+	const float nll[4] = { 0.5f, 1.0f, 1.5f, 2.0f };
+	const float temp[4] = { 10.0f, 20.0f, 30.0f, 40.0f };
+	const unsigned int groups[4] = { 0u, 1u, 0u, 1u };
+
+	std::vector<float> counts(4u), rmsP(4u), rmsQ(4u), logPq(4u);
+	std::vector<float> rmsShear(4u), shearOverP(4u), align(4u), qOutlier(4u);
+	std::vector<float> meanNll(4u), meanTemp(4u);
+	const bool ok = glades::chiron::phs_detached_diagnostics_from_phase(
+	    /*enabled=*/true,
+	    p, q, shear, nll, temp, groups,
+	    T, m, nGroups, nBuckets,
+	    &counts[0], &rmsP[0], &rmsQ[0], &logPq[0],
+	    &rmsShear[0], &shearOverP[0], &align[0], &qOutlier[0],
+	    &meanNll[0], &meanTemp[0], /*eps=*/1e-12f);
+	ASSERT("CHIRONPhsDiagnosticsMath: helper accepts complete detached inputs", ok);
+
+	for (unsigned int i = 0u; i < 4u; ++i)
+		ASSERT("CHIRONPhsDiagnosticsMath: every group/bucket has one token", counts[i] == 1.0f);
+
+	// Layout is [group, bucket]: g0b0, g0b1, g1b0, g1b1.
+	ASSERT("CHIRONPhsDiagnosticsMath: p/q RMS by cell",
+	       rmsP[0] == 2.0f && rmsP[1] == 6.0f && rmsP[2] == 4.0f && rmsP[3] == 8.0f &&
+	       rmsQ[0] == 1.0f && rmsQ[1] == 3.0f && rmsQ[2] == 2.0f && rmsQ[3] == 4.0f);
+	for (unsigned int i = 0u; i < 4u; ++i)
+		ASSERT("CHIRONPhsDiagnosticsMath: log p/q ratio", fabsf(logPq[i] - logf(2.0f)) < 1e-6f);
+	ASSERT("CHIRONPhsDiagnosticsMath: shear RMS by cell",
+	       rmsShear[0] == 1.0f && rmsShear[1] == 6.0f && rmsShear[2] == 4.0f && rmsShear[3] == 0.0f);
+	ASSERT("CHIRONPhsDiagnosticsMath: shear over p by cell",
+	       fabsf(shearOverP[0] - 0.5f) < 1e-6f && fabsf(shearOverP[1] - 1.0f) < 1e-6f &&
+	       fabsf(shearOverP[2] - 1.0f) < 1e-6f && fabsf(shearOverP[3]) < 1e-6f);
+	ASSERT("CHIRONPhsDiagnosticsMath: shear alignment by cell",
+	       fabsf(align[0] - 1.0f) < 1e-6f && fabsf(align[1] + 1.0f) < 1e-6f &&
+	       fabsf(align[2] - 1.0f) < 1e-6f && fabsf(align[3]) < 1e-6f);
+	for (unsigned int i = 0u; i < 4u; ++i)
+		ASSERT("CHIRONPhsDiagnosticsMath: q outlier proxy is maxabs/rms", fabsf(qOutlier[i] - 1.0f) < 1e-6f);
+	ASSERT("CHIRONPhsDiagnosticsMath: unweighted NLL by group/bucket",
+	       meanNll[0] == 0.5f && meanNll[1] == 1.5f && meanNll[2] == 1.0f && meanNll[3] == 2.0f);
+	ASSERT("CHIRONPhsDiagnosticsMath: temp proxy by group/bucket",
+	       meanTemp[0] == 10.0f && meanTemp[1] == 30.0f && meanTemp[2] == 20.0f && meanTemp[3] == 40.0f);
+
+	const unsigned int badGroups[4] = { 0u, 2u, 0u, 1u };
+	const bool bad = glades::chiron::phs_detached_diagnostics_from_phase(
+	    /*enabled=*/true,
+	    p, q, shear, nll, temp, badGroups,
+	    T, m, nGroups, nBuckets,
+	    &counts[0], NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	    /*eps=*/1e-12f);
+	ASSERT("CHIRONPhsDiagnosticsMath: invalid group id rejected", !bad);
+}
+
+void CHIRONPhsEmaTest()
+{
+	const float cur[2] = { 2.0f, 4.0f };
+	float emaCold[2] = { 10.0f, 20.0f };
+	ASSERT("CHIRONPhsEma: cold EMA initializes from current",
+	       glades::chiron::phs_update_ema(true, cur, 2u, 0.5f, false, emaCold));
+	ASSERT("CHIRONPhsEma: cold EMA values", emaCold[0] == 2.0f && emaCold[1] == 4.0f);
+
+	float emaWarm[2] = { 10.0f, 20.0f };
+	ASSERT("CHIRONPhsEma: warm EMA update succeeds",
+	       glades::chiron::phs_update_ema(true, cur, 2u, 0.5f, true, emaWarm));
+	ASSERT("CHIRONPhsEma: warm EMA blends values", emaWarm[0] == 6.0f && emaWarm[1] == 12.0f);
+
+	ASSERT("CHIRONPhsEma: invalid decay rejected",
+	       !glades::chiron::phs_update_ema(true, cur, 2u, 1.0f, true, emaWarm));
 }
 

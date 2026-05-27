@@ -280,6 +280,18 @@ struct TransformerRunConfig
 	float siraHuberTau;
 	int siraWarmupSteps;
 
+	// PHS (Phase-Homeostatic Servo) shadow diagnostics.  This is the default-off
+	// logging-only precursor to the future PHS curriculum/controller: callers may
+	// reduce detached CHIRON phase statistics by data group and position bucket,
+	// then EMA/log them.  These flags do NOT enable sample weighting, token-loss
+	// weighting, or hidden-state gradients.  With phsShadowDiagnostics=false, the
+	// helper path is a strict no-op and production CHIRON defaults are unchanged.
+	bool phsShadowDiagnostics;
+	int phsDataGroups;
+	int phsPositionBuckets;
+	int phsLogEverySteps;
+	float phsEmaDecay;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -325,7 +337,12 @@ struct TransformerRunConfig
 	      siraBalanceWeight(0.25f),
 	      siraActionWeight(0.5f),
 	      siraHuberTau(0.2f),
-	      siraWarmupSteps(1000)
+	      siraWarmupSteps(1000),
+	      phsShadowDiagnostics(false),
+	      phsDataGroups(1),
+	      phsPositionBuckets(8),
+	      phsLogEverySteps(0),
+	      phsEmaDecay(0.95f)
 	{
 	}
 };

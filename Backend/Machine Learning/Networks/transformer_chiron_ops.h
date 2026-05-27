@@ -708,6 +708,226 @@ inline bool sira_phase_diagnostics_from_trajectory(const float* pStates,
 	return true;
 }
 
+// ------------------------------------------------------------------
+// PHS: Phase-Homeostatic Servo shadow diagnostics (2026-05-27)
+//
+// The first PHS implementation is diagnostics/logging-only.  It reduces
+// detached terminal or probe phase states by data group `g` and position
+// bucket `b`, producing the quantities a future controller may consume:
+//   r = log(rms(p) / rms(q))              p/q imbalance
+//   s = rms(shear) / rms(p)               shear magnitude proxy
+//   a = cos(p, shear)                     shear alignment
+//   c = max(|q|) / rms(q)                 q-state outlier proxy
+//   T = mean(tempProxy)                   optional logit/QK-temp proxy
+//   ell = mean(tokenNll)                  optional unweighted CE/NLL
+// No loss is returned and no gradient-bearing state is written.  The public
+// helper takes an explicit `enabled` flag; when false, it returns true before
+// validating dimensions, reading input pointers, or touching output buffers.
+// ------------------------------------------------------------------
+
+inline bool phs_should_log(bool enabled, long long step, int logEverySteps)
+{
+	if (!enabled || logEverySteps <= 0 || step < 0)
+		return false;
+	return (step % static_cast<long long>(logEverySteps)) == 0LL;
+}
+
+inline bool phs_detached_diagnostics_from_phase(bool enabled,
+                                                const float* p,
+                                                const float* q,
+                                                const float* shear,
+                                                const float* tokenNll,
+                                                const float* tempProxy,
+                                                const unsigned int* groupIds,
+                                                unsigned int T,
+                                                unsigned int m,
+                                                unsigned int nGroups,
+                                                unsigned int nBuckets,
+                                                float* tokenCount,
+                                                float* rmsP,
+                                                float* rmsQ,
+                                                float* logPqRatio,
+                                                float* rmsShear,
+                                                float* shearOverP,
+                                                float* shearAlignment,
+                                                float* qOutlier,
+                                                float* meanNll,
+                                                float* meanTempProxy,
+                                                float eps)
+{
+	if (!enabled)
+		return true;
+	if (T == 0u || m == 0u || nGroups == 0u || nBuckets == 0u)
+		return false;
+
+	const bool needP = (rmsP != NULL) || (logPqRatio != NULL) ||
+	                   (shearOverP != NULL) || (shearAlignment != NULL);
+	const bool needQ = (rmsQ != NULL) || (logPqRatio != NULL) ||
+	                   (qOutlier != NULL);
+	const bool needShear = (rmsShear != NULL) || (shearOverP != NULL) ||
+	                       (shearAlignment != NULL);
+	const bool needNll = (meanNll != NULL);
+	const bool needTemp = (meanTempProxy != NULL);
+	const bool needAny = (tokenCount != NULL) || needP || needQ || needShear ||
+	                     needNll || needTemp;
+	if (!needAny)
+		return true;
+	if (needP && p == NULL)
+		return false;
+	if (needQ && q == NULL)
+		return false;
+	if (needShear && shear == NULL)
+		return false;
+	if (needNll && tokenNll == NULL)
+		return false;
+	if (needTemp && tempProxy == NULL)
+		return false;
+	if (nGroups > 1u && groupIds == NULL)
+		return false;
+
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	const size_t cellCount = static_cast<size_t>(nGroups) * static_cast<size_t>(nBuckets);
+	for (size_t i = 0u; i < cellCount; ++i)
+	{
+		if (tokenCount) tokenCount[i] = 0.0f;
+		if (rmsP) rmsP[i] = 0.0f;
+		if (rmsQ) rmsQ[i] = 0.0f;
+		if (logPqRatio) logPqRatio[i] = 0.0f;
+		if (rmsShear) rmsShear[i] = 0.0f;
+		if (shearOverP) shearOverP[i] = 0.0f;
+		if (shearAlignment) shearAlignment[i] = 0.0f;
+		if (qOutlier) qOutlier[i] = 0.0f;
+		if (meanNll) meanNll[i] = 0.0f;
+		if (meanTempProxy) meanTempProxy[i] = 0.0f;
+	}
+
+	std::vector<double> counts(cellCount, 0.0);
+	std::vector<double> p2(needP ? cellCount : 0u, 0.0);
+	std::vector<double> q2(needQ ? cellCount : 0u, 0.0);
+	std::vector<double> sh2(needShear ? cellCount : 0u, 0.0);
+	std::vector<double> dot((shearAlignment != NULL) ? cellCount : 0u, 0.0);
+	std::vector<double> qAbsMax((qOutlier != NULL) ? cellCount : 0u, 0.0);
+	std::vector<double> nllSum(needNll ? cellCount : 0u, 0.0);
+	std::vector<double> tempSum(needTemp ? cellCount : 0u, 0.0);
+
+	for (unsigned int t = 0u; t < T; ++t)
+	{
+		const unsigned int g = groupIds ? groupIds[t] : 0u;
+		if (g >= nGroups)
+			return false;
+		unsigned int b = static_cast<unsigned int>((static_cast<size_t>(t) * nBuckets) / T);
+		if (b >= nBuckets)
+			b = nBuckets - 1u;
+		const size_t cell = static_cast<size_t>(g) * nBuckets + b;
+		counts[cell] += 1.0;
+		if (needNll)
+			nllSum[cell] += static_cast<double>(tokenNll[t]);
+		if (needTemp)
+			tempSum[cell] += static_cast<double>(tempProxy[t]);
+
+		const size_t row = static_cast<size_t>(t) * m;
+		for (unsigned int j = 0u; j < m; ++j)
+		{
+			float pv = 0.0f;
+			float qv = 0.0f;
+			float sv = 0.0f;
+			if (needP)
+			{
+				pv = p[row + j];
+				p2[cell] += static_cast<double>(pv) * static_cast<double>(pv);
+			}
+			if (needQ)
+			{
+				qv = q[row + j];
+				q2[cell] += static_cast<double>(qv) * static_cast<double>(qv);
+				if (qOutlier != NULL)
+				{
+					const double aq = static_cast<double>(fabsf(qv));
+					if (aq > qAbsMax[cell]) qAbsMax[cell] = aq;
+				}
+			}
+			if (needShear)
+			{
+				sv = shear[row + j];
+				sh2[cell] += static_cast<double>(sv) * static_cast<double>(sv);
+			}
+			if (shearAlignment != NULL)
+				dot[cell] += static_cast<double>(pv) * static_cast<double>(sv);
+		}
+	}
+
+	for (size_t cell = 0u; cell < cellCount; ++cell)
+	{
+		const double count = counts[cell];
+		if (tokenCount)
+			tokenCount[cell] = static_cast<float>(count);
+		if (count <= 0.0)
+			continue;
+		const double coordCount = count * static_cast<double>(m);
+		float pR = 0.0f;
+		float qR = 0.0f;
+		float shR = 0.0f;
+		if (needP)
+			pR = sqrtf(static_cast<float>(p2[cell] / coordCount));
+		if (needQ)
+			qR = sqrtf(static_cast<float>(q2[cell] / coordCount));
+		if (needShear)
+			shR = sqrtf(static_cast<float>(sh2[cell] / coordCount));
+		if (rmsP) rmsP[cell] = pR;
+		if (rmsQ) rmsQ[cell] = qR;
+		if (rmsShear) rmsShear[cell] = shR;
+		if (logPqRatio)
+			logPqRatio[cell] = logf(sira_safe_positive(pR, safeEps)) -
+			                    logf(sira_safe_positive(qR, safeEps));
+		if (shearOverP)
+			shearOverP[cell] = shR / sira_safe_positive(pR, safeEps);
+		if (shearAlignment)
+		{
+			const double denom = sqrt(p2[cell] * sh2[cell]);
+			shearAlignment[cell] = (denom > static_cast<double>(safeEps))
+			    ? static_cast<float>(dot[cell] / (denom + static_cast<double>(safeEps)))
+			    : 0.0f;
+		}
+		if (qOutlier)
+			qOutlier[cell] = static_cast<float>(qAbsMax[cell]) /
+			                 sira_safe_positive(qR, safeEps);
+		if (meanNll)
+			meanNll[cell] = static_cast<float>(nllSum[cell] / count);
+		if (meanTempProxy)
+			meanTempProxy[cell] = static_cast<float>(tempSum[cell] / count);
+	}
+
+	return true;
+}
+
+inline bool phs_update_ema(bool enabled,
+                           const float* current,
+                           unsigned int n,
+                           float decay,
+                           bool initialized,
+                           float* ema)
+{
+	if (!enabled)
+		return true;
+	if (n == 0u)
+		return true;
+	if (current == NULL || ema == NULL)
+		return false;
+	if (decay < 0.0f || decay >= 1.0f)
+		return false;
+	if (!initialized)
+	{
+		for (unsigned int i = 0u; i < n; ++i)
+			ema[i] = current[i];
+		return true;
+	}
+	const float keep = decay;
+	const float add = 1.0f - decay;
+	for (unsigned int i = 0u; i < n; ++i)
+		ema[i] = keep * ema[i] + add * current[i];
+	return true;
+}
+
 // SIRA loss from pre-reduced layer/bucket terms.
 //
 // energy, balance: [nStates, nBuckets] for state boundaries l=0..nStates-1.

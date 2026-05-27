@@ -90,6 +90,10 @@ void CHIRONSiraDisabledParityTest();
 void CHIRONSiraDiagnosticsTest();
 void CHIRONSiraEnabledMathTest();
 void CHIRONSiraTrainingLossTest();
+void CHIRONPhsConfigDefaultsTest();
+void CHIRONPhsDisabledParityTest();
+void CHIRONPhsDiagnosticsMathTest();
+void CHIRONPhsEmaTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

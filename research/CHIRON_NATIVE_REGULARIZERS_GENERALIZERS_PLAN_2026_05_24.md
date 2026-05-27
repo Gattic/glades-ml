@@ -25,6 +25,11 @@ Implemented and verified so far:
   terminal training-loss gating/math, GPU loss/gradient smoke behavior, and
   edge cases for energy-only and action-weight paths.
 - `glades-ml` has targeted unit-test selectors `chiron-sira` / `sira`.
+- `glades-ml` has default-off PHS shadow-diagnostics configuration fields,
+  detached CPU helper reductions, EMA helpers, and targeted `chiron-phs` /
+  `phs` tests.  This is logging-only infrastructure: no trainer-side runtime
+  logging, sample/crop weighting, token-loss weighting, or hidden-state
+  gradient path is enabled.
 - `glades-trainer` accepts SIRA CLI/config flags, has `--sira-config-smoke`
   paths proving flag propagation into `glades::TrainingConfig` without
   starting training, and has `--sira-loss-smoke` for terminal-loss
@@ -42,8 +47,11 @@ Not implemented yet / still speculative:
   the terminal CHIRON phase state `(p_L, q_L)`.
 - Persistent phase diagnostics, probe-layer schedule, and position-bucket
   instrumentation do not exist yet for SIRA.
-- `--sira-probe-layers`, `--sira-position-buckets`, PHS, and PTOC remain
-  research proposals in this document, not runnable features.
+- Trainer-side PHS shadow logging is not wired yet; the current PHS state is
+  config + detached helper/test infrastructure only.
+- `--sira-probe-layers`, `--sira-position-buckets`, active PHS
+  controller/curriculum weighting, and PTOC remain research proposals in this
+  document, not runnable training features.
 - No 1B SIRA pilot has been run, and there is no NLL/throughput result to
   compare against `chiron_1B_T16384_regstack_phase2.final`.
 
