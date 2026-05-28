@@ -292,6 +292,17 @@ struct TransformerRunConfig
 	int phsLogEverySteps;
 	float phsEmaDecay;
 
+	// PTOC (Phase-space Tangent Operator Consistency) shadow diagnostics.
+	// Default-off and detached.  The helper consumes already-computed finite-
+	// difference triplets (F(x-eps*u), F(x), F(x+eps*u)) and reports local gain /
+	// curvature summaries.  It does not define a training loss or inject gradients.
+	bool ptocShadowDiagnostics;
+	int ptocLogEverySteps;
+	int ptocSampleLayers;
+	int ptocSampleTokens;
+	float ptocEps;
+	float ptocEta;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -342,7 +353,13 @@ struct TransformerRunConfig
 	      phsDataGroups(1),
 	      phsPositionBuckets(8),
 	      phsLogEverySteps(0),
-	      phsEmaDecay(0.95f)
+	      phsEmaDecay(0.95f),
+	      ptocShadowDiagnostics(false),
+	      ptocLogEverySteps(0),
+	      ptocSampleLayers(2),
+	      ptocSampleTokens(64),
+	      ptocEps(1e-3f),
+	      ptocEta(1e-12f)
 	{
 	}
 };

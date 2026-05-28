@@ -928,6 +928,105 @@ inline bool phs_update_ema(bool enabled,
 	return true;
 }
 
+// ------------------------------------------------------------------
+// PTOC: Phase-space Tangent Operator Consistency shadow diagnostics.
+//
+// The helper is deliberately detached and generic: the caller supplies sampled
+// finite-difference triplets y- = F(x-eps*u), y0 = F(x), y+ = F(x+eps*u)
+// plus the normalized perturbation direction u.  PTOC summaries are local
+// tangent gain and curvature diagnostics only; no loss is returned and no
+// gradient-bearing state is written.  As with SIRA/PHS helpers, disabled mode
+// returns before validating pointers or writing outputs.
+// ------------------------------------------------------------------
+
+inline bool ptoc_should_log(bool enabled, long long step, int logEverySteps)
+{
+	if (!enabled || logEverySteps <= 0 || step < 0)
+		return false;
+	return (step % static_cast<long long>(logEverySteps)) == 0LL;
+}
+
+inline bool ptoc_detached_diagnostics_from_triplets(bool enabled,
+                                                    const float* yMinus,
+                                                    const float* y0,
+                                                    const float* yPlus,
+                                                    const float* direction,
+                                                    unsigned int nSamples,
+                                                    unsigned int sampleDim,
+                                                    float eps,
+                                                    float eta,
+                                                    float* gainMean,
+                                                    float* gainMax,
+                                                    float* curvatureMean,
+                                                    float* curvatureMax,
+                                                    float* cycleMean,
+                                                    float* cycleMax)
+{
+	if (!enabled)
+		return true;
+	if (nSamples == 0u || sampleDim == 0u)
+		return false;
+	if (eps <= 0.0f || eta <= 0.0f)
+		return false;
+	if (yMinus == NULL || y0 == NULL || yPlus == NULL || direction == NULL)
+		return false;
+
+	const bool needGain = (gainMean != NULL) || (gainMax != NULL);
+	const bool needCurv = (curvatureMean != NULL) || (curvatureMax != NULL);
+	const bool needCycle = (cycleMean != NULL) || (cycleMax != NULL);
+	if (!needGain && !needCurv && !needCycle)
+		return true;
+
+	double gainSum = 0.0;
+	double curvSum = 0.0;
+	double cycleSum = 0.0;
+	double gainM = 0.0;
+	double curvM = 0.0;
+	double cycleM = 0.0;
+	for (unsigned int s = 0u; s < nSamples; ++s)
+	{
+		const size_t row = static_cast<size_t>(s) * static_cast<size_t>(sampleDim);
+		double diff2 = 0.0;
+		double second2 = 0.0;
+		double dir2 = 0.0;
+		for (unsigned int j = 0u; j < sampleDim; ++j)
+		{
+			const size_t idx = row + j;
+			const double ym = static_cast<double>(yMinus[idx]);
+			const double y = static_cast<double>(y0[idx]);
+			const double yp = static_cast<double>(yPlus[idx]);
+			const double u = static_cast<double>(direction[idx]);
+			const double d = yp - ym;
+			const double c = yp - 2.0 * y + ym;
+			diff2 += d * d;
+			second2 += c * c;
+			dir2 += u * u;
+		}
+		const double diffNorm = sqrt(diff2);
+		const double secondNorm = sqrt(second2);
+		const double dirNorm = sqrt(dir2);
+		const double safeDir = dirNorm + static_cast<double>(eta);
+		const double safeDiff = diffNorm + static_cast<double>(eta);
+		const double gain = diffNorm / (2.0 * static_cast<double>(eps) * safeDir);
+		const double curv = secondNorm / (static_cast<double>(eps) * static_cast<double>(eps) * safeDir);
+		const double cycle = secondNorm / safeDiff;
+		gainSum += gain;
+		curvSum += curv;
+		cycleSum += cycle;
+		if (s == 0u || gain > gainM) gainM = gain;
+		if (s == 0u || curv > curvM) curvM = curv;
+		if (s == 0u || cycle > cycleM) cycleM = cycle;
+	}
+	const double invN = 1.0 / static_cast<double>(nSamples);
+	if (gainMean) *gainMean = static_cast<float>(gainSum * invN);
+	if (gainMax) *gainMax = static_cast<float>(gainM);
+	if (curvatureMean) *curvatureMean = static_cast<float>(curvSum * invN);
+	if (curvatureMax) *curvatureMax = static_cast<float>(curvM);
+	if (cycleMean) *cycleMean = static_cast<float>(cycleSum * invN);
+	if (cycleMax) *cycleMax = static_cast<float>(cycleM);
+	return true;
+}
+
 // SIRA loss from pre-reduced layer/bucket terms.
 //
 // energy, balance: [nStates, nBuckets] for state boundaries l=0..nStates-1.

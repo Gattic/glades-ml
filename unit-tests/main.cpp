@@ -218,6 +218,9 @@ int main(int argc, char* argv[])
 		CHIRONPhsDisabledParityTest();
 		CHIRONPhsDiagnosticsMathTest();
 		CHIRONPhsEmaTest();
+		CHIRONPtocConfigDefaultsTest();
+		CHIRONPtocDisabledParityTest();
+		CHIRONPtocDiagnosticsMathTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-phs") == 0 || strcmp(argv[1], "phs") == 0)
 	    {
@@ -225,6 +228,12 @@ int main(int argc, char* argv[])
 		CHIRONPhsDisabledParityTest();
 		CHIRONPhsDiagnosticsMathTest();
 		CHIRONPhsEmaTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-ptoc") == 0 || strcmp(argv[1], "ptoc") == 0)
+	    {
+		CHIRONPtocConfigDefaultsTest();
+		CHIRONPtocDisabledParityTest();
+		CHIRONPtocDiagnosticsMathTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();

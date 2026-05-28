@@ -94,6 +94,9 @@ void CHIRONPhsConfigDefaultsTest();
 void CHIRONPhsDisabledParityTest();
 void CHIRONPhsDiagnosticsMathTest();
 void CHIRONPhsEmaTest();
+void CHIRONPtocConfigDefaultsTest();
+void CHIRONPtocDisabledParityTest();
+void CHIRONPtocDiagnosticsMathTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

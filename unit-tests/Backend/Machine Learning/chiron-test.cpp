@@ -11378,6 +11378,9 @@ void CHIRONUnitTest()
 	CHIRONPhsDisabledParityTest();
 	CHIRONPhsDiagnosticsMathTest();
 	CHIRONPhsEmaTest();
+	CHIRONPtocConfigDefaultsTest();
+	CHIRONPtocDisabledParityTest();
+	CHIRONPtocDiagnosticsMathTest();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
@@ -17366,5 +17369,125 @@ void CHIRONPhsEmaTest()
 
 	ASSERT("CHIRONPhsEma: invalid decay rejected",
 	       !glades::chiron::phs_update_ema(true, cur, 2u, 1.0f, true, emaWarm));
+}
+
+// === PTOC TESTS (2026-05-28 default-off shadow diagnostics) ===
+
+void CHIRONPtocConfigDefaultsTest()
+{
+	glades::TransformerRunConfig rc;
+	ASSERT("CHIRONPtocConfigDefaults: PTOC shadow diagnostics default off",
+	       rc.ptocShadowDiagnostics == false);
+	ASSERT("CHIRONPtocConfigDefaults: log cadence default disabled",
+	       rc.ptocLogEverySteps == 0);
+	ASSERT("CHIRONPtocConfigDefaults: sample layers default",
+	       rc.ptocSampleLayers == 2);
+	ASSERT("CHIRONPtocConfigDefaults: sample tokens default",
+	       rc.ptocSampleTokens == 64);
+	ASSERT("CHIRONPtocConfigDefaults: eps default",
+	       fabsf(rc.ptocEps - 1e-3f) < 1e-9f);
+	ASSERT("CHIRONPtocConfigDefaults: eta default",
+	       fabsf(rc.ptocEta - 1e-12f) < 1e-18f);
+	ASSERT("CHIRONPtocConfigDefaults: default should not log",
+	       glades::chiron::ptoc_should_log(rc.ptocShadowDiagnostics, 100LL, rc.ptocLogEverySteps) == false);
+	ASSERT("CHIRONPtocConfigDefaults: enabled cadence logs exactly on cadence",
+	       glades::chiron::ptoc_should_log(true, 100LL, 50) == true &&
+	       glades::chiron::ptoc_should_log(true, 101LL, 50) == false);
+
+	glades::TrainingConfig cfg;
+	glades::NNetworkStatus st = glades::validateTransformerTrainingConfig("ptoc-defaults", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: default training config validates", st.ok());
+
+	cfg.transformer.ptocShadowDiagnostics = true;
+	st = glades::validateTransformerTrainingConfig("ptoc-enabled-zero-cadence", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: enabled PTOC requires positive cadence", !st.ok());
+	cfg.transformer.ptocLogEverySteps = 100;
+	st = glades::validateTransformerTrainingConfig("ptoc-enabled-valid", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: enabled PTOC config validates", st.ok());
+	cfg.transformer.ptocShadowDiagnostics = false;
+	cfg.transformer.ptocLogEverySteps = 0;
+
+	cfg.transformer.ptocLogEverySteps = -1;
+	st = glades::validateTransformerTrainingConfig("ptoc-bad-cadence", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: negative PTOC cadence rejected", !st.ok());
+	cfg.transformer.ptocLogEverySteps = 0;
+
+	cfg.transformer.ptocSampleLayers = 0;
+	st = glades::validateTransformerTrainingConfig("ptoc-bad-layers", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: non-positive sample layers rejected", !st.ok());
+	cfg.transformer.ptocSampleLayers = 2;
+
+	cfg.transformer.ptocSampleTokens = 0;
+	st = glades::validateTransformerTrainingConfig("ptoc-bad-tokens", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: non-positive sample tokens rejected", !st.ok());
+	cfg.transformer.ptocSampleTokens = 64;
+
+	cfg.transformer.ptocEps = 0.0f;
+	st = glades::validateTransformerTrainingConfig("ptoc-bad-eps", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: non-positive eps rejected", !st.ok());
+	cfg.transformer.ptocEps = 1e-3f;
+
+	cfg.transformer.ptocEta = 0.0f;
+	st = glades::validateTransformerTrainingConfig("ptoc-bad-eta", cfg);
+	ASSERT("CHIRONPtocConfigDefaults: non-positive eta rejected", !st.ok());
+}
+
+void CHIRONPtocDisabledParityTest()
+{
+	float gainMean = -7.0f;
+	float gainMax = -7.0f;
+	float curvatureMean = -7.0f;
+	float curvatureMax = -7.0f;
+	float cycleMean = -7.0f;
+	float cycleMax = -7.0f;
+	const bool ok = glades::chiron::ptoc_detached_diagnostics_from_triplets(
+	    /*enabled=*/false,
+	    NULL, NULL, NULL, NULL,
+	    /*nSamples=*/2u, /*sampleDim=*/3u,
+	    /*eps=*/1e-3f, /*eta=*/1e-12f,
+	    &gainMean, &gainMax, &curvatureMean, &curvatureMax, &cycleMean, &cycleMax);
+	ASSERT("CHIRONPtocDisabledParity: disabled helper returns success", ok);
+	ASSERT("CHIRONPtocDisabledParity: disabled helper does not write outputs",
+	       gainMean == -7.0f && gainMax == -7.0f && curvatureMean == -7.0f &&
+	       curvatureMax == -7.0f && cycleMean == -7.0f && cycleMax == -7.0f);
+}
+
+void CHIRONPtocDiagnosticsMathTest()
+{
+	const unsigned int nSamples = 2u;
+	const unsigned int dim = 2u;
+	const float eps = 0.5f;
+	const float eta = 1e-12f;
+	// Sample 0: y = x^2 along direction [1,0] around x=2 -> gain=4, curvature=2.
+	// Sample 1: y = 3x linear along direction [0,2] -> gain=3, curvature=0.
+	const float yMinus[4] = { 2.25f, 0.0f, 0.0f, -3.0f };
+	const float y0[4]     = { 4.00f, 0.0f, 0.0f,  0.0f };
+	const float yPlus[4]  = { 6.25f, 0.0f, 0.0f,  3.0f };
+	const float dir[4]    = { 1.00f, 0.0f, 0.0f,  2.0f };
+	float gainMean = 0.0f;
+	float gainMax = 0.0f;
+	float curvatureMean = 0.0f;
+	float curvatureMax = 0.0f;
+	float cycleMean = 0.0f;
+	float cycleMax = 0.0f;
+	const bool ok = glades::chiron::ptoc_detached_diagnostics_from_triplets(
+	    /*enabled=*/true,
+	    yMinus, y0, yPlus, dir, nSamples, dim, eps, eta,
+	    &gainMean, &gainMax, &curvatureMean, &curvatureMax, &cycleMean, &cycleMax);
+	ASSERT("CHIRONPtocDiagnosticsMath: helper accepts complete triplets", ok);
+	ASSERT("CHIRONPtocDiagnosticsMath: gain mean/max",
+	       fabsf(gainMean - 3.5f) < 1e-5f && fabsf(gainMax - 4.0f) < 1e-5f);
+	ASSERT("CHIRONPtocDiagnosticsMath: curvature mean/max",
+	       fabsf(curvatureMean - 1.0f) < 1e-5f && fabsf(curvatureMax - 2.0f) < 1e-5f);
+	const float expectedCycle0 = 0.5f / 4.0f;
+	ASSERT("CHIRONPtocDiagnosticsMath: cycle mean/max",
+	       fabsf(cycleMean - 0.5f * expectedCycle0) < 1e-5f &&
+	       fabsf(cycleMax - expectedCycle0) < 1e-5f);
+
+	const bool bad = glades::chiron::ptoc_detached_diagnostics_from_triplets(
+	    /*enabled=*/true,
+	    yMinus, y0, yPlus, NULL, nSamples, dim, eps, eta,
+	    &gainMean, NULL, NULL, NULL, NULL, NULL);
+	ASSERT("CHIRONPtocDiagnosticsMath: missing direction rejected when enabled", !bad);
 }
 

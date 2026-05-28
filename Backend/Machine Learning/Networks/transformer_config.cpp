@@ -72,6 +72,19 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 	if (runtimeCfg.phsEmaDecay < 0.0f || runtimeCfg.phsEmaDecay >= 1.0f)
 		return invalid_argument(where, "phsEmaDecay must be in [0,1)");
 
+	if (runtimeCfg.ptocLogEverySteps < 0)
+		return invalid_argument(where, "ptocLogEverySteps must be >= 0");
+	if (runtimeCfg.ptocShadowDiagnostics && runtimeCfg.ptocLogEverySteps <= 0)
+		return invalid_argument(where, "ptocLogEverySteps must be > 0 when PTOC diagnostics are enabled");
+	if (runtimeCfg.ptocSampleLayers <= 0)
+		return invalid_argument(where, "ptocSampleLayers must be > 0");
+	if (runtimeCfg.ptocSampleTokens <= 0)
+		return invalid_argument(where, "ptocSampleTokens must be > 0");
+	if (runtimeCfg.ptocEps <= 0.0f)
+		return invalid_argument(where, "ptocEps must be > 0");
+	if (runtimeCfg.ptocEta <= 0.0f)
+		return invalid_argument(where, "ptocEta must be > 0");
+
 	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 
