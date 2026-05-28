@@ -217,6 +217,12 @@ This rising qout is finite and did not coincide with observed training failure, 
 
 ## Final recommendation
 
+Follow-up qout calibration/reporting is documented in
+`research/PHS_QOUT_CALIBRATION_AND_DEFAULT_POLICY_2026_05_28.md`. That pass
+uses the new `glades-trainer/scripts/phs_log_report.py` parser and confirms the
+policy split: research diagnostic templates may default-enable PHS shadow
+logging, but production/flagship training should keep PHS opt-in.
+
 - **Code/config default:** keep `phsShadowDiagnostics=false` and keep trainer PHS opt-in.
 - **When PHS is enabled:** keep `batch-quantile` as the default group mode.
 - **Research templates:** it is reasonable to include PHS shadow diagnostics by default in diagnostic/research run wrappers with `--phs-log-every 500`.
