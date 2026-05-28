@@ -9,7 +9,7 @@ full layer/bucket trajectory objective below remains a research plan.
 **Baseline metrics:** val NLL **3.5734** @ 30k, ~**28,072 tok/s** @ T=16384,
 ~14.97 GB VRAM.
 
-## Implementation status as of 2026-05-27
+## Implementation status as of 2026-05-28
 
 This document is a research plan plus pre-registration seed. It should not be
 read as claiming that the full trajectory/bucket SIRA objective has shipped.
@@ -39,12 +39,19 @@ Implemented and verified so far:
   position-bucket reductions over detached terminal `(q_L,p_L)`, per-cell EMAs,
   and a `scripts/phs_shadow_smoke.sh` smoke.  It is diagnostics-only; it does
   not change the training objective or inject gradients.
-- Verified commands included `./build/glades-unit-tests chiron-sira`,
-  `./build/glades-unit-tests chiron-phs`, trainer
+- `glades-ml` and `glades-trainer` now have default-off PTOC shadow-diagnostic
+  scaffolding: config/validation, detached finite-difference gain/curvature
+  helpers, `chiron-ptoc` tests, trainer flags (`--ptoc-shadow-diagnostics`,
+  `--ptoc-log-every`, `--ptoc-sample-layers`, `--ptoc-sample-tokens`,
+  `--ptoc-eps`), a detached ReLN finite-difference runtime hook, and
+  `scripts/ptoc_log_report.py` for qout/SIRA alignment.  This is not a PTOC
+  loss and does not inject gradients.
+- Verified commands included `./unit-tests/test.sh chiron-sira`,
+  `./unit-tests/test.sh chiron-phs`, `./unit-tests/test.sh chiron-ptoc`, trainer
   `scripts/sira_config_smoke.sh`, `scripts/sira_training_loss_smoke.sh`,
-  `scripts/phs_shadow_smoke.sh`, direct config-smoke invocations, and the
-  aggregate `./build/glades-unit-tests chiron` after independent CHIRON test
-  stabilization.
+  `scripts/phs_shadow_smoke.sh`, `scripts/ptoc_shadow_smoke.sh`, direct
+  config-smoke invocations, and the aggregate `./build/glades-unit-tests chiron`
+  after independent CHIRON test stabilization.
 
 Not implemented yet / still speculative:
 
@@ -60,8 +67,9 @@ Not implemented yet / still speculative:
   it removes raw-ID count skew without measurable loss/throughput impact; see
   `research/PHS_GROUPING_3SEED_ABLATION_2026_05_27.md`.
 - `--sira-probe-layers`, `--sira-position-buckets`, active PHS
-  controller/curriculum weighting, token/sample weighting, and PTOC remain
-  research proposals in this document, not runnable training features.
+  controller/curriculum weighting, token/sample weighting, and an active PTOC
+  loss remain research proposals in this document, not runnable production
+  features.  PTOC is currently runnable only as detached shadow diagnostics.
 - No 1B SIRA pilot has been run, and there is no NLL/throughput result to
   compare against `chiron_1B_T16384_regstack_phase2.final`.
 
@@ -71,6 +79,8 @@ Relevant code commits:
 - `glades-trainer`: `2b6c791 Add SIRA CLI smoke plumbing`
 - `glades-ml`: `5545a1ba8 Stabilize CHIRON tests` (test-only stabilization,
   not SIRA behavior)
+- `glades-ml`/`glades-trainer`: PTOC shadow-diagnostic implementation (pending
+  commit at the time this note was edited)
 
 This document starts the next research direction after the Phase-3
 regularization sub-program closed. The prior failure pattern is treated as a
