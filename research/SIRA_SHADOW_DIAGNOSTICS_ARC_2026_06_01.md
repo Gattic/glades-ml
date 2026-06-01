@@ -183,6 +183,38 @@ terminal layer keeps a high but stable action proxy (`|action|max 0.8605 ->
 still does not justify an active SIRA objective without a paired active-loss
 pilot and same-seed baseline comparison.
 
+## FP8 paired 5k baseline attribution
+
+Artifact:
+
+```text
+/home/robert/dev/glades-trainer/logs/fp8_sira_shadow_nll_baseline_compare_5000step_20260601_161016/
+```
+
+This run pairs the previous same-binary 5k SIRA-shadow log against a fresh 5k
+baseline.
+
+| mode | VRAM | step5000 loss | val NLL | warm tok/s | non-diagnostic warm tok/s | bad lines |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 14.55 / 15.56 GB | 3.8686 | 3.9619 | 28029.6 | 28029.9 | 0 |
+| SIRA shadow + pos-NLL | 14.55 / 15.56 GB | 3.8666 | 3.9591 | 27834.6 | 28024.6 | 0 |
+
+Delta SIRA-shadow minus baseline:
+
+```text
+VRAM:                      +0.00 GB
+train loss:                -0.0020
+val NLL:                   -0.0028
+warm tok/s mean:           -195.0 tok/s (-0.70%)
+warm non-diagnostic tok/s:   -5.2 tok/s (-0.02%)
+wall time:                 +60.2 s over 5k steps
+```
+
+Final validation position-bucket deltas were `[0/0/0/0/0/0/0/-0.01]` at log
+precision.  Regression flags: none.  The shadow path's visible cost is confined
+to the 50 diagnostic logging steps; ordinary training steps remain effectively
+unchanged.
+
 ## FP8 2k gate
 
 Artifact:
