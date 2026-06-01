@@ -229,3 +229,63 @@ isolates whether the residual comes from PHS host diagnostics versus PTOC
 finite-difference diagnostics or the PTOC×PHS interaction.  If PHS-only matches
 the no-FP8 baseline, run PTOC-only next; if PHS-only matches the combined run,
 inspect PHS synchronization/data-path effects before considering any active loss.
+
+## Evaluation addendum: FP8 readout restored and 2k default-off ablation (2026-06-01)
+
+The FP8 readout OOM was traced to insufficient headroom before first-step lazy
+CUDA/cuBLAS allocations, not to a new PTOC/PHS allocation.  `glades-trainer`
+commit `232c9ec78b3180f5661640f793609036e39cb2d0` reuses the BF16 logits buffer
+as BF16 `dlogits` on `--fp8-readout-fwd`, restoring FP8 headroom while leaving
+the no-FP8 path unchanged.
+
+Artifacts in `/home/robert/dev/glades-trainer`:
+
+- 10-step FP8 matrix:
+  `logs/fp8_alias_diag_matrix_10step_20260531_162938/`
+- 100-step FP8 matrix:
+  `logs/fp8_alias_diag_matrix_100step_20260531_175403/`
+- 500-step FP8 baseline vs PTOC+PHS:
+  `logs/fp8_alias_baseline_vs_ptoc_phs_500step_20260531_181746/`
+- 1k-step FP8 baseline vs PTOC+PHS:
+  `logs/fp8_alias_baseline_vs_ptoc_phs_1000step_20260531_183127/`
+- 2k-step FP8 baseline vs PTOC+PHS:
+  `logs/fp8_alias_baseline_vs_ptoc_phs_2000step_20260601_003004/`
+- 2k four-arm FP8 ablation matrix:
+  `logs/fp8_ablation_matrix_2000step_20260601_070850/`
+
+All FP8 gates completed with `VRAM usage after allocation: 14.49 / 15.56 GB`,
+zero OOM/fallback/rejection/NaN/Inf/grad-skip/forward/backward/stability lines,
+and no persistent warm-throughput regression.  When a diagnostic fires on the
+final step, the instantaneous final-step `tok/s` is expectedly depressed by host
+logging; use warm mean or non-diagnostic-step throughput for comparisons.
+
+Same-seed 2k four-arm ablation:
+
+| Run | val NLL | ΔNLL vs baseline | warm tok/s | Δ warm tok/s | bad lines |
+|---|---:|---:|---:|---:|---:|
+| baseline | 4.9538 | +0.0000 | 28044.6 | +0.0 | 0 |
+| PTOC-only | 4.9514 | -0.0024 | 28017.4 | -27.3 (-0.10%) | 0 |
+| PHS-only | 4.9574 | +0.0036 | 27983.3 | -61.3 (-0.22%) | 0 |
+| PTOC+PHS | 4.9515 | -0.0023 | 27965.5 | -79.1 (-0.28%) | 0 |
+
+Telemetry at 2k stayed bounded:
+
+- PHS-only final `qout_mean=4.879`, `qout_max=5.20`; maximum observed qout
+  across PHS arms was `5.68`.
+- PTOC-only final `gain_mean=0.94524`, `curvature_max=3.3155`,
+  `cycle_max=0.0016591`, `qout_sample=5.179`.
+- PTOC+PHS final `gain_mean=0.94525`, `curvature_max=3.3348`,
+  `cycle_max=0.0016722`, `qout_sample=5.144`.
+- Maximum observed PTOC curvature was `3.5358`; maximum observed cycle was
+  `0.0017706`.
+
+Attribution: the combined small NLL improvement tracks PTOC-only rather than
+PHS-only (`PTOC-only -0.0024`, `PHS-only +0.0036`, `PTOC+PHS -0.0023`, combo
+minus PTOC-only `+0.0001`).  Because PTOC/PHS are detached shadow diagnostics,
+these tiny deltas are not causal evidence for an active loss or default enable.
+
+Decision: freeze PTOC and PHS as CHIRON-native, default-off shadow diagnostics.
+Do not promote PTOC/PHS to default-on, sample weighting, token weighting, or
+active loss from this evidence.  Active work should proceed through SIRA Phase-0
+trajectory diagnostics first, then only consider active SIRA/PTOC/PHS objectives
+if detached telemetry predicts a clear stability or validation target.
