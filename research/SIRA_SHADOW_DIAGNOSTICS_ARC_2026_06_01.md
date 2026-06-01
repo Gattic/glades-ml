@@ -145,6 +145,44 @@ validation value as a stability/checkpoint observation rather than an attributio
 claim.  It remains inside the prior 2k FP8 clean-run noise envelope and produced
 no OOM, fallback, NaN/Inf, grad-skip, forward/backward, or stability failures.
 
+## FP8 5k pos-NLL shadow gate
+
+Artifact:
+
+```text
+/home/robert/dev/glades-trainer/logs/fp8_sira_shadow_nll_5000step_20260601_141803/
+```
+
+SIRA-shadow-only follow-up:
+
+```text
+steps:                       5000
+VRAM:                        14.55 / 15.56 GB
+train loss / EMA:            3.8666 / 4.0078
+val NLL / BPB / PPL:         3.9591 / 1.4279 / 52.41
+warm tok/s mean:             27834.6
+warm non-diagnostic tok/s:   28024.6
+bad/stability lines:         0
+SIRA layer rows:             350
+SIRA pos-NLL rows:           50
+regression flags:            none
+```
+
+Position-NLL proxy trend:
+
+```text
+step100  mean=9.9011 max=9.966 pos_nll=[9.872/9.834/9.862/9.923/9.923/9.966/9.965/9.864]
+step2600 mean=4.3900 max=5.014 pos_nll=[5.014/4.375/4.296/4.257/4.327/4.199/4.270/4.382]
+step5000 mean=3.8536 max=4.037 pos_nll=[3.794/4.014/3.677/3.809/3.889/4.037/3.742/3.867]
+```
+
+Layer/bucket energy and balance remain bounded by 5k.  Non-terminal probe layers
+settle near normalized energy `~1.05–1.08` and `|balance| <= 0.081`; the
+terminal layer keeps a high but stable action proxy (`|action|max 0.8605 ->
+0.8251`).  This supports keeping SIRA Phase-0 as safe default-off telemetry, but
+still does not justify an active SIRA objective without a paired active-loss
+pilot and same-seed baseline comparison.
+
 ## FP8 2k gate
 
 Artifact:
