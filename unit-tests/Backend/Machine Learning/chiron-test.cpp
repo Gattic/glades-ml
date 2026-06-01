@@ -16939,6 +16939,14 @@ void CHIRONSiraConfigDefaultsTest()
 	       rc.siraHuberTau == 0.2f);
 	ASSERT("CHIRONSiraConfigDefaults: warmup default",
 	       rc.siraWarmupSteps == 1000);
+	ASSERT("CHIRONSiraConfigDefaults: shadow diagnostics default off",
+	       rc.siraShadowDiagnostics == false);
+	ASSERT("CHIRONSiraConfigDefaults: shadow log cadence default disabled",
+	       rc.siraLogEverySteps == 0);
+	ASSERT("CHIRONSiraConfigDefaults: shadow position buckets default",
+	       rc.siraPositionBuckets == 8);
+	ASSERT("CHIRONSiraConfigDefaults: shadow probe layers default empty",
+	       rc.siraProbeLayers.empty());
 	ASSERT("CHIRONSiraConfigDefaults: default should not apply",
 	       glades::chiron::sira_should_apply(rc.siraCoef, 100000LL, rc.siraWarmupSteps) == false);
 
@@ -16964,6 +16972,22 @@ void CHIRONSiraConfigDefaultsTest()
 	cfg.transformer.siraWarmupSteps = -1;
 	st = glades::validateTransformerTrainingConfig("sira-bad-warmup", cfg);
 	ASSERT("CHIRONSiraConfigDefaults: negative warmup rejected", !st.ok());
+	cfg.transformer.siraWarmupSteps = 1000;
+
+	cfg.transformer.siraShadowDiagnostics = true;
+	cfg.transformer.siraLogEverySteps = 0;
+	st = glades::validateTransformerTrainingConfig("sira-shadow-no-cadence", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: enabled shadow diagnostics require cadence", !st.ok());
+	cfg.transformer.siraLogEverySteps = 100;
+	st = glades::validateTransformerTrainingConfig("sira-shadow-valid", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: valid shadow diagnostics accepted", st.ok());
+	cfg.transformer.siraPositionBuckets = 0;
+	st = glades::validateTransformerTrainingConfig("sira-shadow-bad-buckets", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: non-positive shadow buckets rejected", !st.ok());
+	cfg.transformer.siraPositionBuckets = 8;
+	cfg.transformer.siraProbeLayers.push_back(-1);
+	st = glades::validateTransformerTrainingConfig("sira-shadow-bad-probe", cfg);
+	ASSERT("CHIRONSiraConfigDefaults: negative probe layer rejected", !st.ok());
 }
 
 void CHIRONSiraDisabledParityTest()

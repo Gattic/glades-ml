@@ -33,6 +33,14 @@ Implemented and verified so far:
   paths proving flag propagation into `glades::TrainingConfig` without
   starting training, and has `--sira-loss-smoke` for terminal-loss
   disabled/warmup/enabled checks.
+- `glades-ml` and `glades-trainer` now have default-off SIRA Phase-0 shadow
+  trajectory diagnostics (`--sira-shadow-diagnostics`, `--sira-log-every`,
+  `--sira-probe-layers`, `--sira-position-buckets`).  The trainer captures
+  selected layer states at logging cadence, reduces detached position-bucket
+  `rms(p)`, `rms(q)`, `rms(shear)`, normalized energy, p/q balance, and action
+  proxy, and logs `loss=none gradients=none`.  CUDA graph capture is disabled
+  when this host-reduction path is active.  `scripts/sira_log_report.py`
+  summarizes SIRA shadow logs.
 - `glades-trainer` now has default-off PHS terminal shadow logging via
   `--phs-shadow-diagnostics --phs-log-every N`, with batch-quantile target-token
   groups by default (`--phs-group-mode id` preserves the legacy raw-ID bins),
@@ -49,8 +57,9 @@ Implemented and verified so far:
 - Verified commands included `./unit-tests/test.sh chiron-sira`,
   `./unit-tests/test.sh chiron-phs`, `./unit-tests/test.sh chiron-ptoc`, trainer
   `scripts/sira_config_smoke.sh`, `scripts/sira_training_loss_smoke.sh`,
-  `scripts/phs_shadow_smoke.sh`, `scripts/ptoc_shadow_smoke.sh`, direct
-  config-smoke invocations, and the aggregate `./build/glades-unit-tests chiron`
+  `scripts/sira_shadow_smoke.sh`, `scripts/phs_shadow_smoke.sh`,
+  `scripts/ptoc_shadow_smoke.sh`, direct config-smoke invocations, and the
+  aggregate `./build/glades-unit-tests chiron`
   after independent CHIRON test stabilization.
 
 Not implemented yet / still speculative:
@@ -58,18 +67,20 @@ Not implemented yet / still speculative:
 - The full trajectory/bucket SIRA objective from §5 is not added to the
   production training objective.  The active port currently regularizes only
   the terminal CHIRON phase state `(p_L, q_L)`.
-- Persistent phase diagnostics, probe-layer schedule, and position-bucket
-  instrumentation do not exist yet for SIRA.
+- Persistent full-trajectory storage and active trajectory/bucket SIRA loss do
+  not exist yet for SIRA.  The implemented SIRA shadow path is sparse,
+  log-cadenced, detached instrumentation rather than a production objective.
 - PHS logging currently observes the terminal state only and uses `p_L` as a
   detached terminal shear proxy because the trainer does not yet retain
   per-layer shear buffers for logging.  A 3-seed 2000-step grouping ablation
   selected batch-quantile target-token groups as the diagnostic default because
   it removes raw-ID count skew without measurable loss/throughput impact; see
   `research/PHS_GROUPING_3SEED_ABLATION_2026_05_27.md`.
-- `--sira-probe-layers`, `--sira-position-buckets`, active PHS
-  controller/curriculum weighting, token/sample weighting, and an active PTOC
-  loss remain research proposals in this document, not runnable production
-  features.  PTOC is currently runnable only as detached shadow diagnostics.
+- Active PHS controller/curriculum weighting, token/sample weighting, and an
+  active PTOC loss remain research proposals in this document, not runnable
+  production features.  PTOC is currently runnable only as detached shadow
+  diagnostics.  SIRA probe-layer and position-bucket flags are now runnable for
+  detached shadow diagnostics only; they do not enable the full SIRA objective.
 - No 1B SIRA pilot has been run, and there is no NLL/throughput result to
   compare against `chiron_1B_T16384_regstack_phase2.final`.
 

@@ -280,6 +280,17 @@ struct TransformerRunConfig
 	float siraHuberTau;
 	int siraWarmupSteps;
 
+	// SIRA shadow trajectory diagnostics.  This is the default-off Phase-0
+	// instrumentation path from the 2026-05-24 plan: callers may log detached
+	// layer/position-bucket phase trajectory terms without adding a loss,
+	// sample/token weighting, RNG, or hidden-state gradients.  If
+	// siraProbeLayers is empty, trainer callers may choose an architecture-aware
+	// default schedule such as 0,4,8,12,16,20,last.
+	bool siraShadowDiagnostics;
+	int siraLogEverySteps;
+	int siraPositionBuckets;
+	std::vector<int> siraProbeLayers;
+
 	// PHS (Phase-Homeostatic Servo) shadow diagnostics.  This is the default-off
 	// logging-only precursor to the future PHS curriculum/controller: callers may
 	// reduce detached CHIRON phase statistics by data group and position bucket,
@@ -349,6 +360,10 @@ struct TransformerRunConfig
 	      siraActionWeight(0.5f),
 	      siraHuberTau(0.2f),
 	      siraWarmupSteps(1000),
+	      siraShadowDiagnostics(false),
+	      siraLogEverySteps(0),
+	      siraPositionBuckets(8),
+	      siraProbeLayers(),
 	      phsShadowDiagnostics(false),
 	      phsDataGroups(1),
 	      phsPositionBuckets(8),

@@ -60,6 +60,17 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 		return invalid_argument(where, "siraHuberTau must be > 0");
 	if (runtimeCfg.siraWarmupSteps < 0)
 		return invalid_argument(where, "siraWarmupSteps must be >= 0");
+	if (runtimeCfg.siraLogEverySteps < 0)
+		return invalid_argument(where, "siraLogEverySteps must be >= 0");
+	if (runtimeCfg.siraShadowDiagnostics && runtimeCfg.siraLogEverySteps <= 0)
+		return invalid_argument(where, "siraLogEverySteps must be > 0 when SIRA diagnostics are enabled");
+	if (runtimeCfg.siraPositionBuckets <= 0)
+		return invalid_argument(where, "siraPositionBuckets must be > 0");
+	for (size_t i = 0; i < runtimeCfg.siraProbeLayers.size(); ++i)
+	{
+		if (runtimeCfg.siraProbeLayers[i] < 0)
+			return invalid_argument(where, "siraProbeLayers entries must be >= 0");
+	}
 
 	if (runtimeCfg.phsDataGroups <= 0)
 		return invalid_argument(where, "phsDataGroups must be > 0");
