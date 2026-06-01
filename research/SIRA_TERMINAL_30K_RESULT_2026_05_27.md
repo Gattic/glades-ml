@@ -161,6 +161,99 @@ it did not isolate a stable root cause.
 
 ---
 
+## Staged FP8 retry after Phase-0 shadow diagnostics (2026-06-01)
+
+After adding default-off SIRA Phase-0 trajectory diagnostics and restoring FP8
+readout headroom, the original terminal-only energy+balance SIRA recipe was
+retried as a **staged active-loss pilot**, still default-off and not a flagship
+promotion:
+
+```text
+--sira-coef 1e-2
+--sira-energy-weight 1.0
+--sira-balance-weight 0.25
+--sira-action-weight 0.0
+--sira-warmup 1000
+--lr 7.5e-5
+--grad-clip 0.5
+--fp8-readout-fwd
+```
+
+Artifacts in `/home/robert/dev/glades-trainer`:
+
+- 2k paired baseline vs active SIRA:
+  `logs/fp8_sira_active_energy_balance_2000step_20260601_170226/`
+- 5k active SIRA compared against the same-binary 5k baseline from
+  `logs/fp8_sira_shadow_nll_baseline_compare_5000step_20260601_161016/baseline.log`:
+  `logs/fp8_sira_active_energy_balance_5000step_20260601_174332/`
+
+### 2k gate
+
+The 2k active run completed with no OOM, FP8 fallback/rejection, NaN/Inf,
+grad-skip, forward/backward, or stability failures.  VRAM was unchanged at
+`14.55 / 15.56 GB`.
+
+| mode | val NLL | bpb | ppl | bad lines |
+|---|---:|---:|---:|---:|
+| baseline | 4.9532 | 1.7865 | 141.62 | 0 |
+| active SIRA E+B | 4.9478 | 1.7845 | 140.87 | 0 |
+
+Delta active minus baseline: `NLL -0.0054`, `BPB -0.0020`, `PPL -0.75`.
+The baseline run used `--log-every 100` and its last train log was step 1901,
+so train-loss deltas from this artifact should not be used for attribution.
+
+Active SIRA telemetry at step 2000:
+
+```text
+sira_loss=0.013030678
+ratio=0.00283
+raw=1.30307
+terms(E/B/A)=1.15212/0.150947/0
+term_grad_rms(q/p)=1.313e-11/4.817e-12
+```
+
+### 5k gate
+
+The 5k active run completed cleanly and compared to the fresh same-binary 5k
+baseline used for the SIRA-shadow attribution gate.
+
+| mode | VRAM | step5000 loss | val NLL | warm tok/s | bad lines |
+|---|---:|---:|---:|---:|---:|
+| baseline | 14.55 / 15.56 GB | 3.8686 | 3.9619 | 28028.8 | 0 |
+| active SIRA E+B | 14.55 / 15.56 GB | 3.8807 | 3.9590 | 27957.8 | 0 |
+
+Delta active minus baseline:
+
+```text
+VRAM:            +0.00 GB
+train loss:      +0.0121  (includes active SIRA loss)
+val NLL:         -0.0029
+warm tok/s mean: -71.0 tok/s (-0.25%)
+wall time:       +7.0 s over 5k steps
+```
+
+Final validation position-bucket deltas were `[0/0/0/-0.01/0/0/0/0]` at log
+precision.  Active SIRA diagnostics remained bounded:
+
+```text
+sira_loss max:      0.0153599344
+sira_ratio max:     0.00377
+step5000 loss:      0.0138957696
+step5000 ratio:     0.00359
+step5000 raw:       1.38958
+terms(E/B/A):       1.23415/0.155427/0
+term_grad_rms(q/p): 1.172e-11/3.924e-12
+```
+
+Interpretation: the LR-stabilized FP8 2k/5k active SIRA gates are clean and the
+small validation deltas are favorable, but they are short-run and do not address
+the prior seed-4242 instability window near 15k.  Keep SIRA default-off.  The
+next active-loss evidence gate, if pursued, should be a staged 10k/15.6k seed
+4242 run at the same LR/clip with the bad-gradient guard and SIRA diagnostics;
+do not jump directly to default enablement.
+
+---
+
 ## Flagship recommendation
 
 Keep flagship defaults unchanged:
