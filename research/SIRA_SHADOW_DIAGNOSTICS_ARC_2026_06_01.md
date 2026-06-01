@@ -24,9 +24,10 @@ scripts/sira_log_report.py logs/fp8_sira_shadow_2000step_20260601_091430/sira_sh
 ```
 
 The trainer logs selected layer/position-bucket `rms(p)`, `rms(q)`,
-`rms(shear)`, normalized energy, p/q balance, and action proxy.  CUDA graph
-capture is disabled when the shadow path is active because it performs detached
-host reductions at log cadence.
+`rms(shear)`, normalized energy, p/q balance, and action proxy.  When BF16
+logit storage is active, it also emits a step-level position-bucket NLL proxy
+from the current probabilities.  CUDA graph capture is disabled when the shadow
+path is active because it performs detached host reductions at log cadence.
 
 ## Verification
 
@@ -41,6 +42,7 @@ cmake --install build
 cd /home/robert/dev/glades-trainer
 bash build.sh
 scripts/sira_shadow_smoke.sh
+# includes BF16-storage pos-NLL proxy assertion: nll_proxy=bf16-position-bucket
 scripts/sira_config_smoke.sh
 scripts/sira_training_loss_smoke.sh
 scripts/phs_shadow_smoke.sh
@@ -68,6 +70,45 @@ Summary:
 
 The final step coincides with SIRA shadow logging and reports a low instantaneous
 `tok/s=9291`; median warm throughput remains near baseline.
+
+## FP8 500-step pos-NLL proxy gate
+
+After the initial SIRA shadow implementation, the shadow path was extended to
+emit a BF16-storage step-level position-bucket NLL proxy alongside the per-layer
+phase metrics.
+
+Artifact:
+
+```text
+/home/robert/dev/glades-trainer/logs/fp8_sira_shadow_nll_500step_20260601_134311/
+```
+
+Summary:
+
+| mode | VRAM | step500 loss | val NLL | warm tok/s | non-diagnostic warm tok/s | bad lines |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 14.49 / 15.56 GB | 7.7079 | 7.6851 | 28077.9 | 28077.7 | 0 |
+| SIRA shadow + pos-NLL | 14.49 / 15.56 GB | 7.7075 | 7.6849 | 27843.7 | 28052.8 | 0 |
+
+Delta SIRA-shadow minus baseline:
+
+```text
+VRAM:                      +0.00 GB
+train loss:                -0.0004
+val NLL:                   -0.0002
+warm tok/s mean:           -234.2 tok/s (-0.83%)
+warm non-diagnostic tok/s:  -24.9 tok/s (-0.09%)
+```
+
+SIRA emitted 35 layer rows plus 5 position-NLL proxy rows.  Final proxy:
+
+```text
+step500 pos_nll=[7.716/7.589/7.722/7.669/7.745/7.630/7.727/7.786]
+mean=7.6980 max=7.7860 source=bf16-position-bucket
+```
+
+Regression flags: none.  The additional NLL proxy is log-cadenced, detached,
+and has no measurable VRAM effect.
 
 ## FP8 2k gate
 

@@ -38,9 +38,10 @@ Implemented and verified so far:
   `--sira-probe-layers`, `--sira-position-buckets`).  The trainer captures
   selected layer states at logging cadence, reduces detached position-bucket
   `rms(p)`, `rms(q)`, `rms(shear)`, normalized energy, p/q balance, and action
-  proxy, and logs `loss=none gradients=none`.  CUDA graph capture is disabled
-  when this host-reduction path is active.  `scripts/sira_log_report.py`
-  summarizes SIRA shadow logs.
+  proxy, plus a step-level BF16-storage position-bucket NLL proxy when available,
+  and logs `loss=none gradients=none`.  CUDA graph capture is disabled when this
+  host-reduction path is active.  `scripts/sira_log_report.py` summarizes SIRA
+  shadow logs.
 - `glades-trainer` now has default-off PHS terminal shadow logging via
   `--phs-shadow-diagnostics --phs-log-every N`, with batch-quantile target-token
   groups by default (`--phs-group-mode id` preserves the legacy raw-ID bins),
