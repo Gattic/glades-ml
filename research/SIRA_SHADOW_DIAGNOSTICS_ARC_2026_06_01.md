@@ -110,6 +110,41 @@ mean=7.6980 max=7.7860 source=bf16-position-bucket
 Regression flags: none.  The additional NLL proxy is log-cadenced, detached,
 and has no measurable VRAM effect.
 
+## FP8 2k pos-NLL follow-up
+
+Artifact:
+
+```text
+/home/robert/dev/glades-trainer/logs/fp8_sira_shadow_nll_2000step_20260601_135541/
+```
+
+SIRA-shadow-only follow-up after the pos-NLL proxy addition:
+
+```text
+steps:                       2000
+VRAM:                        14.55 / 15.56 GB
+train loss / EMA:            4.5998 / 4.8125
+val NLL / BPB / PPL:         4.9614 / 1.7895 / 142.80
+warm tok/s mean:             27851.3
+warm non-diagnostic tok/s:   28043.3
+bad/stability lines:         0
+SIRA layer rows:             140
+SIRA pos-NLL rows:           20
+regression flags:            none
+```
+
+Final SIRA position-NLL proxy:
+
+```text
+step2000 pos_nll=[4.455/4.567/4.556/4.314/4.666/4.747/4.754/4.645]
+mean=4.5880 max=4.7540 source=bf16-position-bucket
+```
+
+The 2k run was not paired with a fresh same-binary baseline, so treat the final
+validation value as a stability/checkpoint observation rather than an attribution
+claim.  It remains inside the prior 2k FP8 clean-run noise envelope and produced
+no OOM, fallback, NaN/Inf, grad-skip, forward/backward, or stability failures.
+
 ## FP8 2k gate
 
 Artifact:
