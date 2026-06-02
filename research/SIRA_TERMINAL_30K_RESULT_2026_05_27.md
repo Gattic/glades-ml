@@ -1,7 +1,7 @@
 # CHIRON-native terminal SIRA 30k result and flagship decision (2026-05-27)
 
-**Status:** HOLD / default-off. Do **not** include SIRA by default in the
-flagship yet.
+**Status:** CANDIDATE-DEFAULT EVIDENCE TRACK / default-off. Do **not** include
+SIRA by default in the flagship yet.
 
 **Candidate evaluated:** terminal-only CHIRON-native SIRA on final
 `(q_L, p_L)`:
@@ -350,37 +350,115 @@ loss-detail step15600: ce=3.642277 zloss=0.0124758212 sira=0.0142372129 total=3.
 
 Regression flags: none.
 
-Interpretation: the LR-stabilized FP8 2k/5k/10k/15.6k active SIRA gates are
-clean, including the previous seed-4242 instability window, and validation
-deltas remain mildly favorable.  SIRA still remains default-off: this is only a
-single-seed staged recovery of the known failure case, not a multi-seed 30k
-promotion.  The next evidence gate, if budget allows, is a fresh matched 30k
-seed-4242 run at the same LR/clip, followed by multi-seed confirmation before
-any default-enable discussion.
+### 30k seed-4242 candidate-default decision run
+
+Because SIRA is now under serious consideration for candidate default status,
+the most important single expensive run was the former failing seed `4242` at
+30k with the stabilized LR/clip/FP8 recipe.  This was run active-only and
+compared against historical 30k baselines and the earlier successful SIRA seeds;
+a fresh same-recipe 30k baseline remains a follow-up if exact attribution is
+needed.
+
+Artifact:
+
+```text
+logs/fp8_sira_active_energy_balance_30000step_seed4242_20260602_121325/
+```
+
+Run recipe:
+
+```text
+--lr 7.5e-5 --grad-clip 0.5 --seed 4242 --fp8-readout-fwd
+--sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25
+--sira-action-weight 0.0 --sira-warmup 1000
+```
+
+The run completed 30k with no OOM, FP8 fallback/rejection, NaN/Inf, grad-skip,
+forward/backward, or stability failures.  VRAM stayed `14.55 / 15.56 GB`.
+
+| run | final NLL | bpb | ppl | acc1 | acc5 | acc10 | warm tok/s | bad lines |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| active SIRA E+B seed4242 LR `7.5e-5` | 3.5235 | 1.2708 | 33.90 | 0.1408 | 0.5610 | 0.8442 | 27856.4 | 0 |
+
+Final position buckets:
+
+```text
+[3.41/3.48/3.61/3.46/3.46/3.63/3.57/3.56]
+```
+
+Historical comparisons, noting they are not all same-binary/same-LR matched:
+
+| Reference | final NLL | delta from new seed4242 SIRA |
+|---|---:|---:|
+| B5 30k baseline record | 3.5734 | -0.0499 |
+| prior seed4242 baseline 30k LR `1e-4` | 3.5929 | -0.0694 |
+| previous successful SIRA 30k mean | 3.5491 | -0.0256 |
+| previous successful SIRA 30k best | 3.5369 | -0.0134 |
+| previous successful SIRA 30k worst | 3.5591 | -0.0356 |
+
+Active SIRA diagnostics remained bounded globally and through the former failure
+window:
+
+```text
+sira_loss max:        0.0147738708
+sira_ratio max:       0.00404
+failure-window ratio: max 0.00369 over steps 14500..16000
+step30000 sira_loss:  0.0140414126
+step30000 ratio:      0.00390
+step30000 raw:        1.40414
+terms(E/B/A):         1.24409/0.160052/0
+term_grad_rms(q/p):   1.257e-11/3.828e-12
+loss-detail step30000: ce=3.58824182 zloss=0.0117069958 sira=0.0140414126 total=3.61399031
+```
+
+Regression flags: none.
+
+Interpretation: the LR-stabilized FP8 2k/5k/10k/15.6k/30k active SIRA gates are
+clean, including the previous seed-4242 instability window and a full 30k
+completion.  The new seed4242 30k result is stronger than the previous
+successful SIRA-seed mean and best historical run.  This justifies moving SIRA
+from “experimental hold” to a **candidate-default evidence track**, but not
+flipping the shipped default yet.  Before actual default enablement, run at
+least one more same-recipe 30k seed and preferably a matched same-recipe 30k
+baseline or multi-seed paired confirmation.
 
 ---
 
 ## Flagship recommendation
 
-Keep flagship defaults unchanged:
+Keep shipped flagship defaults unchanged for now:
 
 - `siraCoef = 0.0`
-- SIRA remains opt-in.
+- SIRA remains opt-in in production defaults.
 - Disabled mode must remain parity/bit-identical.
+
+However, the candidate default recipe is now evidence-backed enough to promote
+from experimental hold into a candidate-default track:
+
+```text
+--sira-coef 1e-2
+--sira-energy-weight 1.0
+--sira-balance-weight 0.25
+--sira-action-weight 0.0
+--sira-warmup 1000
+--lr 7.5e-5
+--grad-clip 0.5
+```
 
 Do not flip SIRA on by default until all of the following are true:
 
-1. Multi-seed 30k includes seed `4242` or an equally adversarial seed without
-   NaNs, non-finite gradients, or guard skips.
-2. The first-cause of the 4242 spike is understood or the mitigation is
-   principled and quality-neutral.
+1. A same-recipe multi-seed 30k gate includes seed `4242` or an equally
+   adversarial seed without NaNs, non-finite gradients, or guard skips.
+2. At least one same-recipe matched 30k baseline comparison confirms the NLL
+   benefit is not solely the LR/clip recipe.
 3. Final NLL clears either the single-run gate (`<= 3.5534`) or a
    pre-registered multi-seed criterion.
 4. Throughput remains `>= 26668 tok/s`.
 5. Position bucket 7 / long-context metrics do not regress.
 6. SIRA flags remain default-off and disabled parity remains verified.
 
-Short version: **SIRA is promising, but not flagship-default shippable yet.**
+Short version: **SIRA is now a serious candidate-default recipe, but not yet a
+shipped default.**
 
 ---
 
