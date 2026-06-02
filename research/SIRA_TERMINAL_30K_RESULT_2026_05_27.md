@@ -245,12 +245,64 @@ terms(E/B/A):       1.23415/0.155427/0
 term_grad_rms(q/p): 1.172e-11/3.924e-12
 ```
 
-Interpretation: the LR-stabilized FP8 2k/5k active SIRA gates are clean and the
-small validation deltas are favorable, but they are short-run and do not address
-the prior seed-4242 instability window near 15k.  Keep SIRA default-off.  The
-next active-loss evidence gate, if pursued, should be a staged 10k/15.6k seed
-4242 run at the same LR/clip with the bad-gradient guard and SIRA diagnostics;
-do not jump directly to default enablement.
+### 10k gate
+
+The next staged gate was run as a matched 10k baseline plus active SIRA pair.
+30k was not attempted in this pass because the matched 10k pair already consumed
+multi-hour GPU time and the prior failure window is still closer to a 15.6k gate
+than to default enablement.
+
+Artifact:
+
+```text
+logs/fp8_sira_active_energy_balance_10000step_20260601_200056/
+```
+
+Both runs completed 10k with no OOM, FP8 fallback/rejection, NaN/Inf, grad-skip,
+forward/backward, or stability failures.  VRAM stayed `14.55 / 15.56 GB`.
+
+| mode | final val NLL | 5k val NLL | warm tok/s | bad lines |
+|---|---:|---:|---:|---:|
+| baseline | 3.7220 | 3.9590 | 28024.4 | 0 |
+| active SIRA E+B | 3.7163 | 3.9541 | 27932.8 | 0 |
+
+Delta active minus baseline:
+
+```text
+VRAM:            +0.00 GB
+5k val NLL:      -0.0049
+10k val NLL:     -0.0057
+warm tok/s mean: -91.6 tok/s (-0.33%)
+wall time:       +18.9 s over 10k steps
+```
+
+Final validation position-bucket deltas were
+`[-0.01/-0.01/0/-0.01/-0.01/-0.01/0/-0.01]` at log precision.  The baseline's
+last train log was step 9901 while active SIRA's debug cadence logged step
+10000, so direct final train-loss deltas from this artifact are not used for
+quality attribution.
+
+Active SIRA diagnostics remained bounded:
+
+```text
+sira_loss max:       0.0170832649
+sira_ratio max:      0.00452
+step10000 sira_loss: 0.0131118475
+step10000 ratio:     0.00380
+step10000 raw:       1.31118
+terms(E/B/A):        1.16425/0.146939/0
+term_grad_rms(q/p):  1.173e-11/4.672e-12
+loss-detail step10000: ce=3.43945336 zloss=0.0131696695 sira=0.0131118475 total=3.46573496
+```
+
+Regression flags: none.
+
+Interpretation: the LR-stabilized FP8 2k/5k/10k active SIRA gates are clean and
+the validation deltas remain favorable, but they still do not reach the prior
+seed-4242 instability window near 15k.  Keep SIRA default-off.  The next
+active-loss evidence gate, if pursued, should be a staged 15.6k seed-4242 run at
+the same LR/clip with the bad-gradient guard and SIRA diagnostics; do not jump
+directly to 30k/default enablement.
 
 ---
 
