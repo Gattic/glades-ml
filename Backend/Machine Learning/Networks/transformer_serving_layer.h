@@ -61,6 +61,9 @@ public:
 
 	struct Config
 	{
+		static const unsigned int DEFAULT_MAX_PENDING_REQUESTS = 1024u;
+		static const unsigned int DEFAULT_MAX_COMPLETED_SNAPSHOTS = 1024u;
+
 		// Batcher capacity.
 		unsigned int maxBatchSize;
 		// Max KV cache length per request.
@@ -68,8 +71,14 @@ public:
 
 		// Queue/backpressure:
 		// - submit() fails if pending queue would exceed this.
-		// - 0 => unlimited (not recommended for production).
+		// - 0 => unlimited (explicit opt-in only; unsafe for exposed serving).
 		unsigned int maxPendingRequests;
+
+		// Retention cap for completed request snapshots/callback handles.
+		// - Oldest completed snapshots are evicted after completion when this cap is exceeded.
+		// - Pending/live snapshots are never evicted.
+		// - 0 => unlimited (explicit opt-in only; unsafe for exposed serving).
+		unsigned int maxCompletedSnapshots;
 
 		// Security/hygiene: wipe KV prefix when removing a slot.
 		bool wipeKvOnRemove;
@@ -78,7 +87,7 @@ public:
 		uint64_t rngSeed;
 
 		// If true, finished requests are removed from the batcher immediately.
-		// Their final results remain available via snapshots until explicitly cleared.
+		// Their final results remain available via snapshots until explicitly cleared or pruned.
 		bool autoRemoveFinished;
 
 		// Structured logs (best-effort) using net.getLogger().
@@ -87,8 +96,9 @@ public:
 		Config()
 		    : maxBatchSize(0u),
 		      maxSeqLen(0u),
-		      maxPendingRequests(0u),
-		      wipeKvOnRemove(false),
+		      maxPendingRequests(DEFAULT_MAX_PENDING_REQUESTS),
+		      maxCompletedSnapshots(DEFAULT_MAX_COMPLETED_SNAPSHOTS),
+		      wipeKvOnRemove(true),
 		      rngSeed(0ULL),
 		      autoRemoveFinished(true),
 		      enableLogs(true)
@@ -140,6 +150,7 @@ public:
 		unsigned int maxBatchSize;
 		unsigned int maxSeqLen;
 		unsigned int maxPendingRequests;
+		unsigned int maxCompletedSnapshots;
 		unsigned int pendingRequests;
 		unsigned int activeRequests;
 		unsigned int doneSnapshots;
@@ -175,6 +186,7 @@ public:
 		uint64_t totalCallbackExceptions;
 		uint64_t totalReentrantStepRejected;
 		uint64_t totalSnapshotClears;
+		uint64_t totalSnapshotEvictions;
 		uint64_t totalQueueWaitUs;
 		uint64_t totalServiceTimeUs;
 		uint64_t totalEndToEndTimeUs;
@@ -209,6 +221,7 @@ public:
 		      maxBatchSize(0u),
 		      maxSeqLen(0u),
 		      maxPendingRequests(0u),
+		      maxCompletedSnapshots(0u),
 		      pendingRequests(0u),
 		      activeRequests(0u),
 		      doneSnapshots(0u),
@@ -244,6 +257,7 @@ public:
 		      totalCallbackExceptions(0ULL),
 		      totalReentrantStepRejected(0ULL),
 		      totalSnapshotClears(0ULL),
+		      totalSnapshotEvictions(0ULL),
 		      totalQueueWaitUs(0ULL),
 		      totalServiceTimeUs(0ULL),
 		      totalEndToEndTimeUs(0ULL),
@@ -495,6 +509,7 @@ private:
 	void updatePeakDepths_();
 	void noteStepDuration_(uint64_t stepStartUs);
 	void finalizeRequestMetrics_(uint64_t requestId, RequestSnapshot& snap);
+	void pruneCompletedSnapshots_();
 	void fillDurationPercentiles_(const DurationWindow& window,
 	                             uint64_t& outP50,
 	                             uint64_t& outP99,

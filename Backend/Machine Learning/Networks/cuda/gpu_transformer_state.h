@@ -208,6 +208,14 @@ struct GpuTransformerWeights
 	GpuBuffer<float> gLnFinalGamma;
 	GpuBuffer<float> gLnFinalBeta;
 
+	// MTP auxiliary head projection: [dModel, dModel]
+	// Allocated only when mtpDepth > 0 (checked by !Wmtp.empty() at use sites).
+	// Wmtp is FP32 only — no BF16 mirror needed (it is small: dModel^2 = 4 MB
+	// at d=1024, 16 MB at d=2048).  gWmtp accumulates on GPU during backward
+	// and is D2H copied to host for the CPU Adam optimizer at each optimizer step.
+	GpuBuffer<float> Wmtp;   // [dModel, dModel]
+	GpuBuffer<float> gWmtp;  // [dModel, dModel] gradient accumulator
+
 	// Per-layer block weights.
 	struct Block
 	{
@@ -530,6 +538,7 @@ struct GpuTransformerScratch
 	GpuBuffer<float> lnFinalInvStd; // [T]
 	GpuBuffer<float> logits;     // [T, outSize]
 	GpuBuffer<float> probs;      // [T, outSize]
+	GpuBuffer<float> logZ;       // [T]  logsumexp per position for Z-loss backward
 
 	// Backward scratch
 	GpuBuffer<float> dLogits;    // [T, outSize]
@@ -551,6 +560,15 @@ struct GpuTransformerScratch
 	// Token IDs (for embedding gather/scatter)
 	GpuBuffer<int> tokenIds;     // [T]
 
+	// MTP auxiliary head scratch (allocated only when mtpDepth > 0 at
+	// ensureTransformerScratch time — checked by !hMtp.empty() at use sites).
+	GpuBuffer<float> hMtp;        // [T, dModel]   hMtp = hPostFinalLN @ Wmtp^T
+	GpuBuffer<float> logitsMtp;   // [T, vocabSize] logitsMtp = hMtp @ tokE^T
+	GpuBuffer<float> probsMtp;    // [T, vocabSize] after softmax
+	GpuBuffer<float> dLogitsMtp;  // [T, vocabSize] CE backward output
+	GpuBuffer<float> dHmtp;       // [T, dModel]   dHmtp = dLogitsMtp @ tokE
+	GpuBuffer<int>   gpuTargetsMtp; // [T]          MTP +2 offset targets
+
 	// Persistent buffers to avoid per-step allocations
 	GpuBuffer<float> gpuInvFreq; // [dHead/2]  (RoPE inverse frequencies)
 	GpuBuffer<int> gpuTargetsT;  // [T]        (target token IDs for loss/backward)
@@ -569,6 +587,16 @@ struct GpuTransformerScratch
 	GpuBuffer<uint16_t> qLowp;
 	GpuBuffer<uint16_t> kLowp;
 	GpuBuffer<uint16_t> vLowp;
+
+	// QK-Norm GPU scratch (Task 2.5).  Allocated lazily on first forward
+	// pass when qknormGamma is non-empty.  Sized to [nLayers, T, ...].
+	// qknormGammaScale: [nHeads] — per-step γ·sqrt(dHead) upload scratch.
+	GpuBuffer<float> qInvNorm;       // [nLayers, T, nHeads]
+	GpuBuffer<float> kInvNorm;       // [nLayers, T, nKVHeads]  (nKVHeads = nHeads in MHA)
+	GpuBuffer<float> qNorm;          // [nLayers, T, nHeads*dHead] post-norm Q copy
+	GpuBuffer<float> kNorm;          // [nLayers, T, nKVHeads*dHead] post-norm K copy
+	GpuBuffer<float> qknormGammaScale; // [nHeads] γ·sqrt(dHead) per head
+	GpuBuffer<float> qknormDGammaTmp; // [nHeads] per-layer dγ scratch for backward
 
 	// Full attention scores matrix [nHeads, T, T] used by the
 	// cuBLAS-tiled flash_attention path (research/WMMA_ATTENTION_PLAN.md).

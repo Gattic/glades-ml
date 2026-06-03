@@ -255,6 +255,7 @@ NNetworkStatus TransformerServingLayer::start(const NNetwork& net, const Config&
 	diagnostics_.maxBatchSize = cfg_.maxBatchSize;
 	diagnostics_.maxSeqLen = cfg_.maxSeqLen;
 	diagnostics_.maxPendingRequests = cfg_.maxPendingRequests;
+	diagnostics_.maxCompletedSnapshots = cfg_.maxCompletedSnapshots;
 	diagnostics_.nextRequestId = nextId_;
 	diagnostics_.startTimeUs = now_micros();
 	requestLatencySamples_.clear();
@@ -371,6 +372,7 @@ bool TransformerServingLayer::cancel(uint64_t requestId)
 			completedCallbacks_[requestId] = q->cb;
 			pending_.erase(q);
 			diagnostics_.totalPendingCancels += 1ULL;
+			pruneCompletedSnapshots_();
 			logEvent("transformer_serving_cancel", shmea::GLogger::LOG_DEBUG, requestId, "cancelled_pending");
 			return true;
 		}
@@ -454,6 +456,7 @@ bool TransformerServingLayer::getDiagnostics(Diagnostics& out) const
 	out.maxBatchSize = cfg_.maxBatchSize;
 	out.maxSeqLen = cfg_.maxSeqLen;
 	out.maxPendingRequests = cfg_.maxPendingRequests;
+	out.maxCompletedSnapshots = cfg_.maxCompletedSnapshots;
 	out.pendingRequests = static_cast<unsigned int>(pending_.size());
 	out.activeRequests = countActiveSlots_();
 	out.doneSnapshots = countDoneSnapshots_();
@@ -530,6 +533,8 @@ void TransformerServingLayer::logEvent(const char* event,
 	append_logfmt_kv(oss, "active_requests", countActiveSlots_());
 	append_logfmt_kv(oss, "done_snapshots", countDoneSnapshots_());
 	append_logfmt_kv(oss, "snapshot_count", static_cast<unsigned int>(snapshots_.size()));
+	append_logfmt_kv(oss, "max_completed_snapshots", cfg_.maxCompletedSnapshots);
+	append_logfmt_kv(oss, "snapshot_evictions", static_cast<unsigned long long>(diagnostics_.totalSnapshotEvictions));
 	append_logfmt_kv(oss, "peak_pending_requests", diagnostics_.peakPendingRequests);
 	append_logfmt_kv(oss, "peak_active_requests", diagnostics_.peakActiveRequests);
 	append_logfmt_kv(oss, "completed_requests", static_cast<unsigned long long>(diagnostics_.totalCompleted));
@@ -712,6 +717,30 @@ void TransformerServingLayer::finalizeRequestMetrics_(uint64_t requestId, Reques
 	updatePeakDepths_();
 
 	(void)requestId;
+}
+
+void TransformerServingLayer::pruneCompletedSnapshots_()
+{
+	if (cfg_.maxCompletedSnapshots == 0u)
+		return;
+
+	while (countDoneSnapshots_() > cfg_.maxCompletedSnapshots)
+	{
+		bool erased = false;
+		for (std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.begin(); it != snapshots_.end(); ++it)
+		{
+			if (!it->second.done)
+				continue;
+			const uint64_t id = it->first;
+			completedCallbacks_.erase(id);
+			snapshots_.erase(it);
+			diagnostics_.totalSnapshotEvictions += 1ULL;
+			erased = true;
+			break;
+		}
+		if (!erased)
+			break;
+	}
 }
 
 void TransformerServingLayer::logRequestDone_(uint64_t requestId,
@@ -916,6 +945,7 @@ void TransformerServingLayer::admitPending_()
 		Pending& p = pending_.front();
 		const uint64_t requestId = p.id;
 		CallbackHandle cb = p.cb;
+		const unsigned long long promptTokenCount = static_cast<unsigned long long>(p.req.promptTokens.size());
 
 		unsigned int outSlot = 0u;
 		const NNetworkStatus st = TransformerPublicAPI::serving(*net_).submit(batcher_, p.req, outSlot);
@@ -932,6 +962,7 @@ void TransformerServingLayer::admitPending_()
 			diagnostics_.totalAdmitFailures += 1ULL;
 			noteFailure_(requestId, outSlot, st);
 			logEvent("transformer_serving_submit_fail", shmea::GLogger::LOG_WARNING, requestId, st.message.c_str(), &st, outSlot);
+			pruneCompletedSnapshots_();
 			pending_.pop_front();
 			continue;
 		}
@@ -955,7 +986,7 @@ void TransformerServingLayer::admitPending_()
 		}
 
 		diagnostics_.totalAdmitted += 1ULL;
-		diagnostics_.totalPromptTokensAdmitted += static_cast<unsigned long long>(p.req.promptTokens.size());
+		diagnostics_.totalPromptTokensAdmitted += promptTokenCount;
 		updatePeakDepths_();
 		logEvent("transformer_serving_admit", shmea::GLogger::LOG_DEBUG, requestId, "admitted", NULL, outSlot);
 	}
@@ -1020,6 +1051,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 		else
 			logEvent("transformer_serving_request_done", shmea::GLogger::LOG_DEBUG, id, "done", &finalStatus, s);
 		completedCallbacks_[id] = live_[s].cb;
+		pruneCompletedSnapshots_();
 
 		clearLiveSlot_(s);
 
@@ -1162,6 +1194,7 @@ NNetworkStatus TransformerServingLayer::step()
 	lock.lock();
 
 	applyTokenCallbackStops_(stopIds, tokenExceptionIds);
+	pruneCompletedSnapshots_();
 	inStep_ = false;
 	updatePeakDepths_();
 
@@ -1212,6 +1245,8 @@ void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const NNetwor
 	}
 	if (clearSnapshots)
 		snapshots_.clear();
+	if (!clearSnapshots)
+		pruneCompletedSnapshots_();
 	net_ = NULL;
 	diagnostics_.running = false;
 	diagnostics_.stopRequested = false;

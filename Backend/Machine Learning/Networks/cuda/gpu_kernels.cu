@@ -634,6 +634,55 @@ __global__ void softmax_stable_rows(const float* __restrict__ x,
 		oRow[i] *= invSum;
 }
 
+// softmax_stable_rows_with_lse: same as softmax_stable_rows but also writes
+// logZ[row] = log(sum_i exp(x[row,i])) = rowMax + log(rowSum).
+// Used by the Z-loss path so the backward can add 2*zlossCoef*logZ[t] to the
+// CE gradient without re-reading logits.
+__global__ void softmax_stable_rows_with_lse(const float* __restrict__ x,
+                                              int cols,
+                                              float* __restrict__ out,
+                                              float* __restrict__ logZ)
+{
+	int row = blockIdx.x;
+	const float* xRow = x + (size_t)row * cols;
+	float* oRow       = out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	// Pass 1: row max.
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, xRow[i]);
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	// Pass 2: sum of exp(x - max).
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float e = expf(xRow[i] - rowMax);
+		oRow[i] = e;
+		localSum += e;
+	}
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	// Pass 3: normalize and write logZ.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] *= invSum;
+	if (threadIdx.x == 0)
+		logZ[row] = rowMax + logf(sRowSum);
+}
+
 } // anonymous namespace
 
 bool softmax_forward(const float* x, int rows, int cols, float* out)
@@ -642,6 +691,19 @@ bool softmax_forward(const float* x, int rows, int cols, float* out)
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
 	softmax_stable_rows<<<rows, block, smemBytes, computeStream()>>>(x, cols, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// softmax_forward_with_lse: identical to softmax_forward but also writes
+// logZ[rows] = log-sum-exp per row.  Required by the Z-loss backward path.
+bool softmax_forward_with_lse(const float* x, int rows, int cols,
+                               float* out, float* logZ)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows_with_lse<<<rows, block, smemBytes, computeStream()>>>(x, cols, out, logZ);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -677,6 +739,55 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	softmax_cross_entropy_backward<<<rows, block, 0, computeStream()>>>(probs, targets, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  6a. Z-loss-aware variant of softmax cross-entropy backward
+// ===========================================================================
+//
+// Adds (2 * zlossCoef * logZ[row]) * probs[row, i] to the standard
+// softmax-CE gradient per element. At zlossCoef == 0.0f the kernel
+// produces bit-identical output to softmax_cross_entropy_backward
+// (the multiply is short-circuited).
+
+namespace {
+
+__global__ void softmax_cross_entropy_backward_zloss(const float* __restrict__ probs,
+                                                     const int* __restrict__ targets,
+                                                     const float* __restrict__ logZ,
+                                                     float zlossCoef,
+                                                     int cols,
+                                                     float* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const float* pRow = probs   + (size_t)row * cols;
+	float* dRow       = dlogits + (size_t)row * cols;
+	const float zScale = (zlossCoef == 0.0f)
+	                       ? 0.0f
+	                       : (2.0f * zlossCoef * logZ[row]);
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = pRow[i];
+		float g = (i == target) ? (p - 1.0f) : p;
+		if (zScale != 0.0f) g += zScale * p;
+		dRow[i] = g;
+	}
+}
+
+} // anonymous namespace
+
+bool softmax_cross_entropy_bwd_zloss(const float* probs, const int* targets,
+                                     const float* logZ, float zlossCoef,
+                                     int rows, int cols, float* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_zloss<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, cols, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1244,6 +1355,28 @@ bool add_two(float* out, const float* a, const float* b, int n)
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	add_two_kernel<<<grid, kBlockElem, 0, computeStream()>>>(a, b, n, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+// add_two_scaled: out[i] = a[i] + beta * b[i]
+__global__ void add_two_scaled_kernel(float* __restrict__ out,
+                                      const float* __restrict__ a,
+                                      const float* __restrict__ b,
+                                      float beta, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] = a[idx] + beta * b[idx];
+}
+} // anonymous namespace
+
+bool add_two_scaled(float* out, const float* a, const float* b, float beta, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	add_two_scaled_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, a, b, beta, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -3316,6 +3449,78 @@ __global__ void softmax_cross_entropy_backward_bf16(
 	}
 }
 
+// BF16-storage variant of softmax_stable_rows_with_lse.  Same 3-pass softmax
+// as softmax_stable_rows_bf16, plus a per-row logZ FP32 write
+// logZ[row] = rowMax + log(rowSum).  Required by the Z-loss path on the
+// --bf16-logits-storage trainer recipe.
+__global__ void softmax_stable_rows_bf16_with_lse(
+    const unsigned short* __restrict__ xb,
+    int cols,
+    unsigned short* __restrict__ ob,
+    float* __restrict__ logZ)
+{
+	int row = blockIdx.x;
+	const unsigned short* xRow = xb + (size_t)row * cols;
+	unsigned short*       oRow = ob + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, bf16_load(xRow[i]));
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localSum += expf(bf16_load(xRow[i]) - rowMax);
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = bf16_store(expf(bf16_load(xRow[i]) - rowMax) * invSum);
+	if (threadIdx.x == 0)
+		logZ[row] = rowMax + logf(sRowSum);
+}
+
+// BF16-storage Z-loss CE backward: dlogits[t, v] = (probs[t, v] - 1_{v==target})
+// + 2·zlossCoef·logZ[t]·probs[t, v]
+// Matches softmax_cross_entropy_backward_zloss but reads BF16 probs and writes
+// BF16 dlogits.  Required by the Z-loss backward on --bf16-logits-storage.
+__global__ void softmax_cross_entropy_backward_bf16_zloss(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    const float* __restrict__ logZ,
+    float zlossCoef,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float lz = logZ[row];
+	const float zterm = 2.0f * zlossCoef * lz;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = bf16_load(pRow[i]);
+		float v = (i == target) ? (p - 1.0f) : p;
+		v += zterm * p;
+		dRow[i] = bf16_store(v);
+	}
+}
+
 __global__ void scale_array_bf16_kernel(unsigned short* __restrict__ x,
                                          float scale, int n)
 {
@@ -3475,6 +3680,33 @@ bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
 	return true;
 }
 
+bool softmax_forward_bf16_with_lse(const unsigned short* x, int rows, int cols,
+                                    unsigned short* out, float* logZ)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows_bf16_with_lse<<<rows, block, smemBytes, computeStream()>>>(
+	    x, cols, out, logZ);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
+                                           const int* targets,
+                                           const float* logZ,
+                                           float zlossCoef,
+                                           int rows, int cols,
+                                           unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_bf16_zloss<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool scale_array_bf16(unsigned short* x, float scale, int n)
 {
 	if (n <= 0) return true;
@@ -3490,8 +3722,8 @@ bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   float* loss_sum, int* valid_count)
 {
 	if (T <= 0 || vocabSize <= 0) return true;
-	GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
-	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
 	int block = 256;
 	int grid = 1;
 	if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
@@ -3508,8 +3740,8 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
                                 int* correct_count, int* valid_count)
 {
 	if (T <= 0 || vocabSize <= 0) return true;
-	GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
-	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
 	// Iter 56/60: warp-parallel argmax (1 warp per row).  Block = 1024 threads
 	// = 32 warps = 32 rows per block.  Replaces the legacy 1-thread-per-row
 	// V-loop pattern.
@@ -9009,6 +9241,252 @@ bool scfa_dct_basis_init(float* B_flat, int T, int k)
 	dim3 grid((k + block - 1) / block, T);
 	scfa_dct_basis_init_kernel<<<grid, block, 0, computeStream()>>>(
 	    B_flat, T, k);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// =========================================================================
+// QK-Norm: per-token, per-head L2 normalization.
+//
+// Used by attention to L2-normalize Q and K rows before the dot product,
+// replacing the fixed 1/sqrt(dHead) scale with a learnable per-head γ
+// (multiplied externally — this kernel only does the unit normalization).
+//
+// At the call site (Task 2.5), Q is normalized first, then pre-multiplied
+// by γ·sqrt(dHead) so the attention kernel's existing 1/sqrt(dHead) scale
+// recovers γ * (Q_norm · K_norm).
+//
+// Reduction: warp-shuffle for the ||x||² sum, then shared-mem combine
+// across warps. Deterministic within a warp (matches existing LayerNorm
+// reduction pattern).
+// =========================================================================
+
+__global__ void qknorm_forward_kernel(float* __restrict__ x,
+                                      float* __restrict__ invNorm,
+                                      int nHeads, int dHead, float eps)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float* row = x + ((size_t)t * nHeads + h) * dHead;
+
+	float local = 0.0f;
+	for (int i = tid; i < dHead; i += block) local += row[i] * row[i];
+
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) warpSums[0] = s;
+	}
+	__syncthreads();
+
+	const float ss = warpSums[0];
+	const float invN = rsqrtf(ss + eps);
+
+	if (tid == 0) invNorm[(size_t)t * nHeads + h] = invN;
+
+	for (int i = tid; i < dHead; i += block) row[i] *= invN;
+}
+
+bool qknorm_forward_gpu(float* x, float* invNorm,
+                        int T, int nHeads, int dHead, float eps)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	qknorm_forward_kernel<<<grid, block, 0, computeStream()>>>(
+	    x, invNorm, nHeads, dHead, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// QK-Norm backward.
+// xNorm, dxNorm, dxOrig: (T, nHeads * dHead).
+// invNorm: (T, nHeads).
+// dx = invN * (dxNorm - (xNorm · dxNorm) * xNorm)
+__global__ void qknorm_backward_kernel(const float* __restrict__ xNorm,
+                                       const float* __restrict__ invNorm,
+                                       const float* __restrict__ dxNorm,
+                                       int nHeads, int dHead,
+                                       float* __restrict__ dxOrig)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	const size_t off = ((size_t)t * nHeads + h) * dHead;
+	const float* xn = xNorm + off;
+	const float* dn = dxNorm + off;
+	float* dox = dxOrig + off;
+
+	float local = 0.0f;
+	for (int i = tid; i < dHead; i += block) local += xn[i] * dn[i];
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) warpSums[0] = s;
+	}
+	__syncthreads();
+
+	const float xnDotDn = warpSums[0];
+	const float ni = invNorm[(size_t)t * nHeads + h];
+
+	for (int i = tid; i < dHead; i += block)
+		dox[i] = ni * (dn[i] - xnDotDn * xn[i]);
+}
+
+bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
+                         const float* dxNorm, int T, int nHeads, int dHead,
+                         float* dxOrig)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	qknorm_backward_kernel<<<grid, block, 0, computeStream()>>>(
+	    xNorm, invNorm, dxNorm, nHeads, dHead, dxOrig);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// scale_q_per_head: multiply each [t, h] row of Q by gammaScale[h].
+// Q layout: [T, nHeads, dHead] (row = Q + (t*nHeads + h)*dHead).
+__global__ void scale_q_per_head_kernel(float* __restrict__ Q,
+                                        const float* __restrict__ gammaScale,
+                                        int nHeads, int dHead)
+{
+	const int t = blockIdx.x;
+	const int h = blockIdx.y;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float* row = Q + ((size_t)t * nHeads + h) * dHead;
+	const float s = gammaScale[h];
+	for (int i = tid; i < dHead; i += block) row[i] *= s;
+}
+
+bool scale_q_per_head(float* Q, const float* gammaScale,
+                      int T, int nHeads, int dHead)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = (dHead < 256) ? dHead : 256;
+	dim3 grid(T, nHeads);
+	scale_q_per_head_kernel<<<grid, block, 0, computeStream()>>>(
+	    Q, gammaScale, nHeads, dHead);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// qknorm_gamma_grad: accumulate γ_h gradient from attention backward.
+// dγ_h = sqrt(dHead) · sum_{t,i} dQPost[t,h,i] · qNorm[t,h,i]
+// dQPost: [T, nHeads, dHead] — gradient at the post-γ-scale Q seen by attn.
+// qNorm:  [T, nHeads, dHead] — post-normalize Q (saved in forward).
+// dGamma: [nHeads] — output, one scalar per head.
+// One block per head; threads cooperatively reduce across (T * dHead) elements.
+// ---------------------------------------------------------------------------
+__global__ void qknorm_gamma_grad_kernel(const float* __restrict__ dQPost,
+                                         const float* __restrict__ qNorm,
+                                         float sqrtDh,
+                                         int T, int nHeads, int dHead,
+                                         float* __restrict__ dGamma)
+{
+	const int h = blockIdx.x;
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+	float local = 0.0f;
+
+	for (int t = 0; t < T; ++t)
+	{
+		const size_t off = ((size_t)t * nHeads + h) * dHead;
+		for (int i = tid; i < dHead; i += block)
+			local += dQPost[off + i] * qNorm[off + i];
+	}
+	local *= sqrtDh;
+
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		local += __shfl_down_sync(0xffffffff, local, offset);
+
+	__shared__ float warpSums[32];
+	int laneId = tid & (warpSize - 1);
+	int warpId = tid / warpSize;
+	if (laneId == 0) warpSums[warpId] = local;
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = (block + warpSize - 1) / warpSize;
+		float s = (laneId < numWarps) ? warpSums[laneId] : 0.0f;
+		for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+			s += __shfl_down_sync(0xffffffff, s, offset);
+		if (laneId == 0) dGamma[h] = s;
+	}
+}
+
+bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
+                       float sqrtDh, int T, int nHeads, int dHead,
+                       float* dGamma)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const int block = 256;
+	qknorm_gamma_grad_kernel<<<nHeads, block, 0, computeStream()>>>(
+	    dQPost, qNorm, sqrtDh, T, nHeads, dHead, dGamma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// qknorm_gamma_scale_gpu: compute gamma_scale[h] = gamma[h] * sqrtDh
+// on the GPU (cuda-graphs capture-safe).
+//
+// Replaces the prior CPU-host round-trip (download gamma, CPU multiply,
+// upload gamma_scale) that was a CUDA Graph capture blocker.  Called once
+// per layer per forward step; nH=16 on the flagship so this is trivially
+// cheap (one kernel launch covering 16 elements).
+// ---------------------------------------------------------------------------
+__global__ void qknorm_gamma_scale_kernel(const float* __restrict__ gamma,
+                                          float sqrtDh,
+                                          float* __restrict__ gamma_scale,
+                                          int nH)
+{
+	int h = blockIdx.x * blockDim.x + threadIdx.x;
+	if (h < nH)
+		gamma_scale[h] = gamma[h] * sqrtDh;
+}
+
+bool qknorm_gamma_scale_gpu(const float* gamma_d,
+                            float sqrtDh,
+                            float* gamma_scale_d,
+                            int nH)
+{
+	if (!gamma_d || !gamma_scale_d || nH <= 0) return false;
+	const int block = 32;
+	const int grid = (nH + block - 1) / block;
+	qknorm_gamma_scale_kernel<<<grid, block, 0, computeStream()>>>(
+	    gamma_d, sqrtDh, gamma_scale_d, nH);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

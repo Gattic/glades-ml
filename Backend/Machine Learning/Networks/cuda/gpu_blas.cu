@@ -6,17 +6,82 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <algorithm>
 #include "gpu_device.h"
+#include "gpu_kernels.h"
 
 namespace glades {
 namespace gpu {
 
 namespace {
 static cublasHandle_t g_handle = 0;
+// Two-handle dispatch design for CUDA Graphs compatibility:
+// g_handleStrict is always set to CUBLAS_DEFAULT_MATH (strict FP32).
+// g_handleTf32 is always set to CUBLAS_TF32_TENSOR_OP_MATH (when CC >= 8.0).
+// Per-call mathMode picks the appropriate handle WITHOUT toggling state.
+// This eliminates cublasSet/GetMathMode calls inside the hot path, which
+// are not capture-compatible (paradigm #51 ATLAS-COMPILE).
+static cublasHandle_t g_handleStrict = NULL;
+static cublasHandle_t g_handleTf32   = NULL;
 static bool g_initialized = false;
 // iter 180: when false, all wrappers below select CUBLAS_DEFAULT_MATH (no TF32).
 static bool g_tf32_enabled = true;
 static float* g_deviceOne = 0;
+
+// CUDA 13.2 mitigation (2026-05-21): cuBLAS 13.x heuristic for cublasGemmEx
+// with CUDA_R_32F inputs + CUBLAS_COMPUTE_32F_FAST_16BF dispatches to a
+// non-bf16-specialized s1688gemm kernel on Ada (sm_8.9), ~1.7-1.8x slower
+// than the s16816_bf16 fast path that CUDA 12.0 picks for the same call.
+// The FAST_16BF wrappers below now pre-cast FP32 inputs to BF16 in scratch
+// and call cublasGemmEx with CUDA_R_16BF inputs to force the fast path.
+// Math envelope unchanged (one BF16 round-trip before TC, same as before).
+static uint16_t* g_fast16bf_scratch_a = 0;
+static uint16_t* g_fast16bf_scratch_b = 0;
+static size_t    g_fast16bf_scratch_a_n = 0;
+static size_t    g_fast16bf_scratch_b_n = 0;
+
+static bool ensureFast16bfScratch(uint16_t** scratch, size_t* size_n, size_t needed_n)
+{
+	if (*size_n >= needed_n) return true;
+	if (*scratch) cudaFree(*scratch);
+	cudaError_t err = cudaMalloc(scratch, needed_n * sizeof(uint16_t));
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] fast16bf-bf16cast scratch alloc failed: %zu elements (%s)\n",
+		        needed_n, cudaGetErrorString(err));
+		*scratch = 0;
+		*size_n = 0;
+		return false;
+	}
+	*size_n = needed_n;
+	return true;
+}
+
+// Constant-BF16 cache: skip the FP32->BF16 cast for pre-registered constant
+// inputs (e.g. SCFA basis scfa_B that never changes).  Caller supplies the
+// BF16 mirror buffer; we just remember the pointer pair.
+struct Fast16bfConstantEntry
+{
+	const float*    fp32_ptr;
+	const uint16_t* bf16_ptr;
+	size_t          n;
+};
+static const int kMaxFast16bfConstants = 16;
+static Fast16bfConstantEntry g_fast16bf_constants[kMaxFast16bfConstants];
+static int g_fast16bf_constants_count = 0;
+
+static const uint16_t* lookupFast16bfConstant(const float* fp32_ptr, size_t needed_n)
+{
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr &&
+		    g_fast16bf_constants[i].n >= needed_n)
+		{
+			return g_fast16bf_constants[i].bf16_ptr;
+		}
+	}
+	return 0;
+}
 
 // ralph-loop iter 6 (2026-05-14): side cuBLAS handle bound to a dedicated
 // side stream, used to dispatch GEMMs that can run concurrently with the
@@ -52,13 +117,26 @@ static bool ensureSideHandle()
 		return false;
 	}
 	cublasSetStream(g_handleSide, g_sideStream);
+	// Side handle follows the same two-handle invariant: set to native mode
+	// at init, never toggled afterwards. Callers dispatch via mathMode arg.
 	if (computeCapabilityMajor() >= 8)
 	{
-		cublasSetMathMode(g_handleSide,
-		    g_tf32_enabled ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+		cublasSetMathMode(g_handleSide, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
 	g_sideInitialized = true;
 	return true;
+}
+
+// Pick the appropriate handle for the requested mathMode.
+// At init, g_handleTf32 is always TF32 (CC>=8) or DEFAULT (CC<8);
+// g_handleStrict is always DEFAULT.  This dispatcher eliminates
+// per-call cublasSet/GetMathMode, making the call sequence
+// graph-captureable.
+static inline cublasHandle_t pick_handle(cublasMath_t mathMode)
+{
+	if (mathMode == CUBLAS_TF32_TENSOR_OP_MATH)
+		return g_handleTf32;
+	return g_handleStrict;
 }
 
 static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
@@ -75,42 +153,19 @@ static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
 	if (!g_initialized && !blasInit())
 		return false;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	// Two-handle dispatch: pick the handle whose math mode matches the
+	// caller's request.  No state toggling, no cublasSet/GetMathMode in
+	// the hot path — capture-compatible (paradigm #51 ATLAS-COMPILE).
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemm(g_handle,
-	                 transa, transb,
-	                 N, M, K,
-	                 &alpha,
-	                 B, ldb,
-	                 A, lda,
-	                 &beta,
-	                 C, ldc);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemm(h,
+	                                transa, transb,
+	                                N, M, K,
+	                                &alpha,
+	                                B, ldb,
+	                                A, lda,
+	                                &beta,
+	                                C, ldc);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
@@ -138,43 +193,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 	if (!Aarray || !Barray || !Carray || batchCount <= 0)
 		return true;
 
-	cublasMath_t oldMathMode = CUBLAS_DEFAULT_MATH;
-	cublasStatus_t st = cublasGetMathMode(g_handle, &oldMathMode);
-	if (st != CUBLAS_STATUS_SUCCESS)
-	{
-		fprintf(stderr, "[glades-cuda] cublasGetMathMode failed: %d\n", static_cast<int>(st));
-		return false;
-	}
-	if (oldMathMode != mathMode)
-	{
-		st = cublasSetMathMode(g_handle, mathMode);
-		if (st != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode failed: %d\n", static_cast<int>(st));
-			return false;
-		}
-	}
+	cublasHandle_t h = pick_handle(mathMode);
 
-	st = cublasSgemmBatched(g_handle,
-	                        transa, transb,
-	                        N, M, K,
-	                        &alpha,
-	                        reinterpret_cast<const float* const*>(Barray), ldb,
-	                        reinterpret_cast<const float* const*>(Aarray), lda,
-	                        &beta,
-	                        Carray, ldc,
-	                        batchCount);
-
-	if (oldMathMode != mathMode)
-	{
-		cublasStatus_t rst = cublasSetMathMode(g_handle, oldMathMode);
-		if (rst != CUBLAS_STATUS_SUCCESS)
-		{
-			fprintf(stderr, "[glades-cuda] cublasSetMathMode restore failed: %d\n",
-			        static_cast<int>(rst));
-			return false;
-		}
-	}
+	cublasStatus_t st = cublasSgemmBatched(h,
+	                                       transa, transb,
+	                                       N, M, K,
+	                                       &alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       &beta,
+	                                       Carray, ldc,
+	                                       batchCount);
 
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
@@ -192,12 +221,17 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 __attribute__((used, visibility("default")))
 void set_tf32_enabled(bool enabled)
 {
+	// Flag-only API.  The two-handle design (Task 1.1) means callers
+	// explicitly request TF32 or strict via the mathMode arg per call;
+	// this flag is read by callers that want to HONOR the user's global
+	// toggle.
+	//
+	// IMPORTANT for cuda-graphs compatibility: NO cublasSetMathMode
+	// happens here.  The handles' math modes are set ONCE at blasInit()
+	// and never toggled afterwards.  This preserves the two-handle
+	// invariant (g_handleStrict always DEFAULT, g_handleTf32 always
+	// TF32 on CC>=8) which is required for capture-compatible dispatch.
 	g_tf32_enabled = enabled;
-	if (g_initialized && g_handle)
-	{
-		cublasSetMathMode(g_handle, enabled ? CUBLAS_TF32_TENSOR_OP_MATH
-		                                     : CUBLAS_DEFAULT_MATH);
-	}
 }
 
 __attribute__((used, visibility("default")))
@@ -208,27 +242,51 @@ bool blasInit()
 	if (g_initialized)
 		return true;
 
-	cublasStatus_t st = cublasCreate(&g_handle);
+	// Create the strict-FP32 handle.
+	cublasStatus_t st = cublasCreate(&g_handleStrict);
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
-		fprintf(stderr, "[glades-cuda] cublasCreate failed: %d\n", static_cast<int>(st));
+		fprintf(stderr, "[glades-cuda] cublasCreate (strict) failed: %d\n", static_cast<int>(st));
 		return false;
 	}
-	cublasSetStream(g_handle, computeStream());
+	cublasSetStream(g_handleStrict, computeStream());
+	cublasSetMathMode(g_handleStrict, CUBLAS_DEFAULT_MATH);
+
+	// Create the TF32 handle.
+	st = cublasCreate(&g_handleTf32);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasCreate (tf32) failed: %d\n", static_cast<int>(st));
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
+		return false;
+	}
+	cublasSetStream(g_handleTf32, computeStream());
 	// Enable TF32 tensor core math on Ampere+ (SM 8.0+) for ~2x SGEMM speedup.
 	if (computeCapabilityMajor() >= 8)
 	{
-		cublasSetMathMode(g_handle, CUBLAS_TF32_TENSOR_OP_MATH);
+		cublasSetMathMode(g_handleTf32, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
-	// Honor any prior set_tf32_enabled(false) call.  No-op if g_tf32_enabled is true.
-	if (!g_tf32_enabled)
-		cublasSetMathMode(g_handle, CUBLAS_DEFAULT_MATH);
+	else
+	{
+		// Pre-Ampere: no TF32; both handles use CUBLAS_DEFAULT_MATH.
+		cublasSetMathMode(g_handleTf32, CUBLAS_DEFAULT_MATH);
+	}
+
+	// Maintain g_handle as an alias to g_handleTf32 for backward compatibility
+	// with code paths that haven't been updated yet.  Will be removed in
+	// Task 1.4 once all callers route through the two-handle dispatch.
+	g_handle = g_handleTf32;
+
 	float hostOne = 1.0f;
 	cudaError_t e = cudaMalloc(&g_deviceOne, sizeof(float));
 	if (e != cudaSuccess)
 	{
 		fprintf(stderr, "[glades-cuda] cudaMalloc for BLAS scalar failed: %d\n", static_cast<int>(e));
-		cublasDestroy(g_handle);
+		cublasDestroy(g_handleTf32);
+		g_handleTf32 = NULL;
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
 		g_handle = 0;
 		return false;
 	}
@@ -238,7 +296,10 @@ bool blasInit()
 		fprintf(stderr, "[glades-cuda] cudaMemcpy for BLAS scalar failed: %d\n", static_cast<int>(e));
 		cudaFree(g_deviceOne);
 		g_deviceOne = 0;
-		cublasDestroy(g_handle);
+		cublasDestroy(g_handleTf32);
+		g_handleTf32 = NULL;
+		cublasDestroy(g_handleStrict);
+		g_handleStrict = NULL;
 		g_handle = 0;
 		return false;
 	}
@@ -256,14 +317,17 @@ void blasDestroy()
 		if (g_sideStream) { cudaStreamDestroy(g_sideStream); g_sideStream = 0; }
 		g_sideInitialized = false;
 	}
-	if (g_initialized && g_handle)
+	if (g_initialized)
 	{
 		if (g_deviceOne)
 		{
 			cudaFree(g_deviceOne);
 			g_deviceOne = 0;
 		}
-		cublasDestroy(g_handle);
+		// Tear down both handles; g_handle is an alias to g_handleTf32 so
+		// destroy through the canonical pointers to avoid double-free.
+		if (g_handleStrict) { cublasDestroy(g_handleStrict); g_handleStrict = NULL; }
+		if (g_handleTf32)   { cublasDestroy(g_handleTf32);   g_handleTf32   = NULL; }
 		g_handle = 0;
 		g_initialized = false;
 	}
@@ -1109,12 +1173,46 @@ static bool sgemm_rowmajor_fast16bf_impl(cublasOperation_t transa,
 {
 	if (!g_initialized && !blasInit()) return false;
 
+	// CUDA 13.2 mitigation: pre-cast FP32 inputs to BF16 scratch, then call
+	// cublasGemmEx with CUDA_R_16BF inputs.  Routes dispatch to the
+	// s16816_bf16 fast path on Ada (vs the s1688gemm slow path that
+	// cuBLAS 13.x picks for FP32-input FAST_16BF).  Numerics unchanged
+	// (FAST_16BF compute path also casts to BF16 internally).
+	//
+	// Size derivation in our row-major calling convention:
+	//   (transa,transb)=(N,N) no-trans wrapper:  A=[M,K] lda=K, B=[K,N] ldb=N
+	//   (transa,transb)=(N,T) atb wrapper (A^T): A=[K,M] lda=M, B=[K,N] ldb=N
+	//   (transa,transb)=(T,N) abt wrapper (B^T): A=[M,K] lda=K, B=[N,K] ldb=K
+	// transa applies to A_cublas (= our B); transb applies to B_cublas (= our A).
+	// So A's storage flips (M→K rows) when transb=T; B's storage flips when transa=T.
+	size_t A_n = (size_t)lda * (size_t)(transb == CUBLAS_OP_N ? M : K);
+	size_t B_n = (size_t)ldb * (size_t)(transa == CUBLAS_OP_N ? K : N);
+
+	// Look up registered constants first (skip cast if hit).
+	const uint16_t* A_bf16 = lookupFast16bfConstant(A, A_n);
+	const uint16_t* B_bf16 = lookupFast16bfConstant(B, B_n);
+
+	if (!A_bf16)
+	{
+		if (!ensureFast16bfScratch(&g_fast16bf_scratch_a, &g_fast16bf_scratch_a_n, A_n))
+			return false;
+		if (!cast_f32_to_bf16(A, g_fast16bf_scratch_a, A_n)) return false;
+		A_bf16 = g_fast16bf_scratch_a;
+	}
+	if (!B_bf16)
+	{
+		if (!ensureFast16bfScratch(&g_fast16bf_scratch_b, &g_fast16bf_scratch_b_n, B_n))
+			return false;
+		if (!cast_f32_to_bf16(B, g_fast16bf_scratch_b, B_n)) return false;
+		B_bf16 = g_fast16bf_scratch_b;
+	}
+
 	cublasStatus_t st = cublasGemmEx(g_handle,
 	                                 transa, transb,
 	                                 N, M, K,
 	                                 &alpha,
-	                                 B, CUDA_R_32F, ldb,
-	                                 A, CUDA_R_32F, lda,
+	                                 B_bf16, CUDA_R_16BF, ldb,
+	                                 A_bf16, CUDA_R_16BF, lda,
 	                                 &beta,
 	                                 C, CUDA_R_32F, ldc,
 	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
@@ -1165,6 +1263,49 @@ bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
 	                                     M, N, K,
 	                                     alpha, A, lda, B, ldb, beta, C, ldc,
 	                                     "cublasGemmEx(FAST_16BF,ABT)");
+}
+
+bool register_fast16bf_constant(const float* fp32_ptr,
+                                 const unsigned short* bf16_ptr,
+                                 size_t n)
+{
+	if (!fp32_ptr || !bf16_ptr || n == 0) return false;
+	// Already registered? Update in place.
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr)
+		{
+			g_fast16bf_constants[i].bf16_ptr = bf16_ptr;
+			g_fast16bf_constants[i].n        = n;
+			return true;
+		}
+	}
+	if (g_fast16bf_constants_count >= kMaxFast16bfConstants)
+	{
+		fprintf(stderr, "[glades-cuda] register_fast16bf_constant: table full (max %d)\n",
+		        kMaxFast16bfConstants);
+		return false;
+	}
+	g_fast16bf_constants[g_fast16bf_constants_count].fp32_ptr = fp32_ptr;
+	g_fast16bf_constants[g_fast16bf_constants_count].bf16_ptr = bf16_ptr;
+	g_fast16bf_constants[g_fast16bf_constants_count].n        = n;
+	++g_fast16bf_constants_count;
+	return true;
+}
+
+bool unregister_fast16bf_constant(const float* fp32_ptr)
+{
+	for (int i = 0; i < g_fast16bf_constants_count; ++i)
+	{
+		if (g_fast16bf_constants[i].fp32_ptr == fp32_ptr)
+		{
+			// Compact (swap with last, pop).
+			g_fast16bf_constants[i] = g_fast16bf_constants[g_fast16bf_constants_count - 1];
+			--g_fast16bf_constants_count;
+			return true;
+		}
+	}
+	return false;
 }
 
 // ralph-loop iter 6 (2026-05-14): FAST_16BF GEMMs dispatched on the side

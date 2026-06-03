@@ -58,14 +58,32 @@ bool GraphExec::endCaptureAndInstantiate()
 		return false;
 	}
 
-	err = cudaGraphInstantiate(&m_exec, m_graph, 0, 0, 0);
+	// Upgrade to cudaGraphInstantiateWithFlags (CUDA 11.4+).
+	// The legacy cudaGraphInstantiate(graph, 0, 0, 0) uses conservative
+	// default scheduling. cudaGraphInstantiateWithFlags with USE_NODE_PRIORITY
+	// allows the runtime to schedule based on per-node priority attributes
+	// rather than enforcing strict stream-order serialization.
+	//
+	// CUDA 13.2 does NOT expose CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_PARALLELISM
+	// (unavailable in this version). USE_NODE_PRIORITY is a weaker but
+	// related feature that may help with scheduling.  If memset serialization
+	// remains a bottleneck, the next step is to either:
+	// - Split the graph to isolate memsets into separate smaller graphs, or
+	// - Capture memsets on a separate stream and skip graph capture for them.
+	err = cudaGraphInstantiateWithFlags(&m_exec, m_graph, cudaGraphInstantiateFlagUseNodePriority);
 	if (err != cudaSuccess) {
-		std::fprintf(stderr, "[gpu-graph] cudaGraphInstantiate failed: %s\n",
+		std::fprintf(stderr, "[gpu-graph] cudaGraphInstantiateWithFlags failed: %s\n",
 		             cudaGetErrorString(err));
-		cudaGraphDestroy(m_graph);
-		m_graph = 0;
-		m_exec = 0;
-		return false;
+		// Fall back to legacy API (shouldn't happen on CUDA 11.4+)
+		err = cudaGraphInstantiate(&m_exec, m_graph, 0, 0, 0);
+		if (err != cudaSuccess) {
+			std::fprintf(stderr, "[gpu-graph] cudaGraphInstantiate fallback also failed: %s\n",
+			             cudaGetErrorString(err));
+			cudaGraphDestroy(m_graph);
+			m_graph = 0;
+			m_exec = 0;
+			return false;
+		}
 	}
 	return true;
 }

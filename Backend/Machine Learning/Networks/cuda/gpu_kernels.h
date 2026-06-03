@@ -49,9 +49,24 @@ bool rmsnorm_backward(const float* dout, const float* x,
 // Numerically-stable row-wise softmax.
 bool softmax_forward(const float* x, int rows, int cols, float* out);
 
-// Fused softmax-cross-entropy backward: dlogits = probs - one_hot(targets).
+// Same as softmax_forward but also writes logZ[rows] = log(sum_i exp(x[row,i])).
+// Required by the Z-loss backward path — logZ must be a device buffer of
+// length rows.
+bool softmax_forward_with_lse(const float* x, int rows, int cols,
+                               float* out, float* logZ);
+
+// Standard softmax-CE backward. The trainer dispatches this when
+// zlossCoef == 0.0f; otherwise it dispatches softmax_cross_entropy_bwd_zloss.
+// Both produce bit-identical output at zlossCoef == 0.0f.
 bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
                                int rows, int cols, float* dlogits);
+
+// Z-loss-aware variant: adds (2 * zlossCoef * logZ[row]) * probs[row, i]
+// on top of the standard CE gradient. At zlossCoef == 0.0f the output is
+// bit-identical to softmax_cross_entropy_bwd.
+bool softmax_cross_entropy_bwd_zloss(const float* probs, const int* targets,
+                                     const float* logZ, float zlossCoef,
+                                     int rows, int cols, float* dlogits);
 
 // ralph-loop iter 10 (2026-05-14) BF16-storage variants — backing the
 // --bf16-logits-storage flag.  Same math as the FP32 paths, BF16 on
@@ -60,10 +75,23 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 // 16 GB hardware (saves 3 × 2 GB = 3 GB net).
 bool softmax_forward_bf16(const unsigned short* x, int rows, int cols,
                            unsigned short* out);
+// BF16-storage variant of softmax_forward_with_lse: also writes per-row
+// logsumexp into a FP32 logZ buffer.  Required by the Z-loss path on the
+// --bf16-logits-storage trainer recipe.
+bool softmax_forward_bf16_with_lse(const unsigned short* x, int rows, int cols,
+                                    unsigned short* out, float* logZ);
 bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
                                      const int* targets,
                                      int rows, int cols,
                                      unsigned short* dlogits);
+// BF16-storage Z-loss CE backward: dlogits[t, v] = (probs[t, v] - 1_{v==target})
+// + 2·zlossCoef·logZ[t]·probs[t, v].  Required on --bf16-logits-storage.
+bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
+                                           const int* targets,
+                                           const float* logZ,
+                                           float zlossCoef,
+                                           int rows, int cols,
+                                           unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
@@ -354,6 +382,8 @@ bool add_residual(float* out, const float* residual, int n);
 
 // out[n] = a[n] + b[n]
 bool add_two(float* out, const float* a, const float* b, int n);
+// out[n] = a[n] + beta * b[n]
+bool add_two_scaled(float* out, const float* a, const float* b, float beta, int n);
 
 // y[n] += alpha * x[n]
 bool axpy(float alpha, const float* x, float* y, int n);
@@ -1038,6 +1068,36 @@ void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spit
                            size_t width, size_t height);
 void device_memset_bytes(void* ptr, int value, size_t bytes);
 
+// ---------------------------------------------------------------------------
+// QK-Norm GPU kernels (Task 2.3). Forward: per-token, per-head L2 normalize
+// in place; writes invNorm[t,h] = 1/||x_orig|| for backward. Backward:
+// jacobian of the normalize step.
+// ---------------------------------------------------------------------------
+bool qknorm_forward_gpu(float* x, float* invNorm,
+                        int T, int nHeads, int dHead, float eps);
+
+bool qknorm_backward_gpu(const float* xNorm, const float* invNorm,
+                         const float* dxNorm, int T, int nHeads, int dHead,
+                         float* dxOrig);
+
+// Multiply each [t,h] row of Q by gammaScale[h].  Q: [T, nHeads, dHead].
+bool scale_q_per_head(float* Q, const float* gammaScale,
+                      int T, int nHeads, int dHead);
+
+// Accumulate γ_h gradient: dGamma[h] = sqrt(dHead) * sum_{t,i} dQPost[t,h,i]*qNorm[t,h,i].
+// dQPost, qNorm: [T, nHeads, dHead].  dGamma: [nHeads] (overwritten, not accumulated).
+bool qknorm_gamma_grad(const float* dQPost, const float* qNorm,
+                       float sqrtDh, int T, int nHeads, int dHead,
+                       float* dGamma);
+
+// Compute gamma_scale[h] = gamma[h] * sqrtDh element-wise on the GPU.
+// Replaces the prior D2H-CPU-H2D round-trip; cuda-graphs capture-safe.
+// gamma_d, gamma_scale_d: device pointers of length nH.
+bool qknorm_gamma_scale_gpu(const float* gamma_d,
+                            float sqrtDh,
+                            float* gamma_scale_d,
+                            int nH);
+
 } // namespace gpu
 } // namespace glades
 
@@ -1053,9 +1113,13 @@ inline bool rmsnorm_forward(const float*, const float*, float, int, int, float*,
 inline bool rmsnorm_backward(const float*, const float*, const float*, const float*, int, int, float*, float*) { return false; }
 
 inline bool softmax_forward(const float*, int, int, float*) { return false; }
+inline bool softmax_forward_with_lse(const float*, int, int, float*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
+inline bool softmax_cross_entropy_bwd_zloss(const float*, const int*, const float*, float, int, int, float*) { return false; }
 inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short*) { return false; }
+inline bool softmax_forward_bf16_with_lse(const unsigned short*, int, int, unsigned short*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
+inline bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short*, const int*, const float*, float, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
@@ -1111,6 +1175,7 @@ inline bool rope_apply_qk(float*, float*, const float*, int, int, int, int, int 
 inline bool add_bias(float*, const float*, int, int) { return false; }
 inline bool add_residual(float*, const float*, int) { return false; }
 inline bool add_two(float*, const float*, const float*, int) { return false; }
+inline bool add_two_scaled(float*, const float*, const float*, float, int) { return false; }
 inline bool axpy(float, const float*, float*, int) { return false; }
 inline bool scale_array(float*, float, int) { return false; }
 
@@ -1240,6 +1305,12 @@ inline void device_memcpy_h2d(void*, const void*, size_t) {}
 inline void device_memcpy_d2h(void*, const void*, size_t) {}
 inline void device_memcpy_2d_d2d(void*, size_t, const void*, size_t, size_t, size_t) {}
 inline void device_memset_bytes(void*, int, size_t) {}
+
+inline bool qknorm_forward_gpu(float*, float*, int, int, int, float) { return false; }
+inline bool qknorm_backward_gpu(const float*, const float*, const float*, int, int, int, float*) { return false; }
+inline bool scale_q_per_head(float*, const float*, int, int, int) { return false; }
+inline bool qknorm_gamma_grad(const float*, const float*, float, int, int, int, float*) { return false; }
+inline bool qknorm_gamma_scale_gpu(const float*, float, float*, int) { return false; }
 
 } // namespace gpu
 } // namespace glades

@@ -1707,15 +1707,41 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 				                        normType, eps, useRope, ropeDim, ropeTheta, gpuPerf);
 			}
 
-			// --- Logits: tied embedding ---
+			// --- Final norm + logits: tied embedding ---
 			if (outLogits)
 			{
 				glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msAttention : NULL);
-				// logits[vocab] = tokE[vocab, dModel] * h[dModel] + lmBias[vocab]
+				const float* logitsInput = gs->h.data();
+				if (gw.lnFinalGamma.allocated())
+				{
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					{
+						if (gpuPerf)
+							gg::perfRecordKernel(&gpuPerf->counters, 1u);
+						gg::rmsnorm_forward(gs->h.data(), gw.lnFinalGamma.data(), eps,
+						                    1, dM, gs->x1.data(), gs->lnInvStd.data());
+						if (gw.lnFinalBeta.allocated())
+						{
+							if (gpuPerf)
+								gg::perfRecordKernel(&gpuPerf->counters, 1u);
+							gg::add_bias(gs->x1.data(), gw.lnFinalBeta.data(), 1, dM);
+						}
+					}
+					else
+					{
+						if (gpuPerf)
+							gg::perfRecordKernel(&gpuPerf->counters, 1u);
+						gg::layernorm_forward(gs->h.data(), gw.lnFinalGamma.data(), gw.lnFinalBeta.data(),
+						                      eps, 1, dM, gs->x1.data(), gs->lnMean.data(), gs->lnInvStd.data());
+					}
+					logitsInput = gs->x1.data();
+				}
+
+				// logits[vocab] = tokE[vocab, dModel] * h_final[dModel] + lmBias[vocab]
 				if (gpuPerf)
 					gg::perfRecordKernel(&gpuPerf->counters, 1u);
 				gg::sgemv_rowmajor(static_cast<int>(vocab), dM, 1.0f,
-				                   gw.tokE.data(), dM, gs->h.data(),
+				                   gw.tokE.data(), dM, logitsInput,
 				                   0.0f, gs->logits.data());
 				if (gw.lmBias.allocated())
 				{
