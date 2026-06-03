@@ -1,7 +1,8 @@
 # CHIRON-native terminal SIRA 30k result and flagship decision (2026-05-27)
 
-**Status:** CANDIDATE-DEFAULT EVIDENCE TRACK / default-off. Do **not** include
-SIRA by default in the flagship yet.
+**Status:** CANDIDATE-DEFAULT INVESTIGATION / default-off. Do **not** include
+SIRA by default in the flagship yet.  The seed-4242 recovery is strong, but the
+second same-recipe 30k validation seed exposed late bad-gradient guard skips.
 
 **Candidate evaluated:** terminal-only CHIRON-native SIRA on final
 `(q_L, p_L)`:
@@ -414,13 +415,115 @@ loss-detail step30000: ce=3.58824182 zloss=0.0117069958 sira=0.0140414126 total=
 Regression flags: none.
 
 Interpretation: the LR-stabilized FP8 2k/5k/10k/15.6k/30k active SIRA gates are
-clean, including the previous seed-4242 instability window and a full 30k
-completion.  The new seed4242 30k result is stronger than the previous
-successful SIRA-seed mean and best historical run.  This justifies moving SIRA
-from “experimental hold” to a **candidate-default evidence track**, but not
-flipping the shipped default yet.  Before actual default enablement, run at
-least one more same-recipe 30k seed and preferably a matched same-recipe 30k
-baseline or multi-seed paired confirmation.
+clean for seed `4242`, including the previous instability window and a full 30k
+completion.  The seed4242 30k result is stronger than the previous successful
+SIRA-seed mean and best historical run.  This justified moving SIRA from
+“experimental hold” to a candidate-default investigation track, but not flipping
+the shipped default yet.  A second same-recipe 30k validation seed was required
+before promotion.
+
+### Second 30k validation seed: seed 2024
+
+A second same-recipe 30k active SIRA E+B run was performed with seed `2024`.
+This is the most important follow-up for candidate-default promotion because it
+checks whether the seed4242 recovery generalizes beyond one seed.
+
+Artifact:
+
+```text
+logs/fp8_sira_active_energy_balance_30000step_seed2024_20260602_204556/
+```
+
+Run recipe matched the seed4242 candidate-default run except for `--seed 2024`:
+
+```text
+--lr 7.5e-5 --grad-clip 0.5 --seed 2024 --fp8-readout-fwd
+--sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25
+--sira-action-weight 0.0 --sira-warmup 1000
+```
+
+The run reached 30k and produced a finite final validation, but it did **not**
+clear the candidate-default stability gate.  The bad-gradient guard started
+skipping updates at step `24127` and skipped `5809` Adam updates through step
+`30000`.  Early/instability-window SIRA diagnostics were normal, but late global
+gradients repeatedly overflowed or became non-finite.
+
+| run | final NLL | bpb | ppl | acc1 | acc5 | acc10 | warm tok/s | bad/skip lines |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| active SIRA E+B seed2024 LR `7.5e-5` | 3.5675 | 1.2867 | 35.43 | 0.1385 | 0.5506 | 0.8361 | 27862.3 | 98040 |
+
+Final position buckets:
+
+```text
+[3.42/3.48/3.61/3.55/3.53/3.73/3.61/3.61]
+```
+
+Seed-to-seed comparison against the clean seed4242 30k run:
+
+| metric | seed4242 | seed2024 | seed2024 − seed4242 |
+|---|---:|---:|---:|
+| final NLL | 3.5235 | 3.5675 | +0.0440 |
+| bpb | 1.2708 | 1.2867 | +0.0159 |
+| ppl | 33.90 | 35.43 | +1.53 |
+| acc1 | 0.1408 | 0.1385 | -0.0023 |
+| acc5 | 0.5610 | 0.5506 | -0.0104 |
+| acc10 | 0.8442 | 0.8361 | -0.0081 |
+| warm tok/s | 27856.4 | 27862.3 | +5.9 |
+| max SIRA loss | 0.0147739 | 0.0148582 | +0.0000844 |
+| max SIRA ratio | 0.00404 | 0.00403 | -0.00001 |
+
+Position-bucket delta seed2024 minus seed4242:
+
+```text
+[+0.01/+0.00/+0.00/+0.09/+0.07/+0.10/+0.04/+0.05]
+```
+
+Late bad-gradient details:
+
+```text
+first grad-skip: step 24127, global_sumsq=1.06774971e+21, norm=3.26764401e+10, bad group=dE
+skip count:      5809 updates skipped from 24127 through 30000
+max bad_groups:  30
+last step:       global_sumsq=inf, norm=inf, scale=0, bad groups include dE and early-layer dgamma/dbeta
+```
+
+SIRA scalar diagnostics did not identify the late instability as an SIRA-scalar
+blow-up:
+
+```text
+sira_loss max:       0.0148582356
+sira_ratio max:      0.00403
+failure-window ratio max over 14500..16000: 0.00371
+step30000 sira_loss: 0.0139291044
+step30000 ratio:     0.00384
+terms(E/B/A):        1.23569/0.157224/0
+term_grad_rms(q/p):  1.211e-11/3.909e-12
+```
+
+Historical comparisons, noting that this seed2024 run has many skipped updates
+and is not an acceptable clean candidate-default pass:
+
+| Reference | final NLL | delta from seed2024 SIRA |
+|---|---:|---:|
+| B5 30k baseline record | 3.5734 | -0.0059 |
+| prior seed2024 SIRA LR `1e-4` | 3.5514 | +0.0161 |
+| previous successful SIRA 30k mean | 3.5491 | +0.0184 |
+| previous successful SIRA 30k best | 3.5369 | +0.0306 |
+| previous successful SIRA 30k worst | 3.5591 | +0.0084 |
+
+Regression flags:
+
+```text
+- bad/stability/fallback lines present
+- VRAM >14.70GB (14.71 / 15.56 GB observed; likely external-memory sensitive but over the current alert threshold)
+```
+
+Interpretation: seed2024 blocks SIRA default promotion.  The recipe still has a
+quality signal and the explicit guard prevented weight corruption, but default
+promotion requires clean multi-seed 30k behavior without thousands of late
+skipped Adam updates.  SIRA should remain default-off while the late dE/early
+layer gradient-overflow path is investigated or a lower-risk candidate recipe is
+defined.
 
 ---
 
@@ -432,8 +535,8 @@ Keep shipped flagship defaults unchanged for now:
 - SIRA remains opt-in in production defaults.
 - Disabled mode must remain parity/bit-identical.
 
-However, the candidate default recipe is now evidence-backed enough to promote
-from experimental hold into a candidate-default track:
+The following recipe is the current candidate-default investigation recipe, but
+seed2024's late guard skips block default promotion:
 
 ```text
 --sira-coef 1e-2
@@ -457,8 +560,9 @@ Do not flip SIRA on by default until all of the following are true:
 5. Position bucket 7 / long-context metrics do not regress.
 6. SIRA flags remain default-off and disabled parity remains verified.
 
-Short version: **SIRA is now a serious candidate-default recipe, but not yet a
-shipped default.**
+Short version: **SIRA has a serious quality signal, but seed2024's late
+bad-gradient skip wave blocks candidate-default promotion until the overflow path
+is understood or mitigated.**
 
 ---
 
