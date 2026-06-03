@@ -527,6 +527,87 @@ defined.
 
 ---
 
+## Late dE / early-layer gradient path investigation (2026-06-03)
+
+Additional default-off trainer diagnostics were added for the investigation:
+
+- `--sira-de-trace` now records `dq` around readout, SIRA terminal backward,
+  and embedding scatter in addition to `dE`.
+- `--sira-layer-grad-trace` records probed-layer `dq`/`dp` norms at
+  `after-reln`, `after-fuse`, and `after-layer` points inside the debug window.
+- These traces are opt-in, disable CUDA graph capture when requested, and remain
+  no-ops in default/disabled runs.
+
+Artifacts in `/home/robert/dev/glades-trainer`:
+
+- `logs/sira_de_path_seed2024_trace_24260_20260603_062225/`
+- `logs/sira_layer_path_seed2024_trace_24110_20260603_103735/`
+- `logs/sira_intralayer_path_seed2024_trace_24110_20260603_143746/`
+- Summary: `logs/sira_gradient_path_investigation_summary_20260603.json`
+
+Key finding: the huge `dE` is not produced by the tied-readout GEMM itself.
+In the 24260-step reproduction, the first skip moved to step `24101` and the
+readout/pre-scatter `dE` norms stayed normal while post-scatter `dE` exploded:
+
+```text
+step 24101: dE after-readout norm=0.936, before-scatter=0.936, after-scatter=3.42e10
+step 24102: dE after-readout norm=0.877, before-scatter=0.877, after-scatter=6.42e13
+step 24108: dE after-readout norm=2.84,  before-scatter=2.84,  after-scatter=inf
+```
+
+Therefore the `dE` guard trips because embedding scatter accumulates an already
+huge `s.dq` into the tied embedding rows.  The scatter kernel is an atomic add
+of `dq_0[t, :]`; it is not the first creator of the large values.
+
+The layerwise trace reproduced the same qualitative path with a large finite
+spike and localized it to the early q-side reverse pass.  At step `24108`:
+
+```text
+dq after readout/SIRA:       ~6.7e-3
+dq before embedding scatter: 7.53e9
+dE after embedding scatter:  7.53e9
+
+dq after-layer-06: 3.94e-2
+dq after-layer-05: 7.01e-1
+dq after-layer-04: 1.85e1
+dq after-layer-03: 6.83e2
+dq after-layer-02: 3.44e4
+dq after-layer-01: 2.65e6
+dq after-layer-00: 7.53e9
+```
+
+`dp` remained tiny in that trace (max layer `dp` around `3e-4`), so the observed
+explosion is q-side and concentrated in the early layers.  This also explains
+why `dE`, `L00.dgamma`, `L00.dbeta`, then early-layer `dgamma/dbeta` dominate
+`grad-detail`: the same exploding `dq` enters the layer-0 ReLN backward and then
+embedding scatter.
+
+A more intrusive intra-layer trace did **not** reproduce the spike in the same
+window (max pre-embed `dq` about `1.28`, no skips).  That result should not be
+read as a fix; long CHIRON runs are run/build/synchronization sensitive.  It does
+show that the failure is not a deterministic SIRA scalar blow-up.  Around the bad
+window, SIRA terminal scalars and terminal-gradient RMS stayed bounded while the
+reverse-path `dq` sometimes entered a high-gain early-layer regime.
+
+Working diagnosis: SIRA is at most an indirect trajectory nudge.  The immediate
+overflow path is:
+
+```text
+normal readout dq  → early-layer q-side reverse amplification
+                   → huge dq_0
+                   → embedding_scatter_add writes huge dE
+                   → dE + L00/L01 dgamma/dbeta dominate grad-detail
+                   → guard skips Adam on overflow/non-finite global norm
+```
+
+This keeps the candidate recipe in investigation/default-off status.  Next
+mitigation candidates should target the early q-side gain path or reduce the
+chance of entering it (for example lower LR, smaller SIRA coefficient, an
+explicit q-side gradient clamp before embedding scatter, or ReLN/early-layer
+stability diagnostics), then re-run 30k multi-seed gates before any promotion.
+
+---
+
 ## Flagship recommendation
 
 Keep shipped flagship defaults unchanged for now:
