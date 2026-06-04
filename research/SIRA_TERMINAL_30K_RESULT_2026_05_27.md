@@ -589,6 +589,38 @@ show that the failure is not a deterministic SIRA scalar blow-up.  Around the ba
 window, SIRA terminal scalars and terminal-gradient RMS stayed bounded while the
 reverse-path `dq` sometimes entered a high-gain early-layer regime.
 
+A follow-up q-branch component trace added `--sira-qbranch-trace` to log
+ReLN gain bounds and SCFA q-branch component norms (`scfa.entry`,
+`dy_compr`, `dq_compr_attn`, `dq_perp`, `dq_compr_total`,
+`after_B_dqcompr`, and `scfa.exit`).  The targeted reproduction artifact is:
+
+- `logs/sira_qbranch_path_seed2024_trace_24110_20260603_195159/`
+- Summary: `qbranch_summary.json` inside that directory.
+
+That q-branch run did **not** reproduce the 7.5e9 spike over steps
+`24100..24110` and produced no guard skips.  It still isolated the normal
+clean-path early q-gain anatomy:
+
+```text
+L06..L02 ReLN amp: ~1.0..1.16
+L01 ReLN amp:      ~1.23..1.32
+L00 ReLN amp:      ~41.6..47.9
+L00 sigma_min:     ~0.0178
+L00 invstd_max:    ~56.0
+L00 gamma_max:     ~1.23
+L00 bound_max:     ~68.8
+SCFA q branch:     entry/after_B/exit norms nearly unchanged
+SCFA dp entry:     ~2e-4..3.6e-4
+```
+
+Thus, in a clean trajectory, the dominant early q-side amplification is the
+layer-0 ReLN Jacobian from low embedding-state variance, not the SCFA q-branch.
+The prior 7.5e9 runaway would require an abnormal early ReLN gain/stat state
+(or an already-corrupted incoming `dq`) that this trace did not reproduce.  If
+it recurs, `--sira-qbranch-trace --sira-probe-layers 0,1,2,3,4,5,6,23` should
+show whether the first abnormal multiplier appears in ReLN stats/bounds or in a
+specific SCFA component.
+
 Working diagnosis: SIRA is at most an indirect trajectory nudge.  The immediate
 overflow path is:
 
