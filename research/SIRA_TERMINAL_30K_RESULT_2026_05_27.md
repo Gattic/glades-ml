@@ -621,6 +621,46 @@ it recurs, `--sira-qbranch-trace --sira-probe-layers 0,1,2,3,4,5,6,23` should
 show whether the first abnormal multiplier appears in ReLN stats/bounds or in a
 specific SCFA component.
 
+### L00 ReLN row/q-state consistency trace (2026-06-05)
+
+The L00 row trace was extended under the same default-off
+`--sira-qbranch-trace` flag to download the reconstructed L00 ReLN input row
+and compare it with the saved forward ReLN `(mu, sigma)` stats.  It logs
+`mu`, reconstructed `qmean`, `mu_delta`, `qsigma/sigma`, `xhat_rms`, and
+`xhat_max` for the top row-amplification rows.
+
+Artifacts:
+
+- Clean smoke: `logs/sira_qbranch_qstate_smoke2_8Rhnac/smoke.log`
+- Clean late window: `logs/sira_qbranch_qstate_seed2024_trace_24110_20260604_113713/`
+- Bad long window: `logs/sira_qbranch_qstate_long_seed2024_trace_24150_20260604_153514/`
+- Clean first-window rerun: `logs/sira_qbranch_qstate_firstbad_seed2024_trace_24060_20260604_193636/`
+
+Clean trajectories show the diagnostic behaving as expected: `qsig_ratio` is
+about `1.0`, `mu_delta` is tiny, and L00 rowamp stays around the ordinary
+`gamma/sigma` scale (`~40..65x`).  For example, the 24045..24060 first-window
+rerun had no guard skips, `qsig_ratio_p50 ~= 1.00001`, `qsig_ratio_max <= 1.45`,
+and `rowamp_max <= 63.6`.
+
+The bad long-window reproduction showed a qualitatively different state before
+embedding scatter: many guard skips occurred and the reconstructed L00 ReLN
+input no longer matched the saved forward stats.  Over steps `24090..24150`,
+`rowamp_max` reached `3.77e5`, while `sigma_min` remained only about `0.018`.
+The corresponding top rows had `qsig_ratio` and `xhat_rms` tens to hundreds of
+times larger than the saved-normalized scale; e.g. step `24090` top token `265`
+had `sigma=0.01813`, `qsigma=0.50597`, `qsig_ratio=27.9`, `xhat_rms=27.9`,
+`xhat_max=1262`, and `rowamp=3.51e4`.  Step `24104` reached
+`qsig_ratio=53.4` and `rowamp=1.29e5`.
+
+Interpretation: rowamp far above the ordinary `gamma/sigma` bound is explained
+by the ReLN backward using a reconstructed `q_in` whose normalized residuals are
+no longer close to the saved forward normalization.  Once `xhat` is huge, the
+LayerNorm/ReLN backward projection term can amplify far beyond the clean
+`gamma/sigma` intuition.  The open question is why the reverse reconstruction
+enters this mismatched state in bad trajectories (upper-layer reverse-state
+corruption, aliasing/state overwrite, or a run-sensitive numerical path), not
+whether low `sigma` alone explains the spikes.
+
 Working diagnosis: SIRA is at most an indirect trajectory nudge.  The immediate
 overflow path is:
 
