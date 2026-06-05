@@ -686,8 +686,32 @@ early layers; using `> 1.5`, it starts at L07; using the severe `> 2.0`
 threshold, it starts at L06.  The corresponding ReLN gradient trace at step
 24080 first shows abnormal amplification around L08/L07 and then explodes
 through L06..L00.  A separate prebreak run with debug active from
-`24070..24080` did not reproduce any guard skip or severe q-state break, again
-confirming run/timing sensitivity.
+`24070..24080` did not reproduce any guard skip or severe all-layer q-state
+break, again confirming run/timing sensitivity.
+
+A focused L00-only prebreak trace reduced the diagnostic perturbation and
+captured exact full-row L00 stats over `24065..24085`:
+
+- `logs/sira_l00_qstate_prebreak_seed2024_trace_24065_24085_20260605_155452/`
+
+This run did not produce guard skips, but L00 q-state mismatch was already
+visible well before step 24080 when compared to the full clean smoke
+(`qsig_ratio_max ~= 1`, `xhat_rms_max ~= 0.47`, `rowamp_max ~= 90.5`):
+
+```text
+step 24065: qsig_ratio_max=1.13, xhat_rms_max=1.04, rowamp_max=60.4
+step 24066: qsig_ratio_max=2.34, xhat_rms_max=2.27, rowamp_max=79.3  (top token 265)
+step 24068: qsig_ratio_max=2.85, xhat_rms_max=2.80, rowamp_max=165.7 (top token 265)
+step 24069: qsig_ratio_max=4.04, xhat_rms_max=4.00, rowamp_max=686.4 (top token 265)
+step 24070: qsig_ratio_max=4.99, xhat_rms_max=4.96, rowamp_max=1080.0 (top token 265)
+```
+
+Thus the first L00 divergence in the focused prebreak trace is a mild
+`qsig/xhat` deviation at step `24065`; the first severe L00 q-state mismatch is
+step `24066`; the first large rowamp response is step `24069`; and rowamp first
+exceeds `1000x` at step `24070`.  `sigma_min` stayed near `0.01778`, so this is
+again a reconstructed-q/stat mismatch rather than an unusually small-sigma
+state.  Token `265` dominates the earliest severe rows.
 
 Interpretation: rowamp far above the ordinary `gamma/sigma` bound is explained
 by the ReLN backward using a reconstructed `q_in` whose normalized residuals are
