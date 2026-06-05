@@ -652,6 +652,43 @@ had `sigma=0.01813`, `qsigma=0.50597`, `qsig_ratio=27.9`, `xhat_rms=27.9`,
 `xhat_max=1262`, and `rowamp=3.51e4`.  Step `24104` reached
 `qsig_ratio=53.4` and `rowamp=1.29e5`.
 
+A follow-up all-layer sampled q-state trace was added under the same flag and
+run on seed2024 with all layers probed:
+
+- Failing-window artifact:
+  `logs/sira_qbranch_layer_qstate_seed2024_trace_24080_24110_20260605_070728/`
+- Full clean smoke:
+  `logs/sira_qbranch_layer_qstate_full_smoke_LOEsbg/full_smoke.log`
+- Prebreak rerun that did not reproduce a skip:
+  `logs/sira_qbranch_layer_qstate_seed2024_prebreak_24070_24080_20260605_111040/`
+
+The full clean smoke had `qsig_ratio_max ~= 1` and `xhat_rms_max ~= 1` for
+L23..L01, and L00 exact `qsig_ratio_max ~= 1`, `xhat_rms_max ~= 0.47`,
+`rowamp_max ~= 90.5`.  In the failing-window run, the first captured debug step
+was also the first guard skip (`24080`).  At that step, L23..L21 remained
+consistent, L20 showed only a small mean-delta drift, and the first severe
+`qsig/xhat` consistency break in reverse traversal was L06:
+
+```text
+step 24080 L06: qsig_ratio_max=2.03, xhat_rms_max=2.03, mu_delta_max=0.043
+step 24080 L05: qsig_ratio_max=2.51, xhat_rms_max=2.51
+step 24080 L04: qsig_ratio_max=3.10, xhat_rms_max=3.10
+step 24080 L03: qsig_ratio_max=3.82, xhat_rms_max=3.82
+step 24080 L02: qsig_ratio_max=4.70, xhat_rms_max=4.70
+step 24080 L01: qsig_ratio_max=5.83, xhat_rms_max=5.83
+step 24080 L00 sampled: qsig_ratio_max=5.99, xhat_rms_max=5.96
+step 24080 L00 exact:   qsig_ratio_max=21.19, xhat_rms_max=21.19, rowamp_max=1.97e4
+```
+
+Using a looser `qsig/xhat > 1.1` drift threshold, the first reverse-layer drift
+at the captured bad step starts around L13 and grows monotonically toward the
+early layers; using `> 1.5`, it starts at L07; using the severe `> 2.0`
+threshold, it starts at L06.  The corresponding ReLN gradient trace at step
+24080 first shows abnormal amplification around L08/L07 and then explodes
+through L06..L00.  A separate prebreak run with debug active from
+`24070..24080` did not reproduce any guard skip or severe q-state break, again
+confirming run/timing sensitivity.
+
 Interpretation: rowamp far above the ordinary `gamma/sigma` bound is explained
 by the ReLN backward using a reconstructed `q_in` whose normalized residuals are
 no longer close to the saved forward normalization.  Once `xhat` is huge, the
