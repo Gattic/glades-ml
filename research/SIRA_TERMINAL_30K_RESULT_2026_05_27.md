@@ -713,6 +713,40 @@ exceeds `1000x` at step `24070`.  `sigma_min` stayed near `0.01778`, so this is
 again a reconstructed-q/stat mismatch rather than an unusually small-sigma
 state.  Token `265` dominates the earliest severe rows.
 
+A token-focused L00 trace hook (`--sira-qbranch-trace-token 265`) was added to
+compare the exact token-265 rows against a clean-ish all-layer trace.  Artifacts:
+
+- Failing/focused token trace:
+  `logs/sira_l00_token265_focused_seed2024_trace_24065_24070_20260606_080007/`
+- Clean-ish all-layer token trace:
+  `logs/sira_l00_token265_cleanish_alllayer_seed2024_trace_24065_24070_20260606_115602/`
+- Comparison summary:
+  `logs/sira_token265_compare_24065_24070_summary.md`
+
+The token trace logs the L00 inverse input normalized as
+`yhat=(q_out-beta)/gamma`, saved stats, `gamma/beta`, reconstructed `q_in`,
+upstream `dqin`, and rowamp.  In the clean-ish trace, token-265 `gamma/beta` and
+stats were stable, `yhat_rms` matched reconstructed `xhat_rms`, `dqin` stayed
+around `3e-5..9e-5`, and rowamp stayed around `58..60` until a mild step-24070
+outlier (`rowamp=239`).  In the failing/focused token trace, `gamma/beta` were
+still effectively unchanged (`gamma_rms` ratio focused/clean `~1.00019`,
+`beta_rms` ratio `~0.9992`), so parameters/stats are not the first culprit.
+
+Within the requested `24065..24070` window:
+
+```text
+step 24065 token 265: yhat_rms_max 1.03 vs clean 0.836; dqin normal; rowamp normal
+step 24066 token 265: dqin_max 1.8e19 vs clean 5.4e-5; rowamp 8.6e4 vs clean 59
+step 24066 token 265: qsig/xhat 43 vs clean 1.6, while gamma/beta remain unchanged
+```
+
+So the first token-265 input drift visible before the q-state mismatch is the
+L00 ReLN inverse input `q_out`/`yhat` at step `24065`, but the first catastrophic
+value feeding the rowamp explosion is the upstream `dqin` tensor at step
+`24066`.  The failing token-focused run had already begun guard skips before
+the debug window, so this is evidence for the failing trajectory rather than a
+clean no-skip trajectory.
+
 Interpretation: rowamp far above the ordinary `gamma/sigma` bound is explained
 by the ReLN backward using a reconstructed `q_in` whose normalized residuals are
 no longer close to the saved forward normalization.  Once `xhat` is huge, the
