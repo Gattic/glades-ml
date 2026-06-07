@@ -780,6 +780,45 @@ enters this mismatched state in bad trajectories (upper-layer reverse-state
 corruption, aliasing/state overwrite, or a run-sensitive numerical path), not
 whether low `sigma` alone explains the spikes.
 
+### Cost-control decision: no more blind SIRA reruns (2026-06-07)
+
+Because full seed2024 24k+ runs are expensive and another clean run would not
+unblock default promotion, the next diagnostic step is a one-shot trigger rather
+than another broad debug window.  Trainer commit `53f88a5` adds default-off flags:
+
+```text
+--sira-grad-trigger-dump
+--sira-grad-trigger-stop
+--sira-grad-trigger-sumsq F
+--sira-qbranch-trace-token 265   # optional token focus for the L00 snapshot
+```
+
+When enabled, the trainer waits until the global gradient sumsq crosses the
+threshold (default `1e20`, the bad-gradient guard scale), logs the normal
+per-group gradient breakdown, downloads a single post-backward L00 q-state
+snapshot (`s.q` versus saved L00 ReLN stats), optionally reports token-265 rows,
+and can stop before Adam.  This has zero default overhead and avoids paying for
+per-step q-branch host downloads before the first bad event.  It does not solve
+the root cause; it makes the next expensive run useful by capturing the first
+trajectory split instead of a later corrupted window.
+
+Recommended next run, only if we decide the remaining uncertainty justifies the
+cost:
+
+```bash
+--sira-grad-trigger-dump \
+--sira-grad-trigger-stop \
+--sira-grad-trigger-sumsq 1e20 \
+--sira-qbranch-trace-token 265
+```
+
+Verification for the trigger hook:
+
+- `git diff --check`
+- `cmake --build build --target glades_chiron_train -j2`
+- Smoke with forced threshold `0`:
+  `logs/sira_grad_trigger_smoke_EaCgyx/smoke.log`
+
 Working diagnosis: SIRA is at most an indirect trajectory nudge.  The immediate
 overflow path is:
 
