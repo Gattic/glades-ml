@@ -819,6 +819,29 @@ Verification for the trigger hook:
 - Smoke with forced threshold `0`:
   `logs/sira_grad_trigger_smoke_EaCgyx/smoke.log`
 
+The first trigger run completed and stopped at the first bad global gradient:
+
+- Artifact: `logs/sira_grad_trigger_seed2024_20260606_214654/`
+- Summary: `trigger_summary.md` and `trigger_summary.json`
+- Runtime: `rc=0`, warm logged throughput excluding step 1: `27954.0 tok/s`
+- Trigger: step `24070`, `global_sumsq=2.49679264e25`, norm `4.9967918e12`
+- Top gradient groups: `dE` (`2.47766636e25`, BAD) and `L00.dgamma`
+  (`1.91250114e23`, BAD), then the early-layer `dgamma/dbeta` ladder.
+- One-shot L00 q-state snapshot at the trigger showed q/stat mismatch already
+  present at the first bad global grad: `qsig_ratio_max=13.03`,
+  `xhat_rms_max=13.02`, and `mean_abs_delta_max=0.00608`.
+- Token `265` was again a major outlier but not the top row: top row was
+  `token=50 pos=9` (`qsig=13.03`); token `265` count was `209`, with top rows
+  at `pos=1761/2978/1317` around `qsig=9.57`, `xhat_rms=9.55`.
+
+This is now a clean first-trigger capture rather than a later window after many
+prior skips.  It confirms that by the first bad global gradient the L00
+reconstructed state is already inconsistent with the saved L00 ReLN stats, and
+that the immediate gradient signature remains `dE` plus early ReLN parameter
+grads.  It still does not identify the first upstream forward/reverse tensor
+that caused the L00 q-state mismatch; a future run should only be considered if
+it adds a similarly triggered all-layer or pre-L00 forward-state snapshot.
+
 Working diagnosis: SIRA is at most an indirect trajectory nudge.  The immediate
 overflow path is:
 
