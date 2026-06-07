@@ -747,6 +747,30 @@ value feeding the rowamp explosion is the upstream `dqin` tensor at step
 the debug window, so this is evidence for the failing trajectory rather than a
 clean no-skip trajectory.
 
+A synchronized rerun of the focused token trace confirmed the `q_out` capture is
+not an async download artifact:
+
+- Focused synced trace:
+  `logs/sira_l00_token265_sync_focused_seed2024_trace_24065_24070_20260606_170448/`
+- Updated comparison:
+  `logs/sira_token265_sync_focus_vs_cleanish_24065_24070_summary.md`
+
+In the synced focused trace, `yhat_rms` and reconstructed `xhat_rms` agree to
+roundoff.  At step `24065`, the top token-265 position is the same as the
+clean-ish comparator (`pos=795`) and the token count is the same (`3/3`), so the
+data/RoPE-position side is not the first divergence.  L00 `gamma_rms` and
+`beta_rms` are essentially unchanged (`1.009` and `0.0381` in both traces), and
+upstream `dqin` remains normal (`3.83e-5` vs `3.41e-5`).  The first in-window
+value that has actually moved is the reconstructed L00 activation itself:
+`yhat_rms_max=2.210` vs `0.836`, `qsig_ratio_max=2.276` vs `1.005`, with normal
+rowamp (`58.8` vs `58.3`).  This rules out L00 gamma/beta, token identity,
+position identity, and L00 ReLN download/normalization as the first cause seen
+inside the window.  The focused synced run had already skipped `20` Adam updates
+before the window (first at step `23939`), whereas the clean-ish comparator had
+none; therefore the earliest upstream event visible in the available traces is
+the prior overflow/guard-skip trajectory split, not a new L00-local weight or
+RoPE/position difference at step `24065`.
+
 Interpretation: rowamp far above the ordinary `gamma/sigma` bound is explained
 by the ReLN backward using a reconstructed `q_in` whose normalized residuals are
 no longer close to the saved forward normalization.  Once `xhat` is huge, the
