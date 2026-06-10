@@ -21,6 +21,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdio>
 
 namespace glades {
@@ -407,7 +408,7 @@ __global__ void chiron_reln_forward_rows_bf16p_kernel(
 
 	if (threadIdx.x == 0) {
 		stats[(size_t)row * 2 + 0] = mu;
-		stats[(size_t)row * 2 + 1] = logf(sigma);
+		stats[(size_t)row * 2 + 1] = sigma;
 	}
 }
 
@@ -427,10 +428,11 @@ __global__ void chiron_reln_inverse_rows_bf16p_sr_kernel(
 	const float* oRow = q_out + (size_t)row * cols;
 	unsigned short* pRow = p_bf_out + (size_t)row * cols;
 	const float mu    = stats[(size_t)row * 2 + 0];
-	const float sigma = expf(stats[(size_t)row * 2 + 1]);
+	const float sigma = stats[(size_t)row * 2 + 1];
 
 	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-		const float v = ((oRow[i] - beta[i]) / gamma[i]) * sigma + mu;
+		const float y = (oRow[i] - beta[i]) / gamma[i];
+		const float v = fmaf(sigma, y, mu);
 		pRow[i] = fp32_to_bf16_sr_dev(v, (uint32_t)((size_t)row * cols + i),
 		                              srStepIdx, srBaseSeed);
 	}
@@ -622,7 +624,7 @@ bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n,
 //
 // One block per token.  Each block computes the row mean and variance via
 // warp/block reductions, writes the normalized row, and records
-// (mu, log(sigma)) into stats[row, 0..1].
+// (mu, sigma) into stats[row, 0..1].
 
 namespace {
 
@@ -673,10 +675,10 @@ __global__ void chiron_reln_forward_rows(const float* __restrict__ q_in,
 	for (int i = threadIdx.x; i < cols; i += blockDim.x)
 		oRow[i] = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
 
-	// Stats: { mu, log(sigma) } for this row.
+	// Stats: { mu, sigma } for this row.
 	if (threadIdx.x == 0) {
 		stats[(size_t)row * 2 + 0] = mu;
-		stats[(size_t)row * 2 + 1] = logf(sigma);
+		stats[(size_t)row * 2 + 1] = sigma;
 	}
 }
 
@@ -773,10 +775,10 @@ __global__ void chiron_reln_axpy_into_q_rows(const float* __restrict__ p,
 		qRow[i] += alpha * p_norm_i;
 	}
 
-	// Stats: { mu, log(sigma) } for this row (same format as chiron_reln_forward).
+	// Stats: { mu, sigma } for this row (same format as chiron_reln_forward).
 	if (threadIdx.x == 0) {
 		stats[(size_t)row * 2 + 0] = mu;
-		stats[(size_t)row * 2 + 1] = logf(sigma);
+		stats[(size_t)row * 2 + 1] = sigma;
 	}
 }
 
@@ -799,7 +801,7 @@ bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
 //  3. Reversible LayerNorm (ReLN) inverse.
 // ===========================================================================
 //
-// Given q_out, stats[row, 0..1] = { mu, log(sigma) }, recover q_in.
+// Given q_out, stats[row, 0..1] = { mu, sigma }, recover q_in.
 // Single-pass per row.
 
 namespace {
@@ -816,12 +818,13 @@ __global__ void chiron_reln_inverse_rows(const float* __restrict__ q_out,
 	float*       xRow = q_in  + (size_t)row * cols;
 
 	const float mu    = stats[(size_t)row * 2 + 0];
-	const float sigma = expf(stats[(size_t)row * 2 + 1]);
+	const float sigma = stats[(size_t)row * 2 + 1];
 
 	for (int i = threadIdx.x; i < cols; i += blockDim.x)
 	{
-		// x = sigma * (y - beta) / gamma + mu
-		xRow[i] = sigma * (yRow[i] - beta[i]) / gamma[i] + mu;
+		// x = fma(sigma, (y - beta) / gamma, mu)
+		const float y = (yRow[i] - beta[i]) / gamma[i];
+		xRow[i] = fmaf(sigma, y, mu);
 	}
 }
 
@@ -844,14 +847,14 @@ bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
 // ===========================================================================
 //
 // ReLN forward is numerically identical to LayerNorm forward — the only
-// novelty is where (mu, log_sigma) are stored. For the backward pass
-// we convert the external (mu, log_sigma) stats buffer into the
+// novelty is where (mu, sigma) are stored. For the backward pass
+// we convert the external (mu, sigma) stats buffer into the
 // (mean[T], invStd[T]) format that the existing layernorm_backward
 // kernel expects, then defer to that kernel.
 
 namespace {
 
-// Kernel to split [T, 2] (mu, log_sigma) -> two separate [T] buffers
+// Kernel to split [T, 2] (mu, sigma) -> two separate [T] buffers
 // (mean, invStd).  One thread per row.
 __global__ void chiron_stats_split_kernel(const float* __restrict__ stats,
                                           int T,
@@ -862,7 +865,7 @@ __global__ void chiron_stats_split_kernel(const float* __restrict__ stats,
 	if (i < T)
 	{
 		mean[i]   = stats[(size_t)i * 2 + 0];
-		invStd[i] = expf(-stats[(size_t)i * 2 + 1]);
+		invStd[i] = 1.0f / stats[(size_t)i * 2 + 1];
 	}
 }
 
@@ -1559,9 +1562,39 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 		return false;
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
 		return false;
-	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
-	                                    sO, scratch_P))
-		return false;
+	// BF16G backward is parity-sensitive here: keep the score GEMM/softmax
+	// path identical to flash_attention_cublas_tiled, but route only P·V
+	// through strict FP32 cuBLAS math (no TF32 tensor-core contraction).
+	{
+		const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+		if (!sgemm_batched_strided_abt(
+		        T, T, dHead,
+		        invSqrtDH,
+		        sQ, dModel, (long long)dHead,
+		        sK, dModel, (long long)dHead,
+		        0.0f,
+		        scratch_P, T, (long long)T * T,
+		        nHeads))
+			return false;
+		if (causal)
+		{
+			if (!causal_mask_softmax_inplace(scratch_P, nHeads, T))
+				return false;
+		}
+		else if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P))
+		{
+			return false;
+		}
+		if (!sgemm_batched_strided_exact(
+		        T, dHead, T,
+		        1.0f,
+		        scratch_P, T, (long long)T * T,
+		        sV, dModel, (long long)dHead,
+		        0.0f,
+		        sO, dModel, (long long)dHead,
+		        nHeads))
+			return false;
+	}
 
 	// 3. Output-projection backward.  dO = dp_new · Wo^T.
 	if (!cast_f32_to_bf16(dp_new, scratch_qbf, static_cast<size_t>(T) * m))
@@ -1980,8 +2013,9 @@ bool flash_attention_backward_cublas_tiled(
 	        nHeads))
 		return false;
 
-	// dQ = (1/sqrt(dH)) · dS · K.
-	if (!sgemm_batched_strided(
+	// dQ = (1/sqrt(dH)) · dS · K.  Use strict FP32 cuBLAS math
+	// for parity-sensitive replay (avoid TF32 tensor-core contraction).
+	if (!sgemm_batched_strided_exact(
 	        T, dHead, T, invSqrtDH,
 	        scratch_dP, T, (long long)T * T,
 	        K, dModel, (long long)dHead,
@@ -1993,7 +2027,7 @@ bool flash_attention_backward_cublas_tiled(
 	// iter 107 (2026-05-21): dK = (1/sqrt(dH)) · dS^T · Q (overwrite, was +=).
 	// Same rationale as dV above — all callers pre-zero sdK and don't depend
 	// on prior content.  Math bit-identical when dK starts at zero.
-	if (!sgemm_batched_strided_atb(
+	if (!sgemm_batched_strided_atb_exact(
 	        T, dHead, T, invSqrtDH,
 	        scratch_dP, T, (long long)T * T,
 	        Q, dModel, (long long)dHead,

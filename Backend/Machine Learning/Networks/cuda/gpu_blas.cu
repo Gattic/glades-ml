@@ -708,6 +708,38 @@ bool sgemm_batched_strided(int M, int N, int K,
 	return true;
 }
 
+bool sgemm_batched_strided_exact(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda, long long int strideA,
+                                  const float* B, int ldb, long long int strideB,
+                                  float beta,
+                                  float* C, int ldc, long long int strideC,
+                                  int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	// Same row-major trick as sgemm_batched_strided, but force the strict-FP32
+	// cuBLAS handle (CUBLAS_DEFAULT_MATH) so Ampere+ does not contract via TF32.
+	cublasHandle_t h = pick_handle(CUBLAS_DEFAULT_MATH);
+	cublasStatus_t st = cublasSgemmStridedBatched(h,
+	                                               CUBLAS_OP_N, CUBLAS_OP_N,
+	                                               N, M, K,
+	                                               &alpha,
+	                                               B, ldb, strideB,
+	                                               A, lda, strideA,
+	                                               &beta,
+	                                               C, ldc, strideC,
+	                                               batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(exact) failed: %d\n",
+		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided_abt(int M, int N, int K,
                                 float alpha,
                                 const float* A, int lda, long long int strideA,
@@ -762,6 +794,38 @@ bool sgemm_batched_strided_atb(int M, int N, int K,
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
 		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(ATB) failed: %d\n",
+		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_strided_atb_exact(int M, int N, int K,
+                                      float alpha,
+                                      const float* A, int lda, long long int strideA,
+                                      const float* B, int ldb, long long int strideB,
+                                      float beta,
+                                      float* C, int ldc, long long int strideC,
+                                      int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	// Same ATB trick as sgemm_batched_strided_atb, but force the strict-FP32
+	// cuBLAS handle (CUBLAS_DEFAULT_MATH) so Ampere+ does not contract via TF32.
+	cublasHandle_t h = pick_handle(CUBLAS_DEFAULT_MATH);
+	cublasStatus_t st = cublasSgemmStridedBatched(h,
+	                                               CUBLAS_OP_N, CUBLAS_OP_T,
+	                                               N, M, K,
+	                                               &alpha,
+	                                               B, ldb, strideB,
+	                                               A, lda, strideA,
+	                                               &beta,
+	                                               C, ldc, strideC,
+	                                               batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(ATB exact) failed: %d\n",
 		        static_cast<int>(st));
 		return false;
 	}

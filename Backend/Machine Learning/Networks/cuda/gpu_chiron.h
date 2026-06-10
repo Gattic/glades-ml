@@ -140,7 +140,7 @@ bool chiron_reln_inverse_rows_bf16p_sr(const float* q_out, const float* stats,
 
 // Forward: given q_in[T, m] and affine parameters gamma[m], beta[m], writes:
 //   - q_out[T, m]  = gamma * (q_in - mu) / sqrt(var + eps) + beta  per row
-//   - stats[T, 2]  = { mu, log(sqrt(var + eps)) }                   per row
+//   - stats[T, 2]  = { mu, sqrt(var + eps) }                        per row
 // Each row has mean mu and std sigma; stats records both so the inverse is
 // deterministic.
 bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
@@ -155,14 +155,14 @@ bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
 // q[i] += alpha · (gamma[i]·(p[i]-mu)/sigma + beta[i]).  Eliminates the
 // p_norm scratch round-trip (~128 MB per call at T=8192 m=2048).  Math is
 // bit-identical FP32 modulo sub-ULP FMA-ordering.  stats[T, 2] is written
-// in the same { mu, log(sigma) } format as chiron_reln_forward.
+// in the same { mu, sigma } format as chiron_reln_forward.
 bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
                               const float* gamma, const float* beta,
                               float alpha, int T, int m, float eps);
 
 // Inverse: given q_out and the stats produced by the forward, recovers q_in.
 //   q_in[i] = sigma * (q_out[i] - beta[i]) / gamma[i] + mu
-// where sigma = exp(stats[t, 1]) and mu = stats[t, 0].
+// where sigma = stats[t, 1] and mu = stats[t, 0].
 bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
                           const float* gamma, const float* beta,
                           int T, int m);
@@ -180,7 +180,7 @@ bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
 // is numerically identical to LayerNorm forward — the only novelty is
 // that stats are stored externally and the map is framed as a reversible
 // shear in p-coordinates).  This is a thin wrapper that converts stats
-// from (mu, log_sigma) to (mean, invStd) format and calls the existing
+// from (mu, sigma) to (mean, invStd) format and calls the existing
 // layernorm_backward kernel.
 //
 // scratch_stats_split: caller-owned buffer of size 2*T floats, used as
