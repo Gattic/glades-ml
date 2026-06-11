@@ -417,6 +417,19 @@ bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
                                 const float* dout,
                                 int T, int vocabSize, int dModel);
 
+// Per-row RMS clamp with non-finite sanitization, in place on x [rows×cols].
+//  - any non-finite element in a row → entire row zeroed, ++*d_nonfiniteCount
+//  - else row RMS > tauRms           → row scaled by tauRms/rms, ++*d_clampedCount
+//  - else                            → row untouched (no write; bit-identical)
+// Row sum-of-squares accumulates in double so huge-but-finite rows rescale
+// correctly instead of overflowing FP32 to inf.  Deterministic.  Count
+// pointers are device ints and may be NULL.  Returns false on invalid args
+// or tauRms <= 0 (the disabled path must not call).  Used by the CHIRON
+// trainer to bound dq_0 rows before embedding_scatter_add (SIRA stability
+// mitigation, 2026-06-11 — see SIRA_TERMINAL_30K_RESULT_2026_05_27.md).
+bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
+                   int* d_clampedCount, int* d_nonfiniteCount);
+
 // ---------------------------------------------------------------------------
 // Adam optimizer
 // ---------------------------------------------------------------------------
@@ -1183,6 +1196,7 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_gather_bf16(const uint16_t*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
+inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }

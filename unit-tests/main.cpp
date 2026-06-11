@@ -221,6 +221,8 @@ int main(int argc, char* argv[])
 		CHIRONPtocConfigDefaultsTest();
 		CHIRONPtocDisabledParityTest();
 		CHIRONPtocDiagnosticsMathTest();
+		CHIRONQClampMathTest();
+		CHIRONQClampEdgeTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-phs") == 0 || strcmp(argv[1], "phs") == 0)
 	    {
@@ -234,6 +236,11 @@ int main(int argc, char* argv[])
 		CHIRONPtocConfigDefaultsTest();
 		CHIRONPtocDisabledParityTest();
 		CHIRONPtocDiagnosticsMathTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-qclamp") == 0 || strcmp(argv[1], "qclamp") == 0)
+	    {
+		CHIRONQClampMathTest();
+		CHIRONQClampEdgeTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();

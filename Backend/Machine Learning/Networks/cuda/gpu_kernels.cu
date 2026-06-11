@@ -1523,6 +1523,73 @@ __global__ void embedding_scatter_add_bf16_kernel(uint16_t* __restrict__ dE_bf16
 	}
 }
 
+// Per-row RMS clamp with non-finite sanitization (in place).  One 256-thread
+// block per row; the row sum-of-squares accumulates in double so huge-but-
+// finite rows (|x| ~ 1e20, whose FP32 square is inf) still compute a correct
+// rescale instead of being misread as overflowed.  Rows that need no change
+// take no write at all — they stay bit-identical.  Deterministic: fixed-order
+// tree reduction, and the count atomics only order independent increments.
+__global__ void row_rms_clamp_kernel(float* __restrict__ x,
+                                     int rows, int cols, float tauRms,
+                                     int* __restrict__ clampedCount,
+                                     int* __restrict__ nonfiniteCount)
+{
+	const int row = blockIdx.x;
+	if (row >= rows) return;
+	float* xr = x + (size_t)row * cols;
+
+	__shared__ double s_ss[256];
+	__shared__ int s_bad[256];
+	__shared__ float s_scale;
+
+	double ss = 0.0;
+	int bad = 0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		const float v = xr[i];
+		if (!isfinite(v)) bad = 1;
+		ss += (double)v * (double)v;
+	}
+	s_ss[threadIdx.x] = ss;
+	s_bad[threadIdx.x] = bad;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < (unsigned int)stride)
+		{
+			s_ss[threadIdx.x] += s_ss[threadIdx.x + stride];
+			s_bad[threadIdx.x] |= s_bad[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+	{
+		float scale = 1.0f;
+		if (s_bad[0])
+		{
+			// Row is poisoned (NaN/Inf): zero it rather than propagate.
+			scale = 0.0f;
+			if (nonfiniteCount) atomicAdd(nonfiniteCount, 1);
+		}
+		else
+		{
+			const double rms = sqrt(s_ss[0] / (double)cols);
+			if (rms > (double)tauRms)
+			{
+				scale = (float)((double)tauRms / rms);
+				if (clampedCount) atomicAdd(clampedCount, 1);
+			}
+		}
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float scale = s_scale;
+	if (scale == 1.0f) return;
+	// scale==0 writes the literal 0.0f (a NaN element times 0 is still NaN).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		xr[i] = (scale == 0.0f) ? 0.0f : xr[i] * scale;
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1569,6 +1636,19 @@ bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
 	embedding_scatter_add_bf16_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE_bf16, tokenIds, dout, T, vocabSize, dModel);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
+                   int* d_clampedCount, int* d_nonfiniteCount)
+{
+	// Strict argument contract: tauRms <= 0 would zero every row, which is
+	// never what a caller wants — the disabled path must not call at all.
+	if (!x || rows <= 0 || cols <= 0) return false;
+	if (!(tauRms > 0.0f)) return false;
+	row_rms_clamp_kernel<<<rows, 256, 0, computeStream()>>>(
+	    x, rows, cols, tauRms, d_clampedCount, d_nonfiniteCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

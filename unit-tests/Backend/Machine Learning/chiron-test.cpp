@@ -17515,3 +17515,212 @@ void CHIRONPtocDiagnosticsMathTest()
 	ASSERT("CHIRONPtocDiagnosticsMath: missing direction rejected when enabled", !bad);
 }
 
+
+// === DQ-EMBED CLAMP TESTS (2026-06-11 SIRA stability mitigation) ===
+// row_rms_clamp bounds dq_0 rows before embedding_scatter_add so exploded
+// rows cannot contaminate dE and overflow the global grad norm.  See
+// docs/superpowers/specs/2026-06-11-dq-embed-clamp-design.md.
+
+void CHIRONQClampMathTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON qclamp math] no CUDA device — skipped\n");
+		return;
+	}
+
+	const int rows = 6;
+	const int cols = 384; // > one 256-thread block stride, not a multiple of it
+	const float tau = 1.0f;
+
+	union { uint32_t u; float f; } nanv; nanv.u = 0x7FC00000u; // quiet NaN
+	union { uint32_t u; float f; } infv; infv.u = 0x7F800000u; // +Inf
+
+	// row 0: healthy (rms ~0.06)      → untouched, bit-identical
+	// row 1: rms ~4·tau               → rescaled to rms == tau
+	// row 2: healthy values + one NaN → zeroed
+	// row 3: healthy values + one Inf → zeroed
+	// row 4: huge finite (±1e20)      → rescaled (FP32 sumsq would be inf;
+	//                                   exercises the double accumulator)
+	// row 5: constant 0.99, rms < tau → untouched, bit-identical
+	std::vector<float> x((size_t)rows * cols);
+	LCG rng(20260611u);
+	for (int i = 0; i < cols; ++i) x[(size_t)0 * cols + i] = 0.1f * rng.next_unit();
+	for (int i = 0; i < cols; ++i) x[(size_t)1 * cols + i] = 4.0f * rng.next_unit();
+	for (int i = 0; i < cols; ++i) x[(size_t)2 * cols + i] = rng.next_unit();
+	x[(size_t)2 * cols + 17] = nanv.f;
+	for (int i = 0; i < cols; ++i) x[(size_t)3 * cols + i] = rng.next_unit();
+	x[(size_t)3 * cols + cols - 1] = infv.f;
+	for (int i = 0; i < cols; ++i)
+		x[(size_t)4 * cols + i] = (i % 2 == 0) ? 1e20f : -1e20f;
+	for (int i = 0; i < cols; ++i) x[(size_t)5 * cols + i] = 0.99f;
+
+	// CPU reference (same math as the kernel: double sumsq, strict > tau).
+	std::vector<float> ref(x);
+	int refClamped = 0, refNonfinite = 0;
+	for (int r = 0; r < rows; ++r)
+	{
+		double ss = 0.0;
+		bool bad = false;
+		for (int i = 0; i < cols; ++i)
+		{
+			const float v = ref[(size_t)r * cols + i];
+			if (v != v || v == infv.f || v == -infv.f) bad = true;
+			ss += (double)v * (double)v;
+		}
+		if (bad)
+		{
+			++refNonfinite;
+			for (int i = 0; i < cols; ++i) ref[(size_t)r * cols + i] = 0.0f;
+		}
+		else
+		{
+			const double rms = sqrt(ss / (double)cols);
+			if (rms > (double)tau)
+			{
+				++refClamped;
+				const float scale = (float)((double)tau / rms);
+				for (int i = 0; i < cols; ++i) ref[(size_t)r * cols + i] *= scale;
+			}
+		}
+	}
+	ASSERT("CHIRONQClampMath: reference clamps rows 1 and 4", refClamped == 2);
+	ASSERT("CHIRONQClampMath: reference zeroes rows 2 and 3", refNonfinite == 2);
+
+	glades::gpu::GpuBuffer<float> d_x;
+	ASSERT("CHIRONQClampMath: alloc x", d_x.allocate(x.size()));
+	ASSERT("CHIRONQClampMath: upload x", d_x.upload(&x[0], x.size()));
+
+	glades::gpu::GpuBuffer<int> d_counts;
+	ASSERT("CHIRONQClampMath: alloc counts", d_counts.allocate(2));
+	const int zeros[2] = { 0, 0 };
+	ASSERT("CHIRONQClampMath: zero counts", d_counts.upload(zeros, 2));
+
+	ASSERT("CHIRONQClampMath: row_rms_clamp runs",
+	       glades::gpu::row_rms_clamp(d_x.data(), rows, cols, tau,
+	                                  d_counts.data(), d_counts.data() + 1));
+
+	std::vector<float> got(x.size());
+	ASSERT("CHIRONQClampMath: download x", d_x.download(&got[0], got.size()));
+	int counts[2] = { -1, -1 };
+	ASSERT("CHIRONQClampMath: download counts", d_counts.download(counts, 2));
+
+	ASSERT("CHIRONQClampMath: clamped count == 2", counts[0] == 2);
+	ASSERT("CHIRONQClampMath: nonfinite count == 2", counts[1] == 2);
+
+	// Untouched rows (0, 5) must be bit-identical to the input.
+	bool untouchedExact = true;
+	for (int i = 0; i < cols; ++i)
+	{
+		if (got[(size_t)0 * cols + i] != x[(size_t)0 * cols + i]) untouchedExact = false;
+		if (got[(size_t)5 * cols + i] != x[(size_t)5 * cols + i]) untouchedExact = false;
+	}
+	ASSERT("CHIRONQClampMath: healthy rows bit-identical", untouchedExact);
+
+	// Zeroed rows (2, 3) must be exactly 0.0f everywhere.
+	bool zeroedExact = true;
+	for (int i = 0; i < cols; ++i)
+	{
+		if (got[(size_t)2 * cols + i] != 0.0f) zeroedExact = false;
+		if (got[(size_t)3 * cols + i] != 0.0f) zeroedExact = false;
+	}
+	ASSERT("CHIRONQClampMath: non-finite rows zeroed", zeroedExact);
+
+	// Rescaled rows (1, 4) match the CPU reference within rtol 1e-6
+	// (CPU sequential vs GPU tree reduction may differ in the last ulp).
+	bool scaledMatch = true;
+	for (int r = 1; r < 5; r += 3) // rows 1 and 4
+	{
+		for (int i = 0; i < cols; ++i)
+		{
+			const float g = got[(size_t)r * cols + i];
+			const float e = ref[(size_t)r * cols + i];
+			const float denom = fabsf(e) > 1.0f ? fabsf(e) : 1.0f;
+			if (fabsf(g - e) / denom > 1e-6f) scaledMatch = false;
+		}
+	}
+	ASSERT("CHIRONQClampMath: rescaled rows match CPU reference", scaledMatch);
+
+	// Post-clamp RMS of rescaled rows must be <= tau (small headroom for
+	// FP32 rounding of the per-element multiply).
+	bool rmsBounded = true;
+	for (int r = 1; r < 5; r += 3)
+	{
+		double ss = 0.0;
+		for (int i = 0; i < cols; ++i)
+		{
+			const float v = got[(size_t)r * cols + i];
+			ss += (double)v * (double)v;
+		}
+		if (sqrt(ss / (double)cols) > (double)tau * (1.0 + 1e-5)) rmsBounded = false;
+	}
+	ASSERT("CHIRONQClampMath: rescaled rows bounded by tau", rmsBounded);
+#else
+	std::printf("  [CHIRON qclamp math] built without CUDA — skipped\n");
+#endif
+}
+
+void CHIRONQClampEdgeTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON qclamp edge] no CUDA device — skipped\n");
+		return;
+	}
+
+	glades::gpu::GpuBuffer<float> d_x;
+	ASSERT("CHIRONQClampEdge: alloc", d_x.allocate(8));
+
+	// Invalid arguments are rejected (disabled path must not call at all).
+	ASSERT("CHIRONQClampEdge: NULL x rejected",
+	       !glades::gpu::row_rms_clamp(0, 1, 8, 1.0f, 0, 0));
+	ASSERT("CHIRONQClampEdge: rows<=0 rejected",
+	       !glades::gpu::row_rms_clamp(d_x.data(), 0, 8, 1.0f, 0, 0));
+	ASSERT("CHIRONQClampEdge: cols<=0 rejected",
+	       !glades::gpu::row_rms_clamp(d_x.data(), 1, 0, 1.0f, 0, 0));
+	ASSERT("CHIRONQClampEdge: tau==0 rejected",
+	       !glades::gpu::row_rms_clamp(d_x.data(), 1, 8, 0.0f, 0, 0));
+	ASSERT("CHIRONQClampEdge: tau<0 rejected",
+	       !glades::gpu::row_rms_clamp(d_x.data(), 1, 8, -1.0f, 0, 0));
+
+	// NULL counters accepted: constant-3 row at tau=1 rescales to 1s.
+	{
+		float h[8];
+		for (int i = 0; i < 8; ++i) h[i] = 3.0f;
+		ASSERT("CHIRONQClampEdge: upload", d_x.upload(h, 8));
+		ASSERT("CHIRONQClampEdge: NULL counters accepted",
+		       glades::gpu::row_rms_clamp(d_x.data(), 1, 8, 1.0f, 0, 0));
+		float out[8];
+		ASSERT("CHIRONQClampEdge: download", d_x.download(out, 8));
+		bool ok = true;
+		for (int i = 0; i < 8; ++i)
+			if (fabsf(out[i] - 1.0f) > 1e-6f) ok = false;
+		ASSERT("CHIRONQClampEdge: constant row rescaled to tau", ok);
+	}
+
+	// cols==1, sign preserved, every row clamped, counters exact.
+	{
+		const float h[2] = { 5.0f, -5.0f };
+		ASSERT("CHIRONQClampEdge: upload cols1", d_x.upload(h, 2));
+		glades::gpu::GpuBuffer<int> d_counts;
+		ASSERT("CHIRONQClampEdge: alloc counts", d_counts.allocate(2));
+		const int zeros[2] = { 0, 0 };
+		ASSERT("CHIRONQClampEdge: zero counts", d_counts.upload(zeros, 2));
+		ASSERT("CHIRONQClampEdge: cols==1 runs",
+		       glades::gpu::row_rms_clamp(d_x.data(), 2, 1, 1.0f,
+		                                  d_counts.data(), d_counts.data() + 1));
+		float out[2];
+		ASSERT("CHIRONQClampEdge: download cols1", d_x.download(out, 2));
+		ASSERT("CHIRONQClampEdge: cols==1 magnitude",
+		       fabsf(out[0] - 1.0f) < 1e-6f && fabsf(out[1] + 1.0f) < 1e-6f);
+		int counts[2] = { -1, -1 };
+		ASSERT("CHIRONQClampEdge: download counts", d_counts.download(counts, 2));
+		ASSERT("CHIRONQClampEdge: all rows counted as clamped",
+		       counts[0] == 2 && counts[1] == 0);
+	}
+#else
+	std::printf("  [CHIRON qclamp edge] built without CUDA — skipped\n");
+#endif
+}
