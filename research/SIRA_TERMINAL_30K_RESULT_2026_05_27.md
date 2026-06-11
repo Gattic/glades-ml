@@ -1040,3 +1040,72 @@ steps before its later wave onset — incidental, not gate-relevant.
 - Promotion criterion 2 (matched no-SIRA 30k baseline at `--lr 7.5e-5
   --grad-clip 0.5`) remains outstanding and independent — still the
   highest-EV next 5h of GPU for the arc.
+
+---
+
+## Per-layer dq clamp seed-2024 30k: STABILITY GATE PASS (2026-06-11)
+
+Escalation run after the dE-only clamp FAIL above.  New trainer flag
+`--dq-layer-clamp F` clamps the incoming dq (`dq_in_ptr`,
+iter-113-alternation-aware) at the top of EVERY backward layer iteration —
+the tensor `chiron_reln_backward` consumes — bounding each layer's
+dgamma/dbeta at the source.  Run = exact candidate recipe, seed `2024`,
+`--dq-layer-clamp 1.0 --dq-embed-clamp 1.0`.
+
+Artifact: `logs/sira_layerclamp_tau1_seed2024_30k_20260611_081639/` (glades-trainer).
+Checkpoint: `database/checkpoints/sira_clamp_seed2024/chiron_sira_layerclamp_tau1_seed2024_20260611_081639.final`.
+
+**Result: zero guard skips in 30k.  Best SIRA NLL in the arc.**
+
+| run (seed 2024 unless noted) | final NLL | skips | warm tok/s |
+|---|---:|---:|---:|
+| B5 flagship baseline record | 3.5734 | 0 | ~28,070 |
+| original (2026-06-02) | 3.5675 | 5,809 | 27,862 |
+| dE-only clamp (2026-06-11) | 3.5618 | 5,659 | ~28,080 |
+| clean seed-4242 (2026-06-02) | 3.5235 | 0 | 27,856 |
+| **per-layer clamp (this run)** | **3.5062** | **0** | 27,184 |
+
+Final position buckets `[3.38/3.42/3.57/3.46/3.46/3.65/3.53/3.57]` —
+every bucket better than B5 `[3.45/3.47/3.65/3.53/3.52/3.69/3.62/3.65]`,
+including bucket 7 (3.57 vs 3.65).
+
+Clamp activity: confined to steps `23766–24276` (~510 steps), 443 layer-
+clamp firing steps (434,304 rows total, peak 127,013 rows/step ≈ 32% of
+the 24×T row-slots, **0 zeroed** — bounding the cascade prevented any
+non-finite value from ever forming) + 467 embed-clamp firing steps
+(175,370 rows).  **No firings after 24,276**: with updates continuing
+(bounded + globally clipped) instead of 5,700 frozen-weight skip steps,
+the optimizer trained through the burst region and exited it.  This
+confirms the skip wave's self-perpetuation mechanism (frozen weights →
+identical amplification next step) and shows bounded-update continuation
+breaks the loop.
+
+Identity evidence (300-step gate, `logs/dq_layer_clamp_gate_20260611/`):
+zero firings in the healthy phase; no-clamp vs both-clamps trajectory
+drift (13/30 last-digit step lines) is within same-seed rerun noise
+(12/30 for a no-clamp rerun); all three gates end at identical val NLL.
+Side-finding: same-seed full-recipe runs are NOT bit-reproducible
+run-to-run at production shape (atomic-ordering noise in
+embedding_scatter_add and friends) — "trajectory parity" claims at this
+shape should always be benchmarked against a rerun control.
+
+### Promotion scorecard (per the 2026-05-27 criteria)
+
+1. **PASS** — adversarial-seed 30k without NaNs/non-finite/guard skips
+   (seed 2024 was the blocking seed; 4242 passed clean 2026-06-02).
+2. **OUTSTANDING** — matched no-SIRA 30k baseline at `--lr 7.5e-5
+   --grad-clip 0.5` (now ideally + clamps) for recipe attribution.
+3. **PASS** — final NLL 3.5062 ≤ 3.5534 single-run gate.
+4. **PASS** — 27,184 tok/s ≥ 26,668 (clamp overhead ~2.4% vs no-clamp).
+5. **PASS** — bucket 7 / long-context improved, no regression.
+6. **PASS** — flags default-off; disabled parity verified by gate A/C.
+
+**SIRA candidate-default promotion is now blocked ONLY on criterion 2.**
+
+Caveats for the eventual promotion decision: (a) the clamp intervened in
+~510 steps of the trajectory, so part of the 3.5062-vs-3.5235 margin over
+the clean 4242 run may be seed/noise rather than clamp benefit; (b) all
+2026-06-11 runs are on the post-BF16G-replay-parity binary (d9b8e3249),
+which shifts trajectories at the ±0.002-nat scale vs 2026-06-02 runs.
+The criterion-2 baseline resolves both at once if run on the current
+binary with clamps in the recipe.
