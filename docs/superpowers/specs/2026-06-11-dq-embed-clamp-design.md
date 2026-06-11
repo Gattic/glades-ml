@@ -124,3 +124,32 @@ healthy row RMS, documented in the run doc). Success = no guard skips and
 NLL within the pre-registered SIRA gates; the clamp then becomes part of the
 candidate recipe (still default-off in production until the full six-point
 SIRA promotion bar is met).
+
+## 7. Per-layer escalation (2026-06-11, post-gate amendment)
+
+The seed-2024 30k gate (run 2026-06-11) showed the embed-site clamp working
+as designed (dE clean at norm 386) while **L00/L01 ReLN dgamma/dbeta
+overflowed independently** — the q-side reverse amplification produces huge
+intermediate dq inside the layer backward, upstream of the embedding
+scatter.  Escalation per §2's design intent:
+
+- **`--dq-layer-clamp F`** (`cfg.dqLayerClampTau`, 0 = off): apply
+  `row_rms_clamp` to the incoming dq (`dq_in_ptr`, alternation-aware) at the
+  **top of every backward layer iteration**, immediately after the
+  iter-113 dq_in/dq_out pointer selection and before the LayerDrop
+  pass-through.  This is the tensor `chiron_reln_backward` consumes, so it
+  bounds every layer's dgamma/dbeta as well as the cascade itself.
+- Counters: separate `dqLayerClampCounts` [2] buffer, zeroed once per step
+  before the loop, accumulated across all L clamp calls (atomicAdd), one
+  `[dq-layer-clamp]` log line per firing step (aggregate, not per-layer;
+  per-layer detail remains available via `--sira-layer-grad-trace`).
+- Same τ for all layers: healthy incoming dq *grows* toward layer 0
+  (after-layer-23 ≈ 0.011 → after-layer-00 ≈ 0.87 global norm), so a τ
+  sized for dq_0 has even more headroom at depth.  τ = 1.0 recommended.
+- Both clamp flags added to the CUDA-graphs auto-disable list (per-step
+  counter downloads are capture-incompatible).
+- Overhead when enabled: L extra T×m reads/step (~3.2 GB ≈ ~1% wall at the
+  flagship shape) + one 8-byte D2H per step.  Zero when disabled.
+- Gate: 300-step A/B at production recipe (no-clamp vs both clamps) must be
+  print-identical in the healthy phase with zero firings, then a seed-2024
+  30k re-run with both clamps decides the stability gate.
