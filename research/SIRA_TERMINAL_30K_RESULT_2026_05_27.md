@@ -1109,3 +1109,59 @@ the clean 4242 run may be seed/noise rather than clamp benefit; (b) all
 which shifts trajectories at the ±0.002-nat scale vs 2026-06-02 runs.
 The criterion-2 baseline resolves both at once if run on the current
 binary with clamps in the recipe.
+
+---
+
+## Criterion-2 matched no-SIRA baseline: SIRA BENEFIT CONFIRMED (2026-06-11)
+
+The last outstanding promotion criterion.  Exact twin of the per-layer-clamp
+PASS run (seed 2024, `--lr 7.5e-5 --grad-clip 0.5`, zloss+qk-norm,
+`--dq-layer-clamp 1.0 --dq-embed-clamp 1.0`, same binary) with **SIRA
+omitted**.
+
+Artifact: `logs/nosira_baseline_lr7p5e5_clamps_seed2024_30k_20260611_133201/`
+(glades-trainer).  Checkpoint:
+`database/checkpoints/nosira_baseline_seed2024/chiron_nosira_baseline_lr7p5e5_clamps_seed2024_20260611_133201.final`.
+
+| run (seed 2024, current binary, clamps on) | final NLL | skips | warm tok/s |
+|---|---:|---:|---:|
+| no-SIRA matched baseline | 3.5373 | 0 | 27,326 |
+| SIRA E+B candidate | **3.5062** | 0 | 27,184 |
+
+**SIRA's attributed contribution: −0.0311 nat** at an otherwise identical
+recipe — criterion 2 PASSES (the benefit is not solely the LR/clip change).
+Decomposition of the total −0.0672 vs the B5 flagship record (3.5734):
+≈ −0.036 from the LR 7.5e-5/clip 0.5 recipe, ≈ −0.031 from SIRA.
+The baseline trailed the SIRA run at 7 of 10 val checkpoints; the gap was
+concentrated in the late phase, consistent with the earlier seed-pair
+evidence.
+
+Instability attribution bonus: the burst fired in the no-SIRA run too —
+window `25898–25956` (~58 steps, 40,317 rows clamped, 0 non-finite,
+0 skips) vs SIRA's `23766–24276` (~510 steps).  **The q-side burst is
+recipe/data-intrinsic at seed 2024; SIRA amplifies and extends it but does
+not cause it.**  The dq clamps contained it in both regimes, and the
+21k val bump + bucket-3 spike also reproduced without SIRA (data-driven).
+
+### Promotion status after this run
+
+All six pre-registered criteria now have a PASS at the candidate recipe
+**as amended with the clamps** (`--sira-coef 1e-2 --sira-energy-weight 1.0
+--sira-balance-weight 0.25 --sira-action-weight 0.0 --sira-warmup 1000
+--lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0`):
+
+1. PASS — seed 2024 (the adversarial seed) clean 30k; seed 4242 clean
+   2026-06-02 (older binary, no clamps).
+2. PASS — this run: SIRA −0.0311 nat vs matched baseline.
+3. PASS — 3.5062 ≤ 3.5534.
+4. PASS — 27,184 tok/s ≥ 26,668.
+5. PASS — all 8 buckets better than B5, incl. bucket 7.
+6. PASS — all flags default-off; disabled parity (300-step gate A/C).
+
+Caveat before flipping any production default: the criteria were
+pre-registered for a clamp-less recipe; the clamps are now part of the
+candidate.  The clean closing move is a **same-binary multi-seed
+confirmation of the full amended recipe** (e.g. seeds 4242 + 1337 at
+SIRA+clamps, expecting no skips and NLL ≤ ~3.55) before promotion, plus a
+flagship-doc/CLAUDE.md update if promoted.  Default flip remains a
+user/owner decision.
