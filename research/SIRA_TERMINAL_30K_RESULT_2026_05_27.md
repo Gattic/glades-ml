@@ -910,3 +910,61 @@ is understood or mitigated.**
   - full unit suite — PASS.
   - `scripts/sira_config_smoke.sh` — PASS.
   - `scripts/sira_training_loss_smoke.sh` — PASS.
+
+---
+
+## q-side gradient clamp implemented (2026-06-11)
+
+The first-listed mitigation candidate — "an explicit q-side gradient clamp
+before embedding scatter" — is now implemented, default-off:
+
+- **Library** (`glades-ml`): new `glades::gpu::row_rms_clamp(x, rows, cols,
+  tauRms, d_clampedCount, d_nonfiniteCount)` in `gpu_kernels.cu`.  Per row of
+  `dq_0`: non-finite row → zeroed (counted); row RMS > τ → rescaled by
+  τ/rms (counted); healthy row → untouched (no write; **bit-identical**).
+  Row sum-of-squares accumulates in double so huge-but-finite rows (whose
+  FP32 square overflows to inf — the observed failure scale) still rescale
+  correctly.  Deterministic (fixed-order tree reduction).
+- **Trainer**: `--dq-embed-clamp F` (`cfg.dqEmbedClampTau`, 0 = off) applies
+  the clamp to `s.dq` immediately before `embedding_scatter_add`, after the
+  pre-embed dq/dE norm traces — so the traces still record the RAW explosion
+  while dE receives the clamped rows.  Per-step counter download logs
+  `[dq-clamp step N] clamped=X zeroed=Y tau=F` only on steps where the clamp
+  fired.  `--dq-embed-clamp-smoke` verifies CLI propagation + kernel
+  behavior.  Wired through `run.sh` (flagship/chiron/legacy arg paths).
+- **Scope honesty:** this bounds the dE contribution only.  If L00/L01 ReLN
+  dgamma/dbeta alone can still overflow the global norm, the guard will
+  still skip — the seed-4242 re-run decides whether dE-side clamping
+  suffices.  Per-layer dq clamping is the documented escalation.
+- **Design doc:** glades-ml
+  `docs/superpowers/specs/2026-06-11-dq-embed-clamp-design.md`.
+
+Verification evidence (all PASS, 2026-06-11):
+
+- glades-ml: `cmake --build build` + `cmake --build unit-tests/build`.
+- `./unit-tests/build/glades-unit-tests chiron-qclamp` — new
+  `CHIRONQClampMathTest` (healthy rows bit-identical, rescaled rows match
+  CPU double reference at rtol 1e-6, non-finite rows zeroed, counters
+  exact, huge-finite 1e20 row exercises the double accumulator) and
+  `CHIRONQClampEdgeTest` (invalid args rejected incl. τ<=0, NULL counters,
+  cols==1 sign preservation).  Also added to the `chiron-sira` selector
+  group; `chiron` and `chiron-sira` suites remain 0-failure.
+- trainer: `bash build.sh`; `./build/glades_chiron_train
+  --dq-embed-clamp-smoke --dq-embed-clamp 2.5` → PASS (RC 0); missing τ →
+  RC 2; `sh run.sh flagship --dq-embed-clamp-smoke --dq-embed-clamp 1.0`
+  → PASS (flag forwarding verified end-to-end).
+- `git diff --check` clean in both repos.
+
+Disabled-path parity is structural: the call is gated on
+`dqEmbedClampTau > 0` and the counter buffer is not even allocated when
+off — no new kernel launches, no code on the hot path.
+
+### Next step for the arc
+
+Re-run the candidate recipe at seed 4242 with the clamp enabled.  Choose τ
+from healthy-run dq pre-embed trace stats with generous headroom (the
+exploded rows sit at overflow scale, so a loose τ catches them while
+remaining identity on healthy steps), and document the τ choice in the run
+log.  Note promotion criterion 2 (matched no-SIRA 30k baseline at
+`--lr 7.5e-5 --grad-clip 0.5`) remains outstanding and is independent of
+this mitigation.
