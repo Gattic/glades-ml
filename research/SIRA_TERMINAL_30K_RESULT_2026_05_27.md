@@ -968,3 +968,75 @@ remaining identity on healthy steps), and document the τ choice in the run
 log.  Note promotion criterion 2 (matched no-SIRA 30k baseline at
 `--lr 7.5e-5 --grad-clip 0.5`) remains outstanding and is independent of
 this mitigation.
+
+---
+
+## q-side clamp seed-2024 30k re-run: FAIL as standalone mitigation (2026-06-11)
+
+First gate run of the dq-embed clamp (`--dq-embed-clamp 1.0`, τ derived from
+healthy ‖dq₀‖ ≈ 0.8–3.0 in the seed-2024 layer traces; ≥15× above the
+worst-case healthy single-row RMS).  Exact candidate-default recipe, seed
+`2024`.  Note: seed 4242 was NOT re-run — it already passed clean at this
+recipe on 2026-06-02; seed 2024 is the failing seed the clamp had to fix.
+
+Artifact: `logs/sira_clamp_tau1_seed2024_30k_20260611_010146/` (glades-trainer).
+Checkpoint: `database/checkpoints/sira_clamp_seed2024/chiron_sira_clamp_tau1_seed2024_20260611_010146.final`.
+
+**Verdict: the clamp mechanism worked exactly as designed and the stability
+gate still FAILS.**  The overflow has a second, independent path the clamp
+cannot reach.
+
+| metric | original seed2024 (2026-06-02) | clamp run (2026-06-11) |
+|---|---:|---:|
+| first guard skip | step 24127 | step 24337 |
+| total skips | 5809 | 5659 |
+| final val NLL | 3.5675 | 3.5618 |
+| step-27k val NLL (mid-wave) | 3.6471 | 3.6238 |
+| warm tok/s | 27862 | ~28080 |
+
+Decisive evidence — grad-detail at the clamp run's first skip (step 24337):
+
+```text
+#01 L00.dgamma  sumsq=2.34e25  BAD   (99.99% of global overflow)
+#02 L01.dgamma  sumsq=5.73e20  BAD
+#11 dE          sumsq=1.49e5  norm=386   (clean — 15 orders below guard)
+```
+
+In the original run, dE was the sole bad group at onset.  With dE fully
+bounded by the clamp (first firing step 24321, 1–9 rows/step pre-wave —
+surgical, zero rows zeroed pre-wave), **L00/L01 ReLN dgamma/dbeta overflow
+independently**: the early-layer q-side reverse amplification produces huge
+intermediate dq *inside* the layer backward, and `reln_backward` converts it
+to huge dgamma/dbeta before the terminal dq ever reaches the embedding
+scatter.  The clamp seals the terminal endpoint only.
+
+Wave interior (weights frozen during skips, so the amplification re-fires
+each step): clamp escalated from ~1.2k to ~6.9k rows/step clamped with up to
+585 non-finite rows/step zeroed; totals 20.1M rows clamped, 1.14M zeroed
+across 5674 firing steps.  The wave did not self-terminate in either run.
+
+Trajectory notes: pre-wave vals tracked the original within ±0.0023 nat
+(3k/6k/9k/12k/15k/18k/21k/24k), confirming the clamp is identity on healthy
+steps at production shape.  Small drift vs 2026-06-02 is attributed to the
+2026-06-10 BF16G replay-parity library change (d9b8e3249).  The clamp run's
+better mid-wave/final NLL (−0.023 / −0.0057) comes from ~210 extra clean
+steps before its later wave onset — incidental, not gate-relevant.
+
+### Disposition
+
+- `--dq-embed-clamp` stays default-off; it is correct, cheap, and surgical,
+  but **insufficient alone**.  Keep it in the recipe for future stability
+  runs (it removes dE from the failure surface and its `[dq-clamp]` log is a
+  free early-warning signal — it fired 16 steps before the first skip).
+- The mitigation that matches the evidence is **bounding the per-layer
+  backward amplification itself**: clamp dq at each layer boundary (e.g.
+  `row_rms_clamp` on `s.dq_buf` after each `chiron_attention_shear_backward`,
+  before `reln_backward`), which bounds both the cascade and the dgamma/dbeta
+  it produces.  Library kernel already exists; trainer needs a per-layer flag
+  + call sites (~24 extra T×m reads/step ≈ 1% wall when enabled).
+- Alternative: per-group selective skip/clip at the Adam boundary (grad-detail
+  already computes per-group norms) — applies the finite groups and skips only
+  the bad ones.  Broader safety net but masks rather than bounds.
+- Promotion criterion 2 (matched no-SIRA 30k baseline at `--lr 7.5e-5
+  --grad-clip 0.5`) remains outstanding and independent — still the
+  highest-EV next 5h of GPU for the arc.
