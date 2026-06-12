@@ -190,3 +190,48 @@ Legality audit kills the specced slice and shrinks the rest:
 surgery, with algo-selection parity risk). Revisit only after Port B; the
 fwd-projection slice remains specified above if the stacked total needs
 the last fraction of a percent.
+
+---
+
+## Port B (dq_perp slice) result: PASS (2026-06-12)
+
+Implemented as `scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror`
+(glades-ml b18dd8ae5; duplicated kernel so legacy codegen is untouched;
+`chiron-castelim` suite extended — dx_primary/dx_secondary/dK bit-identical
+to dual_out, mirror bit-identical to the cast) + `--cast-elim-dqperp`
+(trainer f4c9895). Producer and consumer are adjacent in
+`scfa_attention_backward` with only read-only traces between, so the
+mirror uses a tight register/GEMM/unregister scope — NO freshness flag,
+structurally immune to the Port A lifecycle bug class.
+
+Stacked gate (A/B/C, B = `--cast-elim-reln-q --cast-elim-dqperp`,
+`glades-trainer/logs/cast_elim_portB_gate_20260612/`):
+
+- **Parity PASS**: drift 15/30 step lines vs 16/30 rerun-noise control
+  (inside the noise band); final val matches the rerun control exactly.
+- **Wall +1.9% stacked** (25,007 vs 24,593/24,505 tok/s). The dq_perp
+  slice contributed ~+0.6% measured (vs ~+1.25% predicted — short-run
+  tok/s noise is ±0.5%; the n=3 bench will tighten this).
+
+## Arc status after Ports A+B
+
+| port | status | measured wall |
+|---|---|---:|
+| A (reln q mirror) | PASS, default-off | +1.3% alone |
+| B dq_perp slice | PASS, default-off | +1.9% stacked w/ A |
+| B dy slice | OPEN (next) | ~+1.2% predicted |
+| C (BF16-D GEMM) | analysis-NULL | (~0.85% legal subset, shelved) |
+| D (E_bf) | closed sub-noise | — |
+
+The stack sits at **+1.9% measured** vs the **+3% ship bar** — the dy
+slice decides ship-vs-silent-accrual. dy = `bwd_dy_ptr` (= `s.dp` under
+iter 116 default-ON) consumed by the `B^T·dy` GEMM; producers are the
+fused bwd stream ops (`chiron_scfa_axpy2_dual_p` family). CAUTION
+(repeated from §Port B analysis): those kernels' existing p_bf16 mirror
+is SR-cast (stochastic rounding) — the GEMM mirror must be a separate RNE
+side-write. Same tight-scope consume pattern applies if producer/consumer
+adjacency holds (verify the dataflow between the last s.dp writer and the
+B^T·dy GEMM).
+
+Before any default-flip: n=3 multi-seed 100-step stacked bench per the
+standing methodology.
