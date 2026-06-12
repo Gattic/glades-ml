@@ -156,3 +156,37 @@ Estimated combined: +2–2.5% wall.
 ### Stacked ship decision
 After B+C land: n=3 multi-seed 100-step bench of A+B+C stacked; ship at
 +3% (iter 60 bar). Port A alone (+1.3%) stays flag-gated silent-accrual.
+
+---
+
+## Port C result: ANALYSIS-NULL (2026-06-12, no code)
+
+Legality audit kills the specced slice and shrinks the rest:
+
+1. **cuBLAS type-combo wall**: gemmEx supports BF16-C/D only with BF16
+   A/B inputs; there is NO FP32-in → BF16-out combo. The bwd sdQ/sdK/sdV
+   producers take FP32 inputs — and dQ/dK are **deliberately strict-FP32**
+   since the 2026-06-10 BF16G replay-parity commit (d9b8e3249). BF16-D
+   there would require casting the attention-backward inputs to BF16 — a
+   precision regression of the exact path just hardened. Slice 1 is
+   ILLEGAL as specced.
+2. **Legal subset** = the fwd sQ/sK/sV projection GEMMs
+   (`sgemm_rowmajor_bf16`, BF16 in / FP32 out, gpu_chiron.cu
+   `chiron_attention_shear_bf16w_tiled` ~lines 1380-1385). Checkpoint
+   audit CONFIRMS viability: production saves sQ/sK/sV to a BF16
+   checkpoint (trainer ~8566) and the backward restores by decoding it
+   (~9256), so the bwd already consumes BF16-rounded values; BF16-D
+   projections + cast-skips in `flash_attention_cublas_tiled_bf16` +
+   checkpoint saves switched to d2d copies would be value-preserving
+   modulo GEMM algorithm selection.
+3. **But the value shrank**: 3 inner casts × 48 shear calls/step
+   (~4.3 ms) + checkpoint-save casts→memcpys (~0.8 ms) ≈ **~0.85% wall**
+   — most of the census's 17.2 ms k×dModel bucket is required
+   precision-boundary conversion next to strict-FP32 paths, not
+   eliminable.
+
+**Disposition**: Port C closed as analysis-NULL at current priorities
+(~0.85% for multi-file GEMM-wrapper + shear + inner-attention + trainer
+surgery, with algo-selection parity risk). Revisit only after Port B; the
+fwd-projection slice remains specified above if the stacked total needs
+the last fraction of a percent.
