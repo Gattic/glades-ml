@@ -2,10 +2,51 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (regstack Phase 2 ship 2026-05-22)
+## Current Production Flagship — CHIRON 1B @ T=16384 (SIRA+clamp ship 2026-06-12)
 
-The current production LLM flagship is **CHIRON 1B regstack Phase 2**
-(checkpoint `chiron_1B_T16384_regstack_phase2.final`):
+The current production LLM flagship is **CHIRON 1B SIRA+clamp**
+(checkpoint `chiron_1B_T16384_sira_clamp_phase2.final`):
+
+- **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context;
+  870.94M params + 384 QK-Norm γ (same as regstack Phase 2).
+- **Stack**: regstack Phase 2 ship base (QK-Norm + Z-loss on v5+FP8/CUDA 13.2 —
+  see "Prior regstack Phase 2 flagship" below) **PLUS the SIRA+clamp recipe
+  landed 2026-06-11/12**:
+  - **Terminal CHIRON-native SIRA** (`--sira-coef 1e-2 --sira-energy-weight 1.0
+    --sira-balance-weight 0.25 --sira-action-weight 0.0 --sira-warmup 1000`):
+    phase-space regularizer on the final `(q_L, p_L)` only.
+  - **LR recipe change**: `--lr 7.5e-5 --grad-clip 0.5` (was 1e-4 / 0.5).
+  - **q-side dq clamps** (`--dq-layer-clamp 1.0 --dq-embed-clamp 1.0`): per-row
+    RMS clamp (`row_rms_clamp` kernel, `gpu_kernels.cu`) on the incoming dq at
+    every backward layer boundary + on dq_0 before `embedding_scatter_add`.
+    Bounds the early-layer q-side reverse amplification (dgamma/dbeta + dE
+    overflow) that caused late guard-skip waves; identity on healthy steps.
+- **Perf**: ~**27,200 tok/s** @ T=16384 (−3.1% vs regstack ship 28,072; clamp
+  +SIRA overhead), ~14.7/15.56 GB VRAM. **Final val NLL 3.5062 @ step 30000
+  (seed 2024)**; 3-seed 30k gate (2024/4242/1337) mean **3.5223 ± 0.0146**
+  (Δ −0.0672 best / −0.0511 mean vs regstack ship 3.5734). **Zero grad-skips**
+  across all gate runs (seed 2024 previously had 5,809). Attribution via
+  matched no-SIRA baseline: ≈ −0.036 nat from the LR recipe, ≈ −0.031 from SIRA.
+- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship
+  --zloss-coef 1e-4 --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0
+  --sira-balance-weight 0.25 --sira-action-weight 0.0 --sira-warmup 1000
+  --lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0`.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
+  (prefers `chiron_1B_T16384_sira_clamp_phase2.final` since 2026-06-12).
+- **Ship record**: `research/SIRA_CLAMP_SHIP_2026_06_12.md`. Full evidence
+  chain (candidate runs, overflow tracing, dE-clamp FAIL, per-layer PASS,
+  attribution, multi-seed gate): `research/SIRA_TERMINAL_30K_RESULT_2026_05_27.md`.
+  Clamp mechanism spec: `docs/superpowers/specs/2026-06-11-dq-embed-clamp-design.md`.
+- **Caveats**: same-seed full-recipe runs are NOT bit-reproducible at
+  production shape (atomic-ordering noise) — use rerun controls for parity
+  claims. All SIRA/clamp flags default off; omitting them reproduces the
+  regstack Phase 2 ship exactly.
+
+## Prior regstack Phase 2 Flagship — CHIRON 1B @ T=16384 (ship 2026-05-22, kept for context)
+
+The prior flagship **CHIRON 1B regstack Phase 2**
+(checkpoint `chiron_1B_T16384_regstack_phase2.final`) remains loadable; the
+SIRA+clamp ship builds on it with trainer-side, default-off flags only:
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context.
 - **Params**: 870.94M (~"1B") + 384 QK-Norm γ scalars (16 heads × 24 layers).
@@ -34,9 +75,8 @@ The current production LLM flagship is **CHIRON 1B regstack Phase 2**
   **−0.5983 nat**.
 - **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship
   --zloss-coef 1e-4 --qk-norm`.
-- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
-  (verify which checkpoint the runner script points to; may need to
-  update to `chiron_1B_T16384_regstack_phase2.final`).
+- **Run inference**: load `chiron_1B_T16384_regstack_phase2.final` explicitly
+  (`runner.sh --flagship` prefers the SIRA+clamp ship since 2026-06-12).
 - **Full spec**: `research/REGSTACK_PHASE2_2026_05_22.md` (Phase 2 ship
   doc with per-mechanism pilot deltas and B5 30k trajectory). Spec / plan
   that drove the arc: `docs/superpowers/specs/2026-05-22-chiron-1b-regularization-stack-design.md`
@@ -56,7 +96,7 @@ The current production LLM flagship is **CHIRON 1B regstack Phase 2**
 - **Phase-3 program** (improving CHIRON 1B via novel research, no external
   libs / no external baselines): pre-registration in
   `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
-  anchor on the regstack Phase 2 flagship as the baseline.
+  anchor on the **SIRA+clamp flagship** (2026-06-12) as the baseline.
 
 **Prior v5+FP8 flagship** (`chiron_1B_T16384_v5_fp8_phase2.final`,
 28,887 tok/s, NLL 4.1717 @ 30k, CUDA 13.2 with FP8 readout) remains loadable
@@ -66,10 +106,22 @@ flags default off; math bit-identical to v5+FP8 ship when off. For pure
 from `run.sh flagship`. The v5+FP8 ship was the CUDA 13.2 production
 flagship that the regstack Phase 2 ship builds on; details:
 
-### Phase-3 regularization sub-program — CLOSED 2026-05-24
+### Phase-3 regularization sub-program — CLOSED 2026-05-24 (amended 2026-06-12)
 
-The regstack Phase 2 ship is the **stable terminus** of the Phase-3
-regularization sub-program. Four mechanism arcs investigated; zero
+**2026-06-12 amendment:** after this closure, the CHIRON-native
+regularizer program (SIRA/PHS/PTOC, plan
+`research/CHIRON_NATIVE_REGULARIZERS_GENERALIZERS_PLAN_2026_05_24.md`)
+produced one ship: terminal SIRA + dq clamps became the production
+flagship (see top of this doc). PHS and PTOC remain shadow-diagnostics
+only (default-off; PHS default-enablement evaluated and rejected
+2026-05-28, `research/PHS_DEFAULT_ENABLEMENT_RESULT_2026_05_28.md`).
+The seed-2024 instability investigation that gated SIRA (late guard-skip
+waves → q-side amplification → per-layer dq clamp) is fully recorded in
+`research/SIRA_TERMINAL_30K_RESULT_2026_05_27.md`.
+
+The original closure record below stands for the four ported-mechanism
+arcs it covered. At closure time the regstack Phase 2 ship was the
+**stable terminus**; four mechanism arcs investigated; zero
 shipped:
 
 | Arc | Class | Result | Δ |
