@@ -66,3 +66,33 @@ no-change rerun).
 ## 4. State
 
 No code changes yet. Production flagship unchanged. Next session: Port A.
+
+---
+
+## Port A result: PASS (2026-06-12)
+
+Implemented as `chiron_reln_forward_dual` (glades-ml c7f1d0d5e; mirror
+bit-equality unit test `chiron-castelim`) + `--cast-elim-reln-q` (trainer
+59383c4). Gate (300-step A/B/C at the flagship recipe, seed 1337,
+`glades-trainer/logs/cast_elim_portA_gate_20260612/`):
+
+- **Parity PASS**: drift(B vs A) = 14/30 last-digit step lines vs
+  rerun-noise control 12/30; final val 8.8292 matches the rerun control
+  exactly.
+- **Wall +1.3%** (24,872 vs 24,523/24,568 tok/s at 300-step scale) —
+  matches the ~1.2% per-port prediction.
+
+**Bug found and fixed by the gate** (recorded as a lifecycle lesson for
+Ports B–D): the first gate run FAILED (29/30 lines, +0.077 loss delta at
+step 2) because freshness was only cleared inside `scfa_attention_forward`
+— but the CHIRON backward never routes through it (scfa_attention_backward
+reconstructs internally), so the last layer's mirror survived into the
+next step and step N+1's layer-0 GEMM consumed step N's q_L bits against
+the freshly embedded s.q. Step 1 being bit-identical while step 2 diverged
+localized it in two bisect runs. Fix: invalidate at forward entry, where
+s.q is rewritten from embeddings. **Any future mirror port must enumerate
+ALL writers of the mirrored tensor across fwd/bwd/val, not just the
+producing kernel's function.**
+
+Port A stays default-off pending the stacked multi-port +3% ship decision
+(Ports B/C remain to be implemented per §2).
