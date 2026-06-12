@@ -140,6 +140,17 @@ bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
                                        float beta,
                                        unsigned short* C, int ldc);
 
+// Cast-elim Port C fwd slice (2026-06-12): NN form of the dst-BF16 variant
+// (C = alpha * A · B + beta * C, C stored BF16, FP32 internal accumulate).
+// Used by the inner-attention forward projections to write sQ/sK/sV
+// directly as BF16.
+bool sgemm_rowmajor_bf16_dst_bf16(int M, int N, int K,
+                                   float alpha,
+                                   const unsigned short* A, int lda,
+                                   const unsigned short* B, int ldb,
+                                   float beta,
+                                   unsigned short* C, int ldc);
+
 // === FAST_16BF GEMM wrappers (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same signature as sgemm_rowmajor* (FP32 A, FP32 B, FP32 C) but routes
@@ -432,6 +443,7 @@ inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const fl
 inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_bf16_dst_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, unsigned short*, int) { return false; }
 inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }

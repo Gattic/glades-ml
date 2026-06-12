@@ -1211,6 +1211,22 @@ bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
 	                                  "cublasGemmEx(BF16,ATB,dstBF16)");
 }
 
+// Cast-elim Port C fwd slice (2026-06-12): plain (NN) form of the iter-61
+// dst-BF16 variant.  Used by the inner-attention forward projections to
+// write sQ/sK/sV directly as BF16, eliminating the standalone casts.
+bool sgemm_rowmajor_bf16_dst_bf16(int M, int N, int K,
+                                   float alpha,
+                                   const unsigned short* A, int lda,
+                                   const unsigned short* B, int ldb,
+                                   float beta,
+                                   unsigned short* C, int ldc)
+{
+	return gemmex_bf16_impl_dst_bf16(CUBLAS_OP_N, CUBLAS_OP_N,
+	                                  M, N, K,
+	                                  alpha, A, lda, B, ldb, beta, C, ldc,
+	                                  "cublasGemmEx(BF16,NN,dstBF16)");
+}
+
 // === FAST_16BF GEMM (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same row-major→col-major transpose trick as sgemm_rowmajor.  Routes

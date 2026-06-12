@@ -156,6 +156,11 @@ bool chiron_reln_forward_dual(const float* q_in, float* q_out,
                               const float* gamma, const float* beta,
                               int T, int m, float eps);
 
+// Cast-elim Port C fwd slice (2026-06-12): library toggle for BF16-D
+// inner-attention forward projections (set once at trainer init).
+void set_cast_elim_inner_fwd(bool on);
+bool get_cast_elim_inner_fwd();
+
 // ralph-loop iter 9 (2026-05-14): fused reln-forward + axpy-into-q for
 // CHIRON's per-layer-fuse path.  Replaces:
 //   chiron_reln_forward(p, p_norm, stats, gamma, beta, T, m, eps);
@@ -641,6 +646,8 @@ inline bool chiron_reln_forward(const float*, float*, float*,
 inline bool chiron_reln_forward_dual(const float*, float*, unsigned short*,
                                       float*, const float*, const float*,
                                       int, int, float) { return false; }
+inline void set_cast_elim_inner_fwd(bool) {}
+inline bool get_cast_elim_inner_fwd() { return false; }
 inline bool chiron_reln_axpy_into_q(const float*, float*, float*,
                                      const float*, const float*,
                                      float, int, int, float) { return false; }

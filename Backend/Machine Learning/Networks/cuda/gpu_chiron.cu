@@ -1338,6 +1338,25 @@ bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
 	return true;
 }
 
+// Cast-elim Port C fwd slice (2026-06-12): library toggle.  When ON, the
+// bf16w shear's Q/K/V projections write BF16-D directly into the
+// scratch_*bf16 buffers (sgemm_rowmajor_bf16_dst_bf16) and the inner
+// attention skips its three standalone casts.  The FP32 scratch_Q/K/V are
+// then NOT materialized — callers that consume them (FP32-host checkpoint
+// caches) must keep the toggle off; the trainer gates accordingly.
+// Default OFF; set once at trainer init (not capture-safe to flip mid-run).
+static bool g_cast_elim_inner_fwd = false;
+void set_cast_elim_inner_fwd(bool on) { g_cast_elim_inner_fwd = on; }
+bool get_cast_elim_inner_fwd() { return g_cast_elim_inner_fwd; }
+static bool flash_attention_cublas_tiled_bf16_precast(
+    const unsigned short* Qbf16, const unsigned short* Kbf16,
+    const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Pbf16);
+
 // BF16-weight variant of chiron_attention_shear_bf16_tiled.  Takes BF16
 // weight pointers directly — no per-layer FP32 cast scratch needed for
 // weights.  Q/K/V/O projections run through sgemm_rowmajor_bf16
@@ -1376,6 +1395,29 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
 		return false;
 
+	// Cast-elim Port C fwd slice: project straight to BF16-D and skip the
+	// inner attention's standalone casts.  FP32 scratch_Q/K/V are NOT
+	// written on this path (sole fwd consumers were the casts; checkpoint
+	// saves read the BF16 scratches — trainer gates configs that need the
+	// FP32 copies).  cuBLAS rounds the FP32 accumulator to BF16 (RNE) on
+	// store — same rounding as the standalone cast; algorithm selection
+	// for the D-type change is the gate-decided parity risk.
+	if (g_cast_elim_inner_fwd)
+	{
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Qbf16, dModel))
+			return false;
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_Kbf16, dModel))
+			return false;
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_Vbf16, dModel))
+			return false;
+		if (!flash_attention_cublas_tiled_bf16_precast(
+		        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
+		        T, nHeads, dHead, dModel, causal,
+		        scratch_O, scratch_S, scratch_Pbf16))
+			return false;
+	}
+	else
+	{
 	// BF16 x BF16 -> FP32 projections via BF16 tensor cores.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel))
 		return false;
@@ -1391,6 +1433,7 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	        scratch_O, scratch_S,
 	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
 		return false;
+	}
 
 	// Cast scratch_O -> BF16 for the output projection.
 	if (!cast_f32_to_bf16(scratch_O, scratch_Obf, static_cast<size_t>(T) * dModel))
@@ -2019,6 +2062,59 @@ bool flash_attention_cublas_tiled_bf16(
 	        T, dHead, T, 1.0f,
 	        scratch_Pbf16, T, (long long)T * T,
 	        scratch_Vbf16, dModel, (long long)dHead,
+	        0.0f,
+	        O, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	return true;
+}
+
+// Cast-elim Port C fwd slice (2026-06-12): pre-cast variant — identical
+// pipeline to flash_attention_cublas_tiled_bf16 from the S GEMM onward,
+// with Q/K/V already BF16 (the dst-BF16 projections wrote them).  The
+// legacy function is untouched (no codegen risk to the default path).
+static bool flash_attention_cublas_tiled_bf16_precast(
+    const unsigned short* Qbf16, const unsigned short* Kbf16,
+    const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+
+	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
+	if (!sgemm_batched_strided_abt_bf16(
+	        T, T, dHead, invSqrtDH,
+	        Qbf16, dModel, (long long)dHead,
+	        Kbf16, dModel, (long long)dHead,
+	        0.0f,
+	        scratch_S, T, (long long)T * T,
+	        nHeads))
+		return false;
+
+	// Fused causal softmax + BF16 P write (iter 102 kernel); legacy split
+	// path for the non-causal case (not hit at CHIRON production).
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
+			return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
+		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
+	}
+
+	// O = P · V via BF16 batched (plain NN).
+	if (!sgemm_batched_strided_bf16(
+	        T, dHead, T, 1.0f,
+	        scratch_Pbf16, T, (long long)T * T,
+	        Vbf16, dModel, (long long)dHead,
 	        0.0f,
 	        O, dModel, (long long)dHead,
 	        nHeads))

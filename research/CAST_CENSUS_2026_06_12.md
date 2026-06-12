@@ -285,3 +285,47 @@ recorded above.
 | D | closed sub-noise | — |
 
 Flags all default-off; production flagship recipe unchanged.
+
+---
+
+## Port C fwd slice: QK-NORM CONFLICT — slice as specced is production-inert (2026-06-12)
+
+Implementation began per spec (committed as opt-in infrastructure:
+`sgemm_rowmajor_bf16_dst_bf16` NN wrapper, `set_cast_elim_inner_fwd`
+toggle + BF16-D projections + `flash_attention_cublas_tiled_bf16_precast`
+in `chiron_attention_shear_bf16w_tiled`). During trainer wiring, reading
+the production dispatch revealed: **with `--qk-norm` (the production
+flagship recipe), the SCFA inner forward takes the Task-4B decomposed
+split path** (trainer `chiron_main.cpp`, "Task 4B BF16-inner extension"),
+NOT `chiron_attention_shear_bf16w_tiled`. In that path:
+
+- Q and K projections MUST stay FP32: `qknorm_forward_gpu` +
+  `scale_q_per_head` consume and rewrite FP32 sQ/sK in place between
+  projection and attention. Their inner-attention casts are required
+  precision boundaries — NOT eliminable.
+- The toggle therefore only accelerates the non-QK-Norm branch, which
+  production does not take. **Slice as specced: production-inert.**
+
+**Revised legal remainder at the production recipe** (~0.6% total,
+sites now precisely known):
+1. **V projection** (Step A, 3rd GEMM): BF16-D into p_Vbf16 + an inner
+   variant that skips only the V cast (per-operand granularity).
+2. **O output** (Step E output + Step F cast): `sgemm_batched_strided_bf16`
+   has BF16 inputs → a batched-strided dst-BF16 wrapper writes O directly
+   as BF16; Step F's cast becomes unnecessary (output projection reads the
+   BF16); O is UNUSED in `flash_attention_backward_cublas_tiled` (explicit
+   `/*O unused*/`); bwd's sO comes from the BF16 checkpoint restore.
+3. Checkpoint saves for sV/sO switch from cast to d2d copy.
+
++2.73% (current stack) + ~0.6% ≈ +3.3% — would clear the bar, but needs
+a new wrapper family + per-operand inner variant + two save switches +
+gates. Deferred to a fresh session per scope discipline; the shipped
+infrastructure (NN dst-BF16 wrapper, precast inner variant) is reusable
+for it.
+
+**Also noted for the census ledger**: the k×m bucket's dominant member is
+the Step-A `q_compr → BF16` cast (~96/step). q_compr is a FAST_16BF GEMM
+output (FP32 by type-combo law), but the impl's gemmEx call has BF16 A/B
+inputs post-pre-cast — a FAST_16BF dst-BF16 variant is legal and could
+chain with Port A's mirror. Same diminishing-returns caveat: q_compr FP32
+is also consumed (q_par GEMM, dwconv path) — full audit required.
