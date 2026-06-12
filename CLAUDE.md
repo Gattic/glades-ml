@@ -21,8 +21,10 @@ The current production LLM flagship is **CHIRON 1B SIRA+clamp**
     every backward layer boundary + on dq_0 before `embedding_scatter_add`.
     Bounds the early-layer q-side reverse amplification (dgamma/dbeta + dE
     overflow) that caused late guard-skip waves; identity on healthy steps.
-- **Perf**: ~**27,200 tok/s** @ T=16384 (−3.1% vs regstack ship 28,072; clamp
-  +SIRA overhead), ~14.7/15.56 GB VRAM. **Final val NLL 3.5062 @ step 30000
+- **Perf**: ~**28,100 tok/s** @ T=16384 with the cast-elim stack (shipped
+  2026-06-12, +3.38% ± 0.17% n=3 multi-seed at NLL parity over the SIRA+clamp
+  base's ~27,200; see `research/CAST_CENSUS_2026_06_12.md`), ~14.7/15.56 GB
+  VRAM. **Final val NLL 3.5062 @ step 30000
   (seed 2024)**; 3-seed 30k gate (2024/4242/1337) mean **3.5223 ± 0.0146**
   (Δ −0.0672 best / −0.0511 mean vs regstack ship 3.5734). **Zero grad-skips**
   across all gate runs (seed 2024 previously had 5,809). Attribution via
@@ -30,7 +32,10 @@ The current production LLM flagship is **CHIRON 1B SIRA+clamp**
 - **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship
   --zloss-coef 1e-4 --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0
   --sira-balance-weight 0.25 --sira-action-weight 0.0 --sira-warmup 1000
-  --lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0`.
+  --lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0
+  --cast-elim-reln-q --cast-elim-dqperp --cast-elim-dy --cast-elim-inner-vo`
+  (the four cast-elim flags are wall-only, parity-clean — shipped 2026-06-12;
+  omit them to reproduce the 2026-06-12 checkpoint's exact training run).
 - **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
   (prefers `chiron_1B_T16384_sira_clamp_phase2.final` since 2026-06-12).
 - **Ship record**: `research/SIRA_CLAMP_SHIP_2026_06_12.md`. Full evidence
