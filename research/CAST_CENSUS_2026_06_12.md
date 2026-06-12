@@ -96,3 +96,63 @@ producing kernel's function.**
 
 Port A stays default-off pending the stacked multi-port +3% ship decision
 (Ports B/C remain to be implemented per §2).
+
+---
+
+## Ports B–D continuation spec (2026-06-12, analysis complete, surgery deferred)
+
+### Port D: SKIPPED (decided)
+E_bf/readout bucket is 1.6 ms/step ≈ 0.27% — below the iter-104 sub-noise
+threshold, and the producer is the shared Adam kernel (optimizer surgery
+for sub-noise value). Closed.
+
+### Port C analysis (priority next — biggest bucket, de-risked)
+**De-risking discovery:** the BF16-C/D GEMM mechanism already SHIPPED
+parity-clean as iter 61's `sgemm_rowmajor_atb_bf16_dst_bf16` (D=BF16,
+FP32 internal accumulator, final rounding folded into the GEMM) — used in
+the production bf16-grads path. Port C generalizes this to beta=0
+overwrite sites.
+
+Target sites (k×dModel bucket, 17.2 ms/step, all in `gpu_chiron.cu`):
+1. **bwd sdQ/sdK/sdV** (casts at lines ~1585/1593/1601 in the bf16w path
+   and their bf16g-variant twins): `flash_attention_backward_cublas_tiled`
+   writes them FP32 (beta=0 since iter 107); sole consumers are the
+   per-X casts into the shared `scratch_sdbf`. Change: final dQ/dK/dV
+   GEMMs write BF16-D into three NEW caller-provided buffers
+   (3 × T×dModel × 2B ≈ 25 MB at k=1024), delete the 3 casts, point the
+   6 downstream GEMMs at them. Signature change ripples: lib header +
+   trainer snapshot mirror + call sites (the Port A forward-declaration
+   convention applies).
+2. **fwd sQ/sK/sV inner-attention input casts** (iter-118 doc's pipeline
+   step 1): AUDIT REQUIRED — FP32 sQ/sK/sV are also consumed by the
+   scfa-checkpoint-inner save path and `flash_attention_backward` inputs;
+   BF16-C here changes what the checkpoint stores. Only convert if the
+   checkpoint already stores BF16 (scfa-checkpoint-inner-bf16 suggests
+   yes — verify) and the bwd consumer accepts the mirror.
+
+Gate: same A/B/C rerun-noise methodology. KNOWN RISK: C-type changes can
+shift cuBLAS algorithm selection (iter-78 measured algo changes at
++0.036 nat — outside noise). If the gate fails parity, document FAIL and
+keep the flag off (iter-102-style outcome); the iter-61 precedent says
+beta=1 dst-bf16 held parity, so beta=0 likely holds too.
+
+### Port B analysis (second)
+Production skips the bwd `B^T·q` recompute (scfa-checkpoint-inner), so
+Port B's real targets are:
+1. **dy operand** of `B^T·dy` (line ~9387): under iter 116 (default ON)
+   this operand IS `s.dp` directly. Producer: the fused bwd stream ops
+   (`p±=sign·(ypar+yperp)` family). CAUTION: the existing p_bf16 mirror
+   from those kernels is SR-cast (stochastic rounding) — a GEMM mirror
+   must be a SEPARATE RNE side-write, not a reuse of p_bf16.
+2. **dq_perp operand** of `B^T·dq_perp` (line ~9955): producer is
+   `scfa_dwconv_dx_tiled_kernel_dual_out` (iter 99) — add an RNE BF16
+   third output.
+Both follow the Port A pattern (side-write + scoped registration +
+one-shot freshness). **Lifecycle rule from Port A's bug: enumerate ALL
+writers of the mirrored tensor across fwd/bwd/val before wiring the
+freshness flag — the producing kernel's neighborhood is not enough.**
+Estimated combined: +2–2.5% wall.
+
+### Stacked ship decision
+After B+C land: n=3 multi-seed 100-step bench of A+B+C stacked; ship at
++3% (iter 60 bar). Port A alone (+1.3%) stays flag-gated silent-accrual.
