@@ -2123,6 +2123,65 @@ static bool flash_attention_cublas_tiled_bf16_precast(
 	return true;
 }
 
+// Cast-elim V+O slice (2026-06-12): Task-4B (QK-Norm) production variant.
+// Q and K arrive FP32 (post qknorm_forward_gpu + per-head scale — they MUST
+// stay FP32 through QK-Norm) and are cast here exactly as the legacy
+// pipeline does; V arrives PRE-CAST BF16 (the dst-BF16 projection wrote
+// it); O is written directly as BF16 by the dst-BF16 P·V GEMM (RNE on
+// store — same rounding as the legacy FP32-write + standalone cast).
+// Eliminates the V input cast and the O output cast per call.
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    unsigned short* O_bf16,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const size_t nPacked = static_cast<size_t>(T) * dModel;
+
+	// Cast post-QK-Norm Q/K (required precision boundary); V is pre-cast.
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
+
+	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
+	if (!sgemm_batched_strided_abt_bf16(
+	        T, T, dHead, invSqrtDH,
+	        scratch_Qbf16, dModel, (long long)dHead,
+	        scratch_Kbf16, dModel, (long long)dHead,
+	        0.0f,
+	        scratch_S, T, (long long)T * T,
+	        nHeads))
+		return false;
+
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
+			return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
+		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
+	}
+
+	// O = P · V, written directly as BF16 (FP32 accumulate, RNE store).
+	if (!sgemm_batched_strided_bf16_dst_bf16(
+	        T, dHead, T, 1.0f,
+	        scratch_Pbf16, T, (long long)T * T,
+	        Vbf16, dModel, (long long)dHead,
+	        0.0f,
+	        O_bf16, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	return true;
+}
+
 // ===========================================================================
 //  5c. cuBLAS-tiled flash attention — BACKWARD.
 // ===========================================================================

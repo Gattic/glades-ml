@@ -246,6 +246,7 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONRelnDualMirrorTest();
 		CHIRONDwconvDualMirrorTest();
+		CHIRONInnerVOTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();

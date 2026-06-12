@@ -161,6 +161,17 @@ bool chiron_reln_forward_dual(const float* q_in, float* q_out,
 void set_cast_elim_inner_fwd(bool on);
 bool get_cast_elim_inner_fwd();
 
+// Cast-elim V+O slice (2026-06-12): QK-Norm-compatible inner attention —
+// FP32 Q/K (post-norm, cast internally), pre-cast BF16 V, BF16 O out.
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    unsigned short* O_bf16,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16);
+
 // ralph-loop iter 9 (2026-05-14): fused reln-forward + axpy-into-q for
 // CHIRON's per-layer-fuse path.  Replaces:
 //   chiron_reln_forward(p, p_norm, stats, gamma, beta, T, m, eps);
@@ -648,6 +659,7 @@ inline bool chiron_reln_forward_dual(const float*, float*, unsigned short*,
                                       int, int, float) { return false; }
 inline void set_cast_elim_inner_fwd(bool) {}
 inline bool get_cast_elim_inner_fwd() { return false; }
+inline bool flash_attention_cublas_tiled_bf16_vpre_obf16(const float*, const float*, const unsigned short*, int, int, int, int, bool, unsigned short*, float*, unsigned short*, unsigned short*, unsigned short*) { return false; }
 inline bool chiron_reln_axpy_into_q(const float*, float*, float*,
                                      const float*, const float*,
                                      float, int, int, float) { return false; }

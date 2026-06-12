@@ -17905,3 +17905,88 @@ void CHIRONDwconvDualMirrorTest()
 	std::printf("  [CHIRON dwconv dual mirror] built without CUDA — skipped\n");
 #endif
 }
+
+// === CAST-ELIMINATION V+O SLICE TEST (2026-06-12) ===
+// flash_attention_cublas_tiled_bf16_vpre_obf16 vs the legacy pipeline:
+// same Q/K cast path; V pre-cast with the same kernel; O written BF16-D
+// vs FP32-write + standalone cast.  Bitwise O equality holds iff cuBLAS
+// picks the same algorithm for the D-type change — reported, not asserted;
+// the hard assertion is rtol closeness (the 300-step gate carries the
+// parity verdict).
+
+void CHIRONInnerVOTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON inner V+O] no CUDA device — skipped\n");
+		return;
+	}
+
+	const int T = 32, nH = 4, dH = 16;
+	const int dModel = nH * dH;
+	const size_t n = (size_t)T * dModel;
+	const size_t nS = (size_t)nH * T * T;
+
+	std::vector<float> Q(n), K(n), V(n);
+	LCG rng(20260613u);
+	for (size_t i = 0; i < n; ++i) { Q[i] = rng.next_unit(); K[i] = rng.next_unit(); V[i] = rng.next_unit(); }
+
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O, d_S;
+	glades::gpu::GpuBuffer<unsigned short> d_Qb, d_Kb, d_Vb, d_Pb, d_Ob, d_OrefB;
+	ASSERT("CHIRONInnerVO: alloc",
+	       d_Q.allocate(n) && d_K.allocate(n) && d_V.allocate(n) && d_O.allocate(n) &&
+	       d_S.allocate(nS) && d_Qb.allocate(n) && d_Kb.allocate(n) && d_Vb.allocate(n) &&
+	       d_Pb.allocate(nS) && d_Ob.allocate(n) && d_OrefB.allocate(n));
+	ASSERT("CHIRONInnerVO: upload",
+	       d_Q.upload(&Q[0]) && d_K.upload(&K[0]) && d_V.upload(&V[0]));
+
+	// Legacy: FP32 V in (cast internally), FP32 O out, then standalone cast.
+	ASSERT("CHIRONInnerVO: legacy pipeline",
+	       glades::gpu::flash_attention_cublas_tiled_bf16(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           T, nH, dH, dModel, /*causal=*/true,
+	           d_O.data(), d_S.data(),
+	           d_Qb.data(), d_Kb.data(), d_Vb.data(), d_Pb.data()));
+	ASSERT("CHIRONInnerVO: reference O cast",
+	       glades::gpu::cast_f32_to_bf16(d_O.data(), d_OrefB.data(), n));
+	std::vector<unsigned short> vbLegacy(n);
+	ASSERT("CHIRONInnerVO: download legacy Vb", d_Vb.download(&vbLegacy[0]));
+
+	// Variant: pre-cast V with the same kernel, BF16 O direct.
+	ASSERT("CHIRONInnerVO: precast V",
+	       glades::gpu::cast_f32_to_bf16(d_V.data(), d_Vb.data(), n));
+	std::vector<unsigned short> vbPre(n);
+	ASSERT("CHIRONInnerVO: download precast Vb", d_Vb.download(&vbPre[0]));
+	bool vSame = true;
+	for (size_t i = 0; i < n; ++i) if (vbLegacy[i] != vbPre[i]) vSame = false;
+	ASSERT("CHIRONInnerVO: V bits identical to legacy internal cast", vSame);
+
+	ASSERT("CHIRONInnerVO: V+O variant",
+	       glades::gpu::flash_attention_cublas_tiled_bf16_vpre_obf16(
+	           d_Q.data(), d_K.data(), d_Vb.data(),
+	           T, nH, dH, dModel, /*causal=*/true,
+	           d_Ob.data(), d_S.data(),
+	           d_Qb.data(), d_Kb.data(), d_Pb.data()));
+
+	std::vector<unsigned short> Ob(n), OrefB(n);
+	ASSERT("CHIRONInnerVO: download O", d_Ob.download(&Ob[0]) && d_OrefB.download(&OrefB[0]));
+
+	size_t bitEqual = 0;
+	float maxRel = 0.0f;
+	for (size_t i = 0; i < n; ++i)
+	{
+		if (Ob[i] == OrefB[i]) ++bitEqual;
+		union { uint32_t u; float f; } a, b;
+		a.u = (uint32_t)Ob[i] << 16; b.u = (uint32_t)OrefB[i] << 16;
+		const float denom = fabsf(b.f) > 1e-3f ? fabsf(b.f) : 1e-3f;
+		const float rel = fabsf(a.f - b.f) / denom;
+		if (rel > maxRel) maxRel = rel;
+	}
+	std::printf("  [CHIRON inner V+O] O bitwise-equal %zu/%zu, max rel diff %.3g\n",
+	            bitEqual, n, (double)maxRel);
+	ASSERT("CHIRONInnerVO: O within BF16 rtol of legacy", maxRel < 1e-2f);
+#else
+	std::printf("  [CHIRON inner V+O] built without CUDA — skipped\n");
+#endif
+}

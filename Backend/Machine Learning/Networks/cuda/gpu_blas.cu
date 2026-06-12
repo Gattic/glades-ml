@@ -1552,6 +1552,40 @@ bool sgemm_batched_strided_bf16(int M, int N, int K,
 	                            "cublasGemmStridedBatchedEx(BF16)");
 }
 
+// Cast-elim V+O slice (2026-06-12): dst-BF16 variant of the batched strided
+// NN BF16 GEMM.  FP32 internal accumulate; cuBLAS RNE-rounds to BF16 on the
+// D write (same rounding as a standalone cast of the FP32 result).  Used by
+// the inner-attention P·V GEMM to write O directly as BF16.
+bool sgemm_batched_strided_bf16_dst_bf16(int M, int N, int K,
+                                          float alpha,
+                                          const unsigned short* A, int lda, long long strideA,
+                                          const unsigned short* B, int ldb, long long strideB,
+                                          float beta,
+                                          unsigned short* C, int ldc, long long strideC,
+                                          int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	cublasStatus_t st = cublasGemmStridedBatchedEx(g_handle,
+	    CUBLAS_OP_N, CUBLAS_OP_N,
+	    N, M, K,
+	    &alpha,
+	    B, CUDA_R_16BF, ldb, strideB,
+	    A, CUDA_R_16BF, lda, strideA,
+	    &beta,
+	    C, CUDA_R_16BF, ldc, strideC,
+	    batchCount,
+	    CUBLAS_COMPUTE_32F_FAST_16BF,
+	    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasGemmStridedBatchedEx(BF16,dstBF16) failed: %d (M=%d N=%d K=%d bc=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided_abt_bf16(int M, int N, int K,
                                     float alpha,
                                     const unsigned short* A, int lda, long long strideA,

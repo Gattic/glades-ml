@@ -151,6 +151,16 @@ bool sgemm_rowmajor_bf16_dst_bf16(int M, int N, int K,
                                    float beta,
                                    unsigned short* C, int ldc);
 
+// Cast-elim V+O slice (2026-06-12): batched-strided NN form with BF16 D
+// (FP32 internal accumulate, RNE on store).
+bool sgemm_batched_strided_bf16_dst_bf16(int M, int N, int K,
+                                          float alpha,
+                                          const unsigned short* A, int lda, long long strideA,
+                                          const unsigned short* B, int ldb, long long strideB,
+                                          float beta,
+                                          unsigned short* C, int ldc, long long strideC,
+                                          int batchCount);
+
 // === FAST_16BF GEMM wrappers (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same signature as sgemm_rowmajor* (FP32 A, FP32 B, FP32 C) but routes
@@ -444,6 +454,7 @@ inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, co
 inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_bf16_dst_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, unsigned short*, int) { return false; }
+inline bool sgemm_batched_strided_bf16_dst_bf16(int, int, int, float, const unsigned short*, int, long long, const unsigned short*, int, long long, float, unsigned short*, int, long long, int) { return false; }
 inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
