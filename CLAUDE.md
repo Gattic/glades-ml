@@ -32,10 +32,12 @@ The current production LLM flagship is **CHIRON 1B SIRA+clamp**
 - **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship
   --zloss-coef 1e-4 --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0
   --sira-balance-weight 0.25 --sira-action-weight 0.0 --sira-warmup 1000
-  --lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0
-  --cast-elim-reln-q --cast-elim-dqperp --cast-elim-dy --cast-elim-inner-vo`
-  (the four cast-elim flags are wall-only, parity-clean — shipped 2026-06-12;
-  omit them to reproduce the 2026-06-12 checkpoint's exact training run).
+  --lr 7.5e-5 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0`.
+  The cast-elim stack (wall-only, parity-clean, +3.38% n=3) is **default-ON
+  since the 2026-06-12 Tier-2 promotion** (owner-blessed); strict
+  reproduction of the pre-promotion training runs adds
+  `--no-cast-elim-reln-q --no-cast-elim-dqperp --no-cast-elim-dy
+  --no-cast-elim-inner-vo`.
 - **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
   (prefers `chiron_1B_T16384_sira_clamp_phase2.final` since 2026-06-12).
 - **Ship record**: `research/SIRA_CLAMP_SHIP_2026_06_12.md`. Full evidence
@@ -44,8 +46,10 @@ The current production LLM flagship is **CHIRON 1B SIRA+clamp**
   Clamp mechanism spec: `docs/superpowers/specs/2026-06-11-dq-embed-clamp-design.md`.
 - **Caveats**: same-seed full-recipe runs are NOT bit-reproducible at
   production shape (atomic-ordering noise) — use rerun controls for parity
-  claims. All SIRA/clamp flags default off; omitting them reproduces the
-  regstack Phase 2 ship exactly.
+  claims. SIRA/clamp/regstack flags default off; omitting them reproduces
+  the regstack Phase 2 ship (with `--no-cast-elim-*` for strict
+  pre-2026-06-12 kernel-sequence reproduction — the cast-elim mechanisms are
+  math-identical, so this matters only for exact replay/trace work).
 
 ## Prior regstack Phase 2 Flagship — CHIRON 1B @ T=16384 (ship 2026-05-22, kept for context)
 

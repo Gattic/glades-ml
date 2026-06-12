@@ -367,3 +367,25 @@ Arc total: 4 shipped mechanisms (A, B-dq_perp, B-dy, V+O), 2
 analysis-NULLs (WMMA redirect input, Port C slices 1/fwd-as-specced),
 1 sub-noise closure (D), across 5 gates and 2 n=3 benches — every
 verdict evidence-backed.
+
+---
+
+## Tier-2 promotion: cast-elim stack default-ON (2026-06-12, owner-blessed)
+
+Following the ship, the owner blessed promoting the new features against
+the previous flagship under the unchanged three-tier convention. The
+convention sorts them: the four cast-elim flags are math-identity class →
+**promoted to binary default-ON with `--no-cast-elim-*` opt-outs**
+(iter-116 precedent); SIRA/clamps/LR change math → remain Tier-3
+recipe-explicit (as qk-norm/zloss did at their ship).
+
+- Trainer defaults flipped; run.sh wires the `--no-*` opt-outs through
+  all three arg paths; help/CLAUDE.md updated.
+- Verification: 12-step default-on vs opted-out pair tracks at rerun-noise
+  scale (`logs/cast_elim_promotion_check_20260612`); opt-outs restore the
+  legacy kernel sequence for strict replay work.
+- V+O self-gates off without QK-Norm/BF16-inner; dy self-gates on
+  iter116+fuse-streams; no untested default combination is reachable.
+- Cost accepted with the blessing: strict pre-promotion kernel-sequence
+  reproduction now requires the four `--no-*` flags (math-identical either
+  way).
