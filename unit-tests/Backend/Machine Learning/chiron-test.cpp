@@ -17821,3 +17821,87 @@ void CHIRONRelnDualMirrorTest()
 	std::printf("  [CHIRON reln dual mirror] built without CUDA — skipped\n");
 #endif
 }
+
+// === CAST-ELIMINATION PORT B TEST (2026-06-12) ===
+// scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror must produce
+// dx_primary/dx_secondary/dK bit-identical to the plain dual_out variant,
+// and a mirror bit-identical to cast_f32_to_bf16(dx_secondary).
+
+void CHIRONDwconvDualMirrorTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON dwconv dual mirror] no CUDA device — skipped\n");
+		return;
+	}
+
+	const int T = 48;
+	const int m = 320; // > one 256-col block, not a multiple of it
+	const int w = 4;   // production W_FILTER=5 tiled path
+	const size_t Tm = (size_t)T * m;
+	const size_t Km = (size_t)m * (w + 1);
+
+	std::vector<float> x(Tm), dy(Tm), Kf(Km), dx_init(Tm);
+	LCG rng(612u);
+	for (size_t i = 0; i < Tm; ++i) x[i] = rng.next_unit();
+	for (size_t i = 0; i < Tm; ++i) dy[i] = rng.next_unit();
+	for (size_t i = 0; i < Km; ++i) Kf[i] = 0.5f * rng.next_unit();
+	for (size_t i = 0; i < Tm; ++i) dx_init[i] = 0.25f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_x, d_dy, d_K, d_dxA, d_dxB, d_secA, d_secB, d_dKA, d_dKB;
+	glades::gpu::GpuBuffer<unsigned short> d_mirror, d_castRef;
+	ASSERT("CHIRONDwconvDualMirror: alloc",
+	       d_x.allocate(Tm) && d_dy.allocate(Tm) && d_K.allocate(Km) &&
+	       d_dxA.allocate(Tm) && d_dxB.allocate(Tm) && d_secA.allocate(Tm) &&
+	       d_secB.allocate(Tm) && d_dKA.allocate(Km) && d_dKB.allocate(Km) &&
+	       d_mirror.allocate(Tm) && d_castRef.allocate(Tm));
+	ASSERT("CHIRONDwconvDualMirror: upload",
+	       d_x.upload(&x[0]) && d_dy.upload(&dy[0]) && d_K.upload(&Kf[0]) &&
+	       d_dxA.upload(&dx_init[0]) && d_dxB.upload(&dx_init[0]) &&
+	       d_dKA.zero() && d_dKB.zero());
+
+	ASSERT("CHIRONDwconvDualMirror: plain dual_out",
+	       glades::gpu::scfa_depthwise_causal_conv_bwd_dual_out(
+	           d_x.data(), d_K.data(), d_dy.data(), T, m, w,
+	           d_dxA.data(), d_secA.data(), d_dKA.data()));
+	ASSERT("CHIRONDwconvDualMirror: bf16mirror variant",
+	       glades::gpu::scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+	           d_x.data(), d_K.data(), d_dy.data(), T, m, w,
+	           d_dxB.data(), d_secB.data(), d_mirror.data(), d_dKB.data()));
+	ASSERT("CHIRONDwconvDualMirror: reference cast",
+	       glades::gpu::cast_f32_to_bf16(d_secA.data(), d_castRef.data(), Tm));
+
+	std::vector<float> dxA(Tm), dxB(Tm), secA(Tm), secB(Tm), dKA(Km), dKB(Km);
+	std::vector<unsigned short> mirror(Tm), castRef(Tm);
+	ASSERT("CHIRONDwconvDualMirror: download",
+	       d_dxA.download(&dxA[0]) && d_dxB.download(&dxB[0]) &&
+	       d_secA.download(&secA[0]) && d_secB.download(&secB[0]) &&
+	       d_dKA.download(&dKA[0]) && d_dKB.download(&dKB[0]) &&
+	       d_mirror.download(&mirror[0]) && d_castRef.download(&castRef[0]));
+
+	bool same = true;
+	for (size_t i = 0; i < Tm; ++i)
+		if (dxA[i] != dxB[i] || secA[i] != secB[i]) same = false;
+	ASSERT("CHIRONDwconvDualMirror: dx_primary/dx_secondary bit-identical", same);
+	bool dKSame = true;
+	for (size_t i = 0; i < Km; ++i) if (dKA[i] != dKB[i]) dKSame = false;
+	ASSERT("CHIRONDwconvDualMirror: dK bit-identical", dKSame);
+	bool mirrorSame = true;
+	for (size_t i = 0; i < Tm; ++i) if (mirror[i] != castRef[i]) mirrorSame = false;
+	ASSERT("CHIRONDwconvDualMirror: mirror bit-identical to cast", mirrorSame);
+
+	// NULL mirror falls back to plain dual_out.
+	ASSERT("CHIRONDwconvDualMirror: NULL mirror fallback",
+	       glades::gpu::scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+	           d_x.data(), d_K.data(), d_dy.data(), T, m, w,
+	           d_dxB.data(), d_secB.data(), 0, d_dKB.data()));
+	// Unsupported w rejected when mirror requested.
+	ASSERT("CHIRONDwconvDualMirror: w=3 rejected with mirror",
+	       !glades::gpu::scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+	           d_x.data(), d_K.data(), d_dy.data(), T, m, 3,
+	           d_dxB.data(), d_secB.data(), d_mirror.data(), d_dKB.data()));
+#else
+	std::printf("  [CHIRON dwconv dual mirror] built without CUDA — skipped\n");
+#endif
+}

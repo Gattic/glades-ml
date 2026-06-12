@@ -9143,6 +9143,86 @@ __global__ void scfa_dwconv_dx_tiled_kernel_dual_out(
 	}
 }
 
+// Cast-elim Port B (2026-06-12): identical to scfa_dwconv_dx_tiled_kernel_
+// dual_out but additionally side-writes the BF16 RNE mirror of dx_secondary
+// (bit-identical to a subsequent cast_f32_to_bf16 of dx_secondary).  Lets
+// the downstream B^T·dq_perp FAST_16BF GEMM consume the mirror instead of
+// launching a standalone T×m cast.  Separate kernel (not a runtime branch
+// in the original) so the legacy path's codegen is untouched — FMA-emit
+// drift class precaution.  See research/CAST_CENSUS_2026_06_12.md.
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror(
+    const float* __restrict__ dy,
+    const float* __restrict__ K,
+    int T, int m,
+    float* __restrict__ dx_primary,
+    float* __restrict__ dx_secondary,
+    unsigned short* __restrict__ dx_secondary_bf16)
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int DY_ROWS = N_OUT + W_FILTER - 1;
+
+	__shared__ float dy_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			const int t_in = t_base + k;
+			dy_smem[k][threadIdx.x] = (t_in < T)
+			    ? dy[(size_t)t_in * (size_t)m + (size_t)c]
+			    : 0.0f;
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			dy_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t = t_base + dt;
+		if (t >= T) return;
+
+		float acc = 0.0f;
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t + i >= T) break;
+			acc += K_smem[threadIdx.x][i] * dy_smem[dt + i][threadIdx.x];
+		}
+		const size_t idx = (size_t)t * (size_t)m + (size_t)c;
+		dx_primary[idx]  += acc;
+		dx_secondary[idx] = acc;
+		// BF16 RNE encode of acc — same semantics as k_cast_f32_to_bf16.
+		union { float f; uint32_t u; } enc;
+		enc.f = acc;
+		if (isnan(acc)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			dx_secondary_bf16[idx] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			dx_secondary_bf16[idx] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
@@ -9274,6 +9354,56 @@ bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
 		dim3 grid((m + block - 1) / block, T);
 		scfa_dwconv_dx_kernel_dual_out<<<grid, block, 0, s>>>(
 		    dy, K, T, m, w, dx_primary, dx_secondary);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// dK kernel: same _par variant as the legacy bwd.
+	{
+		const int BLOCK_M = 64;
+		const int BLOCK_T = 8;
+		int wp1 = w + 1;
+		dim3 grid((m + BLOCK_M - 1) / BLOCK_M, wp1);
+		dim3 block(BLOCK_M, BLOCK_T);
+		scfa_dwconv_dK_kernel_par<64, 8><<<grid, block, 0, s>>>(
+		    x, dy, T, m, w, dK);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+    const float* x, const float* K,
+    const float* dy,
+    int T, int m, int w,
+    float* dx_primary,
+    float* dx_secondary,
+    unsigned short* dx_secondary_bf16,
+    float* dK,
+    cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	// Mirror variant is implemented for the tiled w ∈ {4, 8} paths only
+	// (the production iter-99 dispatch gate).  No mirror → use the plain
+	// dual_out path.
+	if (!dx_secondary_bf16)
+		return scfa_depthwise_causal_conv_bwd_dual_out(
+		    x, K, dy, T, m, w, dx_primary, dx_secondary, dK, stream);
+	if (w != 4 && w != 8) return false;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+
+	{
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		if (w == 4)
+			scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror<COLS, N_OUT, 5>
+			    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary,
+			                            dx_secondary_bf16);
+		else
+			scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror<COLS, N_OUT, 9>
+			    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary,
+			                            dx_secondary_bf16);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 

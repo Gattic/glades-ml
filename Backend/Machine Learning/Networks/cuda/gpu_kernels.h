@@ -325,6 +325,22 @@ bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
                                               float* dK,
                                               cudaStream_t stream = 0);
 
+// Cast-elim Port B (2026-06-12): dual_out variant that also side-writes the
+// BF16 RNE mirror of dx_secondary (bit-identical to a subsequent
+// cast_f32_to_bf16), so the downstream B^T·dq_perp FAST_16BF GEMM can
+// consume the mirror via the fast16bf constant table.  NULL mirror falls
+// back to scfa_depthwise_causal_conv_bwd_dual_out; supports w ∈ {4, 8}
+// only (the production iter-99 dispatch gate).
+bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+    const float* x, const float* K,
+    const float* dy,
+    int T, int m, int w,
+    float* dx_primary,
+    float* dx_secondary,
+    unsigned short* dx_secondary_bf16,
+    float* dK,
+    cudaStream_t stream = 0);
+
 // Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
 // to k columns.  Used as the sequence-spectral basis in SCFA.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
@@ -1168,6 +1184,7 @@ inline bool scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled(const float*
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_dual_out(const float*, const float*, const float*, int, int, int, float*, float*, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(const float*, const float*, const float*, int, int, int, float*, float*, unsigned short*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
