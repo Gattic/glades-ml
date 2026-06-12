@@ -235,3 +235,53 @@ B^T·dy GEMM).
 
 Before any default-flip: n=3 multi-seed 100-step stacked bench per the
 standing methodology.
+
+---
+
+## dy slice PASS + n=3 ship bench: BELOW BAR, silent-accrual (2026-06-12)
+
+**dy slice** (`--cast-elim-dy`, trainer 5cd4923): s.dp is loop-invariant
+across the backward layer loop in the production config (additive shear;
+writers — zero, SIRA terminal grad, L-1 fuse axpy — all precede the first
+`scfa_attention_backward`, which is read-only on s.dp per the iter 116
+precondition). One hoisted `cast_f32_to_bf16` + a loop-spanning
+registration replaces the 24 per-layer B^T·dy GEMM casts. No kernel
+changes; RNE bits by construction. Gate
+(`logs/cast_elim_dy_gate_20260612`, B = all three flags): drift 12/30 vs
+13/30 rerun noise, final vals identical, wall +3.0% single-seed.
+
+**n=3 multi-seed 100-step paired bench**
+(`logs/cast_elim_n3_bench_20260612`, seeds 1337/1338/1339):
+
+| seed | base tok/s | stack tok/s | Δ | final loss |
+|---:|---:|---:|---:|---|
+| 1337 | 27,542 | 28,238 | +2.53% | identical (9.9251) |
+| 1338 | 27,514 | 28,254 | +2.69% | identical (9.9143) |
+| 1339 | 27,469 | 28,285 | +2.97% | identical (9.9150) |
+
+**Mean +2.73% ± 0.18% — BELOW the +3% iter-60 multi-seed ship bar.**
+NLL parity is perfect (4-decimal-identical per seed at 100 steps).
+
+**Verdict: the three-flag stack (`--cast-elim-reln-q --cast-elim-dqperp
+--cast-elim-dy`) is parity-clean, kernel-level bit-identical, and stays
+default-off silent-accrual** (iter 97–101 class). Not added to the
+flagship recipe.
+
+**Documented path to the bar**: the shelved Port C fwd-projection slice
+(~+0.85%, §Port C result) would put the stack at ~+3.6%. It requires the
+multi-file BF16-D surgery (GEMM wrapper variant + fwd shear + inner
+attention cast-skip + trainer checkpoint-save switch) with the
+algo-selection parity risk gate-decided. Next session item; all analysis
+recorded above.
+
+## Final arc state (2026-06-12)
+
+| port | verdict | wall contribution |
+|---|---|---:|
+| A reln-q mirror | PASS | +1.3% alone |
+| B dq_perp mirror | PASS | +1.9% w/ A |
+| B dy hoisted cast | PASS | **+2.73% ± 0.18% full stack (n=3)** |
+| C BF16-D | analysis-NULL, fwd slice shelved | ~+0.85% if revisited |
+| D | closed sub-noise | — |
+
+Flags all default-off; production flagship recipe unchanged.
