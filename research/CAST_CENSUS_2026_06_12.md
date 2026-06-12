@@ -329,3 +329,41 @@ output (FP32 by type-combo law), but the impl's gemmEx call has BF16 A/B
 inputs post-pre-cast — a FAST_16BF dst-BF16 variant is legal and could
 chain with Port A's mirror. Same diminishing-returns caveat: q_compr FP32
 is also consumed (q_par GEMM, dwconv path) — full audit required.
+
+---
+
+## V+O slice PASS → STACK SHIPPED (2026-06-12)
+
+**V+O slice** (glades-ml 85c386a98, trainer commit "Add cast-elim V+O
+slice"): on the Task-4B QK-Norm production path, V projects straight to
+BF16 (`sgemm_rowmajor_bf16_dst_bf16` — V is untouched by QK-Norm) and O
+is written BF16-D by the P·V GEMM
+(`flash_attention_cublas_tiled_bf16_vpre_obf16`); checkpoint saves for
+sV/sO become d2d copies of the same bits. Q/K remain FP32 through
+`qknorm_forward_gpu` (required). Unit test: O bitwise-equal 2048/2048 vs
+the legacy FP32-write+cast at test shape.
+
+Four-flag gate (`logs/cast_elim_vo_gate_20260612`): drift 13/30 vs 12/30
+rerun noise; final vals identical; wall +3.6%.
+
+**n=3 ship bench** (`logs/cast_elim_n3_bench_vo_20260612`):
+
+| seed | base | stack | Δ | loss |
+|---:|---:|---:|---:|---|
+| 1337 | 27,522 | 28,387 | +3.14% | 9.9251 vs 9.9250 (last digit) |
+| 1338 | 27,489 | 28,461 | +3.54% | identical |
+| 1339 | 27,482 | 28,436 | +3.47% | identical |
+
+**Mean +3.38% ± 0.17% — CLEARS the +3% iter-60 multi-seed bar with every
+seed individually above it. SHIPPED 2026-06-12**: the four flags
+(`--cast-elim-reln-q --cast-elim-dqperp --cast-elim-dy
+--cast-elim-inner-vo`) join the documented production flagship recipe
+(CLAUDE.md + run.sh help). Flags stay default-off in code; all prior
+ships reproduce bit-identically by omission. Engineering-only change —
+the flagship checkpoint (`chiron_1B_T16384_sira_clamp_phase2.final`) is
+unchanged; expected production throughput ~28,100 tok/s (from 27,184).
+
+Arc total: 4 shipped mechanisms (A, B-dq_perp, B-dy, V+O), 2
+analysis-NULLs (WMMA redirect input, Port C slices 1/fwd-as-specced),
+1 sub-noise closure (D), across 5 gates and 2 n=3 benches — every
+verdict evidence-backed.
