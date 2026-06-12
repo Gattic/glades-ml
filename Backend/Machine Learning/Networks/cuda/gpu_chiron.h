@@ -147,6 +147,15 @@ bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
                           const float* gamma, const float* beta,
                           int T, int m, float eps);
 
+// Port A (cast-elimination arc, 2026-06-12): same as chiron_reln_forward but
+// additionally side-writes the BF16 RNE mirror of q_out into q_out_bf16
+// (bit-identical to a subsequent cast_f32_to_bf16 of q_out).  NULL mirror
+// falls back to chiron_reln_forward.  See research/CAST_CENSUS_2026_06_12.md.
+bool chiron_reln_forward_dual(const float* q_in, float* q_out,
+                              unsigned short* q_out_bf16, float* stats,
+                              const float* gamma, const float* beta,
+                              int T, int m, float eps);
+
 // ralph-loop iter 9 (2026-05-14): fused reln-forward + axpy-into-q for
 // CHIRON's per-layer-fuse path.  Replaces:
 //   chiron_reln_forward(p, p_norm, stats, gamma, beta, T, m, eps);
@@ -629,6 +638,9 @@ inline bool chiron_shear_sub(float*, const float*, int) { return false; }
 inline bool chiron_reln_forward(const float*, float*, float*,
                                  const float*, const float*,
                                  int, int, float) { return false; }
+inline bool chiron_reln_forward_dual(const float*, float*, unsigned short*,
+                                      float*, const float*, const float*,
+                                      int, int, float) { return false; }
 inline bool chiron_reln_axpy_into_q(const float*, float*, float*,
                                      const float*, const float*,
                                      float, int, int, float) { return false; }

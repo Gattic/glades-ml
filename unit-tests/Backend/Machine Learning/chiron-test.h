@@ -99,6 +99,7 @@ void CHIRONPtocDisabledParityTest();
 void CHIRONPtocDiagnosticsMathTest();
 void CHIRONQClampMathTest();
 void CHIRONQClampEdgeTest();
+void CHIRONRelnDualMirrorTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

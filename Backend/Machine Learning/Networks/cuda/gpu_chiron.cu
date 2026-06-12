@@ -682,6 +682,82 @@ __global__ void chiron_reln_forward_rows(const float* __restrict__ q_in,
 	}
 }
 
+// Port A (cast-elimination arc, 2026-06-12): reln forward with a BF16 mirror
+// side-write.  Identical math to chiron_reln_forward_rows; pass 3 also
+// writes the RNE-rounded BF16 encoding of each output element, bit-identical
+// to running k_cast_f32_to_bf16 on q_out afterwards.  Lets the downstream
+// FAST_16BF outer GEMM consume the mirror via the fast16bf constant table
+// instead of launching a standalone T×m cast (iter 97/99/101 side-write
+// mechanism class).  See research/CAST_CENSUS_2026_06_12.md.
+__global__ void chiron_reln_forward_rows_dual(const float* __restrict__ q_in,
+                                              const float* __restrict__ gamma,
+                                              const float* __restrict__ beta,
+                                              float eps, int cols,
+                                              float* __restrict__ q_out,
+                                              unsigned short* __restrict__ q_out_bf16,
+                                              float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const float* xRow = q_in + (size_t)row * cols;
+	float*       oRow = q_out + (size_t)row * cols;
+	unsigned short* bRow = q_out_bf16 + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+
+	const float mu = sMean;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: normalize + affine, with BF16 RNE side-write (same encoding as
+	// k_cast_f32_to_bf16: round-to-nearest-even via lsb bias; NaN flushed to
+	// sign-preserving quiet NaN).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float o = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
+		oRow[i] = o;
+		union { float f; uint32_t u; } enc;
+		enc.f = o;
+		if (isnan(o)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			bRow[i] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			bRow[i] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+
+	// Stats: { mu, sigma } for this row.
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
 } // anonymous namespace
 
 bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
@@ -699,6 +775,24 @@ bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
 	// q_in == q_out or not.
 	chiron_reln_forward_rows<<<T, block, smemBytes, computeStream()>>>(
 		q_in, gamma, beta, eps, m, q_out, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_forward_dual(const float* q_in, float* q_out,
+                              unsigned short* q_out_bf16, float* stats,
+                              const float* gamma, const float* beta,
+                              int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	if (!q_out_bf16)
+		return chiron_reln_forward(q_in, q_out, stats, gamma, beta, T, m, eps);
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	// In-place safe for q_in == q_out by the same per-element read-then-write
+	// argument as chiron_reln_forward (iter 9 note above).
+	chiron_reln_forward_rows_dual<<<T, block, smemBytes, computeStream()>>>(
+		q_in, gamma, beta, eps, m, q_out, q_out_bf16, stats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

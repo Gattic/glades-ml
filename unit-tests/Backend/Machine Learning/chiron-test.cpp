@@ -17724,3 +17724,100 @@ void CHIRONQClampEdgeTest()
 	std::printf("  [CHIRON qclamp edge] built without CUDA — skipped\n");
 #endif
 }
+
+// === CAST-ELIMINATION PORT A TEST (2026-06-12) ===
+// chiron_reln_forward_dual must produce (a) q_out and stats bit-identical to
+// chiron_reln_forward, and (b) a BF16 mirror bit-identical to running
+// cast_f32_to_bf16 on that q_out.  See research/CAST_CENSUS_2026_06_12.md.
+
+void CHIRONRelnDualMirrorTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON reln dual mirror] no CUDA device — skipped\n");
+		return;
+	}
+
+	const int T = 24;
+	const int m = 96;
+	const float eps = 1e-4f;
+
+	std::vector<float> q_in((size_t)T * m), gamma(m), beta(m);
+	LCG rng(20260612u);
+	for (size_t i = 0; i < q_in.size(); ++i) q_in[i] = 2.0f * rng.next_unit();
+	for (int i = 0; i < m; ++i)
+	{
+		gamma[i] = 1.0f + 0.1f * rng.next_unit();
+		beta[i]  = 0.05f * rng.next_unit();
+	}
+	// One NaN element exercises the quiet-NaN encode path (its whole row's
+	// stats go NaN, matching between the two kernels by construction).
+	union { uint32_t u; float f; } nanv; nanv.u = 0xFFC00000u; // negative qNaN
+	q_in[(size_t)5 * m + 17] = nanv.f;
+
+	glades::gpu::GpuBuffer<float> d_in, d_outA, d_outB, d_statsA, d_statsB, d_gamma, d_beta;
+	glades::gpu::GpuBuffer<unsigned short> d_mirror, d_castRef;
+	ASSERT("CHIRONRelnDualMirror: alloc",
+	       d_in.allocate(q_in.size()) && d_outA.allocate(q_in.size()) &&
+	       d_outB.allocate(q_in.size()) && d_statsA.allocate((size_t)T * 2) &&
+	       d_statsB.allocate((size_t)T * 2) && d_gamma.allocate(m) &&
+	       d_beta.allocate(m) && d_mirror.allocate(q_in.size()) &&
+	       d_castRef.allocate(q_in.size()));
+	ASSERT("CHIRONRelnDualMirror: upload",
+	       d_in.upload(&q_in[0]) && d_gamma.upload(&gamma[0]) && d_beta.upload(&beta[0]));
+
+	ASSERT("CHIRONRelnDualMirror: plain reln",
+	       glades::gpu::chiron_reln_forward(d_in.data(), d_outA.data(), d_statsA.data(),
+	                                        d_gamma.data(), d_beta.data(), T, m, eps));
+	ASSERT("CHIRONRelnDualMirror: dual reln",
+	       glades::gpu::chiron_reln_forward_dual(d_in.data(), d_outB.data(), d_mirror.data(),
+	                                             d_statsB.data(), d_gamma.data(), d_beta.data(),
+	                                             T, m, eps));
+	ASSERT("CHIRONRelnDualMirror: reference cast",
+	       glades::gpu::cast_f32_to_bf16(d_outA.data(), d_castRef.data(), q_in.size()));
+
+	std::vector<float> outA(q_in.size()), outB(q_in.size()), statsA((size_t)T * 2), statsB((size_t)T * 2);
+	std::vector<unsigned short> mirror(q_in.size()), castRef(q_in.size());
+	ASSERT("CHIRONRelnDualMirror: download",
+	       d_outA.download(&outA[0]) && d_outB.download(&outB[0]) &&
+	       d_statsA.download(&statsA[0]) && d_statsB.download(&statsB[0]) &&
+	       d_mirror.download(&mirror[0]) && d_castRef.download(&castRef[0]));
+
+	// q_out bit-identical (NaN-aware: compare bit patterns).
+	bool outSame = true;
+	for (size_t i = 0; i < outA.size(); ++i)
+	{
+		union { float f; uint32_t u; } a, b;
+		a.f = outA[i]; b.f = outB[i];
+		if (a.u != b.u) outSame = false;
+	}
+	ASSERT("CHIRONRelnDualMirror: q_out bit-identical to plain reln", outSame);
+
+	bool statsSame = true;
+	for (size_t i = 0; i < statsA.size(); ++i)
+	{
+		union { float f; uint32_t u; } a, b;
+		a.f = statsA[i]; b.f = statsB[i];
+		if (a.u != b.u) statsSame = false;
+	}
+	ASSERT("CHIRONRelnDualMirror: stats bit-identical", statsSame);
+
+	bool mirrorSame = true;
+	size_t firstDiff = q_in.size();
+	for (size_t i = 0; i < mirror.size(); ++i)
+		if (mirror[i] != castRef[i]) { mirrorSame = false; if (firstDiff == q_in.size()) firstDiff = i; }
+	if (!mirrorSame)
+		std::printf("  [CHIRON reln dual mirror] first mismatch at %zu: mirror=0x%04x cast=0x%04x\n",
+		            firstDiff, mirror[firstDiff], castRef[firstDiff]);
+	ASSERT("CHIRONRelnDualMirror: mirror bit-identical to cast_f32_to_bf16", mirrorSame);
+
+	// NULL mirror falls back to plain path.
+	ASSERT("CHIRONRelnDualMirror: NULL mirror fallback runs",
+	       glades::gpu::chiron_reln_forward_dual(d_in.data(), d_outB.data(), 0,
+	                                             d_statsB.data(), d_gamma.data(), d_beta.data(),
+	                                             T, m, eps));
+#else
+	std::printf("  [CHIRON reln dual mirror] built without CUDA — skipped\n");
+#endif
+}
