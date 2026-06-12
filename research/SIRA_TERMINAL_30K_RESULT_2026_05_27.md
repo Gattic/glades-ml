@@ -1165,3 +1165,52 @@ confirmation of the full amended recipe** (e.g. seeds 4242 + 1337 at
 SIRA+clamps, expecting no skips and NLL ≤ ~3.55) before promotion, plus a
 flagship-doc/CLAUDE.md update if promoted.  Default flip remains a
 user/owner decision.
+
+---
+
+## Multi-seed confirmation of the amended recipe: GATE PASS (2026-06-12)
+
+Final closing runs for the promotion package: seeds `4242` and `1337` at the
+full amended candidate recipe (SIRA E+B, `--lr 7.5e-5 --grad-clip 0.5`,
+zloss+qk-norm, `--dq-layer-clamp 1.0 --dq-embed-clamp 1.0`), same binary as
+the seed-2024 PASS and the criterion-2 baseline.
+
+Artifacts (glades-trainer): `logs/sira_layerclamp_confirm_seed4242_30k_20260611_192427/`,
+`logs/sira_layerclamp_confirm_seed1337_30k_20260611_192427/`.
+Checkpoints: `database/checkpoints/sira_clamp_confirm/chiron_sira_layerclamp_tau1_seed{4242,1337}_20260611_192427.final`.
+
+### Complete multi-seed gate (current binary, amended recipe)
+
+| seed | final NLL | Δ vs B5 (3.5734) | skips | clamp firing steps | warm tok/s |
+|---|---:|---:|---:|---:|---:|
+| 2024 | 3.5062 | −0.0672 | 0 | 443 layer + 467 embed (23.8–24.3k) | 27,184 |
+| 4242 | 3.5194 | −0.0540 | 0 | **0** | 27,325 |
+| 1337 | 3.5414 | −0.0320 | 0 | **0** | 27,304 |
+
+Mean final NLL **3.5223 ± 0.0146** (−0.0511 vs B5).  Every seed clears the
+single-run NLL gate (≤ 3.5534) and the throughput bar (≥ 26,668).  Matched
+no-SIRA baseline (seed 2024, same recipe/binary): 3.5373 → SIRA contributes
+−0.0311 nat.
+
+Notable: seeds 4242 and 1337 had **zero clamp firings in 30k** — at this
+recipe their trajectories never approach the τ=1.0 boundary, so those runs
+are mathematically identical to unclamped runs.  The clamps acted only
+where needed (seed 2024's data-driven burst) and were inert insurance
+elsewhere.  The 21k val bump + bucket-3 spike reproduced on all three
+seeds (data-window feature, recovers by 24k in all cases).
+
+### Promotion package — COMPLETE
+
+All six pre-registered criteria PASS at the amended recipe, now with a
+same-binary 3-seed 30k gate (2024/4242/1337), an attribution baseline, and
+disabled-parity evidence.  Remaining steps are owner decisions:
+
+1. Flip the flagship recipe (run.sh + CLAUDE.md) to include
+   `--sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25
+   --sira-action-weight 0.0 --sira-warmup 1000 --lr 7.5e-5 --grad-clip 0.5
+   --dq-layer-clamp 1.0 --dq-embed-clamp 1.0`, OR keep SIRA opt-in.
+2. Designate a new flagship checkpoint (best candidate:
+   `chiron_sira_layerclamp_tau1_seed2024_20260611_081639.final`,
+   val NLL 3.5062) or re-train at a blessed seed.
+3. Update CLAUDE.md (also still missing the post-closure SIRA/PHS/PTOC
+   history) and MEMORY.md (over size limit).
