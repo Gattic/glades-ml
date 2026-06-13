@@ -86,3 +86,33 @@ commits: the LR-schedule × long-horizon interaction is untested beyond 82M
 tokens — the 30k/long run needs its own warmup/cosine-horizon tuning at
 accum=4, and an accum=8 + lr 6e-4 probe remains optional (the monotone LR
 trend suggests the critical batch may be higher still).
+
+---
+
+## accum=8 probe (2026-06-13) — REGRESSION; accum=4 stands
+
+Token-matched 82M, seed 1337, lr 6e-4 (linear ×8), 625 opt steps.
+Artifact: glades-trainer `logs/accum8_probe_20260613_041308/A8_lr6e4.log`.
+
+| arm | accum | steps | LR | final val NLL | Δ vs C0 |
+|---|---:|---:|---:|---:|---:|
+| C0 | 1 | 5000 | 7.5e-5 | 3.9559 | — |
+| A4c | 4 | 1250 | 3e-4 | **3.9230** | **−0.033** |
+| A8 | 8 | 625 | 6e-4 | 4.0641 | +0.108 |
+
+A8 lands **behind both A4c (+0.14) and the C0 baseline (+0.11)** — the
+per-token trend turns over at accum=8. Zero grad-skips, zero clamp firings
+(tok/s 29,582, highest as expected) — the regression is pure optimization
+efficiency, NOT instability.
+
+**Honest confound**: at an 82M budget, accum=8 conflates two effects — a
+larger batch (131k tok/step) AND only 625 optimizer steps (vs A4c's 1250).
+625 steps is genuinely few, so this probe shows "accum=8 is worse *at an
+82M budget*", not cleanly "131k tokens overshoots the critical batch." In
+the long run (5B → 38k steps at accum=8) step-starvation would not apply.
+
+**Decision**: the committed retrain uses **accum=4 + lr 3e-4** — the n=3
+confirmed choice. Pushing batch to accum=8 is unsupported by evidence and
+showed no benefit at the one budget tested. If larger-batch is ever
+revisited, it needs a token-matched test at a LARGER budget (e.g. 500M+
+tokens) so step count is not the confound. Not pursuing now (diminishing).

@@ -49,8 +49,7 @@ without the Chinchilla week. Final call is the owner's (compute).
 
 ## 3. Schedule parameters (recommended)
 
-- **Peak LR**: accum=4 → 3e-4; accum=8 → 6e-4 (pending probe). Linear-in-
-  batch, per the pilot's monotone trend.
+- **Peak LR**: accum=4 → **3e-4** (fixed; accum=8/6e-4 regressed — §4.1).
 - **Warmup**: ~1% of total steps (5B/accum=4 → ~760 → round **750**). The
   pilot's token-matched warmup (~0.65% equiv) was stable; 1% is a small
   conservative margin for the longer high-LR hold. NOT token-matched-tiny.
@@ -67,9 +66,12 @@ without the Chinchilla week. Final call is the owner's (compute).
 
 ## 4. Open parameters the probe + validation close
 
-1. **Batch size** ← accum=8 probe (in flight). If A8 ≥ A4c at 82M with no
-   instability, the retrain uses accum=8 (halves step count / host
-   overhead, same tokens); if it regresses or destabilizes, accum=4 stands.
+1. **Batch size** — RESOLVED 2026-06-13: accum=8 + lr 6e-4 REGRESSED at
+   82M (final 4.0641, behind both A4c 3.9230 and C0 3.9559; zero
+   instability — pure efficiency loss). **Retrain uses accum=4 + lr 3e-4.**
+   Caveat: the 82M probe confounds batch size with step-starvation (625
+   steps); a clean larger-batch test would need a 500M+ token budget. Not
+   pursued — accum=4 is the n=3-confirmed choice.
 2. **Schedule-shape validation** (the §1 risk): before committing the full
    run, launch the EXACT chosen config (correct `maxSteps` for 5B) but kill
    after ~3–5k steps. Verify: warmup completes clean; the extended peak-LR
