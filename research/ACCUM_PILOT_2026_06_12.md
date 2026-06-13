@@ -55,3 +55,34 @@ token AND better wall. Before any recipe consideration:
    adopt accum=4+scaled-LR directly (with the caveat that pilot evidence
    is at 82M tokens; the 30k/long-horizon LR schedule interaction needs
    its own gate).
+
+---
+
+## n=3 multi-seed confirmation (2026-06-13) — CONFIRMED
+
+C0 (accum=1, lr 7.5e-5) vs A4c (accum=4, lr 3e-4), token-matched 81.92M,
+full production recipe. Seed 1337 from the pilot above; 1338/1339 fresh.
+Artifacts: glades-trainer `logs/accum_n3_confirm_20260612_190343/` (1338/1339) + the pilot dir (1337).
+
+| seed | C0 NLL | A4c NLL | Δ (A4c−C0) | A4c wall vs C0 |
+|---|---:|---:|---:|---:|
+| 1337 | 3.9559 | 3.9230 | −0.0329 | +3.97% |
+| 1338 | 3.9393 | 3.9151 | −0.0242 | +3.64% |
+| 1339 | 3.9444 | 3.9055 | −0.0389 | +3.73% |
+| **mean** | **3.9465** | **3.9145** | **−0.0320 ± 0.0060** | **+3.78% ± 0.14%** |
+
+- **All three seeds negative**, mean −0.0320 nat, std 0.0060 — well
+  outside the per-seed noise scale; consistent sign across seeds.
+- **+3.78% wall** uniform (host-work amortization), zero grad-skips and
+  zero clamp firings in all six runs.
+
+**Verdict: CONFIRMED.** accum=4 + linear LR scaling (3e-4) is a genuine
+per-token quality improvement AND a free wall gain at the 82M-token scale.
+
+### Adoption path (unchanged from pilot recommendation)
+Math change → ships only with a fresh blessed 30k checkpoint. Adopt in the
+**data-scale retrain** as the joint vehicle. Open gate before that retrain
+commits: the LR-schedule × long-horizon interaction is untested beyond 82M
+tokens — the 30k/long run needs its own warmup/cosine-horizon tuning at
+accum=4, and an accum=8 + lr 6e-4 probe remains optional (the monotone LR
+trend suggests the critical batch may be higher still).
