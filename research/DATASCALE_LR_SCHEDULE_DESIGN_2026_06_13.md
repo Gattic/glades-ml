@@ -72,13 +72,31 @@ without the Chinchilla week. Final call is the owner's (compute).
    Caveat: the 82M probe confounds batch size with step-starvation (625
    steps); a clean larger-batch test would need a 500M+ token budget. Not
    pursued — accum=4 is the n=3-confirmed choice.
-2. **Schedule-shape validation** (the §1 risk): before committing the full
-   run, launch the EXACT chosen config (correct `maxSteps` for 5B) but kill
-   after ~3–5k steps. Verify: warmup completes clean; the extended peak-LR
-   phase is stable (skip/clamp behavior bounded); early NLL trajectory
-   tracks or beats the flagship's per-token curve. ~2–4 h, cheap vs the
-   2-day run. This is the gate that converts "pilot says accum wins" into
-   "the long-horizon schedule is sound."
+2. **Schedule-shape validation** — RESOLVED 2026-06-13: PASS. Ran the exact
+   5B config (`max_steps=76294`, warmup 750, lr 3e-4, accum 4) to step 4001
+   / 262M tokens at full peak LR, then stopped. Artifact: glades-trainer
+   `logs/schedule_validation_5B_20260613_090658/val.log`. Results:
+   - **Warmup clean**: step 751 post-ramp loss 4.64, ‖g‖ 0.72, no full-LR-
+     onset spike.
+   - **Extended peak-LR stability — the headline PASS**: 262M tokens held at
+     full 3e-4 (cosine only 5% in), **zero grad-skips, zero clamp fires**,
+     ‖g‖ bounded 0.38–2.39. The flagship's q-side burst (5,809 skips at
+     seed 2024) occurred at *decayed* LR late in a 30k run; holding PEAK LR
+     ~9× longer than the pilot is completely stable. The §1 concern (extended
+     high-LR window is burst-prone) is **disproven** for this recipe.
+   - **Per-token trajectory healthy**: cadence vals 4.213 (65.5M) → 3.795
+     (131M) → 3.683 (197M) → 3.726 (262M). Ahead of the flagship's original
+     per-token curve through 65–197M (by 0.06–0.16) while running at up to
+     ~5.7× the flagship's decayed LR. At 262M the run (peak LR) sits ~0.09
+     behind the flagship's *annealed* loss (3.635) at matched tokens —
+     EXPECTED: validation is 5% into its cosine (pure exploration), the
+     flagship was ~50% annealed there. The 262M val's +0.043 uptick is
+     single-batch val noise (elevated pos[0]); EMA is monotone.
+   - **Caveat (inherent)**: validation proves stability + a healthy early/mid
+     path, NOT the 5B endpoint. The payoff is in the annealed tail (17× more
+     tokens + final cosine), which only the full run realizes.
+   - **Verdict: GO.** Schedule shape is sound; committed run gated only on the
+     owner's token-budget decision.
 
 ## 5. Sequence to commit
 
