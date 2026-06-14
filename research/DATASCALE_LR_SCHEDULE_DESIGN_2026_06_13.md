@@ -105,3 +105,52 @@ without the Chinchilla week. Final call is the owner's (compute).
 3. Owner confirms token budget (compute commitment).
 4. Launch committed run; checkpoint = new blessed flagship candidate;
    re-anchor future work there (Phase-3 prereg intent).
+
+---
+
+## COMMITTED RUN #1 FAILED — instability at step 22737 (2026-06-14)
+
+The 5B run (lr 3e-4, accum 4) destabilized at **step 22737 / 1.49B tokens
+(30% through), at effective LR 2.47e-4** (peak 3e-4 × cosine 0.825). Two
+skip clusters: 22737–41 (5, recovered), then 23198–23237+ (sustained
+wave, killed at step 23238). 45 skips total. Process stopped manually.
+
+**Mechanism**: `bad_groups=0` — no single group went non-finite. Every
+layer's dgamma sat at ~1–4e19 simultaneously; the *global* sumsq summed to
+1e22. The per-layer dq clamp fired on up to **300,809 rows** (~76% of all
+24×T layer-row slots) but cannot bound an AGGREGATE when most rows are at
+the τ ceiling at once. This is NOT the seed-2024 single-layer 1e25 spike —
+it's a broad, distributed amplification driven by the 4× LR.
+
+**Root cause**: lr 3e-4 (4× the flagship's 7.5e-5) is too aggressive at the
+long horizon. The clamps (τ=1, tuned at 7.5e-5) reduce per-row magnitude
+but the breadth × count of the amplification at 2.47e-4 effective overflows
+the global guard.
+
+**THE VALIDATION-GAP LESSON (load-bearing for future arcs)**: the 4k-step
+schedule-validation PASSED — but the instability is a **22.7k-step / 1.5B-
+token phenomenon**. A short validation structurally CANNOT catch an
+instability that emerges at 30% of a long run. Likewise the 82M-token pilot
+(1250 steps) never reached the danger zone, so neither A4b nor A4c's pilot
+"stability" was evidence at the long horizon. **Long-horizon stability can
+only be evidenced by running through the danger zone (≥~25k steps).**
+
+**Clean checkpoints intact**: step 10000/15000/20000 (all pre-instability;
+last clean val 3.41 @ 15k). Resume point = step 20000 (1.31B tokens).
+
+### Recovery options
+| option | cost | provenance | stability margin |
+|---|---|---|---|
+| A. Resume@20k, lr 1.5e-4, test danger-zone 20–26k (~3h) then continue | +3h to decision, saves 14h | discontinuity (3e-4→1.5e-4 @20k; standard LR-drop-on-spike) | √-scale; halves the 2.47e-4 failure LR |
+| B. Restart clean, lr 1.5e-4 | +14h vs A | clean | same; but still unproven >25k until run |
+| C. Restart clean, lr 2e-4 | +14h | clean | less margin (effective ~1.65e-4 at danger zone) |
+
+**Recommendation: A** — resume from step-20000 at lr 1.5e-4 (the √-scaling
+rule, pilot-stable A4b LR, half the failure LR) and run THROUGH the danger
+zone as the real test. If it clears 20k–26k clean, continue to 76293 (and
+decide then whether the discontinuity is acceptable for the blessed
+checkpoint or to restart clean at the now-proven 1.5e-4). If it ALSO
+destabilizes, the cause is deeper than LR and needs investigation before
+any further long run. Data-scale gain (10× tokens) dominates final NLL; the
+accum LR being 1.5e-4 vs 3e-4 costs little (pilot: −0.014 vs −0.033, both
+beat baseline) and stability is the gating constraint.
