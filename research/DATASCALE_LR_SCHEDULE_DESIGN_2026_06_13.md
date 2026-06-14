@@ -154,3 +154,49 @@ destabilizes, the cause is deeper than LR and needs investigation before
 any further long run. Data-scale gain (10× tokens) dominates final NLL; the
 accum LR being 1.5e-4 vs 3e-4 costs little (pilot: −0.014 vs −0.033, both
 beat baseline) and stability is the gating constraint.
+
+---
+
+## RECOVERY A FAILED — instability is in the weight state, not just LR (2026-06-14)
+
+Resumed from step-20000 at lr 1.5e-4 (half the failure LR). Result:
+**‖g‖ = 90,824 at the FIRST resumed step (20001)** and 15 sustained skips
+from step 20410 — *earlier* than the original run's first skip (22737) and
+at half the LR. Killed. Recovery A as designed does not work.
+
+Two findings:
+1. **The fragility is in the weights by ~step 20000, not the LR.** Original-
+   run ‖g‖ was clean (~0.2–0.5) through ~step 21000 then spiked suddenly
+   (241k→0.5→1.5M→127k) — a sharp onset near 1.4B tokens, not a gradual
+   build. Lowering LR from a fragile checkpoint doesn't help.
+2. **Resume ≠ original trajectory.** The original at step 20000 had ‖g‖~0.3;
+   the resume from that checkpoint had ‖g‖ 90k immediately. The data-loader
+   position is NOT restored on --load (weights/Adam/step are), so the
+   resumed run sees different data at the step-20000 weights. Resume-based
+   recovery is therefore unreliable for this failure.
+
+**Conclusion**: the accum=4 / high-LR regime develops a fragile (sharp-
+minimum) state around 1.3–1.5B tokens that the current clamp machinery
+cannot contain in aggregate, and it cannot be cheaply recovered by
+resume+lower-LR. The data-scale + accum arc has hit a real stability wall.
+
+### Strategic options (needs owner direction — 2 failed expensive attempts)
+1. **accum=1 data-scale (PROVEN recipe, recommended)**: drop accum, run 5B
+   at the exact stable flagship recipe (accum=1, lr 7.5e-5 + clamps). ~305k
+   steps, ~49h. Forgoes the accum +3.8% wall and −0.03 per-token bump, but
+   banks the dominant data-scale win at the highest confidence (4× lower LR
+   than the failing regime; clamps validated at this exact LR). Caveat: 305k
+   steps is ~10× the longest prior run; burst could still recur but with far
+   more margin.
+2. **Investigate accum=4 instability** (research): why large-batch develops
+   the sharp minimum at ~1.4B tokens; possible global-norm-aware clamp or
+   large-batch-specific stability work. High effort, uncertain payoff.
+3. **Restart clean at conservative accum=4 LR (e.g. 1e-4)**: gamble another
+   ~47h that a never-fragile trajectory avoids it; weakly supported (1.5e-4-
+   from-checkpoint already failed).
+4. **De-risk first**: a 2B accum=1 run before committing 5B.
+
+**Recommendation: Option 1.** The accum speedup was a +3.8% optimization;
+it's not worth gating the entire (dominant) data-scale program on its
+long-horizon instability. Bank the data win with the proven recipe; treat
+accum-at-scale stability as a separate research thread.
