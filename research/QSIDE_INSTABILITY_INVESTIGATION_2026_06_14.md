@@ -13,6 +13,28 @@ is the mechanism analysis + prototype plan.
 | 5B run #1 | accum=4, lr 3e-4 | broad dgamma (all 24 layers ~1e19), global 1e22, step 22737 | clamps fired on 300k rows but **could NOT contain** — 45 skips, killed |
 | 5B recovery A | accum=4, lr 1.5e-4, resume@20k | ‖g‖ 90k at first resumed step | **fragility already in weights**; not LR-fixable |
 
+## 1b. NEW DATA (2026-06-14): the instability is HORIZON-driven, not batch-specific
+
+The accum=1 5B run (proven flagship recipe, lr 7.5e-5) ALSO hit the
+instability — a 14-skip cluster at **step 76138 / 1.25B tokens**, then
+**recovered** (contained, weights protected; the run continued at val 2.99).
+This is decisive for the diagnosis:
+
+- **It is NOT an accum=4 artifact.** The flagship never saw it only because
+  it stopped at 491M tokens; past ~1B tokens it appears regardless of batch.
+  The q-side instability is a **horizon / token-count phenomenon** that
+  emerges past ~1–1.5B tokens — the structural ceiling on scaling the data
+  budget, which is exactly the program's dominant lever.
+- **Severity scales with LR (supports H1).** Same instability, different
+  outcome: at accum=1 / lr 7.5e-5 the clamps+guard CONTAIN it (14 skips,
+  recover); at accum=4 / lr 3e-4 it ESCALATES to a killing wave (45 skips →
+  1e22, divergent). Lower LR keeps it containable; higher LR makes it lethal.
+- Practical corollary: the proven low-LR recipe survives the instability at
+  least to ~1.25B tokens (2.5× the flagship horizon). But as the data budget
+  grows further (toward Chinchilla 17B), these contained bursts will recur
+  more often and the margin shrinks — so the root fix matters more, not less,
+  as scaling continues. The investigation is the right long-term priority.
+
 ## 2. Mechanism
 
 The q-side backward (readout dq → early-layer reverse amplification → dgamma)
