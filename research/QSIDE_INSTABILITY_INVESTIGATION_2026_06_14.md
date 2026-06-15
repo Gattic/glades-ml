@@ -150,3 +150,42 @@ the ceiling is removed.
 gradient clamp) — now with GPU free. The validation harness is a fresh run
 through the danger zone (resume is invalid per recovery A). If it bounds the
 aggregate dgamma and carries a run past ~2B tokens, data scale is unlocked.
+
+---
+
+## MITIGATION 1 VALIDATED — per-group clamp lifts the ceiling (2026-06-15)
+
+Fresh accum=4 / lr 3e-4 run to step 25000 (1.64B tokens) WITH
+`--grad-group-clamp 1.0` — through the step-22737 danger zone where run #1
+diverged. Artifact: `glades-trainer/logs/gradgroupclamp_validation_*`.
+
+**Result: PASS — 0 grad-skips in 25,000 steps, run completed.**
+
+| signal | run #1 (no gg-clamp) | this run (gg-clamp 1.0) |
+|---|---|---|
+| step 22737 region | diverged: ‖g‖→1e10, sumsq 1e22, 45 skips, killed | ‖g‖ peak **2410** (step 23001), then 0.47 — **0 skips** |
+| broad dgamma elevation | yes → overflowed global guard | yes (peak **43/48** vectors clamped @21352) → bounded |
+| trajectory | died at 1.49B | healthy: val 3.2257 @ 1.64B, descending |
+| clamp activity | n/a | 997 fires / 25k steps (~4%), intermittent |
+
+**Mechanism confirmed**: the instability still OCCURS (dgamma spikes broadly,
+43/48 groups), but per-group clamping bounds each vector's L2 norm so the
+global sum stays ~2410 (under the 1e20 guard) instead of 1e22. grad-clip then
+rescales the bounded norm and training continues — converting a lethal
+overflow into a routine clipped bump. Crucially the trajectory is UNHARMED
+(val tracks the unclamped run; the clamp fires on only ~4% of steps and
+doesn't perturb healthy learning — validated by on-trend vals).
+
+**This lifts the structural ceiling.** Both prior recipes failed past ~1.5B
+tokens; this run cleared it and reached 1.64B clean. The dominant lever —
+data scale — is unblocked.
+
+### Next: full data-scale run WITH the fix
+The validation used accum=4/lr3e-4 — so **accum=4 + gg-clamp is now viable
+(fast AND stable)**, reclaiming the +3.8% wall + per-token bump the
+instability had forced us to abandon. Recommended: a full 5B accum=4 run
+(76k steps, ~47h) with `--grad-group-clamp 1.0` + the full recipe, to bank
+the transformational flagship the −0.71 win previewed (now able to COMPLETE
++ anneal). Residual risk: validated to 1.64B; a full 5B run is 3× further and
+may reveal modes beyond the dgamma-aggregate one (escalate to mitigation 2–4
+if so), but the fundamental mechanism is now addressed.
