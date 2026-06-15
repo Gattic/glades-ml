@@ -111,3 +111,42 @@ when the accum=1 run completes (or a deliberate interrupt if the
 investigation is prioritized). Success here is what makes future
 large-batch / higher-LR / larger-token runs viable — i.e., it removes the
 ceiling on the whole scaling program.
+
+---
+
+## accum=1 run OUTCOME: huge win banked, then degraded at ~1.6B tokens (2026-06-15)
+
+The accum=1 5B run did NOT complete — it hit the instability ceiling and was
+stopped at step ~100k / 1.64B tokens. Trajectory (val every 10k steps):
+3.673 → 3.585 → 3.560 → 3.612 → **3.088 → 2.984 → 2.994 → 2.740 → 2.797**
+→ 3.388 (degraded). 
+
+- **Peak: val 2.7403 @ step 80k (1.31B tokens)**; best SAVED checkpoint
+  **step-90000, val 2.7969** (preserved as `...datascale5B_BEST_val2p797.final`).
+- **This is −0.71 nat below the current flagship (3.5062)** — by far the
+  largest single improvement in the project's history, and it validates the
+  data-scale thesis dramatically: the flagship at 491M tokens was severely
+  starved; at 1.3–1.5B tokens (still pre-anneal) the model is a categorically
+  better LM (acc1 0.31 vs the flagship's ~0.14).
+- **Degradation mechanism** (steps ~93k–100k): NO new grad-skips, but ‖g‖
+  climbed to a SUSTAINED 4–5M (vs normal ~0.4) and train EMA rose 3.04→3.43.
+  The gradients were huge-but-under-the-1e20-guard, so clipped-but-nonzero
+  updates slowly corrupted the model — a slow-motion version of the accum=4
+  divergence. The lr-7.5e-5 recipe survived the contained 14-skip burst at
+  1.25B but entered sustained fragility by ~1.6B.
+
+## REVISED CONCLUSION — the instability is the absolute ceiling on data scale
+
+Both recipes now confirm it: NO current recipe reaches even 2B tokens
+cleanly. accum=4/lr3e-4 diverged at 1.49B; accum=1/lr7.5e-5 degraded at
+~1.6B. The dominant capability lever (data scale, 108B tokens available) is
+**hard-blocked past ~1.3–1.5B tokens by the q-side instability.** The
+investigation is no longer a parallel nice-to-have — it is THE gate on all
+further capability progress. The −0.71 win we DID bank (a 3× data increase,
+stopped before degradation) is a preview of how large the full prize is if
+the ceiling is removed.
+
+**Immediate priority shift**: implement + validate mitigation 1 (per-group
+gradient clamp) — now with GPU free. The validation harness is a fresh run
+through the danger zone (resume is invalid per recovery A). If it bounds the
+aggregate dgamma and carries a run past ~2B tokens, data scale is unlocked.
