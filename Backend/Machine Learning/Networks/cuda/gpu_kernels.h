@@ -446,6 +446,15 @@ bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
 bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
                    int* d_clampedCount, int* d_nonfiniteCount);
 
+// Per-vector L2-norm clamp, in place on x[n].  Non-finite vector → zeroed;
+// else ‖x‖₂ > maxNorm → scaled by maxNorm/‖x‖; else untouched (bit-identical).
+// Sum-of-squares accumulates in double so huge-but-finite gradients rescale
+// instead of overflowing.  d_clampedCount may be NULL.  Returns false on
+// invalid args or maxNorm <= 0.  Used by the per-group gradient clamp
+// (q-side instability mitigation 1): bound each layer's dgamma/dbeta L2 norm
+// before the global-norm sum.  See research/QSIDE_INSTABILITY_INVESTIGATION_2026_06_14.md.
+bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount);
+
 // ---------------------------------------------------------------------------
 // Adam optimizer
 // ---------------------------------------------------------------------------
@@ -1214,6 +1223,7 @@ inline bool embedding_gather_bf16(const uint16_t*, const int*, int, int, int, fl
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
 inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
+inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }

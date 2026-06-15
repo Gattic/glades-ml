@@ -17990,3 +17990,80 @@ void CHIRONInnerVOTest()
 	std::printf("  [CHIRON inner V+O] built without CUDA — skipped\n");
 #endif
 }
+
+// === PER-GROUP GRAD CLAMP TEST (2026-06-15, q-side instability mitigation 1) ===
+// clamp_vector_l2norm bounds a vector's L2 norm; bit-identical when below max;
+// huge-but-finite (1e19) rescales via the double accumulator; non-finite zeroed.
+
+void CHIRONGradGroupClampTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON grad-group clamp] no CUDA device — skipped\n");
+		return;
+	}
+	const int n = 2048; // production dgamma/dbeta size (m)
+	const float maxNorm = 1.0f;
+
+	// Case 1: below max → untouched (bit-identical).
+	std::vector<float> small(n);
+	LCG rng(615u);
+	for (int i = 0; i < n; ++i) small[i] = 0.01f * rng.next_unit(); // ‖x‖ ~ 0.01*sqrt(2048/3) << 1
+	// Case 2: huge-but-finite (overflows FP32 sumsq) → rescale to maxNorm.
+	std::vector<float> huge(n);
+	for (int i = 0; i < n; ++i) huge[i] = (i % 2 ? 1e19f : -1e19f);
+	// Case 3: contains NaN → zeroed.
+	std::vector<float> withnan(n);
+	for (int i = 0; i < n; ++i) withnan[i] = rng.next_unit();
+	union { uint32_t u; float f; } nanv; nanv.u = 0x7FC00000u; withnan[100] = nanv.f;
+
+	glades::gpu::GpuBuffer<float> d_small, d_huge, d_nan;
+	glades::gpu::GpuBuffer<int> d_cnt;
+	ASSERT("CHIRONGradGroupClamp: alloc",
+	       d_small.allocate(n) && d_huge.allocate(n) && d_nan.allocate(n) && d_cnt.allocate(1));
+	ASSERT("CHIRONGradGroupClamp: upload",
+	       d_small.upload(&small[0]) && d_huge.upload(&huge[0]) && d_nan.upload(&withnan[0]));
+	const int zero = 0;
+
+	// Case 1: below max, count must stay 0, vector bit-identical.
+	ASSERT("CHIRONGradGroupClamp: zero count", d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONGradGroupClamp: small runs",
+	       glades::gpu::clamp_vector_l2norm(d_small.data(), n, maxNorm, d_cnt.data()));
+	std::vector<float> smallOut(n); int cnt = -1;
+	ASSERT("CHIRONGradGroupClamp: dl small", d_small.download(&smallOut[0]) && d_cnt.download(&cnt, 1));
+	bool bitIdentical = true;
+	for (int i = 0; i < n; ++i) { union { float f; uint32_t u; } a, b; a.f = small[i]; b.f = smallOut[i]; if (a.u != b.u) bitIdentical = false; }
+	ASSERT("CHIRONGradGroupClamp: below-max bit-identical", bitIdentical);
+	ASSERT("CHIRONGradGroupClamp: below-max count 0", cnt == 0);
+
+	// Case 2: huge → rescale to ‖x‖ == maxNorm, count 1.
+	ASSERT("CHIRONGradGroupClamp: zero count 2", d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONGradGroupClamp: huge runs",
+	       glades::gpu::clamp_vector_l2norm(d_huge.data(), n, maxNorm, d_cnt.data()));
+	std::vector<float> hugeOut(n); cnt = -1;
+	ASSERT("CHIRONGradGroupClamp: dl huge", d_huge.download(&hugeOut[0]) && d_cnt.download(&cnt, 1));
+	double ssOut = 0.0; for (int i = 0; i < n; ++i) ssOut += (double)hugeOut[i] * hugeOut[i];
+	const double normOut = sqrt(ssOut);
+	ASSERT("CHIRONGradGroupClamp: huge rescaled to maxNorm", fabs(normOut - 1.0) < 1e-4);
+	ASSERT("CHIRONGradGroupClamp: huge count 1", cnt == 1);
+
+	// Case 3: NaN → zeroed, count 1.
+	ASSERT("CHIRONGradGroupClamp: zero count 3", d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONGradGroupClamp: nan runs",
+	       glades::gpu::clamp_vector_l2norm(d_nan.data(), n, maxNorm, d_cnt.data()));
+	std::vector<float> nanOut(n); cnt = -1;
+	ASSERT("CHIRONGradGroupClamp: dl nan", d_nan.download(&nanOut[0]) && d_cnt.download(&cnt, 1));
+	bool allZero = true; for (int i = 0; i < n; ++i) if (nanOut[i] != 0.0f) allZero = false;
+	ASSERT("CHIRONGradGroupClamp: nan vector zeroed", allZero);
+	ASSERT("CHIRONGradGroupClamp: nan count 1", cnt == 1);
+
+	// Edge: maxNorm <= 0 rejected; NULL count accepted.
+	ASSERT("CHIRONGradGroupClamp: maxNorm<=0 rejected",
+	       !glades::gpu::clamp_vector_l2norm(d_small.data(), n, 0.0f, 0));
+	ASSERT("CHIRONGradGroupClamp: NULL count accepted",
+	       glades::gpu::clamp_vector_l2norm(d_huge.data(), n, maxNorm, 0));
+#else
+	std::printf("  [CHIRON grad-group clamp] built without CUDA — skipped\n");
+#endif
+}

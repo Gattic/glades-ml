@@ -1590,6 +1590,61 @@ __global__ void row_rms_clamp_kernel(float* __restrict__ x,
 		xr[i] = (scale == 0.0f) ? 0.0f : xr[i] * scale;
 }
 
+// Per-vector L2-norm clamp (in place).  One block over the whole vector.
+//  - any non-finite element → entire vector zeroed, ++*d_clampedCount
+//  - else ‖x‖₂ > maxNorm     → scaled by maxNorm/‖x‖, ++*d_clampedCount
+//  - else                    → untouched (no write; bit-identical)
+// Sum-of-squares in double so huge-but-finite gradients (|x|~1e19, whose
+// FP32 square overflows) rescale correctly instead of reading as inf.
+// Used by the per-group gradient clamp (q-side instability mitigation 1):
+// bound each layer's dgamma/dbeta L2 norm BEFORE the global-norm sum, which
+// per-row clamping cannot do.  See research/QSIDE_INSTABILITY_INVESTIGATION_2026_06_14.md.
+__global__ void clamp_vector_l2norm_kernel(float* __restrict__ x, int n,
+                                           float maxNorm,
+                                           int* __restrict__ clampedCount)
+{
+	__shared__ double s_ss[256];
+	__shared__ int s_bad[256];
+	__shared__ float s_scale;
+
+	double ss = 0.0;
+	int bad = 0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const float v = x[i];
+		if (!isfinite(v)) bad = 1;
+		ss += (double)v * (double)v;
+	}
+	s_ss[threadIdx.x] = ss;
+	s_bad[threadIdx.x] = bad;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (threadIdx.x < (unsigned int)stride) {
+			s_ss[threadIdx.x] += s_ss[threadIdx.x + stride];
+			s_bad[threadIdx.x] |= s_bad[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0) {
+		float scale = 1.0f;
+		if (s_bad[0]) {
+			scale = 0.0f;
+			if (clampedCount) atomicAdd(clampedCount, 1);
+		} else {
+			const double norm = sqrt(s_ss[0]);
+			if (norm > (double)maxNorm) {
+				scale = (float)((double)maxNorm / norm);
+				if (clampedCount) atomicAdd(clampedCount, 1);
+			}
+		}
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float scale = s_scale;
+	if (scale == 1.0f) return;
+	for (int i = threadIdx.x; i < n; i += blockDim.x)
+		x[i] = (scale == 0.0f) ? 0.0f : x[i] * scale;
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1649,6 +1704,16 @@ bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
 	if (!(tauRms > 0.0f)) return false;
 	row_rms_clamp_kernel<<<rows, 256, 0, computeStream()>>>(
 	    x, rows, cols, tauRms, d_clampedCount, d_nonfiniteCount);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount)
+{
+	if (!x || n <= 0) return false;
+	if (!(maxNorm > 0.0f)) return false;
+	clamp_vector_l2norm_kernel<<<1, 256, 0, computeStream()>>>(
+	    x, n, maxNorm, d_clampedCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
