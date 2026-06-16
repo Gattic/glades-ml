@@ -189,3 +189,29 @@ the transformational flagship the −0.71 win previewed (now able to COMPLETE
 + anneal). Residual risk: validated to 1.64B; a full 5B run is 3× further and
 may reveal modes beyond the dgamma-aggregate one (escalate to mitigation 2–4
 if so), but the fundamental mechanism is now addressed.
+
+---
+
+## Phase 1 (AGC) — implemented + calibrated; validation running (2026-06-16)
+
+Per docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md. The 5B
+gg-clamp run was killed at step 30000 (val 3.3132 @ 1.97B, banked as
+`...ggclamp_BASELINE_step30k_val3p313.final`) to free the GPU for the
+investigation — its core questions were answered (fix validated past the
+danger zone); the long run is deferrable and would be improved by a cure.
+
+- **`agc_clamp_vector` kernel + `CHIRONAgcClampTest`** (glades-ml 0fb433f49):
+  clip grad to lambda*max(‖w‖,eps); unit-validated (scales to lambda*‖w‖,
+  bit-identical below, eps floor) — 0 failures on GPU.
+- **Trainer `--agc-lambda`/`--agc-eps`** on dgamma/dbeta, mutually exclusive
+  with --grad-group-clamp (trainer commit).
+- **CALIBRATION FINDING**: NFNet's default lambda=0.01 OVER-clamps here — fires
+  every step on exactly 24/48 vectors (one full half: gamma OR beta), because
+  NFNets tunes AGC for weight matrices and EXPLICITLY EXEMPTS LayerNorm
+  gains/biases — precisely our dgamma/dbeta. Re-calibrated by sweep: fire rate
+  on healthy early steps 40/40 (λ=0.1) → 8/40 (2.0) → 4/40 (10) → **1/40
+  (λ=100)**. λ=100 is near-inert on healthy steps while the burst (ratio ~1e8)
+  triggers with huge margin. Validation launched at λ=100.
+- **Validation gate** (running, ~16h): fresh accum=4/lr3e-4 to step 25000.
+  PASS = 0 skips through the danger zone + on-trend val (vs the gg-clamp
+  baseline) + FEWER fires than gg-clamp's chronic ~22%+ (the selectivity win).
