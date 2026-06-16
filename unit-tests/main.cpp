@@ -242,6 +242,10 @@ int main(int argc, char* argv[])
 		CHIRONQClampMathTest();
 		CHIRONQClampEdgeTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-agc") == 0 || strcmp(argv[1], "agc") == 0)
+	    {
+		CHIRONAgcClampTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-castelim") == 0 || strcmp(argv[1], "castelim") == 0)
 	    {
 		CHIRONRelnDualMirrorTest();

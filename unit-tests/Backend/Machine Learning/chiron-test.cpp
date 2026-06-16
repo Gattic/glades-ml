@@ -18067,3 +18067,63 @@ void CHIRONGradGroupClampTest()
 	std::printf("  [CHIRON grad-group clamp] built without CUDA — skipped\n");
 #endif
 }
+
+// === AGC TEST (2026-06-16, Phase 1 — Adaptive Gradient Clipping) ===
+// agc_clamp_vector clips grad to lambda*max(||w||,eps); bit-identical below;
+// scales to exactly lambda*||w|| above; eps floor when ||w||~0.
+
+void CHIRONAgcClampTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON AGC] no CUDA device — skipped\n"); return; }
+	const int n = 2048;
+	const float lambda = 0.01f, eps = 1e-3f;
+
+	// w with ||w|| = 2.0 exactly: each element = 2/sqrt(n).
+	std::vector<float> w(n, 2.0f / sqrtf((float)n));
+	// Case A: grad ||g|| = 10 (>> lambda*||w||=0.02) → scale to 0.02.
+	std::vector<float> gBig(n, 10.0f / sqrtf((float)n));
+	// Case B: grad ||g|| = 0.01 (< 0.02) → untouched (bit-identical).
+	std::vector<float> gSmall(n, 0.01f / sqrtf((float)n));
+
+	glades::gpu::GpuBuffer<float> d_w, d_gBig, d_gSmall; glades::gpu::GpuBuffer<int> d_cnt;
+	ASSERT("CHIRONAgc: alloc", d_w.allocate(n) && d_gBig.allocate(n) && d_gSmall.allocate(n) && d_cnt.allocate(1));
+	ASSERT("CHIRONAgc: upload", d_w.upload(&w[0]) && d_gBig.upload(&gBig[0]) && d_gSmall.upload(&gSmall[0]));
+	const int zero = 0;
+
+	// Case A
+	ASSERT("CHIRONAgc: zero cnt A", d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONAgc: big runs", glades::gpu::agc_clamp_vector(d_gBig.data(), d_w.data(), n, lambda, eps, d_cnt.data()));
+	std::vector<float> gBigOut(n); int cnt = -1;
+	ASSERT("CHIRONAgc: dl A", d_gBig.download(&gBigOut[0]) && d_cnt.download(&cnt, 1));
+	double ss = 0.0; for (int i = 0; i < n; ++i) ss += (double)gBigOut[i] * gBigOut[i];
+	const double gnorm = sqrt(ss);
+	ASSERT("CHIRONAgc: big scaled to lambda*||w|| (0.02)", fabs(gnorm - 0.02) < 1e-4);
+	ASSERT("CHIRONAgc: big count 1", cnt == 1);
+
+	// Case B
+	ASSERT("CHIRONAgc: zero cnt B", d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONAgc: small runs", glades::gpu::agc_clamp_vector(d_gSmall.data(), d_w.data(), n, lambda, eps, d_cnt.data()));
+	std::vector<float> gSmallOut(n); cnt = -1;
+	ASSERT("CHIRONAgc: dl B", d_gSmall.download(&gSmallOut[0]) && d_cnt.download(&cnt, 1));
+	bool bitId = true; for (int i = 0; i < n; ++i) { union { float f; uint32_t u; } a, b; a.f = gSmall[i]; b.f = gSmallOut[i]; if (a.u != b.u) bitId = false; }
+	ASSERT("CHIRONAgc: small bit-identical", bitId);
+	ASSERT("CHIRONAgc: small count 0", cnt == 0);
+
+	// Case C: ||w||~0 → eps floor; grad 0.1 > lambda*eps=1e-5 → clamp to 1e-5.
+	std::vector<float> wZero(n, 0.0f), gC(n, 0.1f / sqrtf((float)n));
+	ASSERT("CHIRONAgc: upload C", d_w.upload(&wZero[0]) && d_gBig.upload(&gC[0]) && d_cnt.upload(&zero, 1));
+	ASSERT("CHIRONAgc: C runs", glades::gpu::agc_clamp_vector(d_gBig.data(), d_w.data(), n, lambda, eps, d_cnt.data()));
+	std::vector<float> gCout(n);
+	ASSERT("CHIRONAgc: dl C", d_gBig.download(&gCout[0]));
+	double ssC = 0.0; for (int i = 0; i < n; ++i) ssC += (double)gCout[i] * gCout[i];
+	ASSERT("CHIRONAgc: eps-floored to lambda*eps (1e-5)", fabs(sqrt(ssC) - (double)(lambda * eps)) < 1e-6);
+
+	// Edge: lambda<=0 rejected; NULL count ok.
+	ASSERT("CHIRONAgc: lambda<=0 rejected", !glades::gpu::agc_clamp_vector(d_gBig.data(), d_w.data(), n, 0.0f, eps, 0));
+	ASSERT("CHIRONAgc: NULL count ok", glades::gpu::agc_clamp_vector(d_gBig.data(), d_w.data(), n, lambda, eps, 0));
+#else
+	std::printf("  [CHIRON AGC] built without CUDA — skipped\n");
+#endif
+}

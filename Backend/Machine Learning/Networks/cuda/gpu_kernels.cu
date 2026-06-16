@@ -1645,6 +1645,39 @@ __global__ void clamp_vector_l2norm_kernel(float* __restrict__ x, int n,
 		x[i] = (scale == 0.0f) ? 0.0f : x[i] * scale;
 }
 
+// Adaptive Gradient Clipping (AGC, NFNets/Brock 2021): clip grad g to
+// lambda*max(‖w‖, eps) — auto-scaled to the parameter's own magnitude rather
+// than a fixed threshold.  One block over the whole vector; both norms in
+// double (huge-but-finite safe).  See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+__global__ void agc_clamp_vector_kernel(float* __restrict__ g,
+                                        const float* __restrict__ w,
+                                        int n, float lambda, float eps,
+                                        int* __restrict__ clampedCount)
+{
+	__shared__ double s_gg[256]; __shared__ double s_ww[256]; __shared__ float s_scale;
+	double gg = 0.0, ww = 0.0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const float gv = g[i], wv = w[i];
+		gg += (double)gv * gv; ww += (double)wv * wv;
+	}
+	s_gg[threadIdx.x] = gg; s_ww[threadIdx.x] = ww; __syncthreads();
+	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+		if (threadIdx.x < (unsigned)s) { s_gg[threadIdx.x] += s_gg[threadIdx.x + s]; s_ww[threadIdx.x] += s_ww[threadIdx.x + s]; }
+		__syncthreads();
+	}
+	if (threadIdx.x == 0) {
+		const double gnorm = sqrt(s_gg[0]);
+		double wnorm = sqrt(s_ww[0]); if (wnorm < (double)eps) wnorm = (double)eps;
+		const double maxg = (double)lambda * wnorm;
+		float scale = 1.0f;
+		if (gnorm > maxg && gnorm > 0.0) { scale = (float)(maxg / gnorm); if (clampedCount) atomicAdd(clampedCount, 1); }
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float sc = s_scale; if (sc == 1.0f) return;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) g[i] *= sc;
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1714,6 +1747,15 @@ bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount)
 	if (!(maxNorm > 0.0f)) return false;
 	clamp_vector_l2norm_kernel<<<1, 256, 0, computeStream()>>>(
 	    x, n, maxNorm, d_clampedCount);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, int* d_count)
+{
+	if (!g || !w || n <= 0) return false;
+	if (!(lambda > 0.0f)) return false;
+	agc_clamp_vector_kernel<<<1, 256, 0, computeStream()>>>(g, w, n, lambda, eps, d_count);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
