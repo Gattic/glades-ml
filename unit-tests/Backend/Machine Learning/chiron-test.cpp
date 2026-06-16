@@ -18127,3 +18127,42 @@ void CHIRONAgcClampTest()
 	std::printf("  [CHIRON AGC] built without CUDA — skipped\n");
 #endif
 }
+
+// === GRADIENT CENTRALIZATION TEST (2026-06-16, Phase 2) ===
+// gradient_centralize subtracts each row's mean (over cols); each row's mean
+// becomes 0 and values == original - row_mean.
+
+void CHIRONGradCentralizeTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON GC] no CUDA device — skipped\n"); return; }
+	const int rows = 4, cols = 8;
+	std::vector<float> g((size_t)rows * cols);
+	LCG rng(616u);
+	for (size_t i = 0; i < g.size(); ++i) g[i] = 2.0f * rng.next_unit() + 0.5f; // nonzero means
+	// CPU reference: per-row mean subtraction.
+	std::vector<float> ref(g);
+	for (int r = 0; r < rows; ++r) {
+		double m = 0.0; for (int c = 0; c < cols; ++c) m += ref[(size_t)r*cols+c];
+		float mu = (float)(m / cols);
+		for (int c = 0; c < cols; ++c) ref[(size_t)r*cols+c] -= mu;
+	}
+	glades::gpu::GpuBuffer<float> d_g;
+	ASSERT("CHIRONGC: alloc", d_g.allocate(g.size()));
+	ASSERT("CHIRONGC: upload", d_g.upload(&g[0]));
+	ASSERT("CHIRONGC: runs", glades::gpu::gradient_centralize(d_g.data(), rows, cols));
+	std::vector<float> out(g.size());
+	ASSERT("CHIRONGC: download", d_g.download(&out[0]));
+	bool match = true; for (size_t i = 0; i < g.size(); ++i) if (fabsf(out[i] - ref[i]) > 1e-5f) match = false;
+	ASSERT("CHIRONGC: matches CPU per-row centralize", match);
+	// each row mean ~0
+	bool zeroMean = true;
+	for (int r = 0; r < rows; ++r) { double m=0.0; for (int c=0;c<cols;++c) m+=out[(size_t)r*cols+c]; if (fabs(m/cols) > 1e-5) zeroMean = false; }
+	ASSERT("CHIRONGC: row means zeroed", zeroMean);
+	// edge: rows/cols <= 0 rejected
+	ASSERT("CHIRONGC: rows<=0 rejected", !glades::gpu::gradient_centralize(d_g.data(), 0, cols));
+#else
+	std::printf("  [CHIRON GC] built without CUDA — skipped\n");
+#endif
+}

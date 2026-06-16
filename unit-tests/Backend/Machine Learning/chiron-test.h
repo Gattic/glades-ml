@@ -104,6 +104,7 @@ void CHIRONDwconvDualMirrorTest();
 void CHIRONInnerVOTest();
 void CHIRONGradGroupClampTest();
 void CHIRONAgcClampTest();
+void CHIRONGradCentralizeTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

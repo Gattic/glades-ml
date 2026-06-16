@@ -1678,6 +1678,25 @@ __global__ void agc_clamp_vector_kernel(float* __restrict__ g,
 	for (int i = threadIdx.x; i < n; i += blockDim.x) g[i] *= sc;
 }
 
+// Gradient Centralization (Yong et al. 2020): subtract each row's mean from
+// a [rows, cols] gradient — cheap landscape-flattening regularizer. One block
+// per row; double-accumulated row sum. See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+__global__ void gradient_centralize_kernel(float* __restrict__ g, int rows, int cols)
+{
+	const int r = blockIdx.x; if (r >= rows) return;
+	float* gr = g + (size_t)r * cols;
+	__shared__ double s[256];
+	double sum = 0.0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += (double)gr[i];
+	s[threadIdx.x] = sum; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	__shared__ float mean;
+	if (threadIdx.x == 0) mean = (float)(s[0] / (double)cols);
+	__syncthreads();
+	const float mu = mean;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) gr[i] -= mu;
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1756,6 +1775,14 @@ bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, 
 	if (!g || !w || n <= 0) return false;
 	if (!(lambda > 0.0f)) return false;
 	agc_clamp_vector_kernel<<<1, 256, 0, computeStream()>>>(g, w, n, lambda, eps, d_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool gradient_centralize(float* g, int rows, int cols)
+{
+	if (!g || rows <= 0 || cols <= 0) return false;
+	gradient_centralize_kernel<<<rows, 256, 0, computeStream()>>>(g, rows, cols);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
