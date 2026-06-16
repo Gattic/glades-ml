@@ -215,3 +215,27 @@ danger zone); the long run is deferrable and would be improved by a cure.
 - **Validation gate** (running, ~16h): fresh accum=4/lr3e-4 to step 25000.
   PASS = 0 skips through the danger zone + on-trend val (vs the gg-clamp
   baseline) + FEWER fires than gg-clamp's chronic ~22%+ (the selectivity win).
+
+---
+
+## Phase 2 (GC) — kernel validated; integration finding (2026-06-16, parallel to AGC validation)
+
+`gradient_centralize` kernel + `CHIRONGradCentralizeTest` GPU-validated
+(glades-ml; ran time-sliced alongside the AGC validation without disrupting
+it — 0 failures, AGC run unaffected at 29,393 tok/s).
+
+**Integration design finding (mirrors the AGC calibration finding):** GC, like
+AGC, is defined for 2D WEIGHT matrices (subtract the per-output-row mean over
+the fan-in), and is conventionally NOT applied to 1D LayerNorm gains/biases.
+So GC's correct target is the attention projection grads dWq/dWk/dWv/dWo
+([m, dModel]), NOT the dgamma/dbeta vectors. In the production recipe those
+weight grads are BF16 (`W.dWq_bf[l]`), so the trainer integration needs a
+BF16-in/BF16-out GC variant (read BF16 → center in FP32 → write BF16), and the
+matrix orientation ([out,in] vs [in,out]) must be confirmed at the call site.
+
+**Decision:** the FP32 GC kernel is banked (validated, reusable). Trainer
+integration (BF16 variant + apply to dWq/k/v/o + danger-zone validation) is
+sequenced AFTER the AGC verdict — because the verdict reshapes the strategy:
+if AGC-on-dgamma/dbeta (the actual overflow source) wins, the weight-grad
+techniques (GC, AGC-on-weights) are secondary hardening; if it doesn't, the
+ReLN-bound cure (Phase 3) jumps ahead. Avoids building blind.
