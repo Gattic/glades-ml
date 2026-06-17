@@ -239,3 +239,39 @@ sequenced AFTER the AGC verdict — because the verdict reshapes the strategy:
 if AGC-on-dgamma/dbeta (the actual overflow source) wins, the weight-grad
 techniques (GC, AGC-on-weights) are secondary hardening; if it doesn't, the
 ReLN-bound cure (Phase 3) jumps ahead. Avoids building blind.
+
+---
+
+## Phase 1 (AGC) VERDICT: NEGATIVE — worse than the gg-clamp (2026-06-17)
+
+AGC λ=100 danger-zone validation completed (0 skips through step 25000) but is
+WORSE than the validated fixed-norm gg-clamp on both selectivity and quality:
+
+| metric | AGC λ=100 | gg-clamp (apples-to-apples validation) |
+|---|---:|---:|
+| grad-skips | 0 | 0 |
+| total clamp fires / 25k steps | **4,371** | 997 |
+| final train EMA (step 24501) | 3.457 | **3.318** |
+| final val (step 25000) | 3.4371 | **3.2257** |
+
+Trajectories matched through step 15k (3.408 vs 3.411), then AGC diverged worse
+through the unstable regime (20k+): it fires on ~17% of steps (vs gg-clamp's
+4%) and trains ~0.14 nat worse on EMA. My "selectivity win" hypothesis is
+FALSIFIED — AGC fires 4.4× MORE often (fewer vectors per event, but far more
+events) and distorts the recovery the absolute-norm gg-clamp handles cleanly.
+
+**Root cause (consistent with the 3 prior signals):** AGC's RELATIVE threshold
+(λ·‖param‖) is a poor fit for LayerNorm gains/biases — exactly why NFNets
+exempts them. The absolute-norm gg-clamp cleanly separates healthy (<1) from
+burst (>>1) dgamma; the relative threshold does not, so it over-fires in the
+unstable regime and degrades learning. Not a λ-tuning issue (lower λ over-
+clamps more; higher λ stops bounding the burst) — the mechanism is wrong for
+this target.
+
+**VERDICT: gg-clamp (fixed maxNorm 1.0) remains the best CONTAINMENT mechanism.
+AGC retired for dgamma/dbeta.** Decisive redirect: clamping-VARIANT tuning does
+not beat the gg-clamp → the path to actual improvement is the SOURCE CURE
+(Phase 3, bounded ReLN backward), which would eliminate the dgamma overflow —
+and the quality cost of ANY clamping — at its origin. GC (Phase 2) targets
+weight grads (orthogonal to the overflow source), so it is deprioritized below
+Phase 3. **Next: Phase 3.**
