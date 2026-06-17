@@ -275,3 +275,51 @@ not beat the gg-clamp → the path to actual improvement is the SOURCE CURE
 and the quality cost of ANY clamping — at its origin. GC (Phase 2) targets
 weight grads (orthogonal to the overflow source), so it is deprioritized below
 Phase 3. **Next: Phase 3.**
+
+---
+
+## Phase 3 (bounded ReLN backward / SOURCE CURE): IMPLEMENTED, validation IN FLIGHT (2026-06-17)
+
+**Mechanism.** The dgamma overflow is `dgamma[col] += Σ_r dout[r,col]·xhat[r,col]`
+with `xhat = (q - mean)·invStd`. `--dq-layer-clamp 1.0` already bounds `dout`,
+so the BF16-inverse reconstruction drift in `xhat` is the last unbounded factor.
+The cure clamps `xhat` to `[-F, F]` inside the dgamma/dbeta reduction itself —
+bounding the overflow at its arithmetic origin, rather than the gg-clamp's
+post-hoc clamp of the already-overflowed aggregate.
+
+**Implementation (committed).**
+- `layernorm_backward_bounded` + a `layernorm_backward_dgamma_dbeta_partial_clamped`
+  kernel (copy of the plain partial with one added `xhat = clamp(xhat, ±F)`),
+  `gpu_kernels.{cu,h}`. Separate kernel — default codegen untouched (FMA-drift
+  precaution per the iter-50/70/73 drift class). glades-ml `6b53b9f86`.
+- `chiron_reln_backward_bounded` wraps it (mirrors `chiron_reln_backward`),
+  `gpu_chiron.{cu,h}`.
+- Trainer `--reln-bwd-xhat-clamp F` routes BOTH q-side and p-side ReLN backward
+  through the bounded path (symmetric — the clamp is the identity on healthy
+  normalized xhat regardless of branch). glades-trainer `bb15257`.
+- Unit test `CHIRONRelnBackwardBoundedTest`: healthy bit-identical to plain;
+  drift row (q=1000 → xhat=1000) bounds `max|dgamma|` **948 → 10.7** at F=8;
+  `F<=0` delegates to plain. 0 failures on GPU.
+- 50-step smoke (F=30, accum=4/lr3e-4, seed 1337): step-1 loss **10.7816**,
+  ‖g‖ **0.831** — bit-identical to the gg-clamp gold run → clamp inert on
+  healthy steps, wiring correct, tok/s 27,736 (≈ gold 27,740, negligible cost).
+
+**Validation gate (running, ~16h).** Fresh accum=4/lr3e-4 to step 25000,
+`--reln-bwd-xhat-clamp 30`, **`--grad-group-clamp` OFF**, seed 1337 — the
+cure-vs-contain test: does the source bound ALONE prevent the overflow without
+the post-hoc gg-clamp? Log: `glades-trainer/logs/relnbound_validation_20260617_052645/run.log`.
+- **PASS** = 0 skips through the step-22737 danger zone AND final val on-trend
+  with the gg-clamp gold (3.2257 @ 25k). A clean PASS means the cure REPLACES
+  the gg-clamp (bounds at source, no chronic post-hoc clamping) and should also
+  recover the ~0.1 nat the gg-clamp's recovery distortion may cost.
+- **PARTIAL** = 0 skips but val worse than gold → cure contains but the F=30
+  bound perturbs learning (retune F, or keep gg-clamp as the shipping fix).
+- **FAIL** = skips appear → source bound alone insufficient; the overflow has a
+  contribution the xhat clamp doesn't reach (e.g. dbeta = Σ dout, or dout not
+  tightly enough bounded) → keep gg-clamp as containment.
+
+**xhatMax = 30 rationale.** Healthy normalized xhat is ≤ ~6 (even with the
+BF16-inverse drift), so F=30 is the identity on healthy steps (parity preserved,
+unit test + smoke confirm) while clamping the ~1000-magnitude drift bursts. With
+`|dout|` bounded by dq-layer-clamp and `|xhat|≤30`, each dgamma term is bounded
+→ no single-element blowup; vs the unclamped 1e19, a ~13-order reduction.
