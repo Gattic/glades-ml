@@ -987,6 +987,27 @@ bool chiron_reln_backward(const float* dq_out, const float* q_in,
 	                           T, m, dq_in, dgamma, dbeta);
 }
 
+// Phase 3 (q-side source cure, 2026-06-17): bounded ReLN backward — clamps the
+// normalized xhat to [-xhatMax, xhatMax] in the dgamma/dbeta reduction, so the
+// BF16-inverse reconstruction drift that inflates xhat (and overflows dgamma)
+// is bounded at its source.  xhatMax<=0 = plain chiron_reln_backward.
+bool chiron_reln_backward_bounded(const float* dq_out, const float* q_in,
+                                   const float* gamma, const float* stats,
+                                   int T, int m,
+                                   float* dq_in, float* dgamma, float* dbeta,
+                                   float* scratch_stats_split, float xhatMax)
+{
+	if (T <= 0 || m <= 0) return true;
+	float* d_mean  = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	const int grid = (T + kBlockElem - 1) / kBlockElem;
+	chiron_stats_split_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    stats, T, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return layernorm_backward_bounded(dq_out, q_in, gamma, d_mean, d_invStd,
+	                                   T, m, dq_in, dgamma, dbeta, xhatMax);
+}
+
 // ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================

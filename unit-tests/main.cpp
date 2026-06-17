@@ -250,6 +250,10 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONGradCentralizeTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-relnbound") == 0 || strcmp(argv[1], "relnbound") == 0)
+	    {
+		CHIRONRelnBackwardBoundedTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-castelim") == 0 || strcmp(argv[1], "castelim") == 0)
 	    {
 		CHIRONRelnDualMirrorTest();

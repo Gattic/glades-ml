@@ -216,6 +216,15 @@ bool chiron_reln_backward(const float* dq_out, const float* q_in,
                            float* dq_in, float* dgamma, float* dbeta,
                            float* scratch_stats_split);
 
+// Phase 3 (q-side source cure): ReLN backward with xhat clamped to
+// [-xhatMax, xhatMax] in the dgamma/dbeta reduction (bounds the drift-driven
+// overflow at its source).  xhatMax<=0 = plain chiron_reln_backward.
+bool chiron_reln_backward_bounded(const float* dq_out, const float* q_in,
+                                   const float* gamma, const float* stats,
+                                   int T, int m,
+                                   float* dq_in, float* dgamma, float* dbeta,
+                                   float* scratch_stats_split, float xhatMax);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -670,6 +679,10 @@ inline bool chiron_reln_backward(const float*, const float*,
                                   const float*, const float*,
                                   int, int,
                                   float*, float*, float*, float*) { return false; }
+inline bool chiron_reln_backward_bounded(const float*, const float*,
+                                  const float*, const float*,
+                                  int, int,
+                                  float*, float*, float*, float*, float) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

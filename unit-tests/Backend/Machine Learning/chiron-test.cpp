@@ -18166,3 +18166,55 @@ void CHIRONGradCentralizeTest()
 	std::printf("  [CHIRON GC] built without CUDA — skipped\n");
 #endif
 }
+
+// === RELN-BACKWARD BOUNDED TEST (2026-06-17, Phase 3 — source cure) ===
+// chiron_reln_backward_bounded clamps xhat=(q-mean)*invStd to [-xhatMax,xhatMax]
+// in the dgamma/dbeta reduction: drift-huge xhat → bounded dgamma; healthy
+// (all |xhat|<=xhatMax) → bit-identical to chiron_reln_backward.
+void CHIRONRelnBackwardBoundedTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON reln-bwd bounded] no CUDA device — skipped\n"); return; }
+	const int T = 64, m = 32;
+	const float xhatMax = 8.0f;
+
+	// stats: mean=0, sigma=1 (invStd=1) per row → xhat = q_in directly.
+	std::vector<float> dq_out((size_t)T*m), q_in((size_t)T*m), gamma(m, 1.0f), stats((size_t)T*2);
+	LCG rng(617u);
+	for (size_t i=0;i<q_in.size();++i) q_in[i] = rng.next_unit();       // healthy xhat in (-1,1)
+	for (size_t i=0;i<dq_out.size();++i) dq_out[i] = rng.next_unit();
+	for (int t=0;t<T;++t){ stats[(size_t)t*2+0]=0.0f; stats[(size_t)t*2+1]=1.0f; }
+
+	glades::gpu::GpuBuffer<float> d_dq,d_q,d_g,d_st,d_dqinA,d_dgA,d_dbA,d_dqinB,d_dgB,d_dbB,d_split;
+	ASSERT("RelnBnd: alloc", d_dq.allocate(T*m)&&d_q.allocate(T*m)&&d_g.allocate(m)&&d_st.allocate(T*2)
+	      &&d_dqinA.allocate(T*m)&&d_dgA.allocate(m)&&d_dbA.allocate(m)
+	      &&d_dqinB.allocate(T*m)&&d_dgB.allocate(m)&&d_dbB.allocate(m)&&d_split.allocate(T*2));
+	ASSERT("RelnBnd: upload", d_dq.upload(&dq_out[0])&&d_q.upload(&q_in[0])&&d_g.upload(&gamma[0])&&d_st.upload(&stats[0]));
+
+	// HEALTHY case: plain vs bounded must be bit-identical (all |xhat|<1<=8).
+	ASSERT("RelnBnd: zero dg/db", d_dgA.zero()&&d_dbA.zero()&&d_dgB.zero()&&d_dbB.zero());
+	ASSERT("RelnBnd: plain healthy", glades::gpu::chiron_reln_backward(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinA.data(),d_dgA.data(),d_dbA.data(),d_split.data()));
+	ASSERT("RelnBnd: bounded healthy", glades::gpu::chiron_reln_backward_bounded(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinB.data(),d_dgB.data(),d_dbB.data(),d_split.data(),xhatMax));
+	std::vector<float> dgA(m),dgB(m),dbA(m),dbB(m);
+	ASSERT("RelnBnd: dl healthy", d_dgA.download(&dgA[0])&&d_dgB.download(&dgB[0])&&d_dbA.download(&dbA[0])&&d_dbB.download(&dbB[0]));
+	bool same=true; for(int j=0;j<m;++j){ union{float f;uint32_t u;}a,b; a.f=dgA[j];b.f=dgB[j]; if(a.u!=b.u)same=false; a.f=dbA[j];b.f=dbB[j]; if(a.u!=b.u)same=false; }
+	ASSERT("RelnBnd: healthy bit-identical (dgamma+dbeta)", same);
+
+	// DRIFT case: blow up one row's q_in to 1000 (xhat=1000) → plain dgamma huge,
+	// bounded dgamma uses clamp(xhat,8) so it stays finite/small.
+	for(int j=0;j<m;++j) q_in[(size_t)5*m+j] = 1000.0f;
+	ASSERT("RelnBnd: upload drift", d_q.upload(&q_in[0]));
+	ASSERT("RelnBnd: zero dg2", d_dgA.zero()&&d_dgB.zero()&&d_dbA.zero()&&d_dbB.zero());
+	ASSERT("RelnBnd: plain drift", glades::gpu::chiron_reln_backward(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinA.data(),d_dgA.data(),d_dbA.data(),d_split.data()));
+	ASSERT("RelnBnd: bounded drift", glades::gpu::chiron_reln_backward_bounded(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinB.data(),d_dgB.data(),d_dbB.data(),d_split.data(),xhatMax));
+	ASSERT("RelnBnd: dl drift", d_dgA.download(&dgA[0])&&d_dgB.download(&dgB[0]));
+	double maxA=0,maxB=0; for(int j=0;j<m;++j){ if(fabs(dgA[j])>maxA)maxA=fabs(dgA[j]); if(fabs(dgB[j])>maxB)maxB=fabs(dgB[j]); }
+	std::printf("  [reln-bwd bounded] drift: plain max|dgamma|=%.3g  bounded max|dgamma|=%.3g\n", maxA, maxB);
+	ASSERT("RelnBnd: drift bounded << plain", maxB < maxA && maxB < (double)(xhatMax * T)); // each col: |sum dout*clamp(xhat)| <= xhatMax*T
+	// xhatMax<=0 delegates to plain (bit-identical)
+	ASSERT("RelnBnd: xhatMax<=0 = plain", glades::gpu::chiron_reln_backward_bounded(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinB.data(),d_dgB.data(),d_dbB.data(),d_split.data(),0.0f));
+#else
+	std::printf("  [CHIRON reln-bwd bounded] built without CUDA — skipped\n");
+#endif
+}

@@ -30,6 +30,16 @@ bool layernorm_backward(const float* dout, const float* x,
                         const float* invStd, int rows, int cols,
                         float* dx, float* dgamma, float* dbeta);
 
+// Phase 3 (q-side source cure): layernorm backward with xhat=(x-mean)*invStd
+// clamped to [-xhatMax, xhatMax] in the dgamma/dbeta reduction — bounds the
+// drift-driven dgamma overflow at its source.  xhatMax<=0 = plain backward.
+// See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+bool layernorm_backward_bounded(const float* dout, const float* x,
+                                const float* gamma, const float* mean,
+                                const float* invStd, int rows, int cols,
+                                float* dx, float* dgamma, float* dbeta,
+                                float xhatMax);
+
 // ---------------------------------------------------------------------------
 // RMSNorm (LLaMA-style)
 // ---------------------------------------------------------------------------
@@ -1155,6 +1165,7 @@ namespace gpu {
 
 inline bool layernorm_forward(const float*, const float*, const float*, float, int, int, float*, float*, float*) { return false; }
 inline bool layernorm_backward(const float*, const float*, const float*, const float*, const float*, int, int, float*, float*, float*) { return false; }
+inline bool layernorm_backward_bounded(const float*, const float*, const float*, const float*, const float*, int, int, float*, float*, float*, float) { return false; }
 
 inline bool rmsnorm_forward(const float*, const float*, float, int, int, float*, float*) { return false; }
 inline bool rmsnorm_backward(const float*, const float*, const float*, const float*, int, int, float*, float*) { return false; }

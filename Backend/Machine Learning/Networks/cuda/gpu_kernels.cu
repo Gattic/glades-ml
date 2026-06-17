@@ -349,6 +349,72 @@ __global__ void layernorm_backward_dgamma_dbeta_partial(
 	}
 }
 
+// Phase 3 (q-side source cure, 2026-06-17): xhat-clamped variant of the
+// dgamma/dbeta partial kernel.  Identical to _partial except xhat is clamped
+// to [-xhatMax, xhatMax] before accumulation.  xhat=(x-mean)*invStd is the
+// layernorm-normalized value (should be O(1)); a huge xhat is BF16-inverse
+// reconstruction drift — clamping it bounds the dgamma overflow at its source
+// (the unbounded factor; dout is already bounded by --dq-layer-clamp).
+// Separate kernel (not a branch in _partial) to keep the default path's
+// codegen untouched (iter-70/73 FMA-drift-class precaution).
+template<int BLOCK_C, int BLOCK_T>
+__global__ void layernorm_backward_dgamma_dbeta_partial_clamped(
+    const float* __restrict__ dout,
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ invStd,
+    int rows, int cols,
+    int rowsPerBlock,
+    float xhatMax,
+    float* __restrict__ partial_dg,
+    float* __restrict__ partial_db)
+{
+	const int col            = blockIdx.x * BLOCK_C + threadIdx.x;
+	const int rowStart       = blockIdx.y * rowsPerBlock;
+	const int rowEnd         = rowStart + rowsPerBlock;
+	const int rowEndClamped  = (rowEnd > rows) ? rows : rowEnd;
+	const int ty             = threadIdx.y;
+
+	float dgAcc = 0.0f;
+	float dbAcc = 0.0f;
+	if (col < cols)
+	{
+		for (int r = rowStart + ty; r < rowEndClamped; r += BLOCK_T)
+		{
+			float mu   = mean[r];
+			float inv  = invStd[r];
+			float xhat = (x[(size_t)r * cols + col] - mu) * inv;
+			xhat = fmaxf(-xhatMax, fminf(xhatMax, xhat));   // <-- the source bound
+			float d    = dout[(size_t)r * cols + col];
+			dgAcc += d * xhat;
+			dbAcc += d;
+		}
+	}
+
+	__shared__ float sDg[BLOCK_T][BLOCK_C];
+	__shared__ float sDb[BLOCK_T][BLOCK_C];
+	sDg[ty][threadIdx.x] = dgAcc;
+	sDb[ty][threadIdx.x] = dbAcc;
+	__syncthreads();
+
+	for (int s = BLOCK_T / 2; s > 0; s >>= 1)
+	{
+		if (ty < s)
+		{
+			sDg[ty][threadIdx.x] += sDg[ty + s][threadIdx.x];
+			sDb[ty][threadIdx.x] += sDb[ty + s][threadIdx.x];
+		}
+		__syncthreads();
+	}
+
+	if (ty == 0 && col < cols)
+	{
+		const size_t base = (size_t)blockIdx.y * (size_t)cols + (size_t)col;
+		partial_dg[base] = sDg[0][threadIdx.x];
+		partial_db[base] = sDb[0][threadIdx.x];
+	}
+}
+
 // Phase 2: deterministic per-col reduce of T_PARTS partials in fixed loop
 // order.  One thread per col; T_PARTS is small (≤8) so loop is cheap.
 __global__ void layernorm_backward_dgamma_dbeta_reduce(
@@ -443,6 +509,51 @@ bool layernorm_backward(const float* dout, const float* x,
 		}
 	}
 
+	return true;
+}
+
+// Phase 3 (q-side source cure): layernorm backward with xhat clamped to
+// [-xhatMax, xhatMax] in the dgamma/dbeta reduction.  dx kernel unchanged
+// (the observed overflow is dgamma; dx feeds the next layer where
+// --dq-layer-clamp bounds it).  xhatMax<=0 delegates to plain
+// layernorm_backward (bit-identical).
+bool layernorm_backward_bounded(const float* dout, const float* x,
+                                const float* gamma, const float* mean,
+                                const float* invStd, int rows, int cols,
+                                float* dx, float* dgamma, float* dbeta,
+                                float xhatMax)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	if (!(xhatMax > 0.0f))
+		return layernorm_backward(dout, x, gamma, mean, invStd, rows, cols, dx, dgamma, dbeta);
+
+	int block1 = rowBlockSize(cols);
+	int smemBytes1 = (block1 / 32 + 2) * 2 * sizeof(float);
+	layernorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
+		dout, x, gamma, mean, invStd, cols, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	const int BLOCK_C = 64;
+	const int BLOCK_T = 8;
+	const int T_PARTS = 4;
+	if (!ensure_ln_partial_scratch(T_PARTS, cols)) return false;
+	int rowsPerBlock = (rows + T_PARTS - 1) / T_PARTS;
+	{
+		dim3 grid((cols + BLOCK_C - 1) / BLOCK_C, T_PARTS);
+		dim3 block(BLOCK_C, BLOCK_T);
+		layernorm_backward_dgamma_dbeta_partial_clamped<64, 8>
+		    <<<grid, block, 0, computeStream()>>>(
+		        dout, x, mean, invStd, rows, cols, rowsPerBlock, xhatMax,
+		        s_ln_partial_dg, s_ln_partial_db);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	{
+		const int RBLOCK = 256;
+		int rgrid = (cols + RBLOCK - 1) / RBLOCK;
+		layernorm_backward_dgamma_dbeta_reduce<<<rgrid, RBLOCK, 0, computeStream()>>>(
+		    s_ln_partial_dg, s_ln_partial_db, T_PARTS, cols, dgamma, dbeta);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
 	return true;
 }
 
