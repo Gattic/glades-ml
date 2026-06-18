@@ -18167,6 +18167,43 @@ void CHIRONGradCentralizeTest()
 #endif
 }
 
+// BF16-grad GC variant (Phase 2): same per-row centralize but on uint16_t BF16
+// grads (the bf16Grads weight-grad path). Checks each row mean ~0 after, within
+// BF16 precision.
+void CHIRONGradCentralizeBf16Test()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON GC bf16] no CUDA device — skipped\n"); return; }
+	// CPU RNE float->bf16 and bf16->float (matches the kernel's converters).
+	struct B { static uint16_t store(float f){ union{float f;uint32_t u;}v; v.f=f;
+		uint32_t lsb=(v.u>>16)&1u, bias=0x7FFFu+lsb; return (uint16_t)((v.u+bias)>>16); }
+		static float load(uint16_t b){ union{uint32_t u;float f;}v; v.u=((uint32_t)b)<<16; return v.f; } };
+	const int rows = 4, cols = 8;
+	std::vector<uint16_t> g((size_t)rows * cols);
+	LCG rng(6161u);
+	for (size_t i = 0; i < g.size(); ++i) g[i] = B::store(2.0f * rng.next_unit() + 0.5f); // nonzero means
+	glades::gpu::GpuBuffer<uint16_t> d_g;
+	ASSERT("CHIRONGCbf16: alloc", d_g.allocate(g.size()));
+	ASSERT("CHIRONGCbf16: upload", d_g.upload(&g[0]));
+	ASSERT("CHIRONGCbf16: runs", glades::gpu::gradient_centralize_bf16(d_g.data(), rows, cols));
+	std::vector<uint16_t> out(g.size());
+	ASSERT("CHIRONGCbf16: download", d_g.download(&out[0]));
+	// each row mean ~0 within BF16 precision (rows of 8 O(1) values).
+	bool zeroMean = true;
+	for (int r = 0; r < rows; ++r) { double mn=0.0; for (int c=0;c<cols;++c) mn += B::load(out[(size_t)r*cols+c]); if (fabs(mn/cols) > 2e-2) zeroMean = false; }
+	ASSERT("CHIRONGCbf16: row means zeroed (bf16 tol)", zeroMean);
+	// centered value ≈ original - row_mean within bf16 tol
+	bool match = true;
+	for (int r = 0; r < rows; ++r) { double mn=0.0; for (int c=0;c<cols;++c) mn += B::load(g[(size_t)r*cols+c]); float mu=(float)(mn/cols);
+		for (int c=0;c<cols;++c){ float want=B::load(g[(size_t)r*cols+c])-mu, got=B::load(out[(size_t)r*cols+c]); if (fabsf(got-want) > 2e-2f) match=false; } }
+	ASSERT("CHIRONGCbf16: matches CPU per-row centralize (bf16 tol)", match);
+	ASSERT("CHIRONGCbf16: rows<=0 rejected", !glades::gpu::gradient_centralize_bf16(d_g.data(), 0, cols));
+#else
+	std::printf("  [CHIRON GC bf16] built without CUDA — skipped\n");
+#endif
+}
+
 // === RELN-BACKWARD BOUNDED TEST (2026-06-17, Phase 3 — source cure) ===
 // chiron_reln_backward_bounded clamps xhat=(q-mean)*invStd to [-xhatMax,xhatMax]
 // in the dgamma/dbeta reduction: drift-huge xhat → bounded dgamma; healthy

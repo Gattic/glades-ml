@@ -249,6 +249,7 @@ int main(int argc, char* argv[])
 	    else if (strcmp(argv[1], "chiron-gc") == 0 || strcmp(argv[1], "gc") == 0)
 	    {
 		CHIRONGradCentralizeTest();
+		CHIRONGradCentralizeBf16Test();
 	    }
 	    else if (strcmp(argv[1], "chiron-relnbound") == 0 || strcmp(argv[1], "relnbound") == 0)
 	    {

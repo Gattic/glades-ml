@@ -473,6 +473,8 @@ bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, 
 // Gradient Centralization (Phase 2): subtract each row's mean from a
 // [rows, cols] gradient in place. See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
 bool gradient_centralize(float* g, int rows, int cols);
+// BF16-in/BF16-out variant for the bf16Grads weight-grad path (dWq/k/v/o_bf).
+bool gradient_centralize_bf16(uint16_t* g, int rows, int cols);
 
 // ---------------------------------------------------------------------------
 // Adam optimizer
@@ -1246,6 +1248,7 @@ inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
 inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
 inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { return false; }
 inline bool gradient_centralize(float*, int, int) { return false; }
+inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }

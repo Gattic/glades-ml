@@ -2210,7 +2210,37 @@ __global__ void sophia_g_update_bf16_state_kernel(
 	param[idx] -= lr * ratio;
 }
 
+// Gradient Centralization, BF16-in/BF16-out variant (Phase 2).  Reads the
+// uint16_t (BF16) weight gradient, centers each output-row over the fan-in in
+// FP32 (double-accumulated row sum), writes the centered value back as BF16
+// (RNE).  Matches gradient_centralize_kernel but for the bf16Grads path where
+// dWq/dWk/dWv/dWo live as BF16.
+__global__ void gradient_centralize_bf16_kernel(uint16_t* __restrict__ g, int rows, int cols)
+{
+	const int r = blockIdx.x; if (r >= rows) return;
+	uint16_t* gr = g + (size_t)r * cols;
+	__shared__ double s[256];
+	double sum = 0.0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += (double)bf16_load_as_f32(gr[i]);
+	s[threadIdx.x] = sum; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	__shared__ float mean;
+	if (threadIdx.x == 0) mean = (float)(s[0] / (double)cols);
+	__syncthreads();
+	const float mu = mean;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		gr[i] = bf16_store_from_f32(bf16_load_as_f32(gr[i]) - mu);
+}
+
 } // anonymous namespace
+
+bool gradient_centralize_bf16(uint16_t* g, int rows, int cols)
+{
+	if (!g || rows <= 0 || cols <= 0) return false;
+	gradient_centralize_bf16_kernel<<<rows, 256, 0, computeStream()>>>(g, rows, cols);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool adam_update_bf16_state(float* param, const float* grad,
                             uint16_t* m_bf16, uint16_t* v_bf16,
