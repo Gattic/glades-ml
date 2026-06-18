@@ -430,8 +430,35 @@ to ~1.7) while destabilizing gradients — the classic weight-norm × adaptive-
 optimizer pathology. A genuine gain (cf. QK-Norm's stable −0.97) does not come
 with ‖g‖=207 and 6× clamp firing.
 
-**Retry: F=2.0** (just below natural 2.17 → ~8% light constraint, intended to
-avoid the effective-LR explosion). If F=2.0 also shows implausible val + ‖g‖
-spikes, spectral-norm-per-step is NEGATIVE for this stack regardless of F; if it
-is stable with plausible val ≈ gold, it's a viable conditioning knob. Either way,
-per the structural finding it does not *replace* the gg-clamp.
+### Spectral-norm F=2.0 VERDICT: NEGATIVE — per-step spectral closed (2026-06-18)
+
+Retry at F=2.0 (just below natural 2.17 → light ~5% cap). Killed at step ~8k.
+**It separated the two failure modes — and that is the decisive finding:**
+
+| | F=1.5 | F=2.0 |
+|---|---:|---:|
+| val @ 5000 | 2.6273 | **2.6312** (same basin) |
+| peak ‖g‖ | 207 | **5.77** (stable) |
+| gg-clamp fires | 608 @ 10k | **51 @ 8k** |
+
+F=2.0 **fixed the instability** (‖g‖ < 6, no spikes, 51 fires) but produced the
+*identical* degenerate val (2.63 @ 5k). So the acute ‖g‖ explosion was an F=1.5
+over-aggression artifact, while the **implausibly-low-val degeneration is
+intrinsic to per-step spectral normalization** — present at both caps, driven by
+the continuous weight down-scaling × Adam effective-LR boost regardless of cap
+strength. Val 2.63 at 0.33B tokens beats the fully-trained production flagship
+(3.5062) by ~0.9 nat — not credible; the easy-later-positions pattern marks
+repetition/copy degeneration.
+
+**Per-step spectral-norm is NEGATIVE for this stack regardless of F. Closed.**
+
+### Spectral-INIT F=1.5 side quest (one-shot, 2026-06-18)
+
+To confirm the per-step *rescaling* (not the weight scale per se) is the culprit:
+gold recipe + `--spectral-init 1.5` (cap σ_max≤1.5 ONCE at init, no per-step
+cost). At init σ_max=2.1675 → scaled to 1.5; step-1 loss 10.8576 / ‖g‖ 0.692
+(vs gold's 10.7816 / 0.831 — the one-shot down-scale visibly shifts the start).
+Expected: benign (weights re-equilibrate; val ≈ gold), confirming per-step is the
+mechanism. Key read = step-5000 val (plausible ≈3.6 = benign; degenerate ≈2.6 =
+surprising). Either way the structural finding stands: spectral does not replace
+the gg-clamp.
