@@ -491,6 +491,10 @@ bool spectral_normalize(float* W, int rows, int cols,
 bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int cols,
                              float* u, float* v, int iters, float maxSigma, float* sigmaOut);
 
+// SAM (Phase 5) perturb/restore: W += scale*g (scale = ±rho/‖g‖). FP32 + BF16.
+bool sam_perturb(float* W, const float* g, int n, float scale);
+bool sam_perturb_bf16(uint16_t* W, const uint16_t* g, int n, float scale);
+
 // ---------------------------------------------------------------------------
 // Adam optimizer
 // ---------------------------------------------------------------------------
@@ -1267,6 +1271,8 @@ inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }
 inline bool spectral_norm_estimate(const float*, int, int, float*, float*, int, float*) { return false; }
 inline bool spectral_normalize(float*, int, int, float*, float*, int, float, float*) { return false; }
 inline bool spectral_normalize_bf16(uint16_t*, const float*, int, int, float*, float*, int, float, float*) { return false; }
+inline bool sam_perturb(float*, const float*, int, float) { return false; }
+inline bool sam_perturb_bf16(uint16_t*, const uint16_t*, int, float) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }

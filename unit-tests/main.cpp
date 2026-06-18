@@ -259,6 +259,10 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONSpectralNormTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-sam") == 0 || strcmp(argv[1], "sam") == 0)
+	    {
+		CHIRONSamTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-castelim") == 0 || strcmp(argv[1], "castelim") == 0)
 	    {
 		CHIRONRelnDualMirrorTest();

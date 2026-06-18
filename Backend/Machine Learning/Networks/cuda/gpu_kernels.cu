@@ -2405,6 +2405,44 @@ bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int col
 	return true;
 }
 
+// === Phase 5: SAM weight perturb / restore =================================
+namespace {
+// W[i] += scale * g[i]   (ascent step to the ρ-ball with scale = +ρ/‖g‖;
+// restore with scale = −ρ/‖g‖). FP32 master.
+__global__ void k_sam_perturb(float* __restrict__ W, const float* __restrict__ g,
+                              int n, float scale)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	W[i] = W[i] + scale * g[i];
+}
+// BF16 master + BF16 grad variant (read both as f32, write bf16 RNE).
+__global__ void k_sam_perturb_bf16(uint16_t* __restrict__ W, const uint16_t* __restrict__ g,
+                                   int n, float scale)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	W[i] = bf16_store_from_f32(bf16_load_as_f32(W[i]) + scale * bf16_load_as_f32(g[i]));
+}
+} // anonymous namespace
+
+// SAM perturb/restore: W += scale*g.  Pass scale = +rho/‖g‖ to ascend to the
+// ρ-ball boundary, scale = −rho/‖g‖ to restore exactly.
+bool sam_perturb(float* W, const float* g, int n, float scale)
+{
+	if (!W || !g || n <= 0) return false;
+	const int tb = 256, grid = (n + tb - 1) / tb;
+	k_sam_perturb<<<grid, tb, 0, computeStream()>>>(W, g, n, scale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+bool sam_perturb_bf16(uint16_t* W, const uint16_t* g, int n, float scale)
+{
+	if (!W || !g || n <= 0) return false;
+	const int tb = 256, grid = (n + tb - 1) / tb;
+	k_sam_perturb_bf16<<<grid, tb, 0, computeStream()>>>(W, g, n, scale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool adam_update_bf16_state(float* param, const float* grad,
                             uint16_t* m_bf16, uint16_t* v_bf16,
                             float lr, float beta1, float beta2, float eps,

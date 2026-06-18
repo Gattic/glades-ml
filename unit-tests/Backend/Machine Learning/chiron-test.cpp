@@ -18204,6 +18204,38 @@ void CHIRONGradCentralizeBf16Test()
 #endif
 }
 
+// SAM perturb/restore (Phase 5): W += scale*g, then exact restore.
+void CHIRONSamTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON SAM] no CUDA device — skipped\n"); return; }
+	const int n = 64;
+	std::vector<float> W(n), g(n);
+	LCG rng(515u);
+	for (int i = 0; i < n; ++i) { W[i] = rng.next_unit(); g[i] = 2.0f*rng.next_unit(); }
+	// global ‖g‖, scale = rho/‖g‖.
+	double ss = 0.0; for (int i=0;i<n;++i) ss += (double)g[i]*g[i];
+	const float gnorm = (float)sqrt(ss), rho = 0.05f, scale = rho / gnorm;
+	std::vector<float> want(n); for (int i=0;i<n;++i) want[i] = W[i] + scale*g[i];
+	glades::gpu::GpuBuffer<float> d_W, d_g;
+	ASSERT("SAM: alloc", d_W.allocate(n) && d_g.allocate(n));
+	ASSERT("SAM: upload", d_W.upload(&W[0]) && d_g.upload(&g[0]));
+	ASSERT("SAM: perturb runs", glades::gpu::sam_perturb(d_W.data(), d_g.data(), n, scale));
+	std::vector<float> got(n); ASSERT("SAM: dl", d_W.download(&got[0]));
+	bool match=true; for (int i=0;i<n;++i) if (fabsf(got[i]-want[i]) > 1e-6f) match=false;
+	ASSERT("SAM: perturb == W + rho*g/‖g‖", match);
+	// restore: subtract the same → back to original (bit-exact float).
+	ASSERT("SAM: restore runs", glades::gpu::sam_perturb(d_W.data(), d_g.data(), n, -scale));
+	std::vector<float> back(n); ASSERT("SAM: dl2", d_W.download(&back[0]));
+	bool restored=true; for (int i=0;i<n;++i) if (fabsf(back[i]-W[i]) > 1e-6f) restored=false;
+	ASSERT("SAM: restore recovers original", restored);
+	ASSERT("SAM: bad args rejected", !glades::gpu::sam_perturb(d_W.data(), d_g.data(), 0, scale));
+#else
+	std::printf("  [CHIRON SAM] built without CUDA — skipped\n");
+#endif
+}
+
 // Spectral norm power iteration (Phase 4): diagonal matrix diag(1..8) has
 // σ_max=8; power iteration must estimate it within 1% after enough iters.
 void CHIRONSpectralNormTest()
