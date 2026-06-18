@@ -2285,40 +2285,123 @@ __global__ void k_spec_scale_inv(float* __restrict__ x, int n, const float* __re
 	x[i] = (nv > 1e-30f) ? (x[i] / nv) : 0.0f;
 }
 
+__global__ void k_spec_fill_ones(float* __restrict__ u, int n)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	u[i] = 1.0f;
+}
+
+// W *= min(1, maxSigma/σ)  — conditional spectral down-scaling, fully on-device
+// (no host σ readback). FP32 master.
+__global__ void k_spec_cond_scale(float* __restrict__ W, int n,
+                                  const float* __restrict__ sigma, float maxSigma)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float s = sigma[0];
+	const float f = (s > maxSigma && s > 1e-30f) ? (maxSigma / s) : 1.0f;
+	W[i] = W[i] * f;
+}
+
+// BF16-master variant of the conditional down-scale (read/scale/write BF16).
+__global__ void k_spec_cond_scale_bf16(uint16_t* __restrict__ W, int n,
+                                       const float* __restrict__ sigma, float maxSigma)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float s = sigma[0];
+	const float f = (s > maxSigma && s > 1e-30f) ? (maxSigma / s) : 1.0f;
+	W[i] = bf16_store_from_f32(bf16_load_as_f32(W[i]) * f);
+}
+
+} // anonymous namespace
+
+namespace {
+// Shared 1-float device scratch for the power-iteration σ.
+static float* spec_sigma_scratch()
+{
+	static float* p = 0;
+	if (!p) { cudaError_t e = cudaMalloc(&p, sizeof(float)); if (e != cudaSuccess) return 0; }
+	return p;
+}
+
+// Power iteration core: estimate σ_max(Wf32 [rows,cols]) leaving σ in *dSigma
+// (device). initU fills u with ones first (cold start); else u is reused warm.
+static bool spec_power_iterate(const float* Wf32, int rows, int cols,
+                               float* u, float* v, int iters, bool initU, float* dSigma)
+{
+	const int tb = 256;
+	const int gridC = (cols + tb - 1) / tb;
+	const int gridR = (rows + tb - 1) / tb;
+	if (initU) k_spec_fill_ones<<<gridR, tb, 0, computeStream()>>>(u, rows);
+	for (int it = 0; it < iters; ++it)
+	{
+		k_spec_ATu<<<gridC, tb, 0, computeStream()>>>(Wf32, u, v, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(v, cols, dSigma);
+		k_spec_scale_inv<<<gridC, tb, 0, computeStream()>>>(v, cols, dSigma);
+		k_spec_Av<<<gridR, tb, 0, computeStream()>>>(Wf32, v, u, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(u, rows, dSigma);  // dSigma = ‖Wv‖ = σ
+		// leave u un-normalized on the last iter (σ already captured)
+		if (it != iters - 1)
+			k_spec_scale_inv<<<gridR, tb, 0, computeStream()>>>(u, rows, dSigma);
+	}
+	return true;
+}
 } // anonymous namespace
 
 // Estimate σ_max(W) by power iteration.  W is [rows, cols] row-major (FP32).
-// u (rows) is the persistent left singular vector — caller initializes it
-// nonzero (e.g. all-ones) for a cold start, or reuses it warm across steps.
-// v (cols) is transient scratch.  Returns σ_max in *sigmaOut (host).
+// u (rows) initialized nonzero by the caller (cold start) or reused warm.
+// v (cols) is scratch.  Returns σ_max in *sigmaOut (host).
 bool spectral_norm_estimate(const float* W, int rows, int cols,
                             float* u, float* v, int iters, float* sigmaOut)
 {
 	if (!W || !u || !v || rows <= 0 || cols <= 0 || iters <= 0) return false;
-	static float* s_norm = 0;            // 1-float device scratch for the norm
-	if (!s_norm) { cudaError_t e = cudaMalloc(&s_norm, sizeof(float)); if (e != cudaSuccess) return false; }
-	const int tb = 256;
-	const int gridC = (cols + tb - 1) / tb;
-	const int gridR = (rows + tb - 1) / tb;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(W, rows, cols, u, v, iters, /*initU=*/false, dSigma)) return false;
 	float sigma = 0.0f;
-	for (int it = 0; it < iters; ++it)
-	{
-		// v = Wᵀu ; v /= ‖v‖
-		k_spec_ATu<<<gridC, tb, 0, computeStream()>>>(W, u, v, rows, cols);
-		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(v, cols, s_norm);
-		k_spec_scale_inv<<<gridC, tb, 0, computeStream()>>>(v, cols, s_norm);
-		// u = Wv ; σ = ‖Wv‖ ; u /= σ
-		k_spec_Av<<<gridR, tb, 0, computeStream()>>>(W, v, u, rows, cols);
-		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(u, rows, s_norm);
-		if (it == iters - 1)
-		{
-			cudaMemcpyAsync(&sigma, s_norm, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
-			if (!synchronizeComputeStream()) return false;   // σ = last ‖Wv‖
-		}
-		k_spec_scale_inv<<<gridR, tb, 0, computeStream()>>>(u, rows, s_norm);
-	}
+	cudaMemcpyAsync(&sigma, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+	if (!synchronizeComputeStream()) return false;
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	if (sigmaOut) *sigmaOut = sigma;
+	return true;
+}
+
+// Per-step spectral normalization (FP32 master): estimate σ_max(W) cold (u/v
+// scratch), then scale W *= min(1, maxSigma/σ) entirely on-device (no host
+// sync).  Optionally returns σ to *sigmaOut if the caller passes a non-null
+// host pointer (adds one D2H — pass null on the hot path).
+bool spectral_normalize(float* W, int rows, int cols,
+                        float* u, float* v, int iters, float maxSigma, float* sigmaOut)
+{
+	if (!W || !u || !v || rows <= 0 || cols <= 0 || iters <= 0 || maxSigma <= 0.0f) return false;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(W, rows, cols, u, v, iters, /*initU=*/true, dSigma)) return false;
+	if (sigmaOut)
+	{
+		cudaMemcpyAsync(sigmaOut, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+		if (!synchronizeComputeStream()) return false;
+	}
+	const int tb = 256, gridN = ((rows * cols) + tb - 1) / tb;
+	k_spec_cond_scale<<<gridN, tb, 0, computeStream()>>>(W, rows * cols, dSigma, maxSigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Per-step spectral normalization (BF16 master): caller materializes the FP32
+// view Wf32 (e.g. via cast_bf16_to_f32 into a scratch); σ is estimated on Wf32
+// and the BF16 master Wbf is scaled in-place on-device.
+bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int cols,
+                             float* u, float* v, int iters, float maxSigma, float* sigmaOut)
+{
+	if (!Wbf || !Wf32 || !u || !v || rows <= 0 || cols <= 0 || iters <= 0 || maxSigma <= 0.0f) return false;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(Wf32, rows, cols, u, v, iters, /*initU=*/true, dSigma)) return false;
+	if (sigmaOut)
+	{
+		cudaMemcpyAsync(sigmaOut, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+		if (!synchronizeComputeStream()) return false;
+	}
+	const int tb = 256, gridN = ((rows * cols) + tb - 1) / tb;
+	k_spec_cond_scale_bf16<<<gridN, tb, 0, computeStream()>>>(Wbf, rows * cols, dSigma, maxSigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 

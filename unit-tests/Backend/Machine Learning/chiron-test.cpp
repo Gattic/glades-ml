@@ -18231,6 +18231,19 @@ void CHIRONSpectralNormTest()
 	ASSERT("Spectral2: runs", glades::gpu::spectral_norm_estimate(d_W2.data(), 3, 5, d_u2.data(), d_v2.data(), 20, &sigma2));
 	ASSERT("Spectral2: σ_max≈5 within 1%", fabsf(sigma2 - 5.0f) <= 0.05f);
 	ASSERT("Spectral: bad args rejected", !glades::gpu::spectral_norm_estimate(d_W.data(), 0, n, d_u.data(), d_v.data(), 30, &sigma));
+	// spectral_normalize: scale diag(1..8) (σ=8) down to maxSigma=2 → re-estimate σ≈2.
+	float sigBefore = 0.0f;
+	ASSERT("SpecNorm: normalize runs", glades::gpu::spectral_normalize(d_W.data(), n, n, d_u.data(), d_v.data(), 30, 2.0f, &sigBefore));
+	ASSERT("SpecNorm: σ before ≈ 8", fabsf(sigBefore - 8.0f) <= 0.08f);
+	float sigAfter = 0.0f;
+	ASSERT("SpecNorm: re-estimate runs", glades::gpu::spectral_norm_estimate(d_W.data(), n, n, d_u.data(), d_v.data(), 30, &sigAfter));
+	ASSERT("SpecNorm: σ after ≈ 2 (clamped)", fabsf(sigAfter - 2.0f) <= 0.03f);
+	// already-below-maxSigma is a no-op: normalizing again to maxSigma=10 keeps σ≈2.
+	float sigNoop = 0.0f;
+	ASSERT("SpecNorm: noop runs", glades::gpu::spectral_normalize(d_W.data(), n, n, d_u.data(), d_v.data(), 30, 10.0f, &sigNoop));
+	float sigStill = 0.0f;
+	ASSERT("SpecNorm: re-estimate2 runs", glades::gpu::spectral_norm_estimate(d_W.data(), n, n, d_u.data(), d_v.data(), 30, &sigStill));
+	ASSERT("SpecNorm: σ unchanged when below max", fabsf(sigStill - 2.0f) <= 0.03f);
 #else
 	std::printf("  [CHIRON spectral] built without CUDA — skipped\n");
 #endif

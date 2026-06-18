@@ -482,6 +482,14 @@ bool gradient_centralize_bf16(uint16_t* g, int rows, int cols);
 // scratch. Returns σ_max in *sigmaOut.
 bool spectral_norm_estimate(const float* W, int rows, int cols,
                             float* u, float* v, int iters, float* sigmaOut);
+// Per-step spectral normalization (on-device conditional down-scale to maxSigma).
+// FP32 master variant scales W in place; BF16 variant scales the BF16 master Wbf
+// using a caller-materialized FP32 view Wf32. u/v are cold-start scratch (rows/
+// cols). Pass sigmaOut=NULL on the hot path to skip the host σ readback.
+bool spectral_normalize(float* W, int rows, int cols,
+                        float* u, float* v, int iters, float maxSigma, float* sigmaOut);
+bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int cols,
+                             float* u, float* v, int iters, float maxSigma, float* sigmaOut);
 
 // ---------------------------------------------------------------------------
 // Adam optimizer
@@ -1257,6 +1265,8 @@ inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { re
 inline bool gradient_centralize(float*, int, int) { return false; }
 inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }
 inline bool spectral_norm_estimate(const float*, int, int, float*, float*, int, float*) { return false; }
+inline bool spectral_normalize(float*, int, int, float*, float*, int, float, float*) { return false; }
+inline bool spectral_normalize_bf16(uint16_t*, const float*, int, int, float*, float*, int, float, float*) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }
