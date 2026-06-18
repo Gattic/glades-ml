@@ -323,3 +323,51 @@ BF16-inverse drift), so F=30 is the identity on healthy steps (parity preserved,
 unit test + smoke confirm) while clamping the ~1000-magnitude drift bursts. With
 `|dout|` bounded by dq-layer-clamp and `|xhat|≤30`, each dgamma term is bounded
 → no single-element blowup; vs the unclamped 1e19, a ~13-order reduction.
+
+### Phase 3 VERDICT: FAIL — structural, not tunable (2026-06-18)
+
+The validation ran to step 25000. It tracked the gg-clamp gold within rerun
+noise through step 20000 (val 3.4066 @ 15k / 3.4739 @ 20k, vs gold 3.4106 /
+3.4896 — Phase 3 even marginally *better*), then **diverged in the danger zone**:
+
+| step | ‖g‖ | loss-scale |
+|---|---:|---:|
+| 20001 | 0.289 | 1.000 (healthy) |
+| **20501** | **447,521** | **0.000** (collapsed) |
+| 21001–24501 | 1.8e3 – 1.18e6 | 0.000 (never recovers) |
+
+Final val **3.4920** vs gg-clamp gold **3.2257** → **+0.266 nat WORSE**. The
+loss-scale collapsed to 0 at step ~20500 and stayed there for the final 4500
+steps (val monotonically worsened 3.4066→3.4739→3.4920 after step 15k). The
+source bound at xhatMax=30, with `--grad-group-clamp` OFF, did NOT contain the
+overflow. (NB: the trainer signals overflow via `scale=0.000`, not a "grad-skip"
+string — the live "0 skips" readings ≤ step 20000 were correct; the danger zone
+was not caught by that grep.)
+
+**Root cause — why no xhatMax cures it (structural).** The dgamma overflow is a
+SUM over the T=16384 rows: `dgamma[col] = Σ_{r} dout[r,col]·xhat[r,col]`. A
+per-element clamp bounds each *term* to `|dout|·F`, but the *sum* still scales
+with T: on a burst step many rows align, so even with `|xhat|≤30` and `|dout|`
+RMS-bounded, `dgamma ≲ 30·Σ_r|dout[r,col]| ~ 30·16384 ≈ 5e5` — exactly the
+‖g‖ ~ 4e5–1e6 observed. Tightening F doesn't help: the T=16384 row-count is the
+multiplier, so even F=1 leaves `dgamma ≲ Σ|dout| ~ 1.6e4`, still orders above
+the healthy O(1). And `dbeta = Σ_r dout[r,col]` contains no xhat factor at all,
+so the xhat clamp cannot touch the dbeta half of the overflow regardless of F.
+
+**Conclusion: a per-element source clamp cannot replace an aggregate-norm clamp
+for a reduction that sums over a large dimension.** This is a structural property,
+not a tuning miss — a tighter-xhatMax rerun is futile. It also *vindicates the
+gg-clamp as the correct mechanism*: it clamps the final aggregated L2 norm (the
+sum), which is the only quantity that bounds a sum-reduction overflow. **The
+gg-clamp (fixed maxNorm 1.0) remains the shipping containment fix; the "source
+cure" line is closed.**
+
+**Strategic implication.** Per-element bounding (Phases 1/3) has now failed twice
+for the same structural reason (relative/per-element thresholds don't fit an
+aggregate sum-reduction overflow). The remaining plan techniques are weight-grad
+(GC, Phase 2 / spectral, Phase 4) or sharpness (SAM, Phase 5) oriented — they
+could reduce burst *frequency/severity* but none replaces the aggregate clamp.
+Highest-EV next GPU use is therefore NOT another clamp-variant run but banking
+the deferred **full 5B data-scale run on the gg-clamp recipe** (the
+transformational flagship the instability work was meant to unblock, val ~2.8
+territory). Phases 2/4/5 are deprioritized to optional hardening behind that.
