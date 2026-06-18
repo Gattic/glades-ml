@@ -404,3 +404,34 @@ generalization / conditioning. Ships:
   shape, or implement the gradient-subset / streamed-ε follow-up. ~2× fwd/bwd cost.
 
 Plan checklist source: `docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md`.
+
+### Spectral-norm F=1.5 VERDICT: NEGATIVE — degenerate / effective-LR explosion (2026-06-18)
+
+First spectral gate: gold gg-clamp recipe + `--spectral-norm 1.5 --spectral-iters 8`,
+seed 1337. Killed at step ~10k (verdict unambiguous). Capping σ_max at 1.5 (vs
+natural 2.17) produced *implausibly* low loss WITH chronic instability:
+
+| step | spectral F=1.5 val | gg-clamp gold | note |
+|---|---:|---:|---|
+| 5000 | **2.6273** (acc1 0.42) | 3.5965 | −0.97 nat — implausible at 0.33B tok |
+| 10000 | **1.8920** (acc1 0.55) | 3.4613 | −1.57 nat — below our best-ever (2.797 @ 1.3B) |
+
+Not a win: val 1.89 at 0.66B tokens beats every checkpoint we've ever made at
+~half the data — not credible. And it is inseparable from instability — ‖g‖
+spiked to **207** (step 8501, loss-scale → 0.002), oscillated (45 @ 9501), and
+gg-clamp fired **608× by step 10k** (gold: 997 over the full 25k, ~6× the rate).
+0 grad-skips only because the gg-clamp safety net contained it.
+
+**Mechanism:** capping σ_max below the natural value rescales the attention
+weights *down* every step while Adam's normalized updates push back → a large
+*relative* step = an **effective-LR explosion**. It races the loss into a
+low-entropy degenerate basin (artificially low val; later-position NLL collapses
+to ~1.7) while destabilizing gradients — the classic weight-norm × adaptive-
+optimizer pathology. A genuine gain (cf. QK-Norm's stable −0.97) does not come
+with ‖g‖=207 and 6× clamp firing.
+
+**Retry: F=2.0** (just below natural 2.17 → ~8% light constraint, intended to
+avoid the effective-LR explosion). If F=2.0 also shows implausible val + ‖g‖
+spikes, spectral-norm-per-step is NEGATIVE for this stack regardless of F; if it
+is stable with plausible val ≈ gold, it's a viable conditioning knob. Either way,
+per the structural finding it does not *replace* the gg-clamp.
