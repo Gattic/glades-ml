@@ -371,3 +371,36 @@ Highest-EV next GPU use is therefore NOT another clamp-variant run but banking
 the deferred **full 5B data-scale run on the gg-clamp recipe** (the
 transformational flagship the instability work was meant to unblock, val ~2.8
 territory). Phases 2/4/5 are deprioritized to optional hardening behind that.
+
+---
+
+## Phases 2 / 4 / 5 IMPLEMENTED (2026-06-18) — code landed, danger-zone gates pending
+
+Per owner request, the three remaining plan techniques were implemented end-to-end
+(kernel + unit test + trainer flag + run.sh + smoke), all default-off. Validation
+runs (each a ~16h danger-zone gate) are NOT yet run — and per the structural
+finding above, none is expected to *replace* the gg-clamp; their value is
+generalization / conditioning. Ships:
+
+| Phase | Flag | Library | Test | Smoke |
+|---|---|---|---|---|
+| 2 GC | `--grad-centralize` | `gradient_centralize_bf16` (glades-ml `9e3a15c5e`) | `chiron-gc` (row-means→0, bf16 tol) | step-1 bit-identical, healthy descent |
+| 4 spectral | `--spectral-init F` / `--spectral-norm F` / `--spectral-iters N` | `spectral_norm_estimate` + on-device `spectral_normalize{,_bf16}` (`dbb0dd605`,`8b2729f18`) | `chiron-spectral` (σ 8→2 cap, noop-below-max) | **flagship σ_max(Wq/k/v/o) ≈ 2.17 natural**; cap inert at F=20 (step-1 identical) |
+| 5 SAM | `--sam-rho F` | `sam_perturb{,_bf16}` (`25467b0b5`) | `chiron-sam` (W+ρg/‖g‖, exact restore) | m128/L4/T1024 accum=2 ρ=0.05: ACTIVE, 6 steps finite+**stable** (restore exact) |
+
+**Key implementation facts for the validations:**
+- **GC** targets the canonical 2D weight grads (dWq/k/v/o), not the 1D LN gains;
+  variant-agnostic hook before `adam_step`. BF16-grad path on the flagship.
+- **Spectral**: `--spectral-init` is the free one-shot floor; `--spectral-norm`
+  caps σ_max≤F every step (cold-start power iteration, default `--spectral-iters 5`
+  — note cold-start *underestimates* σ slightly, so a tight cap should use more
+  iters or the warm-start follow-up). On-device conditional scale, no host sync on
+  the hot path. **The flagship's natural σ_max≈2.17**, so a *constraining* run wants
+  F≈1.0–2.0.
+- **SAM** restructures the loop into a per-window double pass (perturb→replay the
+  cached window→restore→Adam-with-g′). Requires `--bf16-weights --bf16-grads`,
+  forces CUDA graphs off, excludes LN gains. **ε-scratch ≈ 1 grad-set VRAM (~1.9 GB
+  at flagship shape) → OOMs at T=16384**; validate at reduced T/accum or smaller
+  shape, or implement the gradient-subset / streamed-ε follow-up. ~2× fwd/bwd cost.
+
+Plan checklist source: `docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md`.
