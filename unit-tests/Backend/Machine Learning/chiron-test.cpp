@@ -18204,6 +18204,38 @@ void CHIRONGradCentralizeBf16Test()
 #endif
 }
 
+// Spectral norm power iteration (Phase 4): diagonal matrix diag(1..8) has
+// σ_max=8; power iteration must estimate it within 1% after enough iters.
+void CHIRONSpectralNormTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON spectral] no CUDA device — skipped\n"); return; }
+	const int n = 8;
+	std::vector<float> W((size_t)n * n, 0.0f);
+	for (int i = 0; i < n; ++i) W[(size_t)i*n + i] = (float)(i + 1); // diag 1..8, σ_max=8
+	std::vector<float> u(n, 1.0f); // cold-start all-ones
+	glades::gpu::GpuBuffer<float> d_W, d_u, d_v;
+	ASSERT("Spectral: alloc", d_W.allocate(W.size()) && d_u.allocate(n) && d_v.allocate(n));
+	ASSERT("Spectral: upload", d_W.upload(&W[0]) && d_u.upload(&u[0]));
+	float sigma = 0.0f;
+	ASSERT("Spectral: runs", glades::gpu::spectral_norm_estimate(d_W.data(), n, n, d_u.data(), d_v.data(), 30, &sigma));
+	ASSERT("Spectral: σ_max≈8 within 1%", fabsf(sigma - 8.0f) <= 0.08f);
+	// Off-diagonal rectangular sanity: a single nonzero entry W[0,3]=5 → σ_max=5.
+	std::vector<float> W2((size_t)3 * 5, 0.0f); W2[(size_t)0*5 + 3] = 5.0f;
+	std::vector<float> u2(3, 1.0f);
+	glades::gpu::GpuBuffer<float> d_W2, d_u2, d_v2;
+	ASSERT("Spectral2: alloc", d_W2.allocate(W2.size()) && d_u2.allocate(3) && d_v2.allocate(5));
+	ASSERT("Spectral2: upload", d_W2.upload(&W2[0]) && d_u2.upload(&u2[0]));
+	float sigma2 = 0.0f;
+	ASSERT("Spectral2: runs", glades::gpu::spectral_norm_estimate(d_W2.data(), 3, 5, d_u2.data(), d_v2.data(), 20, &sigma2));
+	ASSERT("Spectral2: σ_max≈5 within 1%", fabsf(sigma2 - 5.0f) <= 0.05f);
+	ASSERT("Spectral: bad args rejected", !glades::gpu::spectral_norm_estimate(d_W.data(), 0, n, d_u.data(), d_v.data(), 30, &sigma));
+#else
+	std::printf("  [CHIRON spectral] built without CUDA — skipped\n");
+#endif
+}
+
 // === RELN-BACKWARD BOUNDED TEST (2026-06-17, Phase 3 — source cure) ===
 // chiron_reln_backward_bounded clamps xhat=(q-mean)*invStd to [-xhatMax,xhatMax]
 // in the dgamma/dbeta reduction: drift-huge xhat → bounded dgamma; healthy

@@ -2242,6 +2242,86 @@ bool gradient_centralize_bf16(uint16_t* g, int rows, int cols)
 	return true;
 }
 
+// === Phase 4: spectral norm (power iteration) ==============================
+namespace {
+
+// v[j] = sum_i W[i*cols+j] * u[i]   (Wᵀu, one thread per output column j)
+__global__ void k_spec_ATu(const float* __restrict__ W, const float* __restrict__ u,
+                           float* __restrict__ v, int rows, int cols)
+{
+	const int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= cols) return;
+	double acc = 0.0;
+	for (int i = 0; i < rows; ++i) acc += (double)W[(size_t)i * cols + j] * (double)u[i];
+	v[j] = (float)acc;
+}
+
+// u[i] = sum_j W[i*cols+j] * v[j]   (Wv, one thread per output row i)
+__global__ void k_spec_Av(const float* __restrict__ W, const float* __restrict__ v,
+                          float* __restrict__ u, int rows, int cols)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= rows) return;
+	const float* Wi = W + (size_t)i * cols;
+	double acc = 0.0;
+	for (int j = 0; j < cols; ++j) acc += (double)Wi[j] * (double)v[j];
+	u[i] = (float)acc;
+}
+
+// single-block L2 norm → out[0] = sqrt(sum x^2)
+__global__ void k_spec_l2norm(const float* __restrict__ x, int n, float* __restrict__ out)
+{
+	__shared__ double s[256];
+	double a = 0.0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) a += (double)x[i] * (double)x[i];
+	s[threadIdx.x] = a; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	if (threadIdx.x == 0) out[0] = (float)sqrt(s[0]);
+}
+
+// x /= norm[0]  (zero if norm underflows)
+__global__ void k_spec_scale_inv(float* __restrict__ x, int n, const float* __restrict__ norm)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float nv = norm[0];
+	x[i] = (nv > 1e-30f) ? (x[i] / nv) : 0.0f;
+}
+
+} // anonymous namespace
+
+// Estimate σ_max(W) by power iteration.  W is [rows, cols] row-major (FP32).
+// u (rows) is the persistent left singular vector — caller initializes it
+// nonzero (e.g. all-ones) for a cold start, or reuses it warm across steps.
+// v (cols) is transient scratch.  Returns σ_max in *sigmaOut (host).
+bool spectral_norm_estimate(const float* W, int rows, int cols,
+                            float* u, float* v, int iters, float* sigmaOut)
+{
+	if (!W || !u || !v || rows <= 0 || cols <= 0 || iters <= 0) return false;
+	static float* s_norm = 0;            // 1-float device scratch for the norm
+	if (!s_norm) { cudaError_t e = cudaMalloc(&s_norm, sizeof(float)); if (e != cudaSuccess) return false; }
+	const int tb = 256;
+	const int gridC = (cols + tb - 1) / tb;
+	const int gridR = (rows + tb - 1) / tb;
+	float sigma = 0.0f;
+	for (int it = 0; it < iters; ++it)
+	{
+		// v = Wᵀu ; v /= ‖v‖
+		k_spec_ATu<<<gridC, tb, 0, computeStream()>>>(W, u, v, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(v, cols, s_norm);
+		k_spec_scale_inv<<<gridC, tb, 0, computeStream()>>>(v, cols, s_norm);
+		// u = Wv ; σ = ‖Wv‖ ; u /= σ
+		k_spec_Av<<<gridR, tb, 0, computeStream()>>>(W, v, u, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(u, rows, s_norm);
+		if (it == iters - 1)
+		{
+			cudaMemcpyAsync(&sigma, s_norm, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+			if (!synchronizeComputeStream()) return false;   // σ = last ‖Wv‖
+		}
+		k_spec_scale_inv<<<gridR, tb, 0, computeStream()>>>(u, rows, s_norm);
+	}
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (sigmaOut) *sigmaOut = sigma;
+	return true;
+}
+
 bool adam_update_bf16_state(float* param, const float* grad,
                             uint16_t* m_bf16, uint16_t* v_bf16,
                             float lr, float beta1, float beta2, float eps,

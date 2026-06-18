@@ -476,6 +476,13 @@ bool gradient_centralize(float* g, int rows, int cols);
 // BF16-in/BF16-out variant for the bf16Grads weight-grad path (dWq/k/v/o_bf).
 bool gradient_centralize_bf16(uint16_t* g, int rows, int cols);
 
+// Spectral norm via power iteration (Phase 4): estimate σ_max(W) for the
+// [rows, cols] row-major FP32 matrix W. u (rows) is the persistent left
+// singular vector (caller inits nonzero; reuse warm across steps); v (cols) is
+// scratch. Returns σ_max in *sigmaOut.
+bool spectral_norm_estimate(const float* W, int rows, int cols,
+                            float* u, float* v, int iters, float* sigmaOut);
+
 // ---------------------------------------------------------------------------
 // Adam optimizer
 // ---------------------------------------------------------------------------
@@ -1249,6 +1256,7 @@ inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
 inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { return false; }
 inline bool gradient_centralize(float*, int, int) { return false; }
 inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }
+inline bool spectral_norm_estimate(const float*, int, int, float*, float*, int, float*) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }
