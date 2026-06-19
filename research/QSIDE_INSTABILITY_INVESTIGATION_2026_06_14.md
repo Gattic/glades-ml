@@ -458,7 +458,32 @@ To confirm the per-step *rescaling* (not the weight scale per se) is the culprit
 gold recipe + `--spectral-init 1.5` (cap σ_max≤1.5 ONCE at init, no per-step
 cost). At init σ_max=2.1675 → scaled to 1.5; step-1 loss 10.8576 / ‖g‖ 0.692
 (vs gold's 10.7816 / 0.831 — the one-shot down-scale visibly shifts the start).
-Expected: benign (weights re-equilibrate; val ≈ gold), confirming per-step is the
-mechanism. Key read = step-5000 val (plausible ≈3.6 = benign; degenerate ≈2.6 =
-surprising). Either way the structural finding stands: spectral does not replace
-the gg-clamp.
+**VERDICT: BENIGN / no-op (confirmed).** Step-5000 val **3.6614** (acc1 0.129) —
+plausible, tracks gold's 3.5965; ‖g‖ calm (0.34–1.20), 0 gg-clamp fires, full
+speed 29,403 tok/s. The one-shot down-scaled weights re-equilibrated and training
+reverted to the gold trajectory. This *isolates the mechanism*: the per-step
+degeneration is the continuous **rescaling × Adam effective-LR** dynamic, NOT the
+weight scale — one-shot init scaling is harmless and useless.
+
+**Phase 4 spectral fully resolved — NO SHIP.** Per-step = NEGATIVE (degenerate at
+any F); init = benign no-op. Neither helps; neither replaces the gg-clamp.
+
+---
+
+## 5B DATA-SCALE RUN LAUNCHED (2026-06-18) — the transformational prize
+
+With the per-element (Phase 1/3) and spectral (Phase 4) lines all closed
+NEGATIVE, and the gg-clamp confirmed as the containment fix, the highest-EV GPU
+use is data scale. Launched: full flagship recipe + accum=4/lr3e-4 +
+`--grad-group-clamp 1.0`, **76000 steps = 4.98B tokens** (~47h), seed 1337, save
+`database/checkpoints/chiron_1B_T16384_datascale5B/` (`--save-every 10000`,
+keep-last-3). Step-1 loss 10.7816 / ‖g‖ 0.831 (= gold recipe, clean).
+
+- **Why:** the flagship saw only 0.49B tokens (val 3.5062); 108B are available.
+  The accum=1 data-scale run banked val **2.797 @ 1.3B** before degrading at
+  ~1.6B. This run uses the better accum=4 batch recipe + gg-clamp containment to
+  push to 5B.
+- **WATCH:** gg-clamp is validated to only 1.64B — **1.64B→5B is unvalidated
+  horizon.** The accum=1 run degraded past ~1.6B; if this one shows the same
+  late-instability/degradation, bank the best-val checkpoint and treat that as
+  the data-scale ceiling for the current recipe.
