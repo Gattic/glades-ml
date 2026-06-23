@@ -109,6 +109,7 @@ void CHIRONGradCentralizeBf16Test();
 void CHIRONSpectralNormTest();
 void CHIRONSamTest();
 void CHIRONRelnBackwardBoundedTest();
+void CHIRONRelnReanchorTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

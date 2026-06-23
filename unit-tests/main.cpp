@@ -255,6 +255,10 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONRelnBackwardBoundedTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-reanchor") == 0 || strcmp(argv[1], "reanchor") == 0)
+	    {
+		CHIRONRelnReanchorTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {
 		CHIRONSpectralNormTest();

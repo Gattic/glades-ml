@@ -1009,6 +1009,88 @@ bool chiron_reln_backward_bounded(const float* dq_out, const float* q_in,
 }
 
 // ===========================================================================
+//  3c. ReLN reverse-consistency backward (q-side instability cure, 2026-06-23).
+// ===========================================================================
+//
+// Root cause (grad-trigger evidence, seed 2024 step 24070): the backward
+// normalizes the recomputed activation q_in with the SAVED forward stats,
+// which have drifted, inflating xhat ~13x BEFORE the sum-over-T forms dgamma
+// and overflows it.  This backward re-derives (mean, invStd) from q_in itself
+// (mirroring chiron_reln_forward_rows' two-pass reduction), so the xhat that
+// layernorm_backward forms is unit-RMS by construction.  On a healthy step
+// (recompute == forward) the re-derived stats equal the saved stats up to
+// fp reduction order -> near-identity.  See
+// docs/superpowers/specs/2026-06-23-reln-reverse-consistency-design.md.
+
+namespace {
+
+// One block per row: recompute mean and invStd from q_in over the m columns.
+// Writes mean[T] into split[0..T) and invStd[T] into split[T..2T), matching the
+// (mean, invStd) layout chiron_reln_backward feeds to layernorm_backward.
+__global__ void chiron_reln_reanchor_stats_kernel(const float* __restrict__ q_in,
+                                                  int cols, float eps,
+                                                  float* __restrict__ mean,
+                                                  float* __restrict__ invStd)
+{
+	int row = blockIdx.x;
+	const float* xRow = q_in + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	__shared__ float sMean, sInvStd;
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	// Pass 2: variance -> invStd.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sInvStd = 1.0f / sqrtf(var);
+	}
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		mean[row]   = mu;
+		invStd[row] = sInvStd;
+	}
+}
+
+} // anonymous namespace
+
+// Re-anchored ReLN backward: identical interface to chiron_reln_backward, but
+// derives (mean, invStd) from q_in rather than the saved stats.  `eps` must
+// match the forward's eps_reln so healthy steps reproduce the saved stats.
+bool chiron_reln_backward_reanchor(const float* dq_out, const float* q_in,
+                                    const float* gamma,
+                                    int T, int m, float eps,
+                                    float* dq_in, float* dgamma, float* dbeta,
+                                    float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+	float* d_mean   = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	int block = rowBlockSize(m);
+	size_t smemBytes = 2u * (size_t)(block / 32 + 1) * sizeof(float);
+	chiron_reln_reanchor_stats_kernel<<<T, block, smemBytes, computeStream()>>>(
+	    q_in, m, eps, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return layernorm_backward(dq_out, q_in, gamma, d_mean, d_invStd,
+	                          T, m, dq_in, dgamma, dbeta);
+}
+
+// ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================
 //

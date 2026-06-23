@@ -225,6 +225,18 @@ bool chiron_reln_backward_bounded(const float* dq_out, const float* q_in,
                                    float* dq_in, float* dgamma, float* dbeta,
                                    float* scratch_stats_split, float xhatMax);
 
+// ReLN reverse-consistency backward (q-side instability cure, 2026-06-23):
+// same interface as chiron_reln_backward but re-derives (mean, invStd) from
+// q_in itself, so the xhat layernorm_backward forms is unit-RMS by
+// construction (cures the recompute/saved-stat drift that inflates dgamma).
+// `eps` must equal the forward's eps_reln.  Near-identity on healthy steps.
+// scratch_stats_split: caller-owned buffer of 2*T floats.
+bool chiron_reln_backward_reanchor(const float* dq_out, const float* q_in,
+                                    const float* gamma,
+                                    int T, int m, float eps,
+                                    float* dq_in, float* dgamma, float* dbeta,
+                                    float* scratch_stats_split);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -683,6 +695,10 @@ inline bool chiron_reln_backward_bounded(const float*, const float*,
                                   const float*, const float*,
                                   int, int,
                                   float*, float*, float*, float*, float) { return false; }
+inline bool chiron_reln_backward_reanchor(const float*, const float*,
+                                  const float*,
+                                  int, int, float,
+                                  float*, float*, float*, float*) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

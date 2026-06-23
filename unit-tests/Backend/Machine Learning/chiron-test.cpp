@@ -18332,3 +18332,66 @@ void CHIRONRelnBackwardBoundedTest()
 	std::printf("  [CHIRON reln-bwd bounded] built without CUDA — skipped\n");
 #endif
 }
+
+// Case (2026-06-23): chiron_reln_backward_reanchor — re-deriving (mean,invStd)
+// from q_in makes xhat unit-RMS by construction.  HEALTHY (saved stats == true
+// stats of q_in): near-identical to plain backward.  DRIFT (q_in row corrupted,
+// stats stale): plain dgamma overflows, re-anchored dgamma stays bounded.
+void CHIRONRelnReanchorTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{ std::printf("  [CHIRON reln-bwd reanchor] no CUDA device — skipped\n"); return; }
+	const int T = 64, m = 32;
+	const float eps = 1e-5f;
+
+	// Build q_in with per-row mean=0, sigma~1 (standard normal-ish via LCG),
+	// and set saved stats to each row's TRUE (mean, sigma) so healthy re-anchor
+	// reproduces them.
+	std::vector<float> dq_out((size_t)T*m), q_in((size_t)T*m), gamma(m, 1.0f), stats((size_t)T*2);
+	LCG rng(919u);
+	for (size_t i=0;i<q_in.size();++i) q_in[i] = rng.next_unit();   // (-1,1)
+	for (size_t i=0;i<dq_out.size();++i) dq_out[i] = rng.next_unit();
+	for (int t=0;t<T;++t){
+		double mu=0.0; for(int j=0;j<m;++j) mu += q_in[(size_t)t*m+j]; mu/=m;
+		double var=0.0; for(int j=0;j<m;++j){ double d=q_in[(size_t)t*m+j]-mu; var+=d*d; } var=var/m+eps;
+		stats[(size_t)t*2+0]=(float)mu; stats[(size_t)t*2+1]=(float)std::sqrt(var); // glades-ml: raw sigma
+	}
+
+	glades::gpu::GpuBuffer<float> d_dq,d_q,d_g,d_st,d_dqinA,d_dgA,d_dbA,d_dqinB,d_dgB,d_dbB,d_split;
+	ASSERT("Reanchor: alloc", d_dq.allocate(T*m)&&d_q.allocate(T*m)&&d_g.allocate(m)&&d_st.allocate(T*2)
+	      &&d_dqinA.allocate(T*m)&&d_dgA.allocate(m)&&d_dbA.allocate(m)
+	      &&d_dqinB.allocate(T*m)&&d_dgB.allocate(m)&&d_dbB.allocate(m)&&d_split.allocate(T*2));
+	ASSERT("Reanchor: upload", d_dq.upload(&dq_out[0])&&d_q.upload(&q_in[0])&&d_g.upload(&gamma[0])&&d_st.upload(&stats[0]));
+
+	// HEALTHY: plain(saved stats) vs reanchor(recomputed) must be near-identical.
+	ASSERT("Reanchor: zero dg/db", d_dgA.zero()&&d_dbA.zero()&&d_dgB.zero()&&d_dbB.zero());
+	ASSERT("Reanchor: plain healthy", glades::gpu::chiron_reln_backward(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinA.data(),d_dgA.data(),d_dbA.data(),d_split.data()));
+	ASSERT("Reanchor: reanchor healthy", glades::gpu::chiron_reln_backward_reanchor(d_dq.data(),d_q.data(),d_g.data(),T,m,eps,d_dqinB.data(),d_dgB.data(),d_dbB.data(),d_split.data()));
+	std::vector<float> dgA(m),dgB(m),dbA(m),dbB(m);
+	ASSERT("Reanchor: dl healthy", d_dgA.download(&dgA[0])&&d_dgB.download(&dgB[0])&&d_dbA.download(&dbA[0])&&d_dbB.download(&dbB[0]));
+	double maxRel=0.0;
+	for(int j=0;j<m;++j){
+		double da=std::fabs((double)dgA[j]-(double)dgB[j])/(std::fabs((double)dgA[j])+1e-6);
+		double db=std::fabs((double)dbA[j]-(double)dbB[j])/(std::fabs((double)dbA[j])+1e-6);
+		if(da>maxRel)maxRel=da; if(db>maxRel)maxRel=db;
+	}
+	std::printf("  [reln-bwd reanchor] healthy max rel-err(dgamma,dbeta)=%.3e\n", maxRel);
+	ASSERT("Reanchor: healthy near-identical (rel<1e-3)", maxRel < 1e-3);
+
+	// DRIFT: corrupt row 5's q_in to 1000 but leave stats stale (sigma~1).
+	for(int j=0;j<m;++j) q_in[(size_t)5*m+j] = 1000.0f;
+	ASSERT("Reanchor: upload drift", d_q.upload(&q_in[0]));
+	ASSERT("Reanchor: zero dg2", d_dgA.zero()&&d_dgB.zero()&&d_dbA.zero()&&d_dbB.zero());
+	ASSERT("Reanchor: plain drift", glades::gpu::chiron_reln_backward(d_dq.data(),d_q.data(),d_g.data(),d_st.data(),T,m,d_dqinA.data(),d_dgA.data(),d_dbA.data(),d_split.data()));
+	ASSERT("Reanchor: reanchor drift", glades::gpu::chiron_reln_backward_reanchor(d_dq.data(),d_q.data(),d_g.data(),T,m,eps,d_dqinB.data(),d_dgB.data(),d_dbB.data(),d_split.data()));
+	ASSERT("Reanchor: dl drift", d_dgA.download(&dgA[0])&&d_dgB.download(&dgB[0]));
+	double maxA=0,maxB=0; for(int j=0;j<m;++j){ if(std::fabs(dgA[j])>maxA)maxA=std::fabs(dgA[j]); if(std::fabs(dgB[j])>maxB)maxB=std::fabs(dgB[j]); }
+	std::printf("  [reln-bwd reanchor] drift: plain max|dgamma|=%.3g  reanchor max|dgamma|=%.3g\n", maxA, maxB);
+	// Drifted row contributes ~xhat=1000/sigma~1000 to plain; re-anchor's xhat is unit,
+	// so each column's |sum dout*xhat| <= ~T for re-anchor and is ~1000x larger for plain.
+	ASSERT("Reanchor: drift bounded << plain", maxB < maxA && maxB < (double)(4.0 * T));
+#else
+	std::printf("  [CHIRON reln-bwd reanchor] built without CUDA — skipped\n");
+#endif
+}
