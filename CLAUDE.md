@@ -2,10 +2,76 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (SIRA+clamp ship 2026-06-12)
+## Current Production Flagship — CHIRON 1B @ T=16384 (data-scale ship 2026-06-22)
 
-The current production LLM flagship is **CHIRON 1B SIRA+clamp**
-(checkpoint `chiron_1B_T16384_sira_clamp_phase2.final`):
+The current production LLM flagship is **CHIRON 1B data-scale**
+(checkpoint `chiron_1B_T16384_datascale5B_finish_clean.final`). It is a
+**perplexity flagship**: −0.9/−1.0 nat val NLL over the prior SIRA+clamp ship,
+the largest single jump in the lineage, from training on **~10× more data**.
+
+- **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context;
+  870.94M params + 384 per-head QK-Norm γ (now **persisted** in the checkpoint —
+  CHRF flag bit 256, the serving fix below).
+- **Stack**: the SIRA+clamp ship recipe (QK-Norm + Z-loss + terminal SIRA +
+  dq-clamps on v5+FP8/CUDA 13.2 — see "Prior SIRA+clamp flagship" below) **PLUS
+  the data-scale recipe landed 2026-06-18/22**:
+  - **Data scale + batch recipe**: `--accum 4 --lr 3e-4` (effective batch 65536
+    tok/step) trained to **~2B tokens** (vs the prior flagship's 0.49B / 30k
+    steps). This is the dominant win — perplexity keeps dropping with tokens
+    well past where the prior flagships stopped.
+  - **`--grad-group-clamp 1.0`** (`clamp_vector_l2norm` on each layer's
+    dgamma/dbeta L2 norm before the global grad-norm): the **containment** for
+    the q-side reverse-amplification instability, which re-emerges at ~1.6B
+    tokens and would otherwise diverge (accum=4 run #1 died @1.49B). gg-clamp
+    fires ~every step past 1.6B but holds **0 grad-skips** to 2B+.
+  - **Constant-LR + sharp finish schedule**: constant `lr 3e-4` for the data
+    descent, then a **flat `lr 3e-5` finish** (`--warmup 0 --no-resume-warmup`,
+    ~6k steps). A *gradual cosine* over the full run UNDERPERFORMED by ~0.3 nat
+    (decays LR too early, starving the mid-phase descent) — the anneal must be
+    late + sharp. See `research/DATASCALE_FLAGSHIP_AND_SERVING_2026_06_20.md`.
+- **Perf / val**: same ~28k tok/s + ~14.7/15.56 GB VRAM as the SIRA+clamp ship
+  (data-scale is a token-count change, not a per-step cost). **Held-out val
+  ~2.5** (best 2.4346; 4-batch window variance 2.43–2.62; chiron_infer
+  teacher-forcing nll **2.348** with the exact γ) vs the SIRA+clamp ship's
+  **3.5062** → **Δ −0.9 to −1.0 nat**. 0 grad-skips throughout.
+- **Reproduce training** (two deterministic stages):
+  1. constant-LR base: `cd ~/dev/glades-trainer && sh run.sh flagship --steps
+     60000 --accum 4 --lr 3e-4 --warmup 750 --sira-warmup 250 --zloss-coef 1e-4
+     --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight
+     0.25 --sira-action-weight 0.0 --grad-clip 0.5 --dq-layer-clamp 1.0
+     --dq-embed-clamp 1.0 --grad-group-clamp 1.0 --save-every 10000 --seed 1337`
+     (NO `--lr-decay` — constant LR). Pre-create the `--save` dir (silent
+     save_full failure otherwise).
+  2. flat-3e-5 finish: resume the step-60000 checkpoint with `--lr 3e-5
+     --warmup 0 --no-resume-warmup --max-steps 66000` + the same recipe flags.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
+  (prefers `chiron_1B_T16384_datascale5B_finish_clean.final` since 2026-06-22).
+  **Serving fix**: chiron_infer historically lacked QK-Norm (silently broken for
+  ALL SCFA checkpoints incl. prior flagships since the 2026-05-22 regstack
+  landing); it now implements QK-Norm and **auto-enables it when the checkpoint
+  carries per-head γ** (bit 256). Inference reproduces training val perplexity.
+- **Ship record / evidence**: `research/DATASCALE_FLAGSHIP_AND_SERVING_2026_06_20.md`
+  (full session: data-scale run, instability containment, the cosine-vs-finish
+  lesson, the QK-Norm serving fix + γ-persistence, generation repetition).
+- **Caveats**:
+  - **Perplexity flagship, not a generator.** Free generation from short prompts
+    is incoherent — short prompts pad to T with token-0 (OOD) AND the model has
+    a strong repetition attractor. This is true of **all** CHIRON flagships
+    (they're perplexity-optimized); the ship metric is val NLL, same standard as
+    predecessors. chiron_infer has repetition control (`--freq-penalty` etc.) but
+    coherent generation needs generation-aware fine-tuning, not decoding.
+  - **Instability is contained, not cured.** gg-clamp holds it past 1.6B but it
+    fires chronically; clean 5B isn't reachable with this recipe.
+  - Val is window-noisy (4-batch); same-seed runs are not bit-reproducible at
+    production shape (atomic-ordering noise). The constant+finish recipe IS
+    reproducible step-for-step modulo that noise.
+
+## Prior SIRA+clamp Flagship — CHIRON 1B @ T=16384 (SIRA+clamp ship 2026-06-12, kept for context)
+
+The prior flagship **CHIRON 1B SIRA+clamp**
+(checkpoint `chiron_1B_T16384_sira_clamp_phase2.final`) remains the recipe base
+for the data-scale ship above (which adds only data scale + gg-clamp + the
+finish schedule):
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context;
   870.94M params + 384 QK-Norm γ (same as regstack Phase 2).
