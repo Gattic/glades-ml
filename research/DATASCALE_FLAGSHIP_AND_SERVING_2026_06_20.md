@@ -165,12 +165,47 @@ fine-tuning.
 ~2.5 — flagship candidate); `chiron_1B_T16384_datascale5B_BEST_val2p771.step50000`
 (pre-anneal best, 2.7709); `chiron_1B_T16384_datascale5B/step{30,40,50,60}000`.
 
+## UPDATE 2026-06-22 — clean retrain saga + the production-grade candidate
+
+The "clean retrain" recommendation was pursued and taught a real lesson, then
+landed the deliverable a faster way.
+
+**The gradual cosine UNDERPERFORMED.** A from-scratch 76k-step run with `--lr-decay`
+(proper cosine 3e-4→3e-5, via the fixed run.sh) tracked the original through ~15k
+then fell *behind* at every step (40k: 3.24 vs the original's 2.99; 55k: 3.07 vs
+2.76) and headed for ~3.0, not 2.5. **Cause:** the cosine decays LR too early
+(1.3e-4 by step 40k), starving the **fast mid-phase data-scale descent** the
+original got from its *constant* 3e-4. **Lesson: data-scale gain needs sustained
+high LR; the anneal must be LATE + SHARP, not gradual.** The original's accidental
+recipe (constant high LR → sharp bolt-on finish) is correct. (Also caught + fixed
+a second run.sh bug: `FLAGSHIP_LR_DECAY_MIN` was referenced uninitialized → run.sh
+aborted under `set -u` whenever `--lr-decay` was passed — `321ac15`.)
+
+**The corrected constant+finish — done right.** Killed the cosine run; reused the
+*existing* constant-LR base (`datascale5B.step60000`, val 2.78 — no need to re-run
+37h) + a clean deterministic finish: flat lr 3e-5, `--warmup 0 --no-resume-warmup`
+(the latter bypasses a 5k-step resume mini-warmup that would otherwise waste the
+finish on a near-zero-LR ramp), 6k steps, γ-fix binary. ~4h.
+
+**Result — `chiron_1B_T16384_datascale5B_finish_clean.final`:**
+- val ~2.5 (best 2.4346, bouncing 2.43–2.62 on the noisy 4-batch val), **0 skips**.
+- **Serves with EXACT per-head γ** (CHRF bit 256, L·nH=384) — chiron_infer
+  `--tf-check`: top1 0.3935, **nll 2.348** (reproduces the val; no γ≈14 approx).
+- **−0.9/−1.0 nat vs the production flagship (3.5062)**, reproducible, serveable.
+
+This is the **production-grade flagship candidate** — the thing the whole session
+drove toward, produced properly (proven recipe, deterministic schedule, exact-γ
+serving). Ready for promotion consideration (owner's call).
+
 ## Open items / recommendations
 
-1. **Clean 5B+anneal retrain** via the fixed run.sh (proper cosine, γ persisted)
-   to lock in the ~2.5 flagship candidate reproducibly + serveably. ~47h.
-2. **Don't pursue per-step spectral-norm** (NEGATIVE). gg-clamp stays the
-   containment fix; GC/SAM are optional hardening (untested at scale).
-3. **Generation:** needs generation-aware fine-tuning, not decoding, for coherence.
-4. The data-scale run shows clean 5B isn't reachable with the current recipe —
-   the instability is contained but chronic past ~1.6B; a true *cure* remains open.
+1. **Promote `…datascale5B_finish_clean.final` to production flagship** (owner
+   call) — reproducible, serveable, −0.9 nat. Recipe: constant-LR base to ~60k +
+   flat-3e-5 `--no-resume-warmup` finish (NOT a gradual cosine).
+2. **Don't use a gradual cosine for data-scale** (underperforms ~0.3 nat). Late +
+   sharp finish only. And **don't pursue per-step spectral-norm** (NEGATIVE);
+   gg-clamp stays the containment fix; GC/SAM are optional hardening.
+3. **Generation:** repetition control breaks the catastrophic loops but coherence
+   is model-limited (perplexity-LM) — needs generation-aware fine-tuning.
+4. **A true instability *cure*** remains open — it's contained but chronic past
+   ~1.6B; clean 5B isn't reachable with the current recipe.
