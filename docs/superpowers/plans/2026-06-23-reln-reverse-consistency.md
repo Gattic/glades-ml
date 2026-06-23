@@ -120,27 +120,39 @@ After the existing `std::sort(meanAbsDeltas...)` (`chiron_main.cpp:15083`) add:
 Immediately after the existing summary `log_warn(...l00 step...)` call (ends `chiron_main.cpp:15100`) add a second `log_warn` that prints the disambiguation and an explicit verdict hint:
 
 ```cpp
-	// Phase-0 diagnostic verdict (2026-06-23):
-	//  - xhat_self_rms ~ 1  AND  recomp_sigma >> saved_sigma  -> RECOMPUTE-DRIFT (R)
-	//      => --reln-reanchor restores unit-RMS xhat at its source.
-	//  - xhat_self_rms ~ 1  AND  saved_sigma  << recomp_sigma small/normal AND
-	//      saved invStd huge (saved_sigma -> 0)              -> VARIANCE-COLLAPSE (V)
+	// Phase-0 diagnostic verdict (2026-06-23).  xhat_self_rms is unit-RMS by
+	// construction in BOTH R and V (a row normalized by its own mean/std), so it
+	// only confirms re-anchor would restore unit-RMS; the R-vs-V split is read
+	// from the ABSOLUTE saved-vs-recompute sigma (NOT a ratio — a ratio test
+	// would make R and V the same inequality and V unreachable):
+	//  - xhat_self_rms ~ 1  AND  saved sigma collapsed broadly below the recompute
+	//      scale (saved_p50 << recomp_p50, forward std->0)  -> VARIANCE-COLLAPSE (V)
 	//      => Branch V (variance floor); re-anchor also restores unit but s.q was fine.
-	//  - xhat_self_rms still >> 1                            -> LOCALIZED/other (L); no cure on a guess.
+	//  - xhat_self_rms ~ 1  AND  recompute sigma drifted up in its tail
+	//      (recomp_max >> recomp_p50) with saved normal           -> RECOMPUTE-DRIFT (R)
+	//      => --reln-reanchor restores unit-RMS xhat at its source.
+	//  - xhat_self_rms still >> 1 (only numerically, recomp sigma->0)-> LOCALIZED/other (L).
+	//  - no accepted rows                                          -> INCONCLUSIVE.
 	const double xhatSelfMax = xhatSelfRmsVals.empty() ? std::numeric_limits<double>::quiet_NaN() : xhatSelfRmsVals.back();
 	const double savedSigP50 = percentile_sorted(savedSigmaVals, 0.50);
 	const double recompSigP50 = percentile_sorted(recompSigmaVals, 0.50);
+	const double recompSigMax = recompSigmaVals.empty() ? 0.0 : recompSigmaVals.back();
 	const char* verdict = "INCONCLUSIVE";
-	if (xhatSelfMax < 2.0)
-		verdict = (recompSigP50 > 2.0 * savedSigP50) ? "RECOMPUTE-DRIFT(R)" :
-		          (savedSigP50 < 0.5 * recompSigP50) ? "VARIANCE-COLLAPSE(V)" : "MIXED";
-	else
+	if (!(xhatSelfMax == xhatSelfMax)) {              // NaN -> no accepted rows
+		verdict = "INCONCLUSIVE";
+	} else if (xhatSelfMax < 2.0) {
+		const bool savedCollapsed = savedSigP50 < 0.5 * recompSigP50;   // saved sigma broadly below recompute scale
+		const bool recompTailHigh = recompSigMax > 2.0 * recompSigP50;  // recompute sigma drifted up in the tail
+		verdict = savedCollapsed ? "VARIANCE-COLLAPSE(V)" :
+		          recompTailHigh ? "RECOMPUTE-DRIFT(R)"   : "MIXED";
+	} else {
 		verdict = "LOCALIZED-OR-OTHER(L)";
+	}
 	log_warn("chiron","[sira-grad-trigger-l00-diag step %6d] verdict=%s xhat_self_rms(p50/p99/max)=%.6g/%.6g/%.6g saved_sigma(p50/p99/max)=%.6g/%.6g/%.6g recomp_sigma(p50/p99/max)=%.6g/%.6g/%.6g\n",
 	         step, verdict,
 	         percentile_sorted(xhatSelfRmsVals, 0.50), percentile_sorted(xhatSelfRmsVals, 0.99), xhatSelfMax,
 	         savedSigP50, percentile_sorted(savedSigmaVals, 0.99), savedSigmaVals.empty()?0.0:savedSigmaVals.back(),
-	         recompSigP50, percentile_sorted(recompSigmaVals, 0.99), recompSigmaVals.empty()?0.0:recompSigmaVals.back());
+	         recompSigP50, percentile_sorted(recompSigmaVals, 0.99), recompSigMax);
 ```
 
 - [ ] **Step 4: Build the trainer**

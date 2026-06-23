@@ -119,12 +119,22 @@ trigger step, for the top-K L00 rows ranked by `|dout·xhat|`, record:
 Extend to the early ladder (L00–L03) since the `dgamma/dbeta` ladder lit up,
 not only L00.
 
-**Decision rule.**
-- `xhat_selfconsistent` RMS ≈ 1 **and** `rstd_saved` bounded → **(R)** → Branch R.
-- `xhat_selfconsistent` RMS still ≫ 1 **and** `rstd_saved` huge (forward std→0) →
-  **(V)** → Branch V.
-- Effect confined to a handful of tokens/positions with both globals healthy →
-  **(L)** → per-token trace (tokens 50, 265 first); **do not build a cure**.
+**Decision rule.** Note `xhat_selfconsistent` is unit-RMS *by construction* in
+**both** R and V (any finite row normalized by its own mean/std → RMS≈1) — so it
+confirms only that **re-anchor would restore unit-RMS**, not which mechanism. The
+R-vs-V split is read from the **absolute** saved-σ vs recompute-σ magnitudes:
+- `xhat_selfconsistent` RMS ≈ 1 **and** the **recompute** σ is the anomalous side
+  (`σ_recompute` has a large tail above its own typical value while `σ_saved`
+  stays normal) → **(R) recompute-drift** → Branch R (re-anchor cures it; it was
+  the drifted recompute, so re-anchor bounds a wrong q).
+- `xhat_selfconsistent` RMS ≈ 1 **and** the **saved** σ is the anomalous side
+  (`σ_saved` collapsed broadly below the recompute scale, i.e. forward std→0) →
+  **(V) variance-collapse** → Branch V (re-anchor *also* restores unit here, but
+  `s.q` was fine — a variance floor is the targeted fix).
+- `xhat_selfconsistent` RMS still ≫ 1 (re-anchor would *not* restore unit — only
+  possible numerically when `σ_recompute`→0), or the effect is confined to a
+  handful of tokens/positions with both global σ distributions healthy →
+  **(L) localized** → per-token trace (tokens 50, 265 first); **do not build a cure**.
 
 **Verification.** Smoke with a forced threshold (`--sira-grad-trigger-sumsq 0`)
 must dump all fields finite on a tiny shape before the real run.
