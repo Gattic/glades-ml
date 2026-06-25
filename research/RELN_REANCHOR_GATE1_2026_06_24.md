@@ -83,6 +83,52 @@ stochastic spike, fragile to the exact numerics + same-seed non-reproducibility.
 So the diagnostic pivoted to testing the cure directly on the recipe that
 reliably diverges (the data-scale recipe) — this Gate-1 run.
 
+## Matched gg-clamp control (on disk — apples-to-apples, 2026-06-24)
+
+The production data-scale base run `logs/datascale5B_20260618_221547/run.log`
+(`chiron_1B_T16384_datascale5B`) is the IDENTICAL recipe — accum=4, lr 3e-4,
+seed 1337, warmup 750 — **with gg-clamp instead of re-anchor**. Same seed → same
+data order → a near-perfect head-to-head control at matched tokens. Read off disk
+(no new GPU):
+
+| danger-zone (step / tokens) | gg-clamp control ‖g‖ (scale) | re-anchor ‖g‖ (scale) |
+|---|---|---|
+| 22,001 / 1.44B | 0.238 (1.000) | 0.485 (1.000) |
+| 23,001 / 1.51B | **1712.6 (0.000)** | 7.011 (0.071) |
+| 24,001 / 1.57B | 0.293 (1.000) | 0.718 (0.696) |
+| 25,001 / 1.64B | **1148.6 (0.000)** | 1.895 (0.264) |
+| 26,001 / 1.70B | **2361.6 (0.000)** | 1.591 (0.314) |
+| 27,001 / 1.76B | **5420.1 (0.000)** | — (run ended 26k) |
+
+| val NLL (matched tokens) | gg-clamp control | re-anchor |
+|---|---|---|
+| ~1.64–1.70B | **3.357 @ 1.64B** | **3.042 @ 1.70B** |
+| best 4-batch window | 2.5067 @ 22.8k | 2.2036 @ 5.2k |
+
+**Two findings:**
+
+1. **Gradient regime: re-anchor is ~250–750× cleaner.** gg-clamp's ‖g‖ explodes
+   to **1700–5400 with the loss-scale floored to 0.000, every step past 1.6B**
+   (the "fires chronically past 1.6B" behavior, made quantitative) — it holds 0
+   skips only by violently clamping a *raging* instability. Re-anchor keeps ‖g‖
+   at **O(1–7)** because it removes the xhat inflation at the source, so nothing
+   downstream blows up. This is the source-cure-vs-symptom-clamp distinction as a
+   number: gg-clamp clamps the symptom (dgamma/dbeta norm) while the q-side drift
+   still inflates the rest; re-anchor fixes the cause so the symptom never forms.
+
+2. **Val: re-anchor is ~0.3 nat BETTER at matched tokens** (3.04 @ 1.70B vs
+   gg-clamp 3.36 @ 1.64B), not worse. **This REVERSES the earlier "yellow flag."**
+   That flag compared re-anchor's 3.04 against the **accum=1** run's "2.797 @
+   1.3B" — a different batch recipe, not a valid control. Against the correct
+   accum=4 gg-clamp control, re-anchor is more token-efficient on val, plausibly
+   because gg-clamp's chronic hard clamping (‖g‖→thousands, scale→0) distorts the
+   optimizer's signal while re-anchor keeps it clean.
+
+**No-harm parity: PASS, and then some** — re-anchor does not harm val; at matched
+tokens it improves both the gradient regime and val vs the production gg-clamp
+containment. (Caveats: single seed, 4-batch window noise ±0.1–0.2 on val — though
+the ‖g‖ gap of 7 vs 1700–5400 is structural, not noise; one comparison point.)
+
 ## Caveats / scope
 
 - **Single seed (1337), treatment-only.** No fresh same-codebase control (relies
