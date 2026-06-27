@@ -11484,6 +11484,8 @@ void CHIRONUnitTest()
 	CHIRONCublasTiledAttentionBf16ParityTest();
 	CHIRONProductionScaleMemoryTest();
 	CHIRONDriftGradCheckTest();
+	CHIRONDriftCpuGpuParityTest();
+	CHIRONDriftReversibilityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
