@@ -332,9 +332,16 @@ consider architecture-specific mechanisms (designed for the symplectic
 update, not ported from standard transformers) OR data-side work
 (curriculum, composition, quality filters — orthogonal to the
 architectural ceiling). Iter-style wall mining (per the iter 117 META)
-remains tractable but increasingly diminishing returns; multi-iter
-scope items like reln-fusion and FlashAttention-fused SCFA inner are
-still open.
+remains tractable but increasingly diminishing returns. Of the multi-iter
+scope items: **FlashAttention-fused SCFA inner is CLOSED NO-GO** (Gate-1 META
+2026-06-12, `research/FA_INNER_GATE1_META_2026_06_12.md` — supersedes the
+"still open" framing of this 2026-05-24 closure; iter 118 math-PASS but
++175% slow, iter 119 BF16-input NULL, then a fresh profile showed the inner
+matmuls are <1% of the step so the realistic net was only +2–4%, below bar;
+the thread was redirected to **cast-pipeline elimination, which shipped**
+[+3.38% wall, the now-default-ON cast-elim stack]). Reconsider FA-inner only
+if the EV changes (precision-tier change or much larger k). reln-fusion
+remains open.
 
 ## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
 
