@@ -102,6 +102,13 @@ as expected if gg-clamp's damage accumulates while re-anchor descends cleanly.
 `chiron_1B_T16384_reanchor5B_finish.final` promoted to production flagship
 (val ~1.92, −0.62 nat over the prior 2.54) per owner direction on the single-seed
 evidence. CLAUDE.md + runner.sh updated; serving fix landed (`fffe70d`).
-**Backfilling**: multi-seed (≥3) Gate-0 confirm (seeds 2024/4242) in progress —
-the magnitude dwarfs seed variance so the direction isn't in doubt, but the formal
-gate is the lineage standard.
+
+**Seeding: SINGLE-SEED (1337 only) — multi-seed Gate-0 confirm NOT run (owner
+decision 2026-06-27).** Unlike prior lineage ships (e.g. SIRA+clamp's 3-seed 30k
+gate), this flagship ships on one seed. The result is verified two independent
+ways at that seed (trainer wide-val 1.92 + chiron_infer TF 1.78, flagship
+reproducing its 2.5/2.348), and the −0.62 nat magnitude dwarfs typical seed
+variance (~0.02) — but cross-seed reproduction is **not** established. A seed-2024
+confirm was started and killed at step 4001 (clean to that point) per the same
+decision. If cross-seed rigor is later wanted, re-run the base recipe under seeds
+2024/4242 and check for ~1.98 base val + 0 grad-skips.
