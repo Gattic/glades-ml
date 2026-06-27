@@ -401,10 +401,16 @@ initially (rely on zero-init + bounded `φ` + reanchor). `φ = tanh`, `M⁻¹` i
 - **E2 — reconstruction.** Inverse-walk error ≤ BF16 ULP (FM-3).
 - **E3 — `B`-sweep for `B*`.** Vary `M⁻¹`/`a` init scale; locate the budget that lowers val NLL
   while staying sub-overflow (settles FM-1).
-- **E4 — production quality gate (30k, T=16384, L=24, m=2048).** Ship iff val NLL < 1.92, 0
-  grad-skips through the ~1.6B-token regime that previously needed gg-clamp, wall ≤ +10%,
-  reconstruction within BF16 ULP. Multi-seed Gate-0 (`{1337, 2024, 4242}`) per project methodology
-  (owner may require it given the flagship's single-seed ship).
+- **E4 — production quality gate (T=16384, L=24, m=2048).**
+  - *Primary (single-seed 1337):* the ship val-NLL run. Ship iff val NLL < 1.92, 0 grad-skips
+    through the ~1.6B-token regime that previously needed gg-clamp, wall ≤ +10%, reconstruction
+    within BF16 ULP.
+  - *Multi-seed confirmation:* seeds `{1337, 2024, 4242}`, each capped at **5k or 15k steps at
+    most** (NOT a full 30k per seed — owner cost-control decision 2026-06-27). This confirms the
+    *sign* of the improvement and **0 grad-skips cross-seed** at reduced cost; it is a
+    stability/sign gate, not a full-trajectory multi-seed ship. Consistent with the flagship's
+    single-seed ship precedent (the ship metric is the single-seed primary run; the capped
+    multi-seed run hardens confidence without 3× the production spend).
 
 ---
 
@@ -436,9 +442,11 @@ initially (rely on zero-init + bounded `φ` + reanchor). `φ = tanh`, `M⁻¹` i
 - **C4.** Reanchor on the drift path is *necessary* (not just helpful) for 0 grad-skips at scale.
   *Test:* OBSD with saved-stat backward should re-exhibit the κ_N-driven spike.
 
-**Acceptance (ship gate).** val NLL < 1.92 at production scale; 0 grad-skips through the
-previously-exploding regime; bit-identical flagship at init; wall ≤ +10% / negligible VRAM;
-inverse-reconstruction error within BF16 ULP.
+**Acceptance (ship gate).** val NLL < 1.92 at production scale (single-seed 1337 primary run); 0
+grad-skips through the previously-exploding regime; bit-identical flagship at init; wall ≤ +10% /
+negligible VRAM; inverse-reconstruction error within BF16 ULP. **Multi-seed confirmation is capped
+at 5k–15k steps per seed** (sign + cross-seed stability only, not a full 30k×3 trajectory — owner
+cost-control decision).
 
 ---
 
