@@ -244,6 +244,16 @@ bool chiron_reln_backward_reanchor(const float* dq_out, const float* q_in,
                                     float* dq_in, float* dgamma, float* dbeta,
                                     float* scratch_stats_split);
 
+// OBSD drift backward.  Accumulates dp, da, dgamma(=dM⁻¹), dbeta from dq_out and p.
+// Internally: pre-backward kernel forms du=scale·a·(1−tanh²(u))·dq_out and sdq=scale·tanh(u)·dq_out
+// (μ,σ re-derived from p — reanchor); da=colsum(sdq); then chiron_reln_backward_reanchor(du,p,gamma)
+// yields dp, dgamma, dbeta.  scratch_stats_split: 2*T floats.  All grads ACCUMULATE (caller pre-zeros).
+bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
+                           const float* gamma, const float* beta, float scale,
+                           int T, int m, float eps,
+                           float* dp, float* da, float* dgamma, float* dbeta,
+                           float* scratch_stats_split);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -709,6 +719,10 @@ inline bool chiron_reln_backward_reanchor(const float*, const float*,
                                   const float*,
                                   int, int, float,
                                   float*, float*, float*, float*) { return false; }
+inline bool chiron_drift_backward(const float*, const float*, const float*,
+                                  const float*, const float*, float,
+                                  int, int, float,
+                                  float*, float*, float*, float*, float*) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

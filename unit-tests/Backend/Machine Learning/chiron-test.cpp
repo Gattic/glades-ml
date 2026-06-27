@@ -11486,6 +11486,7 @@ void CHIRONUnitTest()
 	CHIRONDriftGradCheckTest();
 	CHIRONDriftCpuGpuParityTest();
 	CHIRONDriftReversibilityTest();
+	CHIRONDriftBackwardParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18513,5 +18514,42 @@ void CHIRONDriftReversibilityTest()
 	ASSERT(msg, maxErr < 1e-5f);
 #else
 	std::printf("  [CHIRON drift reversibility] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// GPU backward parity for the OBSD drift kernel against the CPU reference oracle.
+void CHIRONDriftBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON drift backward parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=6, m=16; const float eps=1e-4f, scale=0.8f;
+	std::vector<float> p(T*m), dq(T*m), a(m), gp(m), bp(m);
+	for (int i=0;i<T*m;++i){ p[i]=0.4f*sinf(0.5f*i+0.2f); dq[i]=0.15f*cosf(0.3f*i); }
+	for (int i=0;i<m;++i){ a[i]=0.4f+0.01f*i; gp[i]=1.0f+0.03f*i; bp[i]=0.02f*i; }
+	// CPU reference (oracle).
+	std::vector<float> dpc(T*m,0.f), dac(m,0.f), dgc(m,0.f), dbc(m,0.f);
+	glades::chiron::drift_backward(&dq[0],&p[0],&a[0],&gp[0],&bp[0],scale,T,m,eps,&dpc[0],&dac[0],&dgc[0],&dbc[0]);
+	// GPU.
+	glades::gpu::GpuBuffer<float> dP,dDQ,dA,dG,dB,dDP,dDA,dDG,dDB,dScratch;
+	dP.allocate(T*m); dDQ.allocate(T*m); dA.allocate(m); dG.allocate(m); dB.allocate(m);
+	dDP.allocate(T*m); dDA.allocate(m); dDG.allocate(m); dDB.allocate(m); dScratch.allocate(2*T);
+	dP.upload(&p[0],T*m); dDQ.upload(&dq[0],T*m); dA.upload(&a[0],m); dG.upload(&gp[0],m); dB.upload(&bp[0],m);
+	// Backward grads ACCUMULATE — pre-zero all output buffers.
+	dDP.zero(); dDA.zero(); dDG.zero(); dDB.zero();
+	glades::gpu::chiron_drift_backward(dDQ.data(),dP.data(),dA.data(),dG.data(),dB.data(),scale,T,m,eps,
+	                                   dDP.data(),dDA.data(),dDG.data(),dDB.data(),dScratch.data());
+	std::vector<float> dpg(T*m),dag(m),dgg(m),dbg(m);
+	dDP.download(&dpg[0],T*m); dDA.download(&dag[0],m); dDG.download(&dgg[0],m); dDB.download(&dbg[0],m);
+	float me=0.f; for(int i=0;i<T*m;++i) me=fmaxf(me,fabsf(dpg[i]-dpc[i]));
+	for(int i=0;i<m;++i){ me=fmaxf(me,fabsf(dag[i]-dac[i])); me=fmaxf(me,fabsf(dgg[i]-dgc[i])); me=fmaxf(me,fabsf(dbg[i]-dbc[i])); }
+	std::printf("  [CHIRON drift backward parity] maxErr=%.2e (bar 2e-4)\n", me);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift backward CPU/GPU parity (maxErr=%.2e)",me);
+	ASSERT(msg, me < 2e-4f);
+#else
+	std::printf("  [CHIRON drift backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }

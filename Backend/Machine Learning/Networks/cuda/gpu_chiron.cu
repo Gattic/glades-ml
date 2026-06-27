@@ -17,6 +17,7 @@
 #include "gpu_blas.h"
 #include "gpu_blas_fp8.h"
 #include "gpu_kernels.h"
+#include "gpu_buffer.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -1152,6 +1153,96 @@ bool chiron_reln_backward_reanchor(const float* dq_out, const float* q_in,
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return layernorm_backward(dq_out, q_in, gamma, d_mean, d_invStd,
 	                          T, m, dq_in, dgamma, dbeta);
+}
+
+// ===========================================================================
+//  3d. OBSD per-layer drift backward.
+// ===========================================================================
+//
+// Chain: u = gamma·x̂ + beta ; s = tanh(u) ; q_out = q_in + scale·a·s, with
+// x̂ = (p−μ)/σ and μ,σ per row of p (reanchored — recomputed from p).  Given
+// dq_out this accumulates:
+//   da     += Σ_t scale·s·dq_out
+//   du      = scale·a·(1−s²)·dq_out ; dgamma += Σ_t du·x̂ ; dbeta += Σ_t du
+//   dp      = parameter-free-normalize-backward of g = du⊙gamma
+// The dp/dgamma/dbeta computation is delegated to chiron_reln_backward_reanchor
+// called with dq_out:=du, gamma:=gamma_p — it forms g=du⊙gamma internally and
+// also returns dgamma=Σ du·x̂ and dbeta=Σ du.  This pre-backward kernel only
+// materializes du[T,m] and sdq[T,m]=scale·s·dq_out; da is the column-sum of sdq.
+
+namespace {
+
+// Per row: recompute μ,σ,x̂,u from p; write du and sdq.  Mirrors the two-pass
+// reduction of chiron_drift_into_q_rows / chiron_reln_reanchor_stats_kernel.
+__global__ void chiron_drift_pre_backward_rows(const float* __restrict__ p,
+                                               const float* __restrict__ dq,
+                                               const float* __restrict__ a,
+                                               const float* __restrict__ gamma,
+                                               const float* __restrict__ beta,
+                                               float scale, float eps, int cols,
+                                               float* __restrict__ du,
+                                               float* __restrict__ sdq)
+{
+	int row = blockIdx.x;
+	const float* pr = p + (size_t)row*cols; const float* dr = dq + (size_t)row*cols;
+	float* duR = du + (size_t)row*cols; float* sdqR = sdq + (size_t)row*cols;
+	extern __shared__ float smem[];
+	float* sA = smem; float* sB = smem + (blockDim.x/32 + 1);
+	__shared__ float sMean, sSigma;
+	float s=0.f; for (int i=threadIdx.x;i<cols;i+=blockDim.x) s+=pr[i];
+	s=blockReduceSum(s,sA); if(threadIdx.x==0) sMean=s/(float)cols; __syncthreads();
+	const float mu=sMean;
+	float v=0.f; for (int i=threadIdx.x;i<cols;i+=blockDim.x){ float d=pr[i]-mu; v+=d*d; }
+	v=blockReduceSum(v,sB); if(threadIdx.x==0){ float var=v/(float)cols+eps; sSigma=sqrtf(var);} __syncthreads();
+	const float inv=1.0f/sSigma;
+	for (int i=threadIdx.x;i<cols;i+=blockDim.x){
+		float xhat=(pr[i]-mu)*inv; float u=gamma[i]*xhat+beta[i]; float sa=tanhf(u); float sp=1.0f-sa*sa;
+		duR[i]  = scale*a[i]*sp*dr[i];
+		sdqR[i] = scale*sa*dr[i];
+	}
+}
+
+// Deterministic column sum: one block per channel column, loop over rows.
+//   out[j] += Σ_t in[t*cols+j].
+__global__ void chiron_col_accumulate(const float* __restrict__ in, int rows, int cols,
+                                      float* __restrict__ out)
+{
+	int j = blockIdx.x; if (j>=cols) return;
+	float acc=0.f; for (int t=threadIdx.x; t<rows; t+=blockDim.x) acc += in[(size_t)t*cols + j];
+	extern __shared__ float red[];
+	acc = blockReduceSum(acc, red);
+	if (threadIdx.x==0) out[j] += acc;
+}
+
+} // anonymous namespace
+
+bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
+                           const float* gamma, const float* beta, float scale,
+                           int T, int m, float eps,
+                           float* dp, float* da, float* dgamma, float* dbeta,
+                           float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+	// Internal scratch: du and sdq, each [T, m].  Raw cudaMalloc per call (see
+	// header note); fine for the test, but Task 6 should pass pre-allocated
+	// scratch on the training hot path.
+	glades::gpu::GpuBuffer<float> du, sdq;
+	if (!du.allocate((size_t)T * m) || !sdq.allocate((size_t)T * m)) return false;
+
+	int block = rowBlockSize(m);
+	int smemBytes = (block/32 + 2) * 2 * sizeof(float);
+	chiron_drift_pre_backward_rows<<<T, block, smemBytes, computeStream()>>>(
+	    p, dq_out, a, gamma, beta, scale, eps, m, du.data(), sdq.data());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// da = colsum(sdq), accumulated.  One block per channel; deterministic.
+	int rblock = 256; int rsmem = (rblock/32 + 1) * sizeof(float);
+	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(sdq.data(), T, m, da);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// dp, dgamma, dbeta via the reanchor ReLN backward fed du + gamma_p.
+	return chiron_reln_backward_reanchor(du.data(), p, gamma, T, m, eps,
+	                                     dp, dgamma, dbeta, scratch_stats_split);
 }
 
 // ===========================================================================
