@@ -202,9 +202,9 @@ inline void drift_into_q_row(const float* p, float* q, const float* a,
                              float sign, float scale, unsigned int m, float eps)
 {
 	double sum=0.0; for (unsigned i=0;i<m;++i) sum += p[i];
-	const float mu = (float)(sum/(double)m);
-	double vs=0.0; for (unsigned i=0;i<m;++i){ float d=p[i]-mu; vs += (double)d*d; }
-	const float sigma = sqrtf((float)(vs/(double)m) + eps);
+	const float mu = static_cast<float>(sum/static_cast<double>(m));
+	double vs=0.0; for (unsigned i=0;i<m;++i){ float d=p[i]-mu; vs += static_cast<double>(d)*d; }
+	const float sigma = sqrtf(static_cast<float>(vs/static_cast<double>(m)) + eps);
 	const float inv = 1.0f/sigma;
 	for (unsigned i=0;i<m;++i){
 		float xhat = (p[i]-mu)*inv;
@@ -233,17 +233,18 @@ inline void drift_backward(const float* dq_out, const float* p, const float* a,
                            unsigned int T, unsigned int m, float eps,
                            float* dp, float* da, float* dgamma, float* dbeta)
 {
+	// Per-row scratch hoisted out of the t-loop and reused across rows.
+	std::vector<float> xhat(m), g(m);
 	for (unsigned t=0;t<T;++t)
 	{
 		const float* pr = p + t*m; const float* dr = dq_out + t*m; float* dpr = dp + t*m;
 		double sum=0.0; for (unsigned i=0;i<m;++i) sum+=pr[i];
-		const float mu=(float)(sum/(double)m);
-		double vs=0.0; for (unsigned i=0;i<m;++i){ float d=pr[i]-mu; vs+=(double)d*d; }
-		const float sigma=sqrtf((float)(vs/(double)m)+eps); const float inv=1.0f/sigma;
+		const float mu=static_cast<float>(sum/static_cast<double>(m));
+		double vs=0.0; for (unsigned i=0;i<m;++i){ float d=pr[i]-mu; vs+=static_cast<double>(d)*d; }
+		const float sigma=sqrtf(static_cast<float>(vs/static_cast<double>(m))+eps); const float inv=1.0f/sigma;
 		// Per-row du (=dL/du), and the grad flowing into the parameter-free
 		// normalize: g_i = dL/dx̂_i = du_i·gamma_i (the affine gamma·x̂ sits
 		// BETWEEN x̂ and the loss, so it carries into the LN-backward upstream).
-		std::vector<float> xhat(m), g(m);
 		double sum_g=0.0, sum_g_xh=0.0;
 		for (unsigned i=0;i<m;++i){
 			float xh=(pr[i]-mu)*inv; xhat[i]=xh;
@@ -253,9 +254,9 @@ inline void drift_backward(const float* dq_out, const float* p, const float* a,
 			dgamma[i] += dui*xh;            // dM⁻¹ = Σ_t dL/du·x̂
 			dbeta[i]  += dui;
 			float gi  = dui*gamma[i]; g[i]=gi;
-			sum_g     += gi; sum_g_xh += (double)gi*xh;
+			sum_g     += gi; sum_g_xh += static_cast<double>(gi)*xh;
 		}
-		const float mean_g=(float)(sum_g/(double)m), mean_g_xh=(float)(sum_g_xh/(double)m);
+		const float mean_g=static_cast<float>(sum_g/static_cast<double>(m)), mean_g_xh=static_cast<float>(sum_g_xh/static_cast<double>(m));
 		// Standard LN-backward for a parameter-free normalize y=(p−μ)/σ, with
 		// upstream grad g (=dL/dx̂):  dp_i = (1/σ)·( g_i − mean(g) − x̂_i·mean(g·x̂) )
 		for (unsigned i=0;i<m;++i)

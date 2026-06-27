@@ -18418,7 +18418,7 @@ static double drift_J(const std::vector<float>& p, const std::vector<float>& a,
 void CHIRONDriftGradCheckTest()
 {
 	const unsigned int T = 4, m = 8;
-	const float eps = 1e-4f, scale = 1.0f;
+	const float eps = 1e-4f, scale = 0.7f;
 	std::vector<float> p(T*m), a(m), gp(m), bp(m), dq(T*m);
 	for (unsigned i=0;i<T*m;++i){ p[i]=0.3f*sinf(0.7f*i+1.f); dq[i]=0.2f*cosf(0.3f*i); }
 	for (unsigned i=0;i<m;++i){ a[i]=0.5f+0.1f*i; gp[i]=1.0f+0.05f*i; bp[i]=0.02f*i; }
@@ -18440,12 +18440,17 @@ void CHIRONDriftGradCheckTest()
 		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dgp[j])/(1e-3f+fabsf(fd));
 		if(e>maxRelErr)maxRelErr=e;
 	}
+	for (unsigned j=0;j<m;++j){            // check dbp[j]
+		float save=bp[j]; bp[j]=save+h; double Jp=drift_J(p,a,gp,bp,scale,T,m,eps,dq); bp[j]=save-h; double Jm=drift_J(p,a,gp,bp,scale,T,m,eps,dq); bp[j]=save;
+		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dbp[j])/(1e-3f+fabsf(fd));
+		if(e>maxRelErr)maxRelErr=e;
+	}
 	for (unsigned k=0;k<T*m;++k){          // check dp[k]
 		float save=p[k]; p[k]=save+h; double Jp=drift_J(p,a,gp,bp,scale,T,m,eps,dq); p[k]=save-h; double Jm=drift_J(p,a,gp,bp,scale,T,m,eps,dq); p[k]=save;
 		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dp[k])/(1e-3f+fabsf(fd));
 		if(e>maxRelErr)maxRelErr=e;
 	}
 	std::printf("  [CHIRON drift FD grad-check] maxRelErr=%.4f (bar 2e-2)\n", maxRelErr);
-	char msg[128]; snprintf(msg,sizeof(msg),"CHIRON drift backward FD grad-check (maxRelErr=%.4f)",maxRelErr);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift backward FD grad-check (maxRelErr=%.4f)",maxRelErr);
 	ASSERT(msg, maxRelErr < 2e-2f);
 }
