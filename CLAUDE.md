@@ -64,8 +64,17 @@ gg-clamp containment.
     and the −0.62 nat magnitude dwarfs seed variance (~0.02) — but cross-seed
     reproduction is NOT established. To add it later: re-run the base recipe under
     seeds 2024/4242, expect ~1.98 base val + 0 grad-skips.
-  - **Perplexity flagship, not a generator** — same as all CHIRON flagships
-    (free generation is repetition-limited; the ship metric is val NLL).
+  - **Perplexity flagship, not a generator** — same as all CHIRON flagships.
+    Free generation degenerates into a repetition loop even from clean prose
+    context, under greedy AND nucleus sampling (the next-token distribution
+    collapses onto the repeat so hard top-p can't escape). Diagnosed 2026-06-27 as
+    **exposure bias / an intrinsic repetition attractor — NOT inference-fixable**
+    (window-slide, pad, decoding, and forward-bug hypotheses all refuted; the
+    forward is correct, TF top1 0.53). The −0.62 nat perplexity win does NOT confer
+    coherent generation. Fix is generation-aware *training*, deferred to a separate
+    plan. Full diagnosis + the deferred-training scope:
+    `research/CHIRON_GENERATION_LOOP_FIX_2026_06_27.md`. Diagnostic flags landed in
+    chiron_infer (`--gen-metrics`, `--seed-tail`, `--tokens-file-offset`).
   - The flat-3e-5 finish added only ~0.06 here (vs ~0.26 for the gg-clamp
     flagship) because re-anchor's base was still descending — a longer base +
     later finish may extract more (open follow-up).
