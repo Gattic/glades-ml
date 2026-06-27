@@ -82,21 +82,26 @@ as expected if gg-clamp's damage accumulates while re-anchor descends cleanly.
   gate before a formal ship. The −0.62 nat magnitude is far beyond seed variance
   (~0.01–0.02), so the *direction* is not in doubt, but a multi-seed confirm is
   the standard for promotion.
-- **Serving path broken.** `chiron_infer --tf-check` returns mean_nll≈63 for every
-  checkpoint including the flagship (top1_acc ~0.002). This is a forwardInfer
-  regression (the "fuse-attn-per-layer auto-disabled" note — the models trained
-  with fuse-attn-reln and the inference forward isn't reproducing it), same CLASS
-  as the 2026-06-20 QK-Norm serving bug. The val verification stands (trainer
-  metric, the ship standard), but **generation/inference serving of this
-  checkpoint needs the forwardInfer fix first.**
+- **Serving path — FIXED (2026-06-27).** `chiron_infer --tf-check` initially
+  returned mean_nll≈63 for every checkpoint including the flagship — root cause:
+  the SCFA production models train with `--no-fuse-attn --fuse-attn-reln` and
+  carry no per-layer `gamma_p`; chiron_infer auto-disabled per-layer fuse but left
+  reln-fuse OFF, so the forward omitted the fusion (same CLASS as the QK-Norm
+  serving bug). Fixed (`fffe70d`): auto-enable reln-fuse for SCFA-no-gamma_p
+  checkpoints. **This also independently corroborates the val result**: with the
+  fix, TF nll = flagship **2.44** (≈ documented 2.348 ✓), re-anchor finish
+  **1.78** → **−0.66 nat**, matching the trainer wide-val −0.62. `runner.sh
+  --flagship` now serves the candidate correctly (auto reln + QK-Norm).
 - **Finish was nearly redundant.** Re-anchor's base (1.98) was still descending,
   so the flat-3e-5 finish only added ~0.06 (vs ~0.26 for the gg-clamp flagship,
   whose base had plateaued). A longer constant-LR base + later finish may extract
   more — open follow-up.
 
-## Recommendation
+## Recommendation — PROMOTED 2026-06-27
 
-Promote `chiron_1B_T16384_reanchor5B_finish.final` to production flagship
-(val ~1.92, −0.62 nat over the current 2.5) **pending**: (1) a multi-seed
-confirm (≥3 seeds) per Gate-0, and (2) the chiron_infer forwardInfer serving fix
-so it can be served. Both are follow-ups; the val result itself is verified.
+`chiron_1B_T16384_reanchor5B_finish.final` promoted to production flagship
+(val ~1.92, −0.62 nat over the prior 2.54) per owner direction on the single-seed
+evidence. CLAUDE.md + runner.sh updated; serving fix landed (`fffe70d`).
+**Backfilling**: multi-seed (≥3) Gate-0 confirm (seeds 2024/4242) in progress —
+the magnitude dwarfs seed variance so the direction isn't in doubt, but the formal
+gate is the lineage standard.

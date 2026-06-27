@@ -2,11 +2,77 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (data-scale ship 2026-06-22)
+## Current Production Flagship — CHIRON 1B @ T=16384 (reanchor cure ship 2026-06-27)
 
-The current production LLM flagship is **CHIRON 1B data-scale**
-(checkpoint `chiron_1B_T16384_datascale5B_finish_clean.final`). It is a
-**perplexity flagship**: −0.9/−1.0 nat val NLL over the prior SIRA+clamp ship,
+The current production LLM flagship is **CHIRON 1B reanchor-cure**
+(checkpoint `chiron_1B_T16384_reanchor5B_finish.final`). It is a **perplexity
+flagship**: verified **val NLL ~1.92, −0.62 nat over the prior data-scale ship
+(2.54)** — the second-largest single jump in the lineage. The gain comes not from
+more data but from **curing the q-side reverse-amplification instability at its
+source**, which was silently taxing perplexity ~0.7–0.8 nat under the prior
+gg-clamp containment.
+
+- **Shape**: identical to the data-scale ship — m=2048, L=24, nH=16, dH=256,
+  V=32000 BPE, T=16384; 870.94M params + 384 QK-Norm γ (persisted, CHRF bit 256).
+- **The mechanism — `--reln-reanchor` (ReLN reverse-consistency cure)**: the
+  q-side instability is a ReLN-backward overflow — the recomputed activation
+  `q_in` is normalized with **saved forward stats that have drifted**, inflating
+  `xhat` ~13× *before* the `dgamma = Σ_t dout·xhat` sum overflows it. The cure
+  (`chiron_reln_backward_reanchor`, glades-ml `gpu_chiron.cu`) re-derives
+  mean/invStd **from `q_in` itself** in the backward, so `xhat` is unit-RMS by
+  construction — near-identity on healthy steps, removes the inflation at its
+  source on drifted ones. This **replaces gg-clamp** (which only *contained* the
+  instability by clamping ‖g‖→1700–5400 every step past 1.6B — a containment that
+  silently crippled the optimization).
+- **Stack/recipe**: the data-scale ship recipe (see "Prior data-scale Flagship"
+  below) **MINUS `--grad-group-clamp`, PLUS `--reln-reanchor`** (default-off,
+  gated). Same two-stage schedule: constant `lr 3e-4` base to step 60000 (3.93B)
+  then flat `lr 3e-5` finish to 66000 (4.33B).
+- **Stability**: trained to **4.33B with 0 grad-skips, 0 bad-gradient triggers** —
+  the instability that killed the no-clamp control at 1.49B and that gg-clamp
+  fights chronically past 1.6B is a **non-event** here (‖g‖ ~1.0 throughout). No
+  prior run trained cleanly past ~2B.
+- **Verified val** (two independent methods, both vs the prior flagship):
+  trainer wide 32-batch val **1.92** (flagship 2.54); chiron_infer teacher-forcing
+  **1.78** (flagship 2.44 ≈ its documented 2.348). acc1 0.51 vs 0.36. The
+  finish checkpoint is ~0.06 better than the step-60000 base.
+- **Reproduce training** (two deterministic stages, from `~/dev/glades-trainer`):
+  1. base: `sh run.sh flagship --accum 4 --lr 3e-4 --warmup 750 --sira-warmup 250
+     --zloss-coef 1e-4 --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0
+     --sira-balance-weight 0.25 --sira-action-weight 0.0 --grad-clip 0.5
+     --dq-layer-clamp 1.0 --dq-embed-clamp 1.0 --reln-reanchor --steps 60000
+     --seed 1337 --save-every 6000` (NO `--grad-group-clamp`). Pre-create `--save`.
+  2. finish: resume the step-60000 checkpoint with `--lr 3e-5 --warmup 0
+     --no-resume-warmup --steps 66000 --reln-reanchor` + the same recipe flags.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
+  (prefers `chiron_1B_T16384_reanchor5B_finish.final`). **Serving fix (2026-06-27)**:
+  chiron_infer now **auto-enables `--fuse-attn-reln`** for SCFA checkpoints (no
+  per-layer `gamma_p`) — without it, the inference forward omitted the fusion and
+  gave teacher-forced nll ~63 (garbage) for ALL production checkpoints incl. every
+  prior flagship, on every serving path incl. `runner.sh`. Combined with the
+  earlier QK-Norm γ auto-enable (bit 256), inference now reproduces training val.
+- **Ship record / evidence**: `research/RELN_REANCHOR_GATE2_2026_06_27.md`
+  (Gate-2 result + verification + mechanism). Gate-1 (containment vs gg-clamp):
+  `research/RELN_REANCHOR_GATE1_2026_06_24.md`. Design/plan:
+  `docs/superpowers/specs/2026-06-23-reln-reverse-consistency-design.md`,
+  `docs/superpowers/plans/2026-06-23-reln-reverse-consistency.md`.
+- **Caveats**:
+  - **Single-seed (1337), promoted on owner direction; multi-seed (≥3) Gate-0
+    confirm is BACKFILLING.** The −0.62 nat magnitude dwarfs seed variance
+    (~0.02), so the direction is not in doubt, but the formal multi-seed gate is
+    in progress (seeds 2024/4242).
+  - **Perplexity flagship, not a generator** — same as all CHIRON flagships
+    (free generation is repetition-limited; the ship metric is val NLL).
+  - The flat-3e-5 finish added only ~0.06 here (vs ~0.26 for the gg-clamp
+    flagship) because re-anchor's base was still descending — a longer base +
+    later finish may extract more (open follow-up).
+
+## Prior data-scale Flagship — CHIRON 1B @ T=16384 (data-scale ship 2026-06-22, kept for context)
+
+The prior flagship **CHIRON 1B data-scale**
+(checkpoint `chiron_1B_T16384_datascale5B_finish_clean.final`) remains the recipe
+base for the reanchor-cure ship above (which swaps gg-clamp for `--reln-reanchor`).
+It is a **perplexity flagship**: −0.9/−1.0 nat val NLL over the prior SIRA+clamp ship,
 the largest single jump in the lineage, from training on **~10× more data**.
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context;
