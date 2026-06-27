@@ -18534,14 +18534,16 @@ void CHIRONDriftBackwardParityTest()
 	std::vector<float> dpc(T*m,0.f), dac(m,0.f), dgc(m,0.f), dbc(m,0.f);
 	glades::chiron::drift_backward(&dq[0],&p[0],&a[0],&gp[0],&bp[0],scale,T,m,eps,&dpc[0],&dac[0],&dgc[0],&dbc[0]);
 	// GPU.
-	glades::gpu::GpuBuffer<float> dP,dDQ,dA,dG,dB,dDP,dDA,dDG,dDB,dScratch;
+	glades::gpu::GpuBuffer<float> dP,dDQ,dA,dG,dB,dDP,dDA,dDG,dDB,dScrDu,dScrSdq,dScratch;
 	dP.allocate(T*m); dDQ.allocate(T*m); dA.allocate(m); dG.allocate(m); dB.allocate(m);
-	dDP.allocate(T*m); dDA.allocate(m); dDG.allocate(m); dDB.allocate(m); dScratch.allocate(2*T);
+	dDP.allocate(T*m); dDA.allocate(m); dDG.allocate(m); dDB.allocate(m);
+	dScrDu.allocate(T*m); dScrSdq.allocate(T*m); dScratch.allocate(2*T);
 	dP.upload(&p[0],T*m); dDQ.upload(&dq[0],T*m); dA.upload(&a[0],m); dG.upload(&gp[0],m); dB.upload(&bp[0],m);
 	// Backward grads ACCUMULATE — pre-zero all output buffers.
 	dDP.zero(); dDA.zero(); dDG.zero(); dDB.zero();
 	glades::gpu::chiron_drift_backward(dDQ.data(),dP.data(),dA.data(),dG.data(),dB.data(),scale,T,m,eps,
-	                                   dDP.data(),dDA.data(),dDG.data(),dDB.data(),dScratch.data());
+	                                   dDP.data(),dDA.data(),dDG.data(),dDB.data(),
+	                                   dScrDu.data(),dScrSdq.data(),dScratch.data());
 	std::vector<float> dpg(T*m),dag(m),dgg(m),dbg(m);
 	dDP.download(&dpg[0],T*m); dDA.download(&dag[0],m); dDG.download(&dgg[0],m); dDB.download(&dbg[0],m);
 	float me=0.f; for(int i=0;i<T*m;++i) me=fmaxf(me,fabsf(dpg[i]-dpc[i]));
@@ -18549,6 +18551,24 @@ void CHIRONDriftBackwardParityTest()
 	std::printf("  [CHIRON drift backward parity] maxErr=%.2e (bar 2e-4)\n", me);
 	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift backward CPU/GPU parity (maxErr=%.2e)",me);
 	ASSERT(msg, me < 2e-4f);
+
+	// Accumulation regression: call AGAIN without re-zeroing dp/da/dgamma/dbeta.
+	// Every one of the four output buffers must double (locks in that ALL FOUR
+	// ACCUMULATE — in particular dp, which previously OVERWROTE via the reanchor).
+	glades::gpu::chiron_drift_backward(dDQ.data(),dP.data(),dA.data(),dG.data(),dB.data(),scale,T,m,eps,
+	                                   dDP.data(),dDA.data(),dDG.data(),dDB.data(),
+	                                   dScrDu.data(),dScrSdq.data(),dScratch.data());
+	std::vector<float> dpg2(T*m),dag2(m),dgg2(m),dbg2(m);
+	dDP.download(&dpg2[0],T*m); dDA.download(&dag2[0],m); dDG.download(&dgg2[0],m); dDB.download(&dbg2[0],m);
+	bool ok=true;
+	for(int i=0;i<T*m;++i){ float e=fabsf(dpg2[i]-2.f*dpg[i]); if(e>=1e-4f*(1.f+fabsf(2.f*dpg[i]))) ok=false; }
+	for(int i=0;i<m;++i){
+		float ea=fabsf(dag2[i]-2.f*dag[i]); if(ea>=1e-4f*(1.f+fabsf(2.f*dag[i]))) ok=false;
+		float eg=fabsf(dgg2[i]-2.f*dgg[i]); if(eg>=1e-4f*(1.f+fabsf(2.f*dgg[i]))) ok=false;
+		float eb=fabsf(dbg2[i]-2.f*dbg[i]); if(eb>=1e-4f*(1.f+fabsf(2.f*dbg[i]))) ok=false;
+	}
+	std::printf("  [CHIRON drift backward accum] second call ~2x first: %s\n", ok?"PASS":"FAIL");
+	ASSERT("CHIRON drift backward accumulates dp/da/dgamma/dbeta", ok);
 #else
 	std::printf("  [CHIRON drift backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif

@@ -1220,29 +1220,37 @@ bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
                            const float* gamma, const float* beta, float scale,
                            int T, int m, float eps,
                            float* dp, float* da, float* dgamma, float* dbeta,
+                           float* scratch_du, float* scratch_sdq,
                            float* scratch_stats_split)
 {
 	if (T <= 0 || m <= 0) return true;
-	// Internal scratch: du and sdq, each [T, m].  Raw cudaMalloc per call (see
-	// header note); fine for the test, but Task 6 should pass pre-allocated
-	// scratch on the training hot path.
-	glades::gpu::GpuBuffer<float> du, sdq;
-	if (!du.allocate((size_t)T * m) || !sdq.allocate((size_t)T * m)) return false;
+	// du and sdq scratch (each [T, m]) are caller-owned (clobbered) — no
+	// per-call cudaMalloc on the training hot path (Task 6 wires these in).
 
 	int block = rowBlockSize(m);
 	int smemBytes = (block/32 + 2) * 2 * sizeof(float);
 	chiron_drift_pre_backward_rows<<<T, block, smemBytes, computeStream()>>>(
-	    p, dq_out, a, gamma, beta, scale, eps, m, du.data(), sdq.data());
+	    p, dq_out, a, gamma, beta, scale, eps, m, scratch_du, scratch_sdq);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
-	// da = colsum(sdq), accumulated.  One block per channel; deterministic.
+	// da += colsum(sdq).  One block per channel; deterministic.  Consumes
+	// scratch_sdq for da BEFORE we reuse it as the reanchor dp-temp below
+	// (both run on computeStream() → ordered).
 	int rblock = 256; int rsmem = (rblock/32 + 1) * sizeof(float);
-	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(sdq.data(), T, m, da);
+	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(scratch_sdq, T, m, da);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
-	// dp, dgamma, dbeta via the reanchor ReLN backward fed du + gamma_p.
-	return chiron_reln_backward_reanchor(du.data(), p, gamma, T, m, eps,
-	                                     dp, dgamma, dbeta, scratch_stats_split);
+	// dgamma/dbeta ACCUMULATE into the caller's buffers; the reanchor's dq_in
+	// path OVERWRITES, so route its dp output to scratch_sdq (free after
+	// col_accumulate) instead of the caller's dp.
+	if (!chiron_reln_backward_reanchor(scratch_du, p, gamma, T, m, eps,
+	                                   /*dq_in=*/scratch_sdq, dgamma, dbeta,
+	                                   scratch_stats_split))
+		return false;
+
+	// dp += drift dp contribution (so dp accumulates onto the downstream adjoint
+	// already held in dp, rather than clobbering it).
+	return axpy(1.0f, scratch_sdq, dp, T * m);
 }
 
 // ===========================================================================
