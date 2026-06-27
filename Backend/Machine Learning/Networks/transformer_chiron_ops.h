@@ -193,6 +193,77 @@ inline void reln_inverse(const float* q_out, float* q_in, const float* stats_in,
 }
 
 // ------------------------------------------------------------------
+// OBSD per-layer drift (CPU reference).  Forward (sign=+1): q += scale·a ⊙ tanh(gamma·x̂ + beta),
+// x̂ = (p−μ)/σ, μ,σ the per-row mean/std of p.  Inverse (sign=−1): subtract the same term
+// (recompute x̂ from p, which is untouched by the drift).  Parameter-free normalize: μ,σ carry
+// no learnable affine; gamma=M⁻¹ and beta act AFTER the normalize, INSIDE the tanh.
+inline void drift_into_q_row(const float* p, float* q, const float* a,
+                             const float* gamma, const float* beta,
+                             float sign, float scale, unsigned int m, float eps)
+{
+	double sum=0.0; for (unsigned i=0;i<m;++i) sum += p[i];
+	const float mu = (float)(sum/(double)m);
+	double vs=0.0; for (unsigned i=0;i<m;++i){ float d=p[i]-mu; vs += (double)d*d; }
+	const float sigma = sqrtf((float)(vs/(double)m) + eps);
+	const float inv = 1.0f/sigma;
+	for (unsigned i=0;i<m;++i){
+		float xhat = (p[i]-mu)*inv;
+		float u = gamma[i]*xhat + beta[i];
+		q[i] += sign*scale*a[i]*tanhf(u);
+	}
+}
+
+inline void drift_into_q(const float* p, float* q, const float* a,
+                         const float* gamma, const float* beta,
+                         float sign, float scale, unsigned int T, unsigned int m, float eps)
+{
+	for (unsigned t=0;t<T;++t)
+		drift_into_q_row(p + t*m, q + t*m, a, gamma, beta, sign, scale, m, eps);
+}
+
+// OBSD drift backward (CPU reference).  Given dq_out and p (μ,σ re-derived from p — reanchor),
+// accumulate da, dgamma(=dM⁻¹), dbeta, and dp.  Chain:
+//   u = gamma·x̂ + beta ; s = tanh(u) ; q_out = q_in + scale·a·s
+//   da    += Σ_t scale·s·dq_out
+//   du     = scale·a·(1−s²)·dq_out ;  dgamma += Σ_t du·x̂ ;  dbeta += Σ_t du
+//   dp     = normalize_backward(du as dout, p, gamma=1)   [parameter-free; reanchored stats]
+// dp/da/dgamma/dbeta are ACCUMULATED (pre-zero by caller).
+inline void drift_backward(const float* dq_out, const float* p, const float* a,
+                           const float* gamma, const float* beta, float scale,
+                           unsigned int T, unsigned int m, float eps,
+                           float* dp, float* da, float* dgamma, float* dbeta)
+{
+	for (unsigned t=0;t<T;++t)
+	{
+		const float* pr = p + t*m; const float* dr = dq_out + t*m; float* dpr = dp + t*m;
+		double sum=0.0; for (unsigned i=0;i<m;++i) sum+=pr[i];
+		const float mu=(float)(sum/(double)m);
+		double vs=0.0; for (unsigned i=0;i<m;++i){ float d=pr[i]-mu; vs+=(double)d*d; }
+		const float sigma=sqrtf((float)(vs/(double)m)+eps); const float inv=1.0f/sigma;
+		// Per-row du (=dL/du), and the grad flowing into the parameter-free
+		// normalize: g_i = dL/dx̂_i = du_i·gamma_i (the affine gamma·x̂ sits
+		// BETWEEN x̂ and the loss, so it carries into the LN-backward upstream).
+		std::vector<float> xhat(m), g(m);
+		double sum_g=0.0, sum_g_xh=0.0;
+		for (unsigned i=0;i<m;++i){
+			float xh=(pr[i]-mu)*inv; xhat[i]=xh;
+			float u=gamma[i]*xh+beta[i]; float s=tanhf(u); float sp=1.0f-s*s;
+			da[i]     += scale*s*dr[i];
+			float dui = scale*a[i]*sp*dr[i];
+			dgamma[i] += dui*xh;            // dM⁻¹ = Σ_t dL/du·x̂
+			dbeta[i]  += dui;
+			float gi  = dui*gamma[i]; g[i]=gi;
+			sum_g     += gi; sum_g_xh += (double)gi*xh;
+		}
+		const float mean_g=(float)(sum_g/(double)m), mean_g_xh=(float)(sum_g_xh/(double)m);
+		// Standard LN-backward for a parameter-free normalize y=(p−μ)/σ, with
+		// upstream grad g (=dL/dx̂):  dp_i = (1/σ)·( g_i − mean(g) − x̂_i·mean(g·x̂) )
+		for (unsigned i=0;i<m;++i)
+			dpr[i] += inv*( g[i] - mean_g - xhat[i]*mean_g_xh );
+	}
+}
+
+// ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //
 // To prevent BF16 round-off from compounding across the block-inverse

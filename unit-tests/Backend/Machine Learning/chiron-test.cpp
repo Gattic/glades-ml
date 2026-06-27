@@ -11483,6 +11483,7 @@ void CHIRONUnitTest()
 	CHIRONCublasTiledAttentionBackwardParityTest();
 	CHIRONCublasTiledAttentionBf16ParityTest();
 	CHIRONProductionScaleMemoryTest();
+	CHIRONDriftGradCheckTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18394,4 +18395,57 @@ void CHIRONRelnReanchorTest()
 #else
 	std::printf("  [CHIRON reln-bwd reanchor] built without CUDA — skipped\n");
 #endif
+}
+
+// Objective helper for the FD grad-check: J = sum_{t,i} dq[t,i] * q_out[t,i],
+// q_out = q_in (implicitly 0 here) + drift(p).  Recomputed each perturbation.
+// (Helper-function form rather than a GCC statement-expression macro — the
+// codebase uses no statement-expressions and this stays portable C++98.)
+static double drift_J(const std::vector<float>& p, const std::vector<float>& a,
+                      const std::vector<float>& gp, const std::vector<float>& bp,
+                      float scale, unsigned int T, unsigned int m, float eps,
+                      const std::vector<float>& dq)
+{
+	std::vector<float> qo(p.size(), 0.0f);
+	glades::chiron::drift_into_q(&p[0], &qo[0], &a[0], &gp[0], &bp[0], +1.0f, scale, T, m, eps);
+	double J = 0.0;
+	for (unsigned int k = 0; k < T*m; ++k) J += (double)dq[k] * qo[k];
+	return J;
+}
+
+// Finite-difference check of the CPU drift backward against the CPU forward.
+// Objective J = sum_{t,i} dq_out[t,i] * q_out[t,i], q_out = q_in + drift(p).
+void CHIRONDriftGradCheckTest()
+{
+	const unsigned int T = 4, m = 8;
+	const float eps = 1e-4f, scale = 1.0f;
+	std::vector<float> p(T*m), a(m), gp(m), bp(m), dq(T*m);
+	for (unsigned i=0;i<T*m;++i){ p[i]=0.3f*sinf(0.7f*i+1.f); dq[i]=0.2f*cosf(0.3f*i); }
+	for (unsigned i=0;i<m;++i){ a[i]=0.5f+0.1f*i; gp[i]=1.0f+0.05f*i; bp[i]=0.02f*i; }
+
+	// Analytic grads.
+	std::vector<float> da(m,0.f), dgp(m,0.f), dbp(m,0.f), dp(T*m,0.f);
+	glades::chiron::drift_backward(&dq[0], &p[0], &a[0], &gp[0], &bp[0], scale,
+	                               T, m, eps, &dp[0], &da[0], &dgp[0], &dbp[0]);
+
+	const float h = 1e-3f;
+	float maxRelErr = 0.f;
+	for (unsigned j=0;j<m;++j){            // check da[j]
+		float save=a[j]; a[j]=save+h; double Jp=drift_J(p,a,gp,bp,scale,T,m,eps,dq); a[j]=save-h; double Jm=drift_J(p,a,gp,bp,scale,T,m,eps,dq); a[j]=save;
+		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-da[j])/(1e-3f+fabsf(fd));
+		if(e>maxRelErr)maxRelErr=e;
+	}
+	for (unsigned j=0;j<m;++j){            // check dgp[j]
+		float save=gp[j]; gp[j]=save+h; double Jp=drift_J(p,a,gp,bp,scale,T,m,eps,dq); gp[j]=save-h; double Jm=drift_J(p,a,gp,bp,scale,T,m,eps,dq); gp[j]=save;
+		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dgp[j])/(1e-3f+fabsf(fd));
+		if(e>maxRelErr)maxRelErr=e;
+	}
+	for (unsigned k=0;k<T*m;++k){          // check dp[k]
+		float save=p[k]; p[k]=save+h; double Jp=drift_J(p,a,gp,bp,scale,T,m,eps,dq); p[k]=save-h; double Jm=drift_J(p,a,gp,bp,scale,T,m,eps,dq); p[k]=save;
+		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dp[k])/(1e-3f+fabsf(fd));
+		if(e>maxRelErr)maxRelErr=e;
+	}
+	std::printf("  [CHIRON drift FD grad-check] maxRelErr=%.4f (bar 2e-2)\n", maxRelErr);
+	char msg[128]; snprintf(msg,sizeof(msg),"CHIRON drift backward FD grad-check (maxRelErr=%.4f)",maxRelErr);
+	ASSERT(msg, maxRelErr < 2e-2f);
 }
