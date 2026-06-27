@@ -892,6 +892,70 @@ bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
 }
 
 // ===========================================================================
+//  2c. OBSD per-layer drift (richer symplectic block — Task 2).
+// ===========================================================================
+//
+// Forward (sign=+1): q[i] += scale·a[i]·tanh(gamma[i]·x̂ + beta[i]),
+//   x̂ = (p[i] − μ) / σ, with μ,σ the per-row mean/std of p (parameter-free
+//   normalize, μ,σ over the m channels of the row).  Inverse (sign=−1)
+//   subtracts the same term.  The drift never modifies p, so the inverse
+//   recomputes x̂ from p exactly and reconstructs q.  No stats are emitted
+//   (μ,σ are re-derived from p in both directions and in the backward).
+
+namespace {
+
+__global__ void chiron_drift_into_q_rows(const float* __restrict__ p,
+                                         const float* __restrict__ a,
+                                         const float* __restrict__ gamma,
+                                         const float* __restrict__ beta,
+                                         float sign, float scale, float eps, int cols,
+                                         float* __restrict__ q)
+{
+	int row = blockIdx.x;
+	const float* xRow = p + (size_t)row * cols;
+	float*       qRow = q + (size_t)row * cols;
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	__shared__ float sMean, sSigma;
+
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) { float d = xRow[i]-mu; v += d*d; }
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) { float var = v/(float)cols + eps; sSigma = sqrtf(var); }
+	__syncthreads();
+	const float inv_sigma = 1.0f / sSigma;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float xhat = (xRow[i] - mu) * inv_sigma;
+		float u = gamma[i] * xhat + beta[i];
+		qRow[i] += sign * scale * a[i] * tanhf(u);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_drift_into_q(const float* p, float* q, const float* a,
+                         const float* gamma, const float* beta,
+                         float sign, float scale, int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_drift_into_q_rows<<<T, block, smemBytes, computeStream()>>>(
+	    p, a, gamma, beta, sign, scale, eps, m, q);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  3. Reversible LayerNorm (ReLN) inverse.
 // ===========================================================================
 //

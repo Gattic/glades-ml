@@ -18454,3 +18454,62 @@ void CHIRONDriftGradCheckTest()
 	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift backward FD grad-check (maxRelErr=%.4f)",maxRelErr);
 	ASSERT(msg, maxRelErr < 2e-2f);
 }
+
+// GPU forward parity for the OBSD drift kernel against the CPU reference.
+void CHIRONDriftCpuGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON drift GPU parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=5, m=16; const float eps=1e-4f, scale=0.9f;
+	std::vector<float> p(T*m), q0(T*m), a(m), gp(m), bp(m);
+	for (int i=0;i<T*m;++i){ p[i]=0.4f*sinf(0.5f*i); q0[i]=0.1f*i; }
+	for (int i=0;i<m;++i){ a[i]=0.3f+0.02f*i; gp[i]=1.0f; bp[i]=0.0f; }
+	// CPU.
+	std::vector<float> qc=q0;
+	glades::chiron::drift_into_q(&p[0], &qc[0], &a[0], &gp[0], &bp[0], +1.f, scale, T, m, eps);
+	// GPU.
+	glades::gpu::GpuBuffer<float> dP, dQ, dA, dG, dB;
+	dP.allocate(T*m); dQ.allocate(T*m); dA.allocate(m); dG.allocate(m); dB.allocate(m);
+	dP.upload(&p[0], T*m); dQ.upload(&q0[0], T*m); dA.upload(&a[0], m); dG.upload(&gp[0], m); dB.upload(&bp[0], m);
+	glades::gpu::chiron_drift_into_q(dP.data(), dQ.data(), dA.data(), dG.data(), dB.data(), +1.f, scale, T, m, eps);
+	std::vector<float> qg(T*m); dQ.download(&qg[0], T*m);
+	float maxErr=0.f; for(int i=0;i<T*m;++i){ float e=fabsf(qg[i]-qc[i]); if(e>maxErr)maxErr=e; }
+	std::printf("  [CHIRON drift GPU parity] maxErr=%.2e (bar 1e-4)\n", maxErr);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift fwd CPU/GPU parity (maxErr=%.2e)",maxErr);
+	ASSERT(msg, maxErr < 1e-4f);
+#else
+	std::printf("  [CHIRON drift GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// Reversibility: forward then inverse (sign flip) reconstructs q on the GPU path.
+void CHIRONDriftReversibilityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON drift reversibility] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=5, m=16; const float eps=1e-4f, scale=1.0f;
+	std::vector<float> p(T*m), q0(T*m), a(m), gp(m), bp(m);
+	for (int i=0;i<T*m;++i){ p[i]=0.4f*sinf(0.5f*i+0.3f); q0[i]=0.7f*cosf(0.2f*i); }
+	for (int i=0;i<m;++i){ a[i]=0.5f; gp[i]=1.1f; bp[i]=0.05f; }
+	glades::gpu::GpuBuffer<float> dP, dQ, dA, dG, dB;
+	dP.allocate(T*m); dQ.allocate(T*m); dA.allocate(m); dG.allocate(m); dB.allocate(m);
+	dP.upload(&p[0],T*m); dQ.upload(&q0[0],T*m); dA.upload(&a[0],m); dG.upload(&gp[0],m); dB.upload(&bp[0],m);
+	glades::gpu::chiron_drift_into_q(dP.data(),dQ.data(),dA.data(),dG.data(),dB.data(),+1.f,scale,T,m,eps); // forward
+	glades::gpu::chiron_drift_into_q(dP.data(),dQ.data(),dA.data(),dG.data(),dB.data(),-1.f,scale,T,m,eps); // inverse
+	std::vector<float> qb(T*m); dQ.download(&qb[0],T*m);
+	float maxErr=0.f; for(int i=0;i<T*m;++i){ float e=fabsf(qb[i]-q0[i]); if(e>maxErr)maxErr=e; }
+	std::printf("  [CHIRON drift reversibility] maxErr=%.2e (bar 1e-5)\n", maxErr);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"CHIRON drift fwd∘inv reconstructs q (maxErr=%.2e)",maxErr);
+	ASSERT(msg, maxErr < 1e-5f);
+#else
+	std::printf("  [CHIRON drift reversibility] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

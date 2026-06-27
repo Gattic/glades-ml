@@ -185,6 +185,13 @@ bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
                               const float* gamma, const float* beta,
                               float alpha, int T, int m, float eps);
 
+// OBSD per-layer drift.  q += sign·scale·a ⊙ tanh(gamma·(p−μ)/σ + beta), μ,σ per-row of p.
+// sign=+1 forward, sign=−1 inverse (recomputes from p, which the drift never modifies).
+// gamma = M⁻¹ (init 1), beta = b (init 0), a = ReZero gate (init 0).  No stats output.
+bool chiron_drift_into_q(const float* p, float* q, const float* a,
+                         const float* gamma, const float* beta,
+                         float sign, float scale, int T, int m, float eps);
+
 // Inverse: given q_out and the stats produced by the forward, recovers q_in.
 //   q_in[i] = sigma * (q_out[i] - beta[i]) / gamma[i] + mu
 // where sigma = stats[t, 1] and mu = stats[t, 0].
@@ -684,6 +691,9 @@ inline bool flash_attention_cublas_tiled_bf16_vpre_obf16(const float*, const flo
 inline bool chiron_reln_axpy_into_q(const float*, float*, float*,
                                      const float*, const float*,
                                      float, int, int, float) { return false; }
+inline bool chiron_drift_into_q(const float*, float*, const float*,
+                                const float*, const float*,
+                                float, float, int, int, float) { return false; }
 inline bool chiron_reln_inverse(const float*, float*, const float*,
                                  const float*, const float*,
                                  int, int) { return false; }
