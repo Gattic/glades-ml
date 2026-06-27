@@ -1,0 +1,279 @@
+// Intuitive CHIRON production flagship architecture diagram.
+//
+// Runtime source of truth:
+// - /home/robert/dev/glades-trainer/run.sh: `flagship` assembly.
+// - /home/robert/dev/glades-trainer/runner.sh: `--flagship` checkpoint priority.
+// - /home/robert/dev/glades-trainer/trainer/chiron_main.cpp: model dataflow.
+//
+// Library/research sources:
+// - CLAUDE.md: current production flagship notes.
+// - research/CHIRON_framework.md: reversible-flow architecture.
+// - research/REGSTACK_PHASE2_2026_05_22.md: QK-Norm + Z-loss ship.
+// - research/RELN_REANCHOR_GATE2_2026_06_27.md: current reanchor-cure ship.
+// - research/V5_FP8_30K_PHASE2_PASS_2026_05_22.md: v5+FP8 base.
+
+digraph ChironFlagshipArchitecture {
+	graph [
+		rankdir=TB,
+		bgcolor="#fbfaf7",
+		pad=0.35,
+		nodesep=0.45,
+		ranksep=0.55,
+		splines=spline,
+		fontname="Inter,Arial,sans-serif",
+		labelloc=t,
+		label=<
+			<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="4">
+				<TR><TD><FONT POINT-SIZE="25"><B>CHIRON 1B reanchor-cure Flagship</B></FONT></TD></TR>
+				<TR><TD><FONT POINT-SIZE="13">The simple model: tokens become q, attention writes into p, q is normalized and read out, training reverses the stack.</FONT></TD></TR>
+				<TR><TD><FONT POINT-SIZE="11">T=16384 | m=2048 | L=24 | nH=16 | dH=256 | V=32000 | 870.94M params | checkpoint chiron_1B_T16384_reanchor5B_finish.final</FONT></TD></TR>
+			</TABLE>
+		>
+	];
+
+	node [
+		shape=rect,
+		style="rounded,filled",
+		fontname="Inter,Arial,sans-serif",
+		fontsize=11,
+		margin="0.12,0.08",
+		color="#3f4a54",
+		penwidth=1.25,
+		fillcolor="#ffffff"
+	];
+
+	edge [
+		fontname="Inter,Arial,sans-serif",
+		fontsize=10,
+		color="#54616d",
+		arrowsize=0.8,
+		penwidth=1.2
+	];
+
+	run [
+		label=<
+			<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+				<TR><TD><B>Runtime entry points</B></TD></TR>
+				<TR><TD ALIGN="LEFT">train: ~/dev/glades-trainer/run.sh flagship</TD></TR>
+				<TR><TD ALIGN="LEFT">infer: ~/dev/glades-trainer/runner.sh --flagship</TD></TR>
+			</TABLE>
+		>,
+		fillcolor="#e9f0ef"
+	];
+
+	{
+		rank=same;
+
+		tokens [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>1. Tokens</B></TD></TR>
+					<TR><TD ALIGN="LEFT">BPE token ids</TD></TR>
+					<TR><TD ALIGN="LEFT">one 16k-token window</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fff0c9"
+		];
+
+		embed [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>2. Tied embedding</B></TD></TR>
+					<TR><TD ALIGN="LEFT">E: 32000 x 2048</TD></TR>
+					<TR><TD ALIGN="LEFT">q0 = E[token]</TD></TR>
+					<TR><TD ALIGN="LEFT">p0 = 0</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fff0c9"
+		];
+
+		phase [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>3. Phase state</B></TD></TR>
+					<TR><TD ALIGN="LEFT">q = content stream</TD></TR>
+					<TR><TD ALIGN="LEFT">p = accumulated attention momentum</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#eef6fb"
+		];
+
+		stack [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>4. Repeat 24x</B></TD></TR>
+					<TR><TD ALIGN="LEFT">CHIRON reversible block</TD></TR>
+					<TR><TD ALIGN="LEFT">stores tiny ReLN stats, not full activations</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#eef6fb"
+		];
+
+		readout [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>5. Tied readout</B></TD></TR>
+					<TR><TD ALIGN="LEFT">logits = qL * E^T</TD></TR>
+					<TR><TD ALIGN="LEFT">FP8 forward path, BF16 logits storage</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fff0c9"
+		];
+
+		output [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>6. Next-token distribution</B></TD></TR>
+					<TR><TD ALIGN="LEFT">softmax probabilities</TD></TR>
+					<TR><TD ALIGN="LEFT">or sampled next token at inference</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fff0c9"
+		];
+	}
+
+	run -> tokens [style=dashed, label="shape + checkpoint"];
+	tokens -> embed;
+	embed -> phase;
+	phase -> stack;
+	stack -> readout;
+	readout -> output;
+
+	subgraph cluster_block {
+		label="Inside one CHIRON block";
+		color="#90a7b8";
+		fillcolor="#edf6fa";
+		style="rounded,filled";
+		fontname="Inter,Arial,sans-serif";
+		fontsize=14;
+
+		block_note [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="7" COLOR="#90a7b8">
+					<TR>
+						<TD BGCOLOR="#dbeaf0"><B>q branch</B><BR ALIGN="LEFT"/>q_l is never overwritten by attention.<BR ALIGN="LEFT"/>It is normalized by ReLN.</TD>
+						<TD BGCOLOR="#ffffff"><B>SCFA attention</B><BR ALIGN="LEFT"/>Compute Y(q_l) with compressed attention.<BR ALIGN="LEFT"/>QK-Norm stabilizes Q/K at long context.</TD>
+						<TD BGCOLOR="#dbeaf0"><B>p branch</B><BR ALIGN="LEFT"/>p_{l+1} = p_l + Y(q_l)<BR ALIGN="LEFT"/>This additive shear is easy to invert.</TD>
+					</TR>
+					<TR>
+						<TD BGCOLOR="#ffffff" COLSPAN="3"><B>Then:</B> q_{l+1} = ReLN(q_l). On the last layer only, p is folded into q before ReLN so the readout sees the accumulated attention signal.</TD>
+					</TR>
+				</TABLE>
+			>,
+			shape=plain
+		];
+	}
+
+	stack -> block_note [style=dashed, label="zoom"];
+
+	subgraph cluster_train {
+		label="Training-only loop";
+		color="#bd8a82";
+		fillcolor="#fbefed";
+		style="rounded,filled";
+		fontname="Inter,Arial,sans-serif";
+		fontsize=14;
+
+		loss [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>Loss</B></TD></TR>
+					<TR><TD ALIGN="LEFT">cross entropy</TD></TR>
+					<TR><TD ALIGN="LEFT">+ Z-loss, coef 1e-4</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fde3dc"
+		];
+
+		sira [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>Terminal SIRA</B></TD></TR>
+					<TR><TD ALIGN="LEFT">regularizes only final (qL, pL)</TD></TR>
+					<TR><TD ALIGN="LEFT">coef 1e-2, warmup 1000</TD></TR>
+					<TR><TD ALIGN="LEFT">energy 1.0, balance 0.25, action 0.0</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fde3dc"
+		];
+
+		backward [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>Reverse the blocks</B></TD></TR>
+					<TR><TD ALIGN="LEFT">start with dqL from readout and dpL = 0</TD></TR>
+					<TR><TD ALIGN="LEFT">walk layer 23 down to 0</TD></TR>
+					<TR><TD ALIGN="LEFT">recompute/invert each shear</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#ffffff"
+		];
+
+		clamps [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>q-side instability handling</B></TD></TR>
+					<TR><TD ALIGN="LEFT">ReLN reverse-consistency re-anchor (the cure; replaced gg-clamp)</TD></TR>
+					<TR><TD ALIGN="LEFT">dq-layer clamp at every layer boundary</TD></TR>
+					<TR><TD ALIGN="LEFT">dq-embed clamp before embedding scatter</TD></TR>
+					<TR><TD ALIGN="LEFT">tau = 1.0; inert on healthy rows</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#fde3dc"
+		];
+
+		optimizer [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>Update weights</B></TD></TR>
+					<TR><TD ALIGN="LEFT">int8 Adam state</TD></TR>
+					<TR><TD ALIGN="LEFT">BF16 weights + BF16 grad accumulators</TD></TR>
+					<TR><TD ALIGN="LEFT">lr 7.5e-5, grad clip 0.5</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#ffffff"
+		];
+
+		{
+			rank=same;
+			loss;
+			sira;
+			backward;
+			clamps;
+			optimizer;
+		}
+	}
+
+	block_note -> loss [style=invis, weight=8];
+	readout -> loss [style=dashed, label="training", constraint=false];
+	loss -> sira;
+	sira -> backward;
+	backward -> clamps;
+	clamps -> optimizer;
+	optimizer -> embed [style=dashed, label="updates E and block weights", constraint=false];
+
+	subgraph cluster_impl {
+		label="What makes the 1B/16k run fit and move fast";
+		color="#9c8ab7";
+		fillcolor="#f3eff9";
+		style="rounded,filled";
+		fontname="Inter,Arial,sans-serif";
+		fontsize=14;
+
+		impl [
+			label=<
+				<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3">
+					<TR><TD><B>Shipped support stack</B></TD></TR>
+					<TR><TD ALIGN="LEFT">v5+FP8 base: CUDA 13.2 BF16 fix, SCFA B cache, FP8 readout</TD></TR>
+					<TR><TD ALIGN="LEFT">regstack: QK-Norm + Z-loss</TD></TR>
+					<TR><TD ALIGN="LEFT">cast-elim: BF16 mirror side-writes; default ON since 2026-06-12</TD></TR>
+					<TR><TD ALIGN="LEFT">current result: NLL 3.5062 at 30k, about 28.1k tok/s, about 14.7 GB VRAM</TD></TR>
+				</TABLE>
+			>,
+			fillcolor="#ffffff"
+		];
+	}
+
+	impl -> stack [style=dotted, label="kernel/storage path"];
+	impl -> readout [style=dotted, label="FP8/BF16"];
+}
