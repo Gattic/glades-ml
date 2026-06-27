@@ -99,13 +99,37 @@ gate learning. The naive linear coupling has rising ‖g‖, a stuck loss, and h
 - These are **stability/sanity** results, NOT perplexity results. Loss numbers at 40 steps / T=2048
   are not a val-NLL claim.
 
-## What remains: the production quality gate (E3/E4) — the unsettled FM-1 bet
+## Production-scale stability (de-risk probe) — PASS
 
-The central design risk (spec §11 FM-1): the coupling strong enough to *lower val NLL* may exceed the
-BF16-safe budget. Unanswered until run at production scale:
+Short full-T=16384 run (50 steps, full flagship recipe + `--per-layer-drift --drift-warmup 40`):
+**0 grad-skips, ‖g‖ bounded 0.87–3.4**, loss descending 10.77→8.73, `[obsd]` B ramping to 1.31,
+tok/s ~24.3k, VRAM ~15.3 GB (fits). **This is the regime where the naive per-layer coupling
+catastrophically exploded (‖g‖ 1e6–1e18 at step 1); OBSD is stable.** Stability half of FM-1
+confirmed at production geometry.
 
-- **E3 — budget sweep** (production shape, ≤5k steps each, a few hours): vary `--drift-warmup` /
-  init scale; record val NLL vs the flagship's 5k baseline, `[obsd]` B, 0-skip status; pick `B*`.
+## E3 — budget sweep (PASS: OBSD lowers val NLL)
+
+Production shape (T=16384, L=24, m=2048), full flagship recipe, 2500 steps, matched seed 1337,
+wide val (8 batches, 8.39M tok):
+
+| config | val NLL @ 2500 | ppl | acc1 | grad-skips | gate maxA / B |
+|---|---|---|---|---|---|
+| baseline (no drift) | 3.7409 | 42.14 | 0.1318 | 0 | — |
+| **OBSD `--drift-warmup 250`** | **3.7038** | **40.60** | 0.1324 | 0 | 0.456 / 12.4 |
+| OBSD `--drift-warmup 1000` | 3.7088 | 40.80 | 0.1332 | 0 | 0.541 / 12.8 |
+
+**Both OBSD configs beat the baseline at matched steps; best `--drift-warmup 250` = −0.0371 nat**
+(w1000 = −0.0321). 0 grad-skips throughout; the gate learns to a_drift ~0.46 (not stuck at 0), so
+the coupling is genuinely active. **B\* ≈ warmup 250.** Caveats: this is a 2500-step *sign*, not the
+66k ship number — whether −0.037 nat holds/grows/shrinks to full training is the E4 question; the
+margin is modest so far (cf. reanchor −0.62, data-scale −0.9, both at full training).
+
+**Wall cost:** OBSD ~+12% (tok/s 24.3k vs 27.3k) to ~+19% (wall-clock incl. fixed overhead) — above
+the design's +8–10% estimate. The uncoalesced `chiron_col_accumulate` reduction (flagged in review)
+is a likely contributor and is optimizable (2-phase tiled reduction) if wall matters at ship time.
+
+## What remains: E4 — the full quality gate (the unsettled ship question)
+
 - **E4 — quality gate** (production shape, ~60k steps ≈ 1–1.5 days, single seed 1337): full flagship
   recipe + `--per-layer-drift --drift-warmup <best>`. **Ship iff val NLL < 1.92, 0 grad-skips,
   wall ≤ +10%, reconstruction within BF16 ULP.** If it does not beat 1.92 → record the negative
