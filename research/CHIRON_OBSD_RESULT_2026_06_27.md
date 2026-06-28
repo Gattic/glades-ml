@@ -128,6 +128,30 @@ margin is modest so far (cf. reanchor −0.62, data-scale −0.9, both at full t
 the design's +8–10% estimate. The uncoalesced `chiron_col_accumulate` reduction (flagged in review)
 is a likely contributor and is optimizable (2-phase tiled reduction) if wall matters at ship time.
 
+## E3 extension (de-risk to 7500) — PASS: gap robust & non-shrinking
+
+Resumed base + w250 from their 2500 checkpoints to 7500 (val every 625, 8 batches), **0 grad-skips
+in both**. OBSD beats baseline at **all 9 checkpoints**:
+
+| step | base | w250 | gap | step | base | w250 | gap |
+|---|---|---|---|---|---|---|---|
+| 2500 | 3.706 | 3.654 | +0.052 | 5625 | 3.585 | 3.536 | +0.049 |
+| 3125 | 3.673 | 3.628 | +0.045 | 6250 | 3.717 | 3.677 | +0.040 |
+| 3750 | 3.719 | 3.663 | +0.057 | 6875 | 3.835 | 3.776 | +0.059 |
+| 4375 | 3.799 | 3.759 | +0.040 | 7500 | 4.116 | 4.045 | **+0.071** |
+| 5000 | 3.628 | 3.574 | +0.055 | | | | |
+
+Mean gap ~+0.052 nat, largest at the end (+0.071) — **robust, not a fluke, holding/slightly
+growing.** Both trajectories share correlated val-window noise (the 7500 spike hits both, cancels in
+the gap). **Gate strengthening (watch-point):** OBSD `maxA` 0.46→**1.11**, ‖g‖ →~0.8 (moderate clip,
+scale ~0.6), B proxy 12→18 — heavily used, still 0 skips. Monitor for grad-skips as the gate grows
+through 30k.
+
+## E4 — RUNNING (30k, resume both from 7500; launched 2026-06-28)
+
+`/tmp/obsd_e3/e4.sh` → `e4_w250.log` (OBSD, ~17 hr) then `e4_base.log` (matched baseline, ~14 hr).
+Verdict pending; criterion below.
+
 ## What remains: E4 — the quality gate (the unsettled ship question)
 
 - **E4 — quality gate** (production shape, **30k steps** — owner decision 2026-06-28: 30k is
