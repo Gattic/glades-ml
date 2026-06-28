@@ -128,13 +128,19 @@ margin is modest so far (cf. reanchor −0.62, data-scale −0.9, both at full t
 the design's +8–10% estimate. The uncoalesced `chiron_col_accumulate` reduction (flagged in review)
 is a likely contributor and is optimizable (2-phase tiled reduction) if wall matters at ship time.
 
-## What remains: E4 — the full quality gate (the unsettled ship question)
+## What remains: E4 — the quality gate (the unsettled ship question)
 
-- **E4 — quality gate** (production shape, ~60k steps ≈ 1–1.5 days, single seed 1337): full flagship
-  recipe + `--per-layer-drift --drift-warmup <best>`. **Ship iff val NLL < 1.92, 0 grad-skips,
-  wall ≤ +10%, reconstruction within BF16 ULP.** If it does not beat 1.92 → record the negative
-  (FM-1 realized: stable but at flagship perplexity); leave `--per-layer-drift` as a default-off,
-  validated, documented flag.
+- **E4 — quality gate** (production shape, **30k steps** — owner decision 2026-06-28: 30k is
+  sufficient, no 60k — single seed 1337): full flagship recipe + `--per-layer-drift
+  --drift-warmup <best>`, vs a **matched flagship-recipe baseline at 30k** (resume both from the
+  7500 extension checkpoints `ext_{base,w250}.final`).
+  - **Criterion (note: the absolute 1.92 is a FULL-training endpoint, NOT a 30k number — at 30k
+    both runs are mid-training):** validate iff OBSD@30k beats the matched baseline@30k by a clear,
+    non-shrinking margin with **0 grad-skips** and reconstruction within BF16 ULP. A confirmed +Δ at
+    30k means the mechanism is a real improvement; the production checkpoint (to reach the lineage's
+    ~1.92-class endpoint) would then be a separate full-deployment training run.
+  - If the margin shrinks toward 0 by 30k or stability degrades → record the negative (FM-1
+    realized: stable but not a perplexity win); leave `--per-layer-drift` default-off, documented.
 - **Multi-seed confirmation** capped at 5k–15k steps/seed (`{2024,4242}`) — sign + cross-seed
   stability only (owner cost-control decision).
 
