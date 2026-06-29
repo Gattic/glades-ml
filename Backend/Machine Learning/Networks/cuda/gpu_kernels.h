@@ -465,6 +465,11 @@ bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
 // before the global-norm sum.  See research/QSIDE_INSTABILITY_INVESTIGATION_2026_06_14.md.
 bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount);
 
+// Elementwise hard cap: clamp each element of x to [-cap, +cap].  No-op (returns
+// true) on n<=0 or cap<=0.  Used by the OBSD a_drift gate cap (--drift-gate-cap,
+// bounded-gate salvage for the un-capped gate that grew to maxA ~1.8).
+bool clamp_abs(float* x, int n, float cap);
+
 // Adaptive Gradient Clipping (AGC, Phase 1): clip g to lambda*max(‖w‖, eps),
 // auto-scaled to the parameter norm.  d_count may be NULL.  Returns false on
 // invalid args / lambda<=0.  See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
@@ -1265,6 +1270,7 @@ inline bool embedding_scatter_add(float*, const int*, const float*, int, int, in
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
 inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
 inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
+inline bool clamp_abs(float*, int, float) { return false; }
 inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { return false; }
 inline bool gradient_centralize(float*, int, int) { return false; }
 inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }

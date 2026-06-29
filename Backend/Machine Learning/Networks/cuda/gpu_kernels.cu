@@ -1881,6 +1881,24 @@ bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount)
 	return true;
 }
 
+__global__ void clamp_abs_kernel(float* x, int n, float cap)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) x[i] = fmaxf(-cap, fminf(cap, x[i]));
+}
+
+// Elementwise hard cap: clamp each element of x to [-cap, +cap].  Returns true
+// (no-op) on n<=0 or cap<=0.  Used by the OBSD a_drift gate cap (bounded-gate
+// salvage: the un-capped gate grew to maxA ~1.8 and regressed val NLL).
+bool clamp_abs(float* x, int n, float cap)
+{
+	if (n <= 0 || cap <= 0.0f) return true;
+	int block = 256; int grid = (n + block - 1) / block;
+	clamp_abs_kernel<<<grid, block, 0, computeStream()>>>(x, n, cap);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, int* d_count)
 {
 	if (!g || !w || n <= 0) return false;
