@@ -147,10 +147,43 @@ the gap). **Gate strengthening (watch-point):** OBSD `maxA` 0.46→**1.11**, ‖
 scale ~0.6), B proxy 12→18 — heavily used, still 0 skips. Monitor for grad-skips as the gate grows
 through 30k.
 
-## E4 — RUNNING (30k, resume both from 7500; launched 2026-06-28)
+## E4 — RESULT: NEGATIVE (OBSD regresses at scale; stable but not a perplexity win)
 
-`/tmp/obsd_e3/e4.sh` → `e4_w250.log` (OBSD, ~17 hr) then `e4_base.log` (matched baseline, ~14 hr).
-Verdict pending; criterion below.
+Both runs: random-init → 30k, T=16384, same local fineweb data, seed 1337, **identical recipe
+except `--per-layer-drift`**. Wide val (16 batches).
+
+| metric @ 30k | OBSD w250 | baseline |
+|---|---|---|
+| val NLL | 3.27 | **2.61** |
+| acc1 | 0.14 | **0.32** |
+| grad-skips | 0 | 0 |
+
+**Matched val trajectory — a clear crossover, not noise.** OBSD ahead **+0.05–0.07 nat through
+~step 16.5k**, gap closes ~19.5k, then the baseline pulls ahead monotonically:
+−0.03 (21k) → −0.08 (24k) → −0.12 (27k) → **−0.66 (30k)**. The late divergence is real, not a val
+artifact: the **baseline's train loss also dropped** 3.0→2.6 (train acc 0.22→0.31) in the 27–30k
+window — a genuine late-training acceleration — while **OBSD stalled** at train loss ~3.2–3.5.
+
+**Verdict — two findings, kept distinct:**
+- **STABILITY ✅** — 0 grad-skips through the 1.6–2B instability regime (24.4k–30k); ‖g‖ bounded.
+  OBSD's coupling does **not** destabilize where the flagship died at 1.49B without the cure
+  (bounded-φ + reanchor held). The instability-regime question is answered: yes, stable.
+- **PERPLEXITY ✗** — OBSD helps *early* but **regresses −0.66 nat by 30k**. **Does NOT ship as
+  configured.**
+
+**Root cause (well-supported):** the gate grew **unbounded** (maxA 0.46 → 1.8). OBSD won while
+maxA ≲ 1.1 and lost as it grew large — the growth inflated ‖g‖ → heavier grad-clipping (OBSD clip
+scale 0.5–0.7 vs baseline 0.7–1.0) → throttled *effective* LR → OBSD **missed the baseline's
+late-training acceleration**. The reversal tracks the gate growth precisely. (A softer cousin of the
+design's FM-1: not an explosion, but the budget growth quietly taxing convergence.)
+
+## Salvage (in progress 2026-06-29): bounded gate
+
+The design's deferred "optional budget projection" now looks **necessary, not optional**. Testing a
+hard gate cap (`--drift-gate-cap V`, elementwise `|a_drift| ≤ V`): resume OBSD from the step-20000
+checkpoint (just past the reversal onset, maxA ~1.65) with `--drift-gate-cap 0.5`, run to 30k —
+does bounding the gate let OBSD recover the late acceleration? Target: baseline@30k = 2.61; un-capped
+OBSD@30k = 3.27. Resume saves the early steps; the reversal window (must be run) is ~20k→30k (~7.5 hr).
 
 ## What remains: E4 — the quality gate (the unsettled ship question)
 
