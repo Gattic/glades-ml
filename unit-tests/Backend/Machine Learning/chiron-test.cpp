@@ -11488,6 +11488,7 @@ void CHIRONUnitTest()
 	CHIRONDriftReversibilityTest();
 	CHIRONDriftBackwardParityTest();
 	CHIRONRotCpuTest();
+	CHIRONRotGpuParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18653,12 +18654,16 @@ void CHIRONRotGpuParityTest()
 	glades::gpu::chiron_rot_forward(dQ.data(),dP.data(),dA.data(),dC.data(),+1.f,T,m);
 	std::vector<float> qg(T*m),pg(T*m); dQ.download(&qg[0],T*m); dP.download(&pg[0],T*m);
 	float me=0.f; for(int k=0;k<T*m;++k) me=fmaxf(me,fmaxf(fabsf(qg[k]-qc[k]),fabsf(pg[k]-pc[k])));
-	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot fwd CPU/GPU parity (maxErr=%.2e)",me); ASSERT(msg, me<1e-4f);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot fwd CPU/GPU parity (maxErr=%.2e)",me);
+	std::printf("  [SORC rot fwd CPU/GPU parity] maxErr=%.2e (bar 1e-4)\n", me);
+	ASSERT(msg, me<1e-4f);
 	// reversibility: forward then inverse on GPU reconstructs.
 	glades::gpu::chiron_rot_forward(dQ.data(),dP.data(),dA.data(),dC.data(),-1.f,T,m); // inverse (sign=-1)
 	dQ.download(&qg[0],T*m); dP.download(&pg[0],T*m);
 	float mr=0.f; for(int k=0;k<T*m;++k) mr=fmaxf(mr,fmaxf(fabsf(qg[k]-q[k]),fabsf(pg[k]-p[k])));
-	std::snprintf(msg,sizeof(msg),"SORC rot fwd∘inv reconstructs (maxErr=%.2e)",mr); ASSERT(msg, mr<1e-5f);
+	std::snprintf(msg,sizeof(msg),"SORC rot fwd∘inv reconstructs (maxErr=%.2e)",mr);
+	std::printf("  [SORC rot fwd∘inv reconstructs] maxErr=%.2e (bar 1e-5)\n", mr);
+	ASSERT(msg, mr<1e-5f);
 #else
 	std::printf("  [SORC rot GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
