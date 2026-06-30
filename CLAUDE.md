@@ -400,6 +400,33 @@ checkpoint bit 1024; `[sorc]` plateau monitor; flags `--rot-coupling` /
 `docs/superpowers/specs/2026-06-30-chiron-sorc-symplectic-rotation-design.md` +
 `docs/superpowers/plans/2026-06-30-chiron-sorc-symplectic-rotation.md`.
 
+**Update (2026-06-30) — WhiSC-D whitened coupling: E3 GATE PASS (fixes SORC; not yet
+shipped).** The successor that *cures* both prior failures by attacking their shared root cause
+(the p/q scale asymmetry, measured this session: `p²/q²` is trained-in within ~100 steps,
+reaching ~2000+ — `research/CHIRON_INIT_PQ_RATIO` / memory `chiron_init_pq_ratio_measured`).
+WhiSC-D conjugates the SORC rotation by a **detached per-channel whitening kept out of the
+autodiff graph**: `Φ = W⁻¹R(θ)W`, `W=diag(1/a,a)`, `a=(E[q²]/E[p²])^{1/4}` (per-channel EMA),
+so the differentiated signal is `O(‖q‖)` and the backward q-gradient is bounded independent of
+`‖p‖/‖q‖` (det=1 symplectic; φ=0⇒identity/E0). On the **same matched 2500-step T=16384 gate that
+SORC diverged**, WhiSC-D **completed cleanly**: ‖g‖ O(1) (max 3.54), 0 grad-skips, 0 NaN,
+val@2500 **2.78** — vs SORC's 14.45 / ‖g‖ 4.7e10 / 1619 skips / explosion at step ~831. The
+`[whisc]` monitor confirms `ρ_eff` grew to **~3000** (past the SORC-kill regime) and the
+whitening absorbed it; the R1 bound holds in vivo. Perplexity is a promising bonus (matched
+this-session base val@1000 4.21 vs 4.04 = −0.17 nat; vs prior SORC-base val@2500 3.58 vs 2.78 =
+−0.80 nat, widening) but wants a matched-2500 / **E4 (30k, not yet run)** to bank. **Two open
+items gate a ship, neither affecting the stability verdict:** (1) a **−37% wall throughput**
+regression from the unoptimized `chiron_whisc_update_stats` (uncoalesced column reduction; fix =
+fuse the q²/p² accumulation into the coalesced whiten pass); (2) the E4 perplexity confirmation.
+Engineering is **committed default-off**, fully reviewed (merge-ready), reusing the SORC
+infrastructure (`rot_phi`/Adam/checkpoint-bit-1024/`[sorc]` monitor) + new kernels
+`chiron_whisc_scale` / `chiron_whisc_update_stats` + flags `--whisc-coupling` / `--whisc-ema` /
+`--whisc-clamp`. So per-layer cross-depth coupling for CHIRON is no longer a dead end: OBSD
+stable-but-regressed, SORC unstable-diverged, **WhiSC-D stable AND (provisionally)
+improves** — the lever just had to act in a scale-normalized (whitened) frame, from step 1. Full
+record: `research/CHIRON_WHISC_D_GATE_2026_06_30.md`; design/plan
+`docs/superpowers/specs/2026-06-30-chiron-whitened-frame-coupling-design.md` +
+`docs/superpowers/plans/2026-06-30-chiron-whisc-d.md`.
+
 ## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
 
 The v5+FP8 flagship (predecessor):
