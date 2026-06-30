@@ -177,13 +177,34 @@ scale 0.5–0.7 vs baseline 0.7–1.0) → throttled *effective* LR → OBSD **m
 late-training acceleration**. The reversal tracks the gate growth precisely. (A softer cousin of the
 design's FM-1: not an explosion, but the budget growth quietly taxing convergence.)
 
-## Salvage (in progress 2026-06-29): bounded gate
+## Salvage (2026-06-29/30): bounded gate — FAILED (late cap)
 
-The design's deferred "optional budget projection" now looks **necessary, not optional**. Testing a
-hard gate cap (`--drift-gate-cap V`, elementwise `|a_drift| ≤ V`): resume OBSD from the step-20000
-checkpoint (just past the reversal onset, maxA ~1.65) with `--drift-gate-cap 0.5`, run to 30k —
-does bounding the gate let OBSD recover the late acceleration? Target: baseline@30k = 2.61; un-capped
-OBSD@30k = 3.27. Resume saves the early steps; the reversal window (must be run) is ~20k→30k (~7.5 hr).
+Added `--drift-gate-cap V` (elementwise `|a_drift| ≤ V`, glades-ml `clamp_abs` kernel). Resumed OBSD
+from the step-20000 checkpoint (just past the reversal onset, maxA ~1.65) with `--drift-gate-cap 0.5`
+→ 30k. The cap held **maxA = 0.500** for all 10k steps, 0 grad-skips.
+
+| @ 30k | val NLL | acc1 |
+|---|---|---|
+| capped-OBSD (gate=0.5 from 20k) | **3.29** | 0.142 |
+| un-capped OBSD | 3.27 | 0.144 |
+| baseline | **2.61** | 0.32 |
+
+**No recovery — capping made essentially zero difference (3.29 vs 3.27).** So the late divergence is
+**not** an instantaneous-gate-level effect: at step 20k, gate 1.8 vs 0.5 changed the 30k outcome by
+0.02 (noise). OBSD's trajectory had already missed the baseline's late-acceleration window by 20k,
+and a late cap can't re-enter it. This is confounded (late resume) — it cannot distinguish
+"irreversible by 20k" from "the coupling itself blocks the acceleration." The one clean remaining
+test is an *early* cap (resume from step 10000, still winning, cap from there → 30k, ~15 hr); prior
+is low given the late cap's null effect.
+
+## Overall arc verdict: NO-GO (as a perplexity mechanism)
+
+OBSD is **correctly implemented** (5 unit tests, exact reversibility, O(1) memory) and **stable**
+(0 grad-skips through the 1.6–2B instability regime — the design's stability mechanism held). But it
+**does not lower perplexity at scale**: it helps early (+0.05 nat to ~16.5k) then regresses to −0.66
+nat by 30k, and a bounded gate did not salvage it. Leave `--per-layer-drift` / `--drift-gate-cap`
+**default-off**, documented. The engineering (kernels, reanchor-reuse, gate param, cap) is sound and
+reusable; the empirical result is a clean negative.
 
 ## What remains: E4 — the quality gate (the unsettled ship question)
 
