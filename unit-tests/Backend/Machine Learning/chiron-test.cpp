@@ -18776,3 +18776,32 @@ void WhiSCStatsCpuTest()
 		ASSERT("WhiSC stats: whitened subspaces not balanced", std::fabs(eq-ep) < 0.05*(eq+ep)+1e-6);
 	}
 }
+
+void WhiSCGpuParityTest()
+{
+	const int T = 64, m = 8;
+	std::vector<float> q(T*m), p(T*m), a(m);
+	for (int k=0;k<T*m;++k){ q[k]=0.2f*std::sin(0.3f*k); p[k]=17.0f*std::cos(0.21f*k); }
+	for (int i=0;i<m;++i) a[i]=0.15f+0.1f*i;
+	// CPU scale
+	std::vector<float> qc=q, pc=p; glades::chiron::whisc_scale(&qc[0],&pc[0],&a[0],+1.0f,(unsigned)T,(unsigned)m);
+	// GPU scale
+	glades::gpu::GpuBuffer<float> dQ,dP,dA; dQ.allocate(T*m); dP.allocate(T*m); dA.allocate(m);
+	dQ.upload(&q[0],T*m); dP.upload(&p[0],T*m); dA.upload(&a[0],m);
+	ASSERT("whisc_scale gpu failed", glades::gpu::chiron_whisc_scale(dQ.data(),dP.data(),dA.data(),+1.0f,T,m));
+	std::vector<float> qg(T*m), pg(T*m); dQ.download(&qg[0],T*m); dP.download(&pg[0],T*m);
+	float e=0; for (int k=0;k<T*m;++k){ e=std::max(e,std::fabs(qg[k]-qc[k])); e=std::max(e,std::fabs(pg[k]-pc[k])); }
+	ASSERT("whisc_scale gpu/cpu mismatch", e < 1e-4f);
+
+	// stats parity (ema=1 -> batch means)
+	std::vector<float> Pc(m,1.0f),Qc(m,1.0f),Ac(m,1.0f);
+	glades::chiron::whisc_update_stats(&q[0],&p[0],(unsigned)T,(unsigned)m,1.0f,1e-12f,8.0f,&Pc[0],&Qc[0],&Ac[0]);
+	glades::gpu::GpuBuffer<float> dPb,dQb,dAo; dPb.allocate(m); dQb.allocate(m); dAo.allocate(m);
+	std::vector<float> ones(m,1.0f); dPb.upload(&ones[0],m); dQb.upload(&ones[0],m);
+	dQ.upload(&q[0],T*m); dP.upload(&p[0],T*m); // pristine q,p (dQ,dP were whitened by the scale test above)
+	ASSERT("whisc_stats gpu failed",
+	       glades::gpu::chiron_whisc_update_stats(dQ.data(),dP.data(),T,m,1.0f,1e-12f,8.0f,dPb.data(),dQb.data(),dAo.data()));
+	std::vector<float> Ag(m); dAo.download(&Ag[0],m);
+	float ea=0; for (int i=0;i<m;++i) ea=std::max(ea,std::fabs(Ag[i]-Ac[i]));
+	ASSERT("whisc_stats gpu/cpu a mismatch", ea < 1e-4f);
+}

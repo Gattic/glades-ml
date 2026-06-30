@@ -1368,6 +1368,61 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
 }
 
 // ===========================================================================
+//  WhiSC: per-channel whitening scale + EMA second-moment stats.
+// ===========================================================================
+
+__global__ void whisc_scale_kernel(float* __restrict__ q, float* __restrict__ p,
+                                   const float* __restrict__ a, float sign, int T, int m) {
+	long k = (long)blockIdx.x * blockDim.x + threadIdx.x;
+	long n = (long)T * m;
+	if (k >= n) return;
+	int i = (int)(k % m);
+	float ai = a[i];
+	if (sign > 0.0f) { q[k] = q[k] / ai; p[k] = p[k] * ai; }
+	else             { q[k] = q[k] * ai; p[k] = p[k] / ai; }
+}
+
+bool chiron_whisc_scale(float* q, float* p, const float* a, float sign, int T, int m) {
+	if (!q || !p || !a || T <= 0 || m <= 0) return false;
+	long n = (long)T * m; int blk = 256; int grid = (int)((n + blk - 1) / blk);
+	whisc_scale_kernel<<<grid, blk, 0, computeStream()>>>(q, p, a, sign, T, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// one block per channel; block reduces sum of squares over T tokens (column i, stride m).
+__global__ void whisc_stats_kernel(const float* __restrict__ q, const float* __restrict__ p,
+                                   int T, int m, float ema, float eps, float clamp,
+                                   float* __restrict__ Pbar, float* __restrict__ Qbar, float* __restrict__ a) {
+	int i = blockIdx.x; if (i >= m) return;
+	__shared__ float sq[256]; __shared__ float sp[256];
+	float lq = 0.0f, lp = 0.0f;
+	for (int t = threadIdx.x; t < T; t += blockDim.x) {
+		float qv = q[(long)t*m + i], pv = p[(long)t*m + i];
+		lq += qv*qv; lp += pv*pv;
+	}
+	sq[threadIdx.x] = lq; sp[threadIdx.x] = lp; __syncthreads();
+	for (int s = blockDim.x/2; s > 0; s >>= 1) { if (threadIdx.x < s) { sq[threadIdx.x]+=sq[threadIdx.x+s]; sp[threadIdx.x]+=sp[threadIdx.x+s]; } __syncthreads(); }
+	if (threadIdx.x == 0) {
+		float mq = sq[0]/(float)T, mp = sp[0]/(float)T;
+		float qb = (1.0f-ema)*Qbar[i] + ema*mq;
+		float pb = (1.0f-ema)*Pbar[i] + ema*mp;
+		Qbar[i]=qb; Pbar[i]=pb;
+		float ai = powf(qb/(pb+eps), 0.25f);
+		float lo = 1.0f/clamp, hi = clamp;
+		a[i] = (ai<lo)?lo:((ai>hi)?hi:ai);
+	}
+}
+
+bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
+                               float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a) {
+	if (!q || !p || !Pbar || !Qbar || !a || T <= 0 || m <= 0) return false;
+	whisc_stats_kernel<<<m, 256, 0, computeStream()>>>(q, p, T, m, ema, eps, clamp, Pbar, Qbar, a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================
 //

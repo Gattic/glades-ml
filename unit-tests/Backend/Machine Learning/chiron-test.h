@@ -120,6 +120,7 @@ void CHIRONRotBackwardParityTest();
 
 void WhiSCScaleCpuTest();
 void WhiSCStatsCpuTest();
+void WhiSCGpuParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

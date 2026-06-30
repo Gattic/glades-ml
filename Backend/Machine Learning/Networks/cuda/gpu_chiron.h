@@ -299,6 +299,12 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
                          float* dq_in, float* dp_in, float* dphi,
                          float* scratch_da, float* scratch_dc);
 
+// WhiSC per-channel whitening scale (sign=+1 whiten q/=a,p*=a; sign=-1 unwhiten).
+bool chiron_whisc_scale(float* q, float* p, const float* a, float sign, int T, int m);
+// WhiSC EMA second-moment stats: updates Pbar=E[p^2], Qbar=E[q^2] per channel, writes a=clamp((Qbar/(Pbar+eps))^0.25,1/clamp,clamp).
+bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
+                               float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -779,6 +785,8 @@ inline bool chiron_rot_backward(const float*, const float*,
                                 const float*, float, float,
                                 int, int,
                                 float*, float*, float*, float*, float*) { return false; }
+inline bool chiron_whisc_scale(float*, float*, const float*, float, int, int) { return false; }
+inline bool chiron_whisc_update_stats(const float*, const float*, int, int, float, float, float, float*, float*, float*) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,
