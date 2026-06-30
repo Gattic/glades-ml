@@ -1,8 +1,10 @@
-# CHIRON SORC: Symplectic Orthogonal Rotation Coupling — Small-shape Validation
+# CHIRON SORC: Symplectic Orthogonal Rotation Coupling — RESULT: NO-GO
 
 **Date:** 2026-06-30  
-**Status:** PASS (small-shape) — ready for production E3/E4  
+**Status:** **NO-GO** — small-shape validation PASSED (E0/E1/E2), but **E3 (production scale) DIVERGED**. Closed as NO-GO; all code default-off.  
 **Branch:** glades-ml `chiron3`, glades-trainer `reln-reanchor`
+
+> **TL;DR:** SORC is implemented correctly (verified math + reviewer-confirmed wiring) and the bounded-angle property holds exactly. But at production scale the treatment **diverges at step ~831** (val@2500 **14.45** vs baseline **3.58**, 1619 grad-skips, ‖g‖→4.7e10). Root cause is **fundamental, not a bug**: the symplectic block has `‖p‖ ≈ 17×‖q‖` (reln normalizes q each layer; p is un-normalized and accumulates attention across depth), so the rotation's `q += a·p` is a *p-scaled* perturbation to the much smaller q. The `‖R‖₂=1` conservation preserves the **joint (q,p) norm — which is p-dominated** — and therefore does **not** protect the q subspace. Same root-cause family as OBSD ([[research/CHIRON_OBSD_RESULT_2026_06_27.md]]); different symptom (OBSD stable-but-regresses, SORC unstable/diverges). See **E3 — Production RESULT** below.
 
 ---
 
@@ -132,18 +134,106 @@ cd /home/robert/dev/glades-ml/unit-tests && bash test.sh chiron-rot
 
 ---
 
-## Verdict: proceed to E3/E4
+## E3 — Production RESULT: FAILED (treatment diverges) — DECISIVE
 
-All small-shape validation passes:
-- E0 (bit-identity): PASS on both non-SCFA and production SCFA path
-- E1 (unit tests): 8/8 PASS (compose, norm-conservation, reversibility, FD gradcheck, CPU/GPU parity, warmup-scale chain)
-- E2 (reconstruction): PASS (0 grad-skips, phi learns, inverse correct)
-- SCFA-path 40-step run: PASS (0 grad-skips, no NaN/Inf, loss descending)
-- Plateau monitor: confirmed maxTheta ≤ thetaMax structurally; grows from 0 (phi learning)
+Production geometry (T=16384, L=24, m=2048, nH=16, dH=256), full reanchor-flagship recipe
+(`--accum 4 --lr 3e-4 --warmup 750 --sira-warmup 250 --zloss-coef 1e-4 --qk-norm
+--sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25 --sira-action-weight 0.0
+--grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0 --reln-reanchor`), seed 1337,
+2500 steps, wide 8-batch val. Baseline = identical minus `--rot-coupling`. Treatment adds
+`--rot-coupling --rot-theta-max 1.0472 (π/3) --rot-warmup 250`. Single GPU → serial.
 
-The mechanism is correct and transparent at the production SCFA path. Proceed to E3: production-geometry stability probe (shape L=24, m=2048, T=16384, ~2500 steps, full flagship recipe) to confirm 0 grad-skips and bounded `[sorc] maxTheta` at production scale before the E4 quality gate.
+| metric @ 2500 | baseline | SORC (θ_max=π/3) |
+|---|---|---|
+| val NLL | **3.5803** | **14.4541** (diverged) |
+| grad-skips | 0 | **1619** |
+| ‖g‖ (last) | 0.340 | **4.7e10** |
+| loss scale | 1.000 | **0.000** (collapsed) |
+| E0 step-1 loss | 10.7955 | 10.7955 (bit-identical ✓) |
 
-**Key risk to monitor in E3/E4:** OBSD failed not at small scale but at long training (30k steps) as the gate grew, throttling effective LR. SORC's structural bound prevents the same runaway, but whether the learned rotations improve val NLL is an open question that E4 must answer.
+**Divergence trajectory.** SORC tracked the baseline closely through step ~748
+(loss 10.80→4.07, best 4.0095@727), then **exploded at step ~831**: loss 4.07→21.0,
+‖g‖→6e10, loss-scale→0, and it never recovered (val 14.45 @ 2500). The onset coincides
+with **lr finishing its warmup to full 3e-4** AND the learned angle reaching **θ≈0.08**
+(maxTheta 0.0806 @ 748). The baseline is perfectly stable at that same lr (‖g‖ 0.34).
+
+**The exploding gradient is exclusively `drot_phi`, in a clean geometric cascade across depth**
+(grad-detail step 820):
+
+```
+L15.drot_phi  norm = 150          (late layer — shallow in backward)
+L14           = 2,963             ×~20
+L13           = 51,083            ×~17
+...           (≈ ×2.5 per layer)
+L03           = 1.02e10
+L02           = 2.54e10
+L01           = 7.13e10           (early layer — deep in backward)
+```
+
+### Why this is fundamental, not a bug
+
+A correct **orthogonal** rotation backward (Rᵀ) preserves the adjoint norm exactly and
+*cannot* amplify. We verified the implementation is correct at all three layers:
+- **CPU-ref backward** = the exact orthogonal Rᵀ — all three reversed-transpose adjoint
+  shears traced by hand (`rot_backward`, `transformer_chiron_ops.h`).
+- **Trainer wiring** correct (coeffs recomputed from φ with matching `sw`; inverse-walk
+  recovers pre-rotation (q,p); both adjoints Rᵀ-transformed in place) — Task-6 reviewer-confirmed.
+- **E0** step-1 bit-identical to baseline (φ=0 ⇒ R=I). The blow-up emerges only as φ grows.
+
+**Root cause — the p/q scale asymmetry.** The SIRA diagnostic shows the block runs with
+`mean(p²)/mean(q²) ≈ 300`, i.e. **‖p‖ ≈ 17×‖q‖**, because **reln normalizes q every layer
+while p is un-normalized and accumulates attention outputs across depth**. SORC's
+`q += a·p` therefore injects a **p-scaled** perturbation into the ~17× smaller q. The
+conservation theorem (`‖R‖₂=1`) preserves the **joint** (q,p) norm — but that joint norm is
+**p-dominated** (`p²/q²≈300`), so conserving it does **nothing** to protect the q subspace.
+This creates positive feedback: rotation perturbs the dynamics → **p runs away**
+(`mean(p²)` jumps **373 → 79527, ×213**, exactly at the step-831 explosion, while q² stays
+~1.23) → `q += a·p` dumps an enormous p into q → backward adjoints and `drot_phi` explode.
+
+**The conservation argument was mathematically correct but conserves the wrong quantity.**
+The forward stayed finite (loss 21, not inf — the isometry held); the *backward* exploded.
+Norm-preservation of the forward map does **not** bound the backward gradient when the
+phase space is scale-asymmetric.
+
+### Relationship to OBSD
+
+Same root-cause family — both per-layer symplectic-coupling mechanisms founder on the
+block's p/q structure ([[research/CHIRON_OBSD_RESULT_2026_06_27.md]]):
+- **OBSD** (`q += a⊙tanh(M⁻¹⊙N(p)+b)`, ReZero gate): *stable but regresses* −0.66 nat at
+  30k (gate grew unbounded → throttled effective LR).
+- **SORC** (orthogonal rotation, hard-bounded angle): *unstable, diverges* at 2500 steps
+  (bounded angle held, but the p-dominated conservation didn't protect q).
+
+Fixing OBSD's unbounded gate with a hard angle bound removed the *runaway-gate* failure but
+exposed a deeper one: the coupling's perturbation to q is intrinsically p-scaled.
+
+---
+
+## Verdict: NO-GO (closed 2026-06-30)
+
+- **E0** (bit-identity, incl. production SCFA path): PASS
+- **E1** (unit tests, 8/8): PASS
+- **E2** (small-shape reconstruction): PASS
+- **E3** (production-scale, 2500 steps): **FAILED — diverges (val 14.45 vs 3.58, 1619 skips)**
+- **E4** (30k decisive gate): **NOT RUN** — the E3 gate failed; running E4 was not warranted.
+  The cheap E3 gate caught the divergence in ~3.4 GPU-hr and saved the ~44 hr E4 pair.
+
+Per-layer symplectic **rotation** coupling is ruled out as a perplexity lever for CHIRON:
+the bounded-angle design is *implemented correctly and the bound holds*, but the mechanism
+**diverges at production scale** because the symplectic block's `‖p‖ ≫ ‖q‖` asymmetry makes
+any joint-norm-conserving q↔p coupling a large perturbation to the small q coordinate.
+
+**Engineering is sound, reusable, and committed default-off**: kernels (`chiron_rot_coeffs`,
+`chiron_rot_forward` fwd/inv, `chiron_rot_backward` + dphi chain), CPU refs, 8 unit tests
+(`test.sh chiron-rot`), the `rot_phi[l]` param (checkpoint bit 1024), the `[sorc]` plateau
+monitor, and flags `--rot-coupling` / `--rot-theta-max` / `--rot-warmup`. None affect the
+default path (φ=0 ⇒ R=I, E0-verified).
+
+**If anyone revisits cross-depth coupling for CHIRON:** the lever must act in a
+**scale-normalized / whitened (q,p) frame** so the perturbation to q is bounded by `‖q‖`,
+not `‖p‖`. A joint-norm conservation law is the *wrong* invariant here; the relevant one is
+per-subspace (q vs p) scale control. Until that is solved, both additive (OBSD) and
+rotational (SORC) per-layer symplectic coupling are NO-GO.
 
 ---
 

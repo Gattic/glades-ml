@@ -365,6 +365,41 @@ else `scfa_attention_backward` SIGSEGVs). Full record:
 `docs/superpowers/specs/2026-06-27-chiron-richer-symplectic-block-design.md` +
 `docs/superpowers/plans/2026-06-27-chiron-richer-symplectic-block.md`.
 
+**Update (2026-06-30) — SORC orthogonal-rotation coupling: CLOSED NO-GO
+(diverges at scale).** The natural successor to OBSD: replace the unbounded
+ReZero *additive* drift with a **norm-preserving per-channel symplectic rotation**
+`(q,p) → R(θ)(q,p)`, `θ = θ_max·tanh(φ)` (hard-bounded angle, realized as 3
+reversible shears; `R∈SO(2)`, `‖R‖₂=1`). The hypothesis was that OBSD's failure
+was the *unbounded gate*, so a conservation-bounded coupling would be safe. It is
+**implemented correctly** (CPU-ref backward = exact orthogonal Rᵀ verified by hand;
+trainer wiring reviewer-confirmed; E0 bit-identical at φ=0; E1 8/8 unit tests; E2
+small-shape reconstruction clean; the angle bound provably holds), **but the E3
+production gate DIVERGED**: matched single-seed 2500-step run at T=16384, the
+treatment tracks baseline to step ~748 then **explodes at step ~831** (val@2500
+**14.45** vs baseline **3.58**, 1619 grad-skips, ‖g‖→4.7e10, loss-scale→0). The
+exploding gradient is **exclusively `drot_phi`** in a clean ~2.5×/layer geometric
+cascade across depth. **Root cause is fundamental, not a bug**: the block runs with
+**`‖p‖ ≈ 17×‖q‖`** (reln normalizes q each layer; p is un-normalized and accumulates
+attention across depth, `mean(p²)/mean(q²)≈300`), so the rotation's `q += a·p` is a
+*p-scaled* perturbation to the ~17× smaller q. The `‖R‖₂=1` conservation preserves
+the **joint (q,p) norm — which is p-DOMINATED** — and therefore does **not** protect
+the q subspace; positive feedback makes p run away (`mean(p²)` jumps ×213 at the
+explosion) and the backward/`drot_phi` blow up. **Norm-preservation of the forward
+map does not bound the backward gradient when the phase space is scale-asymmetric.**
+So **both** additive (OBSD) and rotational (SORC) per-layer symplectic coupling are
+now NO-GO, for the **same root-cause family** (the block's p/q asymmetry) — OBSD
+stable-but-regresses, SORC unstable-diverges. A future cross-depth lever must act in
+a **scale-normalized / whitened (q,p) frame** (bound the q-perturbation by `‖q‖`,
+not `‖p‖`); joint-norm conservation is the wrong invariant. The cheap E3 gate caught
+this in ~3.4 GPU-hr (E4 not run). Engineering committed **default-off** and reusable
+(kernels `chiron_rot_coeffs` / `chiron_rot_forward` [fwd+inv] / `chiron_rot_backward`
++ dphi chain; CPU refs; 8 unit tests `test.sh chiron-rot`; `rot_phi[l]` param +
+checkpoint bit 1024; `[sorc]` plateau monitor; flags `--rot-coupling` /
+`--rot-theta-max` / `--rot-warmup`). Full record:
+`research/CHIRON_SORC_RESULT_2026_06_30.md`; design/plan
+`docs/superpowers/specs/2026-06-30-chiron-sorc-symplectic-rotation-design.md` +
+`docs/superpowers/plans/2026-06-30-chiron-sorc-symplectic-rotation.md`.
+
 ## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
 
 The v5+FP8 flagship (predecessor):
