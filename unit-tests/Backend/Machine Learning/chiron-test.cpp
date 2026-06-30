@@ -18859,3 +18859,87 @@ void WhiSCBackwardParityTest()
 		ASSERT("WhiSC dphi != finite-difference at rho=45", rel < 2e-2f);
 	}
 }
+
+// WhiSC fold backward parity: GPU chiron_rot_backward with whisc_a vs FD of the
+// folded forward (A=a^2*sorc_a, C=sorc_c/a^2) at rho=45 and rho=3000.
+// Guards that the folded dphi chain stays correct under production-scale p/q asymmetry.
+void WhiSCFoldBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [WhiSC fold backward parity] no CUDA device -- skipped\n");
+		return;
+	}
+	const int T=8, m=3;
+	const float theta_max=0.07f, sw=1.0f;
+	const float rhos[2] = {45.0f, 3000.0f};
+	for (int ri=0; ri<2; ++ri)
+	{
+		float RHO = rhos[ri];
+		std::vector<float> phi(m), q0(T*m), p0(T*m), wa(m), cot_q(T*m), cot_p(T*m);
+		for (int i=0;i<m;++i) { phi[i]=0.2f*(float)i-0.3f; wa[i]=powf(1.0f/(RHO*RHO),0.25f); }
+		for (int k=0;k<T*m;++k) { q0[k]=sinf(0.4f*(float)k); p0[k]=RHO*cosf(0.27f*(float)k); cot_q[k]=sinf(0.13f*(float)k+1.0f); cot_p[k]=cosf(0.31f*(float)k); }
+
+		// Build folded coeffs on GPU: chiron_rot_coeffs then chiron_whisc_fold_coeffs
+		glades::gpu::GpuBuffer<float> dPhi,dA,dC,dWa,dQ,dP,dDQO,dDPO,dDQI,dDPI,dDPHI,dSda,dSdc;
+		dPhi.allocate(m); dPhi.upload(&phi[0],m);
+		dA.allocate(m); dC.allocate(m);
+		dWa.allocate(m); dWa.upload(&wa[0],m);
+		ASSERT("chiron_rot_coeffs failed", glades::gpu::chiron_rot_coeffs(dPhi.data(),theta_max,sw,m,dA.data(),dC.data()));
+		ASSERT("chiron_whisc_fold_coeffs failed", glades::gpu::chiron_whisc_fold_coeffs(dA.data(),dC.data(),dWa.data(),m));
+
+		// Upload inputs and cotangents
+		dQ.allocate(T*m); dQ.upload(&q0[0],T*m);
+		dP.allocate(T*m); dP.upload(&p0[0],T*m);
+		dDQO.allocate(T*m); dDQO.upload(&cot_q[0],T*m);
+		dDPO.allocate(T*m); dDPO.upload(&cot_p[0],T*m);
+		dDQI.allocate(T*m); dDPI.allocate(T*m);
+		dDPHI.allocate(m); dDPHI.zero();
+		dSda.allocate(m); dSdc.allocate(m);
+
+		// Backward with whisc_a = whitening scales; computes the folded dphi chain
+		ASSERT("chiron_rot_backward (folded) failed",
+		       glades::gpu::chiron_rot_backward(dDQO.data(),dDPO.data(),
+		                                        dQ.data(),dP.data(),
+		                                        dA.data(),dC.data(),
+		                                        dPhi.data(),theta_max,sw,
+		                                        T,m,
+		                                        dDQI.data(),dDPI.data(),dDPHI.data(),
+		                                        dSda.data(),dSdc.data(),
+		                                        dWa.data()));
+		std::vector<float> dphi_gpu(m); dDPHI.download(&dphi_gpu[0],m);
+
+		// FD of folded forward: perturb phi[i], fold coeffs, run CPU rot_forward
+		const float h=1e-3f;
+		float worst=0.0f;
+		for (int j=0;j<m;++j)
+		{
+			float save=phi[j]; double Lp, Lm;
+			for (int s=0;s<2;++s)
+			{
+				phi[j]=save+(s==0?h:-h);
+				std::vector<float> rc_a(m), rc_c(m); float th_dum;
+				for (int ii=0;ii<m;++ii) {
+					glades::chiron::rot_coeffs(phi[ii],theta_max,sw,rc_a[ii],rc_c[ii],th_dum);
+					float wa2=wa[ii]*wa[ii]; rc_a[ii]*=wa2; rc_c[ii]/=wa2;
+				}
+				std::vector<float> qq=q0, pp=p0;
+				glades::chiron::rot_forward(&qq[0],&pp[0],&rc_a[0],&rc_c[0],T,m);
+				double L=0; for (int k=0;k<T*m;++k) L+=(double)cot_q[k]*qq[k]+(double)cot_p[k]*pp[k];
+				if (s==0) Lp=L; else Lm=L;
+			}
+			phi[j]=save;
+			float fd=(float)((Lp-Lm)/(2.0*h));
+			float rel=fabsf(dphi_gpu[j]-fd)/(fabsf(fd)+1e-4f);
+			if (rel>worst) worst=rel;
+		}
+		char msg[128];
+		std::snprintf(msg,sizeof(msg),"WhiSC fold dphi vs FD rho=%.0f (worst=%.4g)",RHO,worst);
+		std::printf("  [WhiSC fold backward parity] rho=%.0f worst dphi rel-err=%.4g  %s\n",RHO,worst,worst<2e-2f?"PASS":"FAIL");
+		ASSERT(msg, worst < 2e-2f);
+	}
+#else
+	std::printf("  [WhiSC fold backward parity] GLADES_HAVE_CUDA not defined -- skipped\n");
+#endif
+}

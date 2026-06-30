@@ -291,19 +291,27 @@ bool chiron_rot_forward(float* q, float* p, const float* a, const float* c,
 //   (2) column reduction to da, dc via chiron_col_accumulate;
 //   (3) coefficient chain kernel maps (da, dc, phi) -> dphi accumulation.
 //   scratch_da, scratch_dc: caller-owned [m] scratch buffers.
+// chiron_rot_backward: whisc_a is optional (pass NULL for the SORC path).
+//   When non-NULL, the coefficient chain scales da by whisc_a[i]^2 and dc by
+//   1/whisc_a[i]^2 before computing dphi, implementing the folded WhiSC dtheta
+//   chain: dtheta = (da*a^2*dsorc_a/dth + dc*(1/a^2)*dsorc_c/dth)*dth/dphi.
 bool chiron_rot_backward(const float* dq_out, const float* dp_out,
                          const float* q_in, const float* p_in,
                          const float* a, const float* c,
                          const float* phi, float theta_max, float s_warm,
                          int T, int m,
                          float* dq_in, float* dp_in, float* dphi,
-                         float* scratch_da, float* scratch_dc);
+                         float* scratch_da, float* scratch_dc,
+                         const float* whisc_a = NULL);
 
 // WhiSC per-channel whitening scale (sign=+1 whiten q/=a,p*=a; sign=-1 unwhiten).
 bool chiron_whisc_scale(float* q, float* p, const float* a, float sign, int T, int m);
 // WhiSC EMA second-moment stats: updates Pbar=E[p^2], Qbar=E[q^2] per channel, writes a=clamp((Qbar/(Pbar+eps))^0.25,1/clamp,clamp).
 bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
                                float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a);
+// WhiSC coefficient folding: folds whitening scale wa into rotation coeffs a,c in place.
+//   a[i] *= wa[i]^2 ; c[i] /= wa[i]^2. Eliminates separate whiten/unwhiten passes.
+bool chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, int m);
 
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
@@ -784,9 +792,11 @@ inline bool chiron_rot_backward(const float*, const float*,
                                 const float*, const float*,
                                 const float*, float, float,
                                 int, int,
-                                float*, float*, float*, float*, float*) { return false; }
+                                float*, float*, float*, float*, float*,
+                                const float* = NULL) { return false; }
 inline bool chiron_whisc_scale(float*, float*, const float*, float, int, int) { return false; }
 inline bool chiron_whisc_update_stats(const float*, const float*, int, int, float, float, float, float*, float*, float*) { return false; }
+inline bool chiron_whisc_fold_coeffs(float*, float*, const float*, int) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

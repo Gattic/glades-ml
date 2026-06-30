@@ -278,6 +278,7 @@ int main(int argc, char* argv[])
 		WhiSCStatsCpuTest();
 		WhiSCGpuParityTest();
 		WhiSCBackwardParityTest();
+		WhiSCFoldBackwardParityTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {

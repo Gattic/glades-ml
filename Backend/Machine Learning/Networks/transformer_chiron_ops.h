@@ -348,6 +348,19 @@ inline void whisc_update_stats(const float* q, const float* p, unsigned int T, u
 	}
 }
 
+// WhiSC coefficient folding: absorbs the whitening scale into the rotation
+// coefficients in place so that chiron_rot_forward(q,p,a,c,...) IS Phi=W^-1 R W.
+// a[i] *= wa[i]^2  (sorc_a folds in the a^2 scale for the q-shear)
+// c[i] /= wa[i]^2  (sorc_c folds in the 1/a^2 scale for the p-shear)
+// wa is the per-channel WhiSC whitening scale (output of whisc_update_stats).
+inline void chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, unsigned int m) {
+	for (unsigned int i = 0; i < m; ++i) {
+		float wa2 = wa[i] * wa[i];
+		a[i] *= wa2;
+		c[i] /= wa2;
+	}
+}
+
 // ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //

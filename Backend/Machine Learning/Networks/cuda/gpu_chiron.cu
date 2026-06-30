@@ -1313,13 +1313,24 @@ __global__ void chiron_rot_pre_backward_rows(const float* __restrict__ dqo, cons
 	}
 }
 
+// whisc_a: optional per-channel WhiSC whitening scale. When non-NULL, the da
+// contribution is scaled by whisc_a[i]^2 and the dc contribution by 1/whisc_a[i]^2,
+// implementing the folded-coeff dtheta chain (SORC path: whisc_a=NULL, factor=1).
 __global__ void chiron_rot_chain_kernel(const float* __restrict__ da, const float* __restrict__ dc,
-        const float* __restrict__ phi, float theta_max, float s_warm, int m, float* __restrict__ dphi) {
+        const float* __restrict__ phi, float theta_max, float s_warm, int m,
+        float* __restrict__ dphi, const float* __restrict__ whisc_a) {
 	int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=m) return;
 	float th=s_warm*theta_max*tanhf(phi[i]);  // FIXED: include s_warm in effective angle θ_eff
 	float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th);
 	float dthdphi=s_warm*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i]));
-	dphi[i] += (da[i]*dadth + dc[i]*dcdth)*dthdphi;   // ACCUMULATE
+	float da_eff, dc_eff;
+	if (whisc_a != NULL) {
+		float wa2 = whisc_a[i]*whisc_a[i];
+		da_eff = da[i]*wa2; dc_eff = dc[i]/wa2;
+	} else {
+		da_eff = da[i]; dc_eff = dc[i];
+	}
+	dphi[i] += (da_eff*dadth + dc_eff*dcdth)*dthdphi;   // ACCUMULATE
 }
 
 bool chiron_rot_backward(const float* dq_out, const float* dp_out,
@@ -1328,7 +1339,8 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
                          const float* phi, float theta_max, float s_warm,
                          int T, int m,
                          float* dq_in, float* dp_in, float* dphi,
-                         float* scratch_da, float* scratch_dc) {
+                         float* scratch_da, float* scratch_dc,
+                         const float* whisc_a) {
 	if (T <= 0 || m <= 0) return true;
 
 	// Allocate scratch buffers for per-element da and dc (T*m each)
@@ -1358,10 +1370,10 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
 	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(dc_el, T, m, scratch_dc);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
-	// Chain kernel: map (da, dc, phi) -> dphi
+	// Chain kernel: map (da, dc, phi) -> dphi; whisc_a NULL on SORC path (identity scale)
 	int blk = 256; int grd2 = (m + blk - 1) / blk;
 	chiron_rot_chain_kernel<<<grd2, blk, 0, computeStream()>>>(
-	    scratch_da, scratch_dc, phi, theta_max, s_warm, m, dphi);
+	    scratch_da, scratch_dc, phi, theta_max, s_warm, m, dphi, whisc_a);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	return true;
@@ -1386,6 +1398,23 @@ bool chiron_whisc_scale(float* q, float* p, const float* a, float sign, int T, i
 	if (!q || !p || !a || T <= 0 || m <= 0) return false;
 	long n = (long)T * m; int blk = 256; int grid = (int)((n + blk - 1) / blk);
 	whisc_scale_kernel<<<grid, blk, 0, computeStream()>>>(q, p, a, sign, T, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// WhiSC coefficient folding: absorbs whitening scale wa into rotation coeffs a,c in place.
+// a[i] *= wa[i]^2 ; c[i] /= wa[i]^2. Eliminates the explicit whiten/unwhiten passes.
+__global__ void whisc_fold_coeffs_kernel(float* __restrict__ a, float* __restrict__ c,
+                                          const float* __restrict__ wa, int m) {
+	int i = blockIdx.x*blockDim.x + threadIdx.x; if (i >= m) return;
+	float wa2 = wa[i]*wa[i];
+	a[i] *= wa2; c[i] /= wa2;
+}
+
+bool chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, int m) {
+	if (!a || !c || !wa || m <= 0) return false;
+	int blk = 256, grd = (m + blk - 1) / blk;
+	whisc_fold_coeffs_kernel<<<grd, blk, 0, computeStream()>>>(a, c, wa, m);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
