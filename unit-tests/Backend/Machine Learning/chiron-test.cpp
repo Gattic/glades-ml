@@ -18686,7 +18686,7 @@ void CHIRONRotBackwardParityTest()
 	// CPU oracle: rot_backward -> da,dc -> dphi.
 	std::vector<float> dqi(T*m,0.f),dpi(T*m,0.f),da(m,0.f),dc(m,0.f),dphic(m,0.f);
 	glades::chiron::rot_backward(&dqo[0],&dpo[0],&q[0],&p[0],&a[0],&c[0],T,m,&dqi[0],&dpi[0],&da[0],&dc[0]);
-	for(int i=0;i<m;++i){ float th=theta_max*tanhf(phi[i]); float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th); float dthdphi=sw*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i])); dphic[i]=(da[i]*dadth+dc[i]*dcdth)*dthdphi; }
+	for(int i=0;i<m;++i){ float th=sw*theta_max*tanhf(phi[i]); float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th); float dthdphi=sw*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i])); dphic[i]=(da[i]*dadth+dc[i]*dcdth)*dthdphi; }
 	// GPU.
 	glades::gpu::GpuBuffer<float> dPhi,dA,dC,dQ,dP,dDQO,dDPO,dDQI,dDPI,dDPHI,dSda,dSdc;
 	dPhi.allocate(m);dPhi.upload(&phi[0],m); dA.allocate(m);dC.allocate(m);
@@ -18701,6 +18701,19 @@ void CHIRONRotBackwardParityTest()
 	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot backward CPU/GPU parity (maxErr=%.2e)",me);
 	std::printf("  [SORC rot backward CPU/GPU parity] maxErr=%.2e (bar 2e-4)\n", me);
 	ASSERT(msg, me<2e-4f);
+
+	// Independent FD grad-check of dphi vs the actual forward at sw!=1 (catches s_warm-in-chain bugs).
+	const float hfd=1e-3f; float maxFdRel=0.f;
+	for (int j=0;j<m;++j){
+		float save=phi[j];
+		#define ROTFWD_J(PH) ({ std::vector<float> qq(q), pp(p), av(a), cv(c); float th2; glades::chiron::rot_coeffs((PH),theta_max,sw,av[j],cv[j],th2); glades::chiron::rot_forward(&qq[0],&pp[0],&av[0],&cv[0],T,m); double J=0.0; for(int k=0;k<T*m;++k) J+=(double)dqo[k]*qq[k]+(double)dpo[k]*pp[k]; J; })
+		double Jp=ROTFWD_J(save+hfd), Jm=ROTFWD_J(save-hfd); phi[j]=save;
+		#undef ROTFWD_J
+		float fd=(float)((Jp-Jm)/(2.0*hfd)); float e=fabsf(fd-dphig[j])/(1e-3f+fabsf(fd)); if(e>maxFdRel)maxFdRel=e;
+	}
+	char msg2[128]; std::snprintf(msg2,sizeof(msg2),"SORC rot dphi FD-vs-forward at sw=0.8 (maxRel=%.4f)",maxFdRel);
+	std::printf("  [SORC rot dphi FD-vs-forward at sw=0.8] maxRel=%.4f (bar 2e-2)\n", maxFdRel);
+	ASSERT(msg2, maxFdRel<2e-2f);
 #else
 	std::printf("  [SORC rot backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif

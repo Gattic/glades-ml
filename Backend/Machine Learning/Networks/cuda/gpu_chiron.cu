@@ -1316,7 +1316,7 @@ __global__ void chiron_rot_pre_backward_rows(const float* __restrict__ dqo, cons
 __global__ void chiron_rot_chain_kernel(const float* __restrict__ da, const float* __restrict__ dc,
         const float* __restrict__ phi, float theta_max, float s_warm, int m, float* __restrict__ dphi) {
 	int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=m) return;
-	float th=theta_max*tanhf(phi[i]);  // Note: NO s_warm in th for chain derivatives
+	float th=s_warm*theta_max*tanhf(phi[i]);  // FIXED: include s_warm in effective angle θ_eff
 	float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th);
 	float dthdphi=s_warm*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i]));
 	dphi[i] += (da[i]*dadth + dc[i]*dcdth)*dthdphi;   // ACCUMULATE
@@ -1347,6 +1347,7 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
 
 	// Zero scratch buffers before column accumulation
 	cudaMemsetAsync(scratch_da, 0, (size_t)m*sizeof(float), computeStream());
+	GLADES_CUDA_CHECK(cudaGetLastError());
 	cudaMemsetAsync(scratch_dc, 0, (size_t)m*sizeof(float), computeStream());
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
