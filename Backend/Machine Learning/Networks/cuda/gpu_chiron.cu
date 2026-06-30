@@ -1297,6 +1297,75 @@ bool chiron_rot_forward(float* q, float* p, const float* a, const float* c, floa
 	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
 }
 
+__global__ void chiron_rot_pre_backward_rows(const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ q_in, const float* __restrict__ p_in,
+        const float* __restrict__ a, const float* __restrict__ c, int T, int m,
+        float* __restrict__ dqi, float* __restrict__ dpi, float* __restrict__ da_el, float* __restrict__ dc_el) {
+	long n=(long)T*m;
+	for (long k=blockIdx.x*(long)blockDim.x+threadIdx.x; k<n; k+=(long)gridDim.x*blockDim.x) {
+		int i=k%m; float ai=a[i], ci=c[i]; float q0=q_in[k], p0=p_in[k];
+		float q1=q0+ai*p0; float p1=p0+ci*q1;
+		float dq2=dqo[k], dp1=dpo[k];
+		float dq1=dq2; float dp1a=dp1+ai*dq2; float dael=p1*dq2;       // shear3 bwd
+		float dp0=dp1a; dq1+=ci*dp1a; float dcel=q1*dp1a;             // shear2 bwd
+		float dq0=dq1; dp0+=ai*dq1; dael+=p0*dq1;                     // shear1 bwd
+		dqi[k]=dq0; dpi[k]=dp0; da_el[k]=dael; dc_el[k]=dcel;
+	}
+}
+
+__global__ void chiron_rot_chain_kernel(const float* __restrict__ da, const float* __restrict__ dc,
+        const float* __restrict__ phi, float theta_max, float s_warm, int m, float* __restrict__ dphi) {
+	int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=m) return;
+	float th=theta_max*tanhf(phi[i]);  // Note: NO s_warm in th for chain derivatives
+	float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th);
+	float dthdphi=s_warm*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i]));
+	dphi[i] += (da[i]*dadth + dc[i]*dcdth)*dthdphi;   // ACCUMULATE
+}
+
+bool chiron_rot_backward(const float* dq_out, const float* dp_out,
+                         const float* q_in, const float* p_in,
+                         const float* a, const float* c,
+                         const float* phi, float theta_max, float s_warm,
+                         int T, int m,
+                         float* dq_in, float* dp_in, float* dphi,
+                         float* scratch_da, float* scratch_dc) {
+	if (T <= 0 || m <= 0) return true;
+
+	// Allocate scratch buffers for per-element da and dc (T*m each)
+	glades::gpu::GpuBuffer<float> da_el_buf, dc_el_buf;
+	da_el_buf.allocate((size_t)T*m);
+	dc_el_buf.allocate((size_t)T*m);
+	float* da_el = da_el_buf.data();
+	float* dc_el = dc_el_buf.data();
+
+	// Launch pre-backward kernel to compute dq_in, dp_in, da_el, dc_el
+	int block = rowBlockSize(m);
+	long n = (long)T*m; int grd = (int)((n+block-1)/block); if(grd>65535)grd=65535;
+	chiron_rot_pre_backward_rows<<<grd, block, 0, computeStream()>>>(
+	    dq_out, dp_out, q_in, p_in, a, c, T, m, dq_in, dp_in, da_el, dc_el);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Zero scratch buffers before column accumulation
+	cudaMemsetAsync(scratch_da, 0, (size_t)m*sizeof(float), computeStream());
+	cudaMemsetAsync(scratch_dc, 0, (size_t)m*sizeof(float), computeStream());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Column reduction: scratch_da/dc ACCUMULATE (+=) the column sums
+	int rblock = 256; int rsmem = (rblock/32 + 1) * sizeof(float);
+	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(da_el, T, m, scratch_da);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(dc_el, T, m, scratch_dc);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Chain kernel: map (da, dc, phi) -> dphi
+	int blk = 256; int grd2 = (m + blk - 1) / blk;
+	chiron_rot_chain_kernel<<<grd2, blk, 0, computeStream()>>>(
+	    scratch_da, scratch_dc, phi, theta_max, s_warm, m, dphi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
 // ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================

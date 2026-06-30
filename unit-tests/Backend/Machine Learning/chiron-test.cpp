@@ -11489,6 +11489,7 @@ void CHIRONUnitTest()
 	CHIRONDriftBackwardParityTest();
 	CHIRONRotCpuTest();
 	CHIRONRotGpuParityTest();
+	CHIRONRotBackwardParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18666,5 +18667,39 @@ void CHIRONRotGpuParityTest()
 	ASSERT(msg, mr<1e-5f);
 #else
 	std::printf("  [SORC rot GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// GPU rotation backward parity + coeff-chain (dphi) against CPU oracle.
+void CHIRONRotBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [SORC rot backward parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=6,m=8; const float theta_max=1.0471975512f, sw=0.8f;
+	std::vector<float> phi(m),a(m),c(m),q(T*m),p(T*m),dqo(T*m),dpo(T*m);
+	for(int i=0;i<m;++i){ phi[i]=0.2f*i-0.5f; float th; glades::chiron::rot_coeffs(phi[i],theta_max,sw,a[i],c[i],th); }
+	for(int k=0;k<T*m;++k){ q[k]=0.4f*sinf(0.5f*k+0.2f); p[k]=0.3f*cosf(0.3f*k); dqo[k]=0.15f*cosf(0.4f*k); dpo[k]=0.12f*sinf(0.35f*k); }
+	// CPU oracle: rot_backward -> da,dc -> dphi.
+	std::vector<float> dqi(T*m,0.f),dpi(T*m,0.f),da(m,0.f),dc(m,0.f),dphic(m,0.f);
+	glades::chiron::rot_backward(&dqo[0],&dpo[0],&q[0],&p[0],&a[0],&c[0],T,m,&dqi[0],&dpi[0],&da[0],&dc[0]);
+	for(int i=0;i<m;++i){ float th=theta_max*tanhf(phi[i]); float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th); float dthdphi=sw*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i])); dphic[i]=(da[i]*dadth+dc[i]*dcdth)*dthdphi; }
+	// GPU.
+	glades::gpu::GpuBuffer<float> dPhi,dA,dC,dQ,dP,dDQO,dDPO,dDQI,dDPI,dDPHI,dSda,dSdc;
+	dPhi.allocate(m);dPhi.upload(&phi[0],m); dA.allocate(m);dC.allocate(m);
+	glades::gpu::chiron_rot_coeffs(dPhi.data(),theta_max,sw,m,dA.data(),dC.data());
+	dQ.allocate(T*m);dQ.upload(&q[0],T*m); dP.allocate(T*m);dP.upload(&p[0],T*m);
+	dDQO.allocate(T*m);dDQO.upload(&dqo[0],T*m); dDPO.allocate(T*m);dDPO.upload(&dpo[0],T*m);
+	dDQI.allocate(T*m);dDPI.allocate(T*m); dDPHI.allocate(m);dDPHI.zero(); dSda.allocate(m);dSdc.allocate(m);
+	glades::gpu::chiron_rot_backward(dDQO.data(),dDPO.data(),dQ.data(),dP.data(),dA.data(),dC.data(),dPhi.data(),theta_max,sw,T,m,dDQI.data(),dDPI.data(),dDPHI.data(),dSda.data(),dSdc.data());
+	std::vector<float> dqig(T*m),dpig(T*m),dphig(m); dDQI.download(&dqig[0],T*m); dDPI.download(&dpig[0],T*m); dDPHI.download(&dphig[0],m);
+	float me=0.f; for(int k=0;k<T*m;++k) me=fmaxf(me,fmaxf(fabsf(dqig[k]-dqi[k]),fabsf(dpig[k]-dpi[k])));
+	for(int i=0;i<m;++i) me=fmaxf(me,fabsf(dphig[i]-dphic[i]));
+	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot backward CPU/GPU parity (maxErr=%.2e)",me); ASSERT(msg, me<2e-4f);
+#else
+	std::printf("  [SORC rot backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }

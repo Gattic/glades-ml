@@ -283,6 +283,22 @@ bool chiron_rot_coeffs(const float* phi, float theta_max, float s_warm, int m,
 bool chiron_rot_forward(float* q, float* p, const float* a, const float* c,
                         float sign, int T, int m);
 
+// chiron_rot_backward:
+//   Backward adjoint of the rotation. Computes:
+//   - dq_in, dp_in: gradients w.r.t. q_in, p_in
+//   - dphi: ACCUMULATES gradient w.r.t. phi via the coefficient chain
+//   Internally: (1) per-element kernel writes dq_in, dp_in + per-element da_el, dc_el;
+//   (2) column reduction to da, dc via chiron_col_accumulate;
+//   (3) coefficient chain kernel maps (da, dc, phi) -> dphi accumulation.
+//   scratch_da, scratch_dc: caller-owned [m] scratch buffers.
+bool chiron_rot_backward(const float* dq_out, const float* dp_out,
+                         const float* q_in, const float* p_in,
+                         const float* a, const float* c,
+                         const float* phi, float theta_max, float s_warm,
+                         int T, int m,
+                         float* dq_in, float* dp_in, float* dphi,
+                         float* scratch_da, float* scratch_dc);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -757,6 +773,12 @@ inline bool chiron_rot_coeffs(const float*, float, float, int,
                               float*, float*) { return false; }
 inline bool chiron_rot_forward(float*, float*, const float*, const float*,
                                float, int, int) { return false; }
+inline bool chiron_rot_backward(const float*, const float*,
+                                const float*, const float*,
+                                const float*, const float*,
+                                const float*, float, float,
+                                int, int,
+                                float*, float*, float*, float*, float*) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

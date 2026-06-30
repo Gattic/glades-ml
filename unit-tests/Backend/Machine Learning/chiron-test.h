@@ -116,6 +116,7 @@ void CHIRONDriftReversibilityTest();
 void CHIRONDriftBackwardParityTest();
 void CHIRONRotCpuTest();
 void CHIRONRotGpuParityTest();
+void CHIRONRotBackwardParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
