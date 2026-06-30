@@ -413,10 +413,13 @@ val@2500 **2.78** — vs SORC's 14.45 / ‖g‖ 4.7e10 / 1619 skips / explosion 
 `[whisc]` monitor confirms `ρ_eff` grew to **~3000** (past the SORC-kill regime) and the
 whitening absorbed it; the R1 bound holds in vivo. Perplexity is a promising bonus (matched
 this-session base val@1000 4.21 vs 4.04 = −0.17 nat; vs prior SORC-base val@2500 3.58 vs 2.78 =
-−0.80 nat, widening) but wants a matched-2500 / **E4 (30k, not yet run)** to bank. **Two open
-items gate a ship, neither affecting the stability verdict:** (1) a **−37% wall throughput**
-regression from the unoptimized `chiron_whisc_update_stats` (uncoalesced column reduction; fix =
-fuse the q²/p² accumulation into the coalesced whiten pass); (2) the E4 perplexity confirmation.
+−0.80 nat, widening) but wants a matched-2500 / **E4 (30k, not yet run)** to bank. **Perf
+addressed post-E3:** profiling corrected the bottleneck — the explicit `whisc_scale`
+whiten/unwhiten passes (19.1% GPU time), NOT the stats kernel. **Coefficient folding** (`A=a²·sorc_a,
+C=sorc_c/a²`, FD-validated `a²`-aware `dθ`) eliminated them → **+24% throughput, −37%→−22%**
+(committed `c83303e9c`/`6e429d6`, E0 identity preserved); a stats-kernel coalesce (`18be3228d`) was
+correct but overlap-hidden (~0 end-to-end), residual −22% = the inherent rotation kernels. **One
+open item gates a ship: the E4 (30k) perplexity confirmation** vs a matched baseline.
 Engineering is **committed default-off**, fully reviewed (merge-ready), reusing the SORC
 infrastructure (`rot_phi`/Adam/checkpoint-bit-1024/`[sorc]` monitor) + new kernels
 `chiron_whisc_scale` / `chiron_whisc_update_stats` + flags `--whisc-coupling` / `--whisc-ema` /

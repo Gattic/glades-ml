@@ -61,7 +61,26 @@ divergence categorically.
   but not yet banked. A matched no-whisc 2500-step run this session, and/or the E4 30k gate,
   would establish it rigorously.
 
-## Wall-throughput regression (perf follow-up — OPEN)
+## Wall-throughput — PERF PASS DONE (folding recovered the bulk; −37%→−22%)
+
+**Resolved 2026-06-30 (post-E3).** An nsys profile **corrected the earlier hypothesis**: the
+dominant cost was NOT the stats kernel (3.7%) but the **explicit `whiten/unwhiten` scale passes
+(`whisc_scale_kernel` 19.1% of GPU time, ~768 passes/step)** — a consequence of the plan's
+explicit `whiten∘rot∘unwhiten` composition. The fix was **coefficient folding** (the spec's
+original §5.2 design): fold `a²` into the rot coeffs (`A=a²·sorc_a`, `C=sorc_c/a²`) so the
+whitening rides the existing rot kernel, eliminating all 768 scale passes. The folded `dθ` chain
+(`a²`-aware) was FD-validated at ρ=45/300/3000 (rel-err ≤2e-4). **Result: throughput 17,930 →
+22,200 tok/s (+24%); slowdown −37% (×1.62) → −22% (×1.28).** E0 identity preserved (folded
+φ=0 ⇒ A=C=0 ⇒ identity, loss 10.7612 exact). Committed: lib `c83303e9c`, trainer `6e429d6`.
+
+A second pass **coalesced the stats kernel** (32 transactions/warp → 1; committed `18be3228d`,
+parity worst ~1e-5) — correct, but it gave **~0 end-to-end gain** (22,170 ≈ 22,200): the stats
+kernel's GPU time is **overlap-hidden** at this workload (CPU dispatch / other-GPU-work overlap),
+not on the wall-clock critical path. The remaining −22% is the **inherent rotation kernels**
+(~12.5%, shared with SORC) plus overlap-limited overhead; further micro-opt would also be
+overlap-hidden (measured). The folding pass extracted the available room.
+
+### (historical) Original wall finding (now addressed by folding):
 - WhiSC-D **~17,930 tok/s** vs matched baseline **~28,500 tok/s** → **−37% (×0.62), +1.4 s/step
   (×1.62)**. (The design spec predicted ≈parity — that claim under-accounted for the new stats
   kernel; correcting the record here.)
