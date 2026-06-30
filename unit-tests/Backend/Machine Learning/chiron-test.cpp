@@ -18698,7 +18698,9 @@ void CHIRONRotBackwardParityTest()
 	std::vector<float> dqig(T*m),dpig(T*m),dphig(m); dDQI.download(&dqig[0],T*m); dDPI.download(&dpig[0],T*m); dDPHI.download(&dphig[0],m);
 	float me=0.f; for(int k=0;k<T*m;++k) me=fmaxf(me,fmaxf(fabsf(dqig[k]-dqi[k]),fabsf(dpig[k]-dpi[k])));
 	for(int i=0;i<m;++i) me=fmaxf(me,fabsf(dphig[i]-dphic[i]));
-	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot backward CPU/GPU parity (maxErr=%.2e)",me); ASSERT(msg, me<2e-4f);
+	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot backward CPU/GPU parity (maxErr=%.2e)",me);
+	std::printf("  [SORC rot backward CPU/GPU parity] maxErr=%.2e (bar 2e-4)\n", me);
+	ASSERT(msg, me<2e-4f);
 #else
 	std::printf("  [SORC rot backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
