@@ -343,6 +343,28 @@ the thread was redirected to **cast-pipeline elimination, which shipped**
 if the EV changes (precision-tier change or much larger k). reln-fusion
 remains open.
 
+**Update (2026-06-30) — OBSD per-layer symplectic coupling: CLOSED NO-GO.**
+The architecture-native arc this paragraph invites was tried: a per-layer
+reversible, ReZero-gated, mass-preconditioned nonlinear drift
+`q += a⊙tanh(M⁻¹⊙N(p)+b)` (let attention compose across depth, since the
+flagship folds p→q only at the final layer). It is **stable** through the
+1.6–2B-token instability regime (0 grad-skips; bounded-φ + p-side reanchor held
+where the data-scale flagship died at 1.49B), but **regresses perplexity at
+scale**: helps early (+0.05 nat to ~16.5k) then reverses to **−0.66 nat by 30k**
+(matched single-seed E4, val 3.27 vs baseline 2.61) as the ReZero gate grows
+unbounded (maxA 0.46→1.8) → ‖g‖ inflates → grad-clipping throttles effective LR
+→ OBSD misses the baseline's late-training acceleration. A bounded-gate salvage
+(`--drift-gate-cap`, late) had zero effect. So **per-layer symplectic coupling
+is ruled out as a perplexity lever**; reln-fusion and data-side work remain the
+open directions. Engineering (drift kernels reusing reanchor, `clamp_abs`, the
+`a_drift` gate param + checkpoint bit 512, flags `--per-layer-drift` /
+`--drift-warmup` / `--drift-gate-cap`) is committed **default-off** and reusable;
+the arc also fixed a latent crash (**`--scfa` now requires `--bf16-weights`** —
+else `scfa_attention_backward` SIGSEGVs). Full record:
+`research/CHIRON_OBSD_RESULT_2026_06_27.md`; design/plan
+`docs/superpowers/specs/2026-06-27-chiron-richer-symplectic-block-design.md` +
+`docs/superpowers/plans/2026-06-27-chiron-richer-symplectic-block.md`.
+
 ## Prior v5+FP8 Flagship Details — CHIRON 1B @ T=16384 (kept for context)
 
 The v5+FP8 flagship (predecessor):
