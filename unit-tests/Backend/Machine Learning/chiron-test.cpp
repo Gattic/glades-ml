@@ -18718,3 +18718,38 @@ void CHIRONRotBackwardParityTest()
 	std::printf("  [SORC rot backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// WhiSC Task 1: CPU reference whisc_scale + reversibility/symplecticity test
+// ---------------------------------------------------------------------------
+void WhiSCScaleCpuTest()
+{
+	const unsigned int T = 5, m = 4;
+	std::vector<float> a(m);
+	for (unsigned i = 0; i < m; ++i) a[i] = 0.2f + 0.5f * (float)i; // distinct, >0
+	std::vector<float> q(T*m), p(T*m), q0, p0;
+	for (unsigned k = 0; k < T*m; ++k) { q[k] = 0.3f*(float)k - 1.0f; p[k] = 17.0f*(0.1f*(float)k + 0.5f); } // p ~ 17x q (the asymmetry)
+	q0 = q; p0 = p;
+
+	// (a) whiten then unwhiten == identity
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], +1.0f, T, m);
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], -1.0f, T, m);
+	float maxerr = 0.0f;
+	for (unsigned k = 0; k < T*m; ++k) { maxerr = std::max(maxerr, std::fabs(q[k]-q0[k])); maxerr = std::max(maxerr, std::fabs(p[k]-p0[k])); }
+	ASSERT("WhiSC scale whiten/unwhiten not identity", maxerr < 1e-5f);
+
+	// (b) composite reversibility: unwhiten . rot . whiten , inverted by unwhiten . rot_inverse . whiten
+	std::vector<float> rc_a(m), rc_c(m); float th;
+	for (unsigned i = 0; i < m; ++i) glades::chiron::rot_coeffs(0.4f*(float)i - 0.5f, 0.1f, 1.0f, rc_a[i], rc_c[i], th);
+	q = q0; p = p0;
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], +1.0f, T, m);
+	glades::chiron::rot_forward(&q[0], &p[0], &rc_a[0], &rc_c[0], T, m);
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], -1.0f, T, m);
+	// inverse:
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], +1.0f, T, m);
+	glades::chiron::rot_inverse(&q[0], &p[0], &rc_a[0], &rc_c[0], T, m);
+	glades::chiron::whisc_scale(&q[0], &p[0], &a[0], -1.0f, T, m);
+	maxerr = 0.0f;
+	for (unsigned k = 0; k < T*m; ++k) { maxerr = std::max(maxerr, std::fabs(q[k]-q0[k])); maxerr = std::max(maxerr, std::fabs(p[k]-p0[k])); }
+	ASSERT("WhiSC composite not reversible", maxerr < 1e-4f);
+}

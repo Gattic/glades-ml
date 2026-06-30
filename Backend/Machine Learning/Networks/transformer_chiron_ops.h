@@ -322,6 +322,16 @@ inline void rot_backward(const float* dq_out, const float* dp_out, const float* 
 	}
 }
 
+// WhiSC per-channel symplectic whitening scale. sign=+1 whitens (q/=a, p*=a);
+// sign=-1 unwhitens (q*=a, p/=a). a is per-channel [m], broadcast over T. det=1.
+inline void whisc_scale(float* q, float* p, const float* a, float sign, unsigned int T, unsigned int m) {
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i) {
+		unsigned long k=(unsigned long)t*m+i; float ai=a[i];
+		if (sign > 0.0f) { q[k] = q[k]/ai; p[k] = p[k]*ai; }
+		else             { q[k] = q[k]*ai; p[k] = p[k]/ai; }
+	}
+}
+
 // ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //
