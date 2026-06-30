@@ -262,6 +262,28 @@ bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
                            float* scratch_stats_split);
 
 // ---------------------------------------------------------------------------
+// SORC: per-channel symplectic rotation coupling (CHIRON symplectic shear).
+//
+// Rotates the (q,p) state via a per-channel angle theta(phi) = s_warm * theta_max * tanh(phi).
+// The rotation is realized as 3 shears: q += a*p, p += c*q, q += a*p,
+// where a = -tan(theta/2) and c = sin(theta).
+// This composes to the 2D rotation matrix R(theta) = [[cos(theta), -sin(theta)], [sin(theta), cos(theta)]].
+//
+// chiron_rot_coeffs:
+//   Given per-channel phi [m], computes a [m] and c [m] for use in rot_forward/inverse.
+//   theta_eff[i] = s_warm * theta_max * tanh(phi[i])
+//   a[i] = -tan(theta_eff[i]/2), c[i] = sin(theta_eff[i])
+//
+// chiron_rot_forward:
+//   Forward (sign=+1): applies 3 shears: q += a*p, p += c*q, q += a*p
+//   Inverse (sign=-1): applies 3 negated shears in reverse: q -= a*p, p -= c*q, q -= a*p
+//   a, c are per-channel [m], broadcast over T tokens.
+bool chiron_rot_coeffs(const float* phi, float theta_max, float s_warm, int m,
+                       float* a, float* c);
+bool chiron_rot_forward(float* q, float* p, const float* a, const float* c,
+                        float sign, int T, int m);
+
+// ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
 //
@@ -731,6 +753,10 @@ inline bool chiron_drift_backward(const float*, const float*, const float*,
                                   int, int, float,
                                   float*, float*, float*, float*,
                                   float*, float*, float*) { return false; }
+inline bool chiron_rot_coeffs(const float*, float, float, int,
+                              float*, float*) { return false; }
+inline bool chiron_rot_forward(float*, float*, const float*, const float*,
+                               float, int, int) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

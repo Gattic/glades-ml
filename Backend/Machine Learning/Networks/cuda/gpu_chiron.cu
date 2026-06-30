@@ -1254,6 +1254,50 @@ bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
 }
 
 // ===========================================================================
+//  3b. SORC per-channel symplectic rotation coupling.
+// ===========================================================================
+//
+// Rotates the (q,p) state via per-channel angle theta(phi) = s_warm * theta_max * tanh(phi).
+// The rotation is realized as 3 shears: q += a*p, p += c*q, q += a*p,
+// where a = -tan(theta/2) and c = sin(theta).
+
+namespace {
+
+__global__ void chiron_rot_coeffs_kernel(const float* __restrict__ phi, float theta_max, float s_warm, int m,
+                                         float* __restrict__ a, float* __restrict__ c) {
+	int i = blockIdx.x*blockDim.x + threadIdx.x; if (i>=m) return;
+	float th = s_warm*theta_max*tanhf(phi[i]);
+	a[i] = -tanf(0.5f*th); c[i] = sinf(th);
+}
+
+// sign=+1 forward (3 shears), sign=-1 inverse (3 negated shears reversed). One block-stride over T*m.
+__global__ void chiron_rot_forward_rows(float* __restrict__ q, float* __restrict__ p,
+                                        const float* __restrict__ a, const float* __restrict__ c,
+                                        float sign, int T, int m) {
+	long n=(long)T*m;
+	for (long k=blockIdx.x*(long)blockDim.x+threadIdx.x; k<n; k+=(long)gridDim.x*blockDim.x) {
+		int i=k%m; float qv=q[k], pv=p[k], ai=a[i], ci=c[i];
+		if (sign>0.f) { qv+=ai*pv; pv+=ci*qv; qv+=ai*pv; }       // forward
+		else          { qv-=ai*pv; pv-=ci*qv; qv-=ai*pv; }       // inverse
+		q[k]=qv; p[k]=pv;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_rot_coeffs(const float* phi, float theta_max, float s_warm, int m, float* a, float* c) {
+	if (m<=0) return true; int blk=256, grd=(m+blk-1)/blk;
+	chiron_rot_coeffs_kernel<<<grd,blk,0,computeStream()>>>(phi,theta_max,s_warm,m,a,c);
+	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
+}
+
+bool chiron_rot_forward(float* q, float* p, const float* a, const float* c, float sign, int T, int m) {
+	if (T<=0||m<=0) return true; long n=(long)T*m; int blk=256; int grd=(int)((n+blk-1)/blk); if(grd>65535)grd=65535;
+	chiron_rot_forward_rows<<<grd,blk,0,computeStream()>>>(q,p,a,c,sign,T,m);
+	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
+}
+
+// ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================
 //

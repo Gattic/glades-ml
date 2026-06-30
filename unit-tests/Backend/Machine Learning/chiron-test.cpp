@@ -18632,3 +18632,34 @@ void CHIRONRotCpuTest()
 	std::printf("  [SORC FD grad-check] maxRel=%.4f (bar 2e-2)\n", maxRel);
 	ASSERT(msg, maxRel<2e-2f);
 }
+
+// GPU forward parity + reversibility for the SORC rotation kernel against CPU reference.
+void CHIRONRotGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [SORC rot GPU parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=5,m=8; const float theta_max=1.0471975512f, sw=0.9f;
+	std::vector<float> phi(m), a(m), c(m), q(T*m), p(T*m);
+	for(int i=0;i<m;++i){ phi[i]=0.25f*i-0.7f; float th; glades::chiron::rot_coeffs(phi[i],theta_max,sw,a[i],c[i],th); }
+	for(int k=0;k<T*m;++k){ q[k]=0.4f*sinf(0.5f*k); p[k]=0.3f*cosf(0.2f*k); }
+	std::vector<float> qc=q, pc=p; glades::chiron::rot_forward(&qc[0],&pc[0],&a[0],&c[0],T,m); // CPU
+	glades::gpu::GpuBuffer<float> dPhi,dA,dC,dQ,dP;
+	dPhi.allocate(m); dPhi.upload(&phi[0],m); dA.allocate(m); dC.allocate(m); dQ.allocate(T*m); dQ.upload(&q[0],T*m); dP.allocate(T*m); dP.upload(&p[0],T*m);
+	glades::gpu::chiron_rot_coeffs(dPhi.data(),theta_max,sw,m,dA.data(),dC.data());
+	glades::gpu::chiron_rot_forward(dQ.data(),dP.data(),dA.data(),dC.data(),+1.f,T,m);
+	std::vector<float> qg(T*m),pg(T*m); dQ.download(&qg[0],T*m); dP.download(&pg[0],T*m);
+	float me=0.f; for(int k=0;k<T*m;++k) me=fmaxf(me,fmaxf(fabsf(qg[k]-qc[k]),fabsf(pg[k]-pc[k])));
+	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot fwd CPU/GPU parity (maxErr=%.2e)",me); ASSERT(msg, me<1e-4f);
+	// reversibility: forward then inverse on GPU reconstructs.
+	glades::gpu::chiron_rot_forward(dQ.data(),dP.data(),dA.data(),dC.data(),-1.f,T,m); // inverse (sign=-1)
+	dQ.download(&qg[0],T*m); dP.download(&pg[0],T*m);
+	float mr=0.f; for(int k=0;k<T*m;++k) mr=fmaxf(mr,fmaxf(fabsf(qg[k]-q[k]),fabsf(pg[k]-p[k])));
+	std::snprintf(msg,sizeof(msg),"SORC rot fwd∘inv reconstructs (maxErr=%.2e)",mr); ASSERT(msg, mr<1e-5f);
+#else
+	std::printf("  [SORC rot GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
