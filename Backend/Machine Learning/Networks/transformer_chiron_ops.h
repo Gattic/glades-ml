@@ -265,6 +265,64 @@ inline void drift_backward(const float* dq_out, const float* p, const float* a,
 }
 
 // ------------------------------------------------------------------
+// SORC: per-channel symplectic rotation coupling (CPU reference).
+//
+// Rotates the (q,p) state via a per-channel angle theta(phi) = s_warm * theta_max * tanh(phi).
+// The rotation is realized as 3 shears: q += a*p, p += c*q, q += a*p,
+// where a = -tan(theta/2) and c = sin(theta).
+// This composes to the 2D rotation matrix R(theta) = [[cos(theta), -sin(theta)], [sin(theta), cos(theta)]].
+
+inline void rot_coeffs(float phi, float theta_max, float s_warm, float& a, float& c, float& theta_eff) {
+	theta_eff = s_warm * theta_max * tanhf(phi);
+	a = -tanf(0.5f * theta_eff);
+	c = sinf(theta_eff);
+}
+
+// Forward: (q,p) <- R(theta)(q,p) per element, via 3 shears. a,c are per-channel [m], broadcast over t.
+inline void rot_forward(float* q, float* p, const float* a, const float* c, unsigned int T, unsigned int m) {
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i) {
+		unsigned long k=(unsigned long)t*m+i; float qv=q[k], pv=p[k], ai=a[i], ci=c[i];
+		qv = qv + ai*pv;   // shear1: q += a*p
+		pv = pv + ci*qv;   // shear2: p += c*q
+		qv = qv + ai*pv;   // shear3: q += a*p
+		q[k]=qv; p[k]=pv;
+	}
+}
+
+// Inverse from (q2,p1): recover (q0,p0).
+inline void rot_inverse(float* q, float* p, const float* a, const float* c, unsigned int T, unsigned int m) {
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i) {
+		unsigned long k=(unsigned long)t*m+i; float qv=q[k], pv=p[k], ai=a[i], ci=c[i];
+		qv = qv - ai*pv;   // q1 = q2 - a*p1
+		pv = pv - ci*qv;   // p0 = p1 - c*q1
+		qv = qv - ai*pv;   // q0 = q1 - a*p0
+		q[k]=qv; p[k]=pv;
+	}
+}
+
+// Backward: given output adjoints (dq_out=dL/dq2, dp_out=dL/dp1) and the rotation INPUT (q_in=q0,p_in=p0),
+// produce input adjoints (dq_in,dp_in) and accumulate da,dc (per channel). Recomputes q1,p1 from inputs.
+inline void rot_backward(const float* dq_out, const float* dp_out, const float* q_in, const float* p_in,
+                         const float* a, const float* c, unsigned int T, unsigned int m,
+                         float* dq_in, float* dp_in, float* da, float* dc) {
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i) {
+		unsigned long k=(unsigned long)t*m+i; float ai=a[i], ci=c[i];
+		float q0=q_in[k], p0=p_in[k];
+		float q1=q0+ai*p0;          // shear1
+		float p1=p0+ci*q1;          // shear2  (q2 not needed; dq_out is adjoint of q2)
+		float dq2=dq_out[k], dp1=dp_out[k];
+		// shear3 bwd: q2=q1+a*p1
+		float dq1=dq2; float dp1_acc=dp1 + ai*dq2; float da_el=p1*dq2;
+		// shear2 bwd: p1=p0+c*q1
+		float dp0=dp1_acc; dq1 += ci*dp1_acc; float dc_el=q1*dp1_acc;
+		// shear1 bwd: q1=q0+a*p0
+		float dq0=dq1; dp0 += ai*dq1; da_el += p0*dq1;
+		dq_in[k]=dq0; dp_in[k]=dp0;
+		da[i]+=da_el; dc[i]+=dc_el;
+	}
+}
+
+// ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //
 // To prevent BF16 round-off from compounding across the block-inverse

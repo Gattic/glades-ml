@@ -11487,6 +11487,7 @@ void CHIRONUnitTest()
 	CHIRONDriftCpuGpuParityTest();
 	CHIRONDriftReversibilityTest();
 	CHIRONDriftBackwardParityTest();
+	CHIRONRotCpuTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18572,4 +18573,62 @@ void CHIRONDriftBackwardParityTest()
 #else
 	std::printf("  [CHIRON drift backward parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
+}
+
+// SORC CPU reference test: verify rotation composes, conserves norm, reconstructs via inverse, and backward gradients pass FD.
+void CHIRONRotCpuTest()
+{
+	const unsigned T=4, m=6; const float theta_max=1.0471975512f /*60deg*/, sw=1.0f;
+	std::vector<float> phi(m), a(m), c(m); std::vector<float> q(T*m), p(T*m), q0, p0;
+	for (unsigned i=0;i<m;++i){ phi[i]=0.3f*(float)i-0.6f; float th; glades::chiron::rot_coeffs(phi[i],theta_max,sw,a[i],c[i],th); }
+	for (unsigned k=0;k<T*m;++k){ q[k]=0.5f*sinf(0.7f*k+1.f); p[k]=0.4f*cosf(0.3f*k); }
+	q0=q; p0=p;
+	// (1)+(3): rotate, check it equals R(theta) per element AND conserves q^2+p^2.
+	glades::chiron::rot_forward(&q[0],&p[0],&a[0],&c[0],T,m);
+	float maxComposeErr=0.f, maxNormErr=0.f;
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i){
+		float th=theta_max*tanhf(phi[i]); size_t k=(size_t)t*m+i;
+		float qr=cosf(th)*q0[k]-sinf(th)*p0[k], pr=sinf(th)*q0[k]+cosf(th)*p0[k];
+		maxComposeErr=fmaxf(maxComposeErr, fmaxf(fabsf(q[k]-qr),fabsf(p[k]-pr)));
+		float n0=q0[k]*q0[k]+p0[k]*p0[k], n1=q[k]*q[k]+p[k]*p[k];
+		maxNormErr=fmaxf(maxNormErr, fabsf(n1-n0));
+	}
+	std::printf("  [SORC 3-shear composes] maxErr=%.4e (bar 1e-4)\n", maxComposeErr);
+	ASSERT("SORC 3-shear composes to R(theta)", maxComposeErr<1e-4f);
+	std::printf("  [SORC rotation norm conservation] maxErr=%.4e (bar 1e-4)\n", maxNormErr);
+	ASSERT("SORC rotation conserves q^2+p^2", maxNormErr<1e-4f);
+	// (2): inverse reconstructs.
+	glades::chiron::rot_inverse(&q[0],&p[0],&a[0],&c[0],T,m);
+	float maxRecon=0.f; for (unsigned k=0;k<T*m;++k) maxRecon=fmaxf(maxRecon, fmaxf(fabsf(q[k]-q0[k]),fabsf(p[k]-p0[k])));
+	std::printf("  [SORC fwd then inverse reconstructs] maxErr=%.4e (bar 1e-5)\n", maxRecon);
+	ASSERT("SORC fwd then inverse reconstructs (q,p)", maxRecon<1e-5f);
+	// (4): FD grad-check of dphi (objective J = sum dq_out*q2 + dp_out*p1).
+	std::vector<float> dqo(T*m), dpo(T*m); for (unsigned k=0;k<T*m;++k){ dqo[k]=0.2f*cosf(0.5f*k); dpo[k]=0.15f*sinf(0.4f*k); }
+	std::vector<float> dqi(T*m,0.f), dpi(T*m,0.f), da(m,0.f), dc(m,0.f);
+	glades::chiron::rot_backward(&dqo[0],&dpo[0],&q0[0],&p0[0],&a[0],&c[0],T,m,&dqi[0],&dpi[0],&da[0],&dc[0]);
+	// map da,dc -> dphi analytically:
+	std::vector<float> dphi(m);
+	for (unsigned i=0;i<m;++i){ float th=theta_max*tanhf(phi[i]); float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th); float dthdphi=theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i])); dphi[i]=(da[i]*dadth+dc[i]*dcdth)*dthdphi; }
+	const float h=1e-3f; float maxRel=0.f;
+	for (unsigned j=0;j<m;++j){
+		float save=phi[j]; float aj,cj,th;
+		double Jp=0.0, Jm=0.0;
+		{
+			std::vector<float> qq=q0, pp=p0; std::vector<float> av=a, cv=c;
+			glades::chiron::rot_coeffs(save+h,theta_max,sw,av[j],cv[j],th);
+			glades::chiron::rot_forward(&qq[0],&pp[0],&av[0],&cv[0],T,m);
+			for(unsigned k=0;k<T*m;++k) Jp+=(double)dqo[k]*qq[k]+(double)dpo[k]*pp[k];
+		}
+		{
+			std::vector<float> qq=q0, pp=p0; std::vector<float> av=a, cv=c;
+			glades::chiron::rot_coeffs(save-h,theta_max,sw,av[j],cv[j],th);
+			glades::chiron::rot_forward(&qq[0],&pp[0],&av[0],&cv[0],T,m);
+			for(unsigned k=0;k<T*m;++k) Jm+=(double)dqo[k]*qq[k]+(double)dpo[k]*pp[k];
+		}
+		phi[j]=save; (void)aj;(void)cj;
+		float fd=(float)((Jp-Jm)/(2.0*h)); float e=fabsf(fd-dphi[j])/(1e-3f+fabsf(fd)); if(e>maxRel)maxRel=e;
+	}
+	char msg[128]; std::snprintf(msg,sizeof(msg),"SORC rot backward FD grad-check (maxRel=%.4f)",maxRel);
+	std::printf("  [SORC FD grad-check] maxRel=%.4f (bar 2e-2)\n", maxRel);
+	ASSERT(msg, maxRel<2e-2f);
 }
