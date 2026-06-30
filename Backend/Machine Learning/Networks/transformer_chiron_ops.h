@@ -332,6 +332,22 @@ inline void whisc_scale(float* q, float* p, const float* a, float sign, unsigned
 	}
 }
 
+// WhiSC per-channel EMA second-moment stats + whitening scale derivation.
+// Qbar=E[q^2], Pbar=E[p^2] over T tokens, EMA-blended; a=clamp((Qbar/(Pbar+eps))^0.25, 1/clamp, clamp).
+inline void whisc_update_stats(const float* q, const float* p, unsigned int T, unsigned int m,
+                               float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a) {
+	for (unsigned i=0;i<m;++i) {
+		double sq=0.0, sp=0.0;
+		for (unsigned t=0;t<T;++t) { float qv=q[(unsigned long)t*m+i], pv=p[(unsigned long)t*m+i]; sq+=(double)qv*qv; sp+=(double)pv*pv; }
+		float mq=(float)(sq/(double)T), mp=(float)(sp/(double)T);
+		Qbar[i]=(1.0f-ema)*Qbar[i]+ema*mq;
+		Pbar[i]=(1.0f-ema)*Pbar[i]+ema*mp;
+		float ai=powf(Qbar[i]/(Pbar[i]+eps), 0.25f);
+		float lo=1.0f/clamp, hi=clamp;
+		a[i] = (ai<lo)?lo:((ai>hi)?hi:ai);
+	}
+}
+
 // ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //

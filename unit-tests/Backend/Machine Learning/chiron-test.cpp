@@ -18753,3 +18753,26 @@ void WhiSCScaleCpuTest()
 	for (unsigned k = 0; k < T*m; ++k) { maxerr = std::max(maxerr, std::fabs(q[k]-q0[k])); maxerr = std::max(maxerr, std::fabs(p[k]-p0[k])); }
 	ASSERT("WhiSC composite not reversible", maxerr < 1e-4f);
 }
+
+void WhiSCStatsCpuTest()
+{
+	const unsigned int T = 256, m = 3;
+	std::vector<float> q(T*m), p(T*m);
+	// channel 0: p ~ 17x q ; channel 1: p ~ 5x q ; channel 2: balanced
+	float pscale[3] = {17.0f, 5.0f, 1.0f};
+	for (unsigned t=0;t<T;++t) for (unsigned i=0;i<m;++i) {
+		float u = std::sin(0.123f*(float)(t*m+i)); // deterministic pseudo-noise
+		q[t*m+i] = u; p[t*m+i] = pscale[i]*std::cos(0.077f*(float)(t*m+i));
+	}
+	std::vector<float> Pbar(m,1.0f), Qbar(m,1.0f), a(m,1.0f);
+	// one-shot EMA=1.0 => Qbar,Pbar become the batch means exactly
+	glades::chiron::whisc_update_stats(&q[0], &p[0], T, m, /*ema=*/1.0f, /*eps=*/1e-12f, /*clamp=*/8.0f, &Pbar[0], &Qbar[0], &a[0]);
+	// whiten and check balance per channel
+	std::vector<float> qt=q, pt=p;
+	glades::chiron::whisc_scale(&qt[0], &pt[0], &a[0], +1.0f, T, m);
+	for (unsigned i=0;i<m;++i) {
+		double sq=0, sp=0; for (unsigned t=0;t<T;++t){ sq+=qt[t*m+i]*qt[t*m+i]; sp+=pt[t*m+i]*pt[t*m+i]; }
+		double eq=sq/T, ep=sp/T;
+		ASSERT("WhiSC stats: whitened subspaces not balanced", std::fabs(eq-ep) < 0.05*(eq+ep)+1e-6);
+	}
+}

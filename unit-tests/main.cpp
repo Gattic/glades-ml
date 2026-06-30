@@ -275,6 +275,7 @@ int main(int argc, char* argv[])
 	    else if (strcmp(argv[1], "chiron-whisc") == 0 || strcmp(argv[1], "whisc") == 0)
 	    {
 		WhiSCScaleCpuTest();
+		WhiSCStatsCpuTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {
