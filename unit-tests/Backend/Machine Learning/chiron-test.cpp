@@ -18805,3 +18805,57 @@ void WhiSCGpuParityTest()
 	float ea=0; for (int i=0;i<m;++i) ea=std::max(ea,std::fabs(Ag[i]-Ac[i]));
 	ASSERT("whisc_stats gpu/cpu a mismatch", ea < 1e-4f);
 }
+
+// WhiSC Task 4: composite backward dphi vs finite-difference parity at rho=45 (R1 guard)
+void WhiSCBackwardParityTest()
+{
+	const unsigned int T = 8, m = 3;
+	const float theta_max = 0.07f, sw = 1.0f, RHO = 45.0f;
+	std::vector<float> phi(m), q0(T*m), p0(T*m), a(m), cot_q(T*m), cot_p(T*m);
+	for (unsigned i=0;i<m;++i){ phi[i]=0.2f*(float)i-0.3f; a[i]=powf(1.0f/(RHO*RHO),0.25f); } // a=(E[q2]/E[p2])^.25 with E[p2]=RHO^2 E[q2]
+	for (unsigned k=0;k<T*m;++k){ q0[k]=std::sin(0.4f*(float)k); p0[k]=RHO*std::cos(0.27f*(float)k); cot_q[k]=std::sin(0.13f*k+1.0f); cot_p[k]=std::cos(0.31f*k); }
+
+	// forward F(q,p)=unwhiten . rot . whiten ; loss L=<cot,(q_out,p_out)>
+	// analytic dphi via composite backward:
+	std::vector<float> rc_a(m), rc_c(m); float th;
+	for (unsigned i=0;i<m;++i) glades::chiron::rot_coeffs(phi[i],theta_max,sw,rc_a[i],rc_c[i],th);
+	// d_out = cot ; dR_out = unwhiten-adjoint(cot) = whisc_scale(cot, sign=-1)
+	std::vector<float> dq=cot_q, dp=cot_p;
+	glades::chiron::whisc_scale(&dq[0], &dp[0], &a[0], -1.0f, T, m);
+	// whitened rot-input = whiten(q0,p0)
+	std::vector<float> qt=q0, pt=p0;
+	glades::chiron::whisc_scale(&qt[0], &pt[0], &a[0], +1.0f, T, m);
+	// rot_backward -> da,dc (state adjoints dq,dp overwritten but unused here)
+	std::vector<float> dqi(T*m), dpi(T*m), da(m,0.0f), dc(m,0.0f);
+	glades::chiron::rot_backward(&dq[0],&dp[0],&qt[0],&pt[0],&rc_a[0],&rc_c[0],T,m,&dqi[0],&dpi[0],&da[0],&dc[0]);
+	// coeff chain: a=-tan(th/2), c=sin th, th=sw*tmax*tanh(phi)
+	std::vector<float> dphi(m,0.0f);
+	for (unsigned i=0;i<m;++i){
+		float thi = sw*theta_max*tanhf(phi[i]);
+		float dadth = -0.5f/ (cosf(0.5f*thi)*cosf(0.5f*thi)); // d(-tan(th/2))/dth = -1/2 sec^2(th/2)
+		float dcdth = cosf(thi);
+		float dthdphi = sw*theta_max*(1.0f - tanhf(phi[i])*tanhf(phi[i]));
+		dphi[i] = (da[i]*dadth + dc[i]*dcdth) * dthdphi;
+	}
+
+	// central finite differences of L wrt phi[i]
+	const float h = 1e-3f;
+	for (unsigned i=0;i<m;++i){
+		float save=phi[i];
+		double Lp, Lm;
+		for (int s=0; s<2; ++s){
+			phi[i] = save + (s==0? h : -h);
+			std::vector<float> rca(m), rcc(m); for (unsigned j=0;j<m;++j) glades::chiron::rot_coeffs(phi[j],theta_max,sw,rca[j],rcc[j],th);
+			std::vector<float> q=q0,p=p0;
+			glades::chiron::whisc_scale(&q[0],&p[0],&a[0],+1.0f,T,m);
+			glades::chiron::rot_forward(&q[0],&p[0],&rca[0],&rcc[0],T,m);
+			glades::chiron::whisc_scale(&q[0],&p[0],&a[0],-1.0f,T,m);
+			double L=0; for (unsigned k=0;k<T*m;++k) L += (double)cot_q[k]*q[k] + (double)cot_p[k]*p[k];
+			if (s==0) Lp=L; else Lm=L;
+		}
+		phi[i]=save;
+		float fd = (float)((Lp-Lm)/(2.0*h));
+		float rel = std::fabs(dphi[i]-fd) / (std::fabs(fd)+1e-4f);
+		ASSERT("WhiSC dphi != finite-difference at rho=45", rel < 2e-2f);
+	}
+}
