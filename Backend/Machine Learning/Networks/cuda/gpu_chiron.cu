@@ -1419,35 +1419,88 @@ bool chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, int m) {
 	return true;
 }
 
-// one block per channel; block reduces sum of squares over T tokens (column i, stride m).
-__global__ void whisc_stats_kernel(const float* __restrict__ q, const float* __restrict__ p,
-                                   int T, int m, float ema, float eps, float clamp,
-                                   float* __restrict__ Pbar, float* __restrict__ Qbar, float* __restrict__ a) {
-	int i = blockIdx.x; if (i >= m) return;
-	__shared__ float sq[256]; __shared__ float sp[256];
+// Coalesced two-pass per-channel second-moment stats.
+//
+// Pass 1 (whisc_partial_kernel): coalesced partial reduction.
+//   Grid (ceil(m/256), WHISC_NCHUNK), block 256.
+//   Thread c = blockIdx.x*256 + threadIdx.x covers one channel (guard c<m).
+//   Token chunk blockIdx.y covers [by*chunk, (by+1)*chunk) tokens.
+//   Consecutive threads read consecutive channels at a fixed t  =>  fully coalesced.
+//   Writes partialQ[by*m + c] and partialP[by*m + c].
+//
+// Pass 2 (whisc_finalize_kernel): one thread per channel.
+//   Sums the WHISC_NCHUNK partial values, applies EMA and computes a[c].
+//
+// Internal scratch (partialQ, partialP) is function-static; lazily allocated/
+// resized so the public signature needs no scratch parameter.
+
+static const int WHISC_NCHUNK = 32;
+
+__global__ void whisc_partial_kernel(const float* __restrict__ q, const float* __restrict__ p,
+                                     int T, int m, int chunk,
+                                     float* __restrict__ partialQ, float* __restrict__ partialP) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
 	float lq = 0.0f, lp = 0.0f;
-	for (int t = threadIdx.x; t < T; t += blockDim.x) {
-		float qv = q[(long)t*m + i], pv = p[(long)t*m + i];
+	for (int t = t_start; t < t_end; ++t) {
+		float qv = q[(long)t*m + c];
+		float pv = p[(long)t*m + c];
 		lq += qv*qv; lp += pv*pv;
 	}
-	sq[threadIdx.x] = lq; sp[threadIdx.x] = lp; __syncthreads();
-	for (int s = blockDim.x/2; s > 0; s >>= 1) { if (threadIdx.x < s) { sq[threadIdx.x]+=sq[threadIdx.x+s]; sp[threadIdx.x]+=sp[threadIdx.x+s]; } __syncthreads(); }
-	if (threadIdx.x == 0) {
-		float mq = sq[0]/(float)T, mp = sp[0]/(float)T;
-		float qb = (1.0f-ema)*Qbar[i] + ema*mq;
-		float pb = (1.0f-ema)*Pbar[i] + ema*mp;
-		Qbar[i]=qb; Pbar[i]=pb;
-		float ai = powf(qb/(pb+eps), 0.25f);
-		float lo = 1.0f/clamp, hi = clamp;
-		a[i] = (ai<lo)?lo:((ai>hi)?hi:ai);
+	partialQ[(long)by*m + c] = lq;
+	partialP[(long)by*m + c] = lp;
+}
+
+__global__ void whisc_finalize_kernel(const float* __restrict__ partialQ,
+                                      const float* __restrict__ partialP,
+                                      int T, int m, int nchunk,
+                                      float ema, float eps, float clamp_val,
+                                      float* __restrict__ Pbar, float* __restrict__ Qbar,
+                                      float* __restrict__ a) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	float sumQ = 0.0f, sumP = 0.0f;
+	for (int by = 0; by < nchunk; ++by) {
+		sumQ += partialQ[(long)by*m + c];
+		sumP += partialP[(long)by*m + c];
 	}
+	float mq = sumQ / (float)T;
+	float mp = sumP / (float)T;
+	float qb = (1.0f - ema)*Qbar[c] + ema*mq;
+	float pb = (1.0f - ema)*Pbar[c] + ema*mp;
+	Qbar[c] = qb; Pbar[c] = pb;
+	float ai = powf(qb / (pb + eps), 0.25f);
+	float lo = 1.0f/clamp_val, hi = clamp_val;
+	a[c] = (ai < lo) ? lo : ((ai > hi) ? hi : ai);
 }
 
 bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
                                float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a) {
 	if (!q || !p || !Pbar || !Qbar || !a || T <= 0 || m <= 0) return false;
-	whisc_stats_kernel<<<m, 256, 0, computeStream()>>>(q, p, T, m, ema, eps, clamp, Pbar, Qbar, a);
+
+	// Lazily allocate/resize internal scratch buffers (function-static lifetime).
+	static glades::gpu::GpuBuffer<float> partialQ, partialP;
+	size_t need = (size_t)WHISC_NCHUNK * m;
+	if (partialQ.size() < need) {
+		partialQ.allocate(need);
+		partialP.allocate(need);
+	}
+
+	int chunk = (T + WHISC_NCHUNK - 1) / WHISC_NCHUNK;
+	int blk = 256;
+	dim3 grid1((m + blk - 1) / blk, WHISC_NCHUNK);
+	whisc_partial_kernel<<<grid1, blk, 0, computeStream()>>>(
+	    q, p, T, m, chunk, partialQ.data(), partialP.data());
 	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	int grid2 = (m + blk - 1) / blk;
+	whisc_finalize_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialQ.data(), partialP.data(), T, m, WHISC_NCHUNK, ema, eps, clamp, Pbar, Qbar, a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
 	return true;
 }
 
