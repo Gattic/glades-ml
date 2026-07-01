@@ -1,7 +1,39 @@
 # CHIRON WhiSC-D — E3 Production Gate: PASS
 
 **Date:** 2026-06-30
-**Status:** E3 PASS (divergence falsifier satisfied). E4 (30k decisive perplexity gate) NOT yet run.
+**Status:** E3 PASS + **E4 PASS** (2026-07-01) + perf (+24%). Ship gate remaining: multi-seed / wide-val confirmation of the (large) perplexity magnitude.
+
+## E4 (30k decisive perplexity gate) — PASS (2026-07-01)
+
+WhiSC-30k treatment (24.7 GPU-hr, 0 grad-skips, 0 NaN, 1 isolated ‖g‖ spike @step9001, recovered)
+vs the **matched no-whisc baseline** = the reanchor flagship *base* run (2026-06-25, this exact
+recipe minus `--whisc-coupling`, seed 1337 — **step 1 bit-identical**: loss 10.7816, ‖g‖ 0.831; its
+val@30000 anchored by matching val-acc1 0.318 to step-30001 train-acc 0.312). **No baseline re-run
+needed** (owner call — it was already trained).
+
+| metric @ step 30000 | **WhiSC-D** | matched baseline (no-whisc) | Δ |
+|---|---|---|---|
+| **val nll** | **1.3753** (ppl 3.96) | **2.6488** (ppl 14.14) | **−1.27 nat** |
+| **acc@1** | **0.6333** | 0.3184 | +0.315 (~2×) |
+| acc@5 / acc@10 | 0.9399 / 0.9801 | — | — |
+| best train loss | 0.9952@28344 | 1.8473@26441 | −0.85 |
+
+**The coupling ~doubles top-1 accuracy and cuts val nll ~−1.27 nat** at matched step/seed/recipe.
+Robust lower bound: WhiSC@30k (1.38) beats even the *fully-trained* no-whisc flagship (val ~1.92
+@66k+finish) by **−0.54 nat** — it surpasses a baseline trained 2.2× longer with a finish anneal it
+lacks.
+
+**Caveats on the magnitude (important):** single-seed (1337), single 4-batch val window — both sides
+noisy. WhiSC's final-val 1.38 sits below its running vals (~1.58); the baseline was in a rough patch
+at 30k (train loss bounced to 2.71 vs its best 1.85). The *true matched* Δ is likely **−1.0 to −1.27
+nat** — the **largest jump in the CHIRON lineage** (prior record ~−0.9). A result this large **must
+get multi-seed (≥3) + wide-val (32-batch) confirmation before shipping**; E4 establishes the effect
+is real and big, not the exact number to lineage-ship rigor.
+
+---
+
+### (E3 record below)
+**Status (E3):** divergence falsifier satisfied.
 **Mechanism:** WhiSC-D (Whitened Symplectic Coupling, diagonal). Design spec
 `docs/superpowers/specs/2026-06-30-chiron-whitened-frame-coupling-design.md`; plan
 `docs/superpowers/plans/2026-06-30-chiron-whisc-d.md`. Builds on (fixes) **SORC**

@@ -418,8 +418,14 @@ addressed post-E3:** profiling corrected the bottleneck — the explicit `whisc_
 whiten/unwhiten passes (19.1% GPU time), NOT the stats kernel. **Coefficient folding** (`A=a²·sorc_a,
 C=sorc_c/a²`, FD-validated `a²`-aware `dθ`) eliminated them → **+24% throughput, −37%→−22%**
 (committed `c83303e9c`/`6e429d6`, E0 identity preserved); a stats-kernel coalesce (`18be3228d`) was
-correct but overlap-hidden (~0 end-to-end), residual −22% = the inherent rotation kernels. **One
-open item gates a ship: the E4 (30k) perplexity confirmation** vs a matched baseline.
+correct but overlap-hidden (~0 end-to-end), residual −22% = the inherent rotation kernels. **E4
+(30k) — PASS (2026-07-01):** WhiSC-30k val@30000 **1.3753 / acc@1 0.633** vs the matched no-whisc
+baseline (reanchor flagship *base*, this exact recipe minus whisc, seed 1337, step-1 bit-identical)
+val@30000 **2.6488 / acc@1 0.318** → **Δ ≈ −1.27 nat, top-1 ~doubled** (best-train 0.995 vs 1.847);
+robust lower bound −0.54 nat vs the *fully-trained* flagship (1.92@66k). 0 grad-skips, 1 isolated
+recovered ‖g‖ spike. **Caveat: single-seed / 4-batch-window — the ~−1.0 to −1.27 nat magnitude is
+the LARGEST in the lineage, so it needs multi-seed (≥3) + wide-val (32-batch) confirmation before a
+ship.** (No baseline re-run — reused the reanchor base from the training logs.)
 Engineering is **committed default-off**, fully reviewed (merge-ready), reusing the SORC
 infrastructure (`rot_phi`/Adam/checkpoint-bit-1024/`[sorc]` monitor) + new kernels
 `chiron_whisc_scale` / `chiron_whisc_update_stats` + flags `--whisc-coupling` / `--whisc-ema` /
