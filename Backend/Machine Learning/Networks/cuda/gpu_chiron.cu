@@ -1297,38 +1297,77 @@ bool chiron_rot_forward(float* q, float* p, const float* a, const float* c, floa
 	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
 }
 
-__global__ void chiron_rot_pre_backward_rows(const float* __restrict__ dqo, const float* __restrict__ dpo,
+// Two-pass fused rot backward: eliminates the 2x[T*m] (~536 MB/call) da_el/dc_el
+// scratch traffic by reducing directly into [ROT_NCHUNK*m] partials (~256 KB each).
+//
+// Pass 1 (chiron_rot_fused_backward): grid (ceil(m/256), ROT_NCHUNK), block 256.
+//   Thread cx = blockIdx.x*256+threadIdx.x owns one channel (guard cx<m).
+//   blockIdx.y = by covers token chunk [by*chunk, min(...,T)).
+//   For each token: recomputes shear intermediates, transforms dq/dp in-place
+//   (coalesced at fixed t, consecutive cx), accumulates local da/dc in registers.
+//   Writes partialDa[by*m+cx] and partialDc[by*m+cx] (ROT_NCHUNK*m each).
+//
+// Pass 2 (chiron_rot_fused_chain_kernel): one thread per channel.
+//   Sums ROT_NCHUNK partials, applies whisc_a scaling, applies chain rule -> dphi.
+//   Folds the former chiron_rot_chain_kernel so no separate finalize pass is needed.
+//
+// Internal scratch (partialDa, partialDc) is function-static; lazily allocated/
+// resized. The public chiron_rot_backward signature is unchanged.
+// scratch_da/scratch_dc arguments are accepted but unused (kept for ABI stability).
+
+static const int ROT_NCHUNK = 32;
+
+__global__ void chiron_rot_fused_backward(
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
         const float* __restrict__ q_in, const float* __restrict__ p_in,
-        const float* __restrict__ a, const float* __restrict__ c, int T, int m,
-        float* __restrict__ dqi, float* __restrict__ dpi, float* __restrict__ da_el, float* __restrict__ dc_el) {
-	long n=(long)T*m;
-	for (long k=blockIdx.x*(long)blockDim.x+threadIdx.x; k<n; k+=(long)gridDim.x*blockDim.x) {
-		int i=k%m; float ai=a[i], ci=c[i]; float q0=q_in[k], p0=p_in[k];
-		float q1=q0+ai*p0; float p1=p0+ci*q1;
-		float dq2=dqo[k], dp1=dpo[k];
-		float dq1=dq2; float dp1a=dp1+ai*dq2; float dael=p1*dq2;       // shear3 bwd
-		float dp0=dp1a; dq1+=ci*dp1a; float dcel=q1*dp1a;             // shear2 bwd
-		float dq0=dq1; dp0+=ai*dq1; dael+=p0*dq1;                     // shear1 bwd
-		dqi[k]=dq0; dpi[k]=dp0; da_el[k]=dael; dc_el[k]=dcel;
+        const float* __restrict__ a, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int cx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (cx >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	float ai = a[cx], ci = c_coeff[cx];
+	float local_da = 0.0f, local_dc = 0.0f;
+	for (int t = t_start; t < t_end; ++t) {
+		long k = (long)t * m + cx;
+		float q0 = q_in[k], p0 = p_in[k];
+		float q1 = q0 + ai*p0; float p1 = p0 + ci*q1;
+		float dq2 = dqo[k], dp1 = dpo[k];
+		float dq1 = dq2; float dp1a = dp1 + ai*dq2; float dael = p1*dq2;    // shear3 bwd
+		float dp0 = dp1a; dq1 += ci*dp1a; float dcel = q1*dp1a;             // shear2 bwd
+		float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;                     // shear1 bwd
+		dqi[k] = dq0; dpi[k] = dp0;
+		local_da += dael; local_dc += dcel;
 	}
+	partialDa[(long)by*m + cx] = local_da;
+	partialDc[(long)by*m + cx] = local_dc;
 }
 
-// whisc_a: optional per-channel WhiSC whitening scale. When non-NULL, the da
-// contribution is scaled by whisc_a[i]^2 and the dc contribution by 1/whisc_a[i]^2,
-// implementing the folded-coeff dtheta chain (SORC path: whisc_a=NULL, factor=1).
-__global__ void chiron_rot_chain_kernel(const float* __restrict__ da, const float* __restrict__ dc,
-        const float* __restrict__ phi, float theta_max, float s_warm, int m,
+// Finalize + chain: sums ROT_NCHUNK partials, applies optional whisc_a scaling,
+// maps (da,dc,phi) -> dphi (ACCUMULATE). whisc_a=NULL on the SORC path.
+__global__ void chiron_rot_fused_chain_kernel(
+        const float* __restrict__ partialDa, const float* __restrict__ partialDc,
+        const float* __restrict__ phi, float theta_max, float s_warm, int m, int nchunk,
         float* __restrict__ dphi, const float* __restrict__ whisc_a) {
-	int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=m) return;
-	float th=s_warm*theta_max*tanhf(phi[i]);  // FIXED: include s_warm in effective angle θ_eff
-	float dadth=-0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth=cosf(th);
-	float dthdphi=s_warm*theta_max*(1.f-tanhf(phi[i])*tanhf(phi[i]));
+	int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= m) return;
+	float sumDa = 0.0f, sumDc = 0.0f;
+	for (int by = 0; by < nchunk; ++by) {
+		sumDa += partialDa[(long)by*m + i];
+		sumDc += partialDc[(long)by*m + i];
+	}
+	float th = s_warm*theta_max*tanhf(phi[i]);  // FIXED: include s_warm in effective angle theta_eff
+	float dadth = -0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth = cosf(th);
+	float dthdphi = s_warm*theta_max*(1.f - tanhf(phi[i])*tanhf(phi[i]));
 	float da_eff, dc_eff;
 	if (whisc_a != NULL) {
 		float wa2 = whisc_a[i]*whisc_a[i];
-		da_eff = da[i]*wa2; dc_eff = dc[i]/wa2;
+		da_eff = sumDa*wa2; dc_eff = sumDc/wa2;
 	} else {
-		da_eff = da[i]; dc_eff = dc[i];
+		da_eff = sumDa; dc_eff = sumDc;
 	}
 	dphi[i] += (da_eff*dadth + dc_eff*dcdth)*dthdphi;   // ACCUMULATE
 }
@@ -1342,38 +1381,31 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
                          float* scratch_da, float* scratch_dc,
                          const float* whisc_a) {
 	if (T <= 0 || m <= 0) return true;
+	(void)scratch_da; (void)scratch_dc;  // caller scratch no longer needed; kept for ABI
 
-	// Allocate scratch buffers for per-element da and dc (T*m each)
-	glades::gpu::GpuBuffer<float> da_el_buf, dc_el_buf;
-	da_el_buf.allocate((size_t)T*m);
-	dc_el_buf.allocate((size_t)T*m);
-	float* da_el = da_el_buf.data();
-	float* dc_el = dc_el_buf.data();
+	// Lazily allocate/resize internal partial-reduction scratch (ROT_NCHUNK*m each).
+	static glades::gpu::GpuBuffer<float> partialDa_buf, partialDc_buf;
+	size_t need = (size_t)ROT_NCHUNK * m;
+	if (partialDa_buf.size() < need) {
+		partialDa_buf.allocate(need);
+		partialDc_buf.allocate(need);
+	}
 
-	// Launch pre-backward kernel to compute dq_in, dp_in, da_el, dc_el
-	int block = rowBlockSize(m);
-	long n = (long)T*m; int grd = (int)((n+block-1)/block); if(grd>65535)grd=65535;
-	chiron_rot_pre_backward_rows<<<grd, block, 0, computeStream()>>>(
-	    dq_out, dp_out, q_in, p_in, a, c, T, m, dq_in, dp_in, da_el, dc_el);
+	// Pass 1: per-element backward + partial column reduction (no T*m scratch writes).
+	int chunk = (T + ROT_NCHUNK - 1) / ROT_NCHUNK;
+	int blk = 256;
+	dim3 grid1((m + blk - 1) / blk, ROT_NCHUNK);
+	chiron_rot_fused_backward<<<grid1, blk, 0, computeStream()>>>(
+	    dq_out, dp_out, q_in, p_in, a, c, T, m, chunk,
+	    dq_in, dp_in, partialDa_buf.data(), partialDc_buf.data());
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
-	// Zero scratch buffers before column accumulation
-	cudaMemsetAsync(scratch_da, 0, (size_t)m*sizeof(float), computeStream());
-	GLADES_CUDA_CHECK(cudaGetLastError());
-	cudaMemsetAsync(scratch_dc, 0, (size_t)m*sizeof(float), computeStream());
-	GLADES_CUDA_CHECK(cudaGetLastError());
-
-	// Column reduction: scratch_da/dc ACCUMULATE (+=) the column sums
-	int rblock = 256; int rsmem = (rblock/32 + 1) * sizeof(float);
-	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(da_el, T, m, scratch_da);
-	GLADES_CUDA_CHECK(cudaGetLastError());
-	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(dc_el, T, m, scratch_dc);
-	GLADES_CUDA_CHECK(cudaGetLastError());
-
-	// Chain kernel: map (da, dc, phi) -> dphi; whisc_a NULL on SORC path (identity scale)
-	int blk = 256; int grd2 = (m + blk - 1) / blk;
-	chiron_rot_chain_kernel<<<grd2, blk, 0, computeStream()>>>(
-	    scratch_da, scratch_dc, phi, theta_max, s_warm, m, dphi, whisc_a);
+	// Pass 2: finalize partials + chain rule -> dphi (ACCUMULATE).
+	int grid2 = (m + blk - 1) / blk;
+	chiron_rot_fused_chain_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialDa_buf.data(), partialDc_buf.data(),
+	    phi, theta_max, s_warm, m, ROT_NCHUNK,
+	    dphi, whisc_a);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	return true;
