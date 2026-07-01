@@ -1,7 +1,34 @@
 # CHIRON WhiSC-D — E3 Production Gate: PASS
 
 **Date:** 2026-06-30
-**Status:** E3 PASS + **E4 PASS** (2026-07-01) + perf (+24%). Ship gate remaining: multi-seed / wide-val confirmation of the (large) perplexity magnitude.
+**Status:** **SHIPPED — production flagship 2026-07-01** (owner decision, single-seed per the
+reanchor-ship precedent; multi-seed ≥3 NOT run). E3 PASS + E4 PASS + wide-val banked + serving
+verified + two perf passes. Checkpoint `chiron_1B_T16384_whisc30k.final`; `runner.sh --flagship`
+serves it (auto-injecting `--whisc-coupling --rot-theta-max 0.07`).
+
+## Ship addendum (2026-07-01)
+
+- **Wide 32-batch val (the ship metric):** two 33.5M-token windows: **1.6390 (acc1 0.5813)** and
+  **1.8191 (acc1 0.5594)** — vs the reanchor flagship's wide **1.92 / 0.51** at 66k+finish. Run via
+  the lr=0 + `--whisc-ema 1.0` resume trick (weights untouched; per-batch stats warm the whitening).
+  The 4-batch E4 numbers (1.3753) were window-optimistic; the wide numbers are the banked claim:
+  **better than the prior flagship on its own metric at <½ the training.**
+- **Serving (chiron_infer commit `049b35e` + unknown-bits guard):** WhiSC support = rot_phi loader
+  (bit 1024, EOF-tail read — guarded against future format extensions), per-batch whitening stats
+  (ema=1.0; `a`/theta_max are NOT persisted), folded forward, hard-error interlocks both directions
+  (exit 7), dead-gamma_p fuse-mode guard (caught a live nll-19.96 trap). **TF verification: nll
+  1.4655 / top1 0.626** (< 1.6 gate); reanchor flagship regression-checked (1.7798 ≈ documented 1.78).
+- **Perf correction (honest):** the trainer links glades CUDA kernels **statically** — the earlier
+  "stats-coalesce = overlap-hidden ~0" claim was measured on a binary that never contained the
+  coalesced kernel (make install alone doesn't update the trainer). Re-measured with the rebuilt
+  binary: **22,945 tok/s** — coalesce adds **+3.7%** over fold-only (22,130). Corrected progression:
+  explicit 17,930 (−37%) → folding 22,130 (−22.3%) → **fold+coalesce 22,945 (−19.5%, ×1.24)** vs
+  no-coupling 28,500. (E4 itself ran fold+old-stats — correctness unaffected.)
+- **Open follow-ups:** multi-seed confirm; 60k base + flat-3e-5 finish schedule (untried upside);
+  WhiSC-M/T upgrades; further perf (rot backward fusion — pre_backward+col_accumulate materialize
+  ~536 MB/layer-microstep of da/dc scratch traffic).
+
+---
 
 ## E4 (30k decisive perplexity gate) — PASS (2026-07-01)
 

@@ -2,9 +2,75 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (reanchor cure ship 2026-06-27)
+## Current Production Flagship — CHIRON 1B @ T=16384 (WhiSC-D ship 2026-07-01)
 
-The current production LLM flagship is **CHIRON 1B reanchor-cure**
+The current production LLM flagship is **CHIRON 1B WhiSC-D 30k**
+(checkpoint `database/checkpoints/chiron_1B_T16384_whisc30k/chiron_1B_T16384_whisc30k.final`).
+It is a **perplexity flagship**: **wide 32-batch val NLL ~1.64–1.82 (two 33.5M-token
+windows), vs the prior reanchor ship's wide 1.92** — i.e. better than the prior
+flagship on its own ship metric at **less than half the training** (30k steps / 1.97B
+tok vs 66k+finish / 4.33B). At **matched** step/seed/recipe the gain is dramatic:
+**val@30k 1.3753 / acc@1 0.633 vs the no-whisc base's 2.6488 / 0.318 (Δ ≈ −1.27 nat,
+top-1 ~doubled; 4-batch windows)** — the largest matched jump in the lineage.
+
+- **Shape**: identical to the reanchor ship — m=2048, L=24, nH=16, dH=256, V=32000
+  BPE, T=16384; 870.94M params + 384 QK-Norm γ (bit 256) + **24×2048 `rot_phi`
+  coupling angles (CHRF bit 1024, the last checkpoint section)**.
+- **The mechanism — WhiSC-D (`--whisc-coupling`)**: a per-layer cross-depth coupling
+  — the SORC per-channel rotation **conjugated by a detached per-channel whitening**
+  `Φ = W⁻¹R(θ)W`, `W=diag(1/a,a)`, `a=(E[q²]/E[p²])^{1/4}` (EMA, out of the autodiff
+  graph). The whitening factors the trained-in `p²/q²≈10³` phase asymmetry (which
+  diverged SORC and regressed OBSD) into a detached frame, so the coupling perturbs
+  q by O(‖q‖) and the backward q-gradient is bounded independent of ‖p‖/‖q‖.
+  Implemented as **coefficient folding** into the SORC 3-shear kernel
+  (`A=a²·sorc_a`, `C=sorc_c/a²`; FD-validated a²-aware dθ) — no extra passes.
+- **Stack/recipe**: the reanchor-cure recipe (see prior flagship below) **PLUS
+  `--whisc-coupling --rot-theta-max 0.07`**, trained 30k steps at constant lr 3e-4
+  (accum 4, seed 1337). **No finish anneal** — a 60k base + flat-3e-5 finish (the
+  full reanchor schedule) with WhiSC is an open upside, untried.
+- **Stability**: 0 grad-skips, 0 NaN over 30k steps; one isolated recovered ‖g‖
+  spike (10.8 @step 9001). The `[whisc]` monitor showed ρ_eff→~4100 absorbed by the
+  whitening (a→0.125, clamp-binding); maxTheta 0.067 < the 0.07 cap.
+- **Perf**: **~22,900 tok/s** (vs ~28,500 no-coupling: −19.5%, ×1.24/step) after two
+  perf passes: coefficient folding (+24%, eliminated the explicit whiten/unwhiten
+  passes = 19.1% GPU time) + coalesced stats reduction (+3.7%). Residual = the
+  inherent rotation kernels. **Build gotcha: the trainer links the glades CUDA
+  kernels STATICALLY — after any glades-ml kernel change, `make install` alone does
+  NOT update the trainer; rebuild it (`bash build.sh`).**
+- **Verified three ways**: trainer wide 32-batch val 1.639/1.819; trainer 4-batch
+  final-val 1.3753/acc1 0.633; **chiron_infer teacher-forcing 1.4655/top1 0.626**
+  (serving parity, see below).
+- **Serving (chiron_infer, 2026-07-01)**: WhiSC checkpoints need
+  `--whisc-coupling --rot-theta-max 0.07` — **`runner.sh --flagship` injects these
+  automatically** (prefers the whisc30k checkpoint since 2026-07-01). Two serving
+  parameters are NOT in the checkpoint: the whitening scale (recomputed per-batch at
+  inference, ema=1.0) and theta_max (CLI; 0.07 = the flagship recipe value).
+  chiron_infer **hard-errors** (exit 7) on a bit-1024 checkpoint without the flags
+  (and vice versa), guards dead-gamma_p fuse-mode misdetection, and rejects
+  unknown-CHRF-bit checkpoints (the rot_phi EOF-tail read must stay last).
+- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship --steps
+  30000 --accum 4 --lr 3e-4 --warmup 750 --sira-warmup 250 --zloss-coef 1e-4
+  --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25
+  --sira-action-weight 0.0 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0
+  --reln-reanchor --whisc-coupling --rot-theta-max 0.07 --save-every 6000 --seed 1337`.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
+- **Ship record / evidence**: `research/CHIRON_WHISC_D_GATE_2026_06_30.md` (E3
+  divergence gate + E4 30k gate + wide-val + perf + serving). Design/plan:
+  `docs/superpowers/specs/2026-06-30-chiron-whitened-frame-coupling-design.md`,
+  `docs/superpowers/plans/2026-06-30-chiron-whisc-d.md`.
+- **Caveats**:
+  - **Single-seed (1337) ship — multi-seed (≥3) NOT run (owner decision
+    2026-07-01, same precedent as the reanchor ship).** The matched Δ−1.27 (4-batch)
+    is window-noisy; the wide 32-batch numbers (1.64–1.82 vs 1.92) are the banked
+    ship-metric claim. Cross-seed reproduction is NOT established.
+  - **Perplexity flagship, not a generator** — inherited from the whole lineage
+    (see the reanchor section's generation caveat; unchanged by WhiSC).
+  - The upstream WhiSC upgrades (WhiSC-M Mahalanobis, WhiSC-T thermostat) and the
+    60k+finish schedule are untried follow-ups.
+
+## Prior reanchor-cure Flagship — CHIRON 1B @ T=16384 (reanchor ship 2026-06-27, kept for context)
+
+The prior flagship **CHIRON 1B reanchor-cure**
 (checkpoint `chiron_1B_T16384_reanchor5B_finish.final`). It is a **perplexity
 flagship**: verified **val NLL ~1.92, −0.62 nat over the prior data-scale ship
 (2.54)** — the second-largest single jump in the lineage. The gain comes not from
@@ -44,8 +110,8 @@ gg-clamp containment.
      --seed 1337 --save-every 6000` (NO `--grad-group-clamp`). Pre-create `--save`.
   2. finish: resume the step-60000 checkpoint with `--lr 3e-5 --warmup 0
      --no-resume-warmup --steps 66000 --reln-reanchor` + the same recipe flags.
-- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`
-  (prefers `chiron_1B_T16384_reanchor5B_finish.final`). **Serving fix (2026-06-27)**:
+- **Run inference**: load `chiron_1B_T16384_reanchor5B_finish.final` explicitly
+  (`runner.sh --flagship` prefers the WhiSC-D ship since 2026-07-01). **Serving fix (2026-06-27)**:
   chiron_infer now **auto-enables `--fuse-attn-reln`** for SCFA checkpoints (no
   per-layer `gamma_p`) — without it, the inference forward omitted the fusion and
   gave teacher-forced nll ~63 (garbage) for ALL production checkpoints incl. every
