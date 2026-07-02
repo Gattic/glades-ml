@@ -286,6 +286,8 @@ int main(int argc, char* argv[])
 		CHIRONPiedMaskCpuTest();
 		CHIRONPiedCommitInverseCpuTest();
 		CHIRONPiedGpuParityTest();
+		CHIRONPiedDualPParityTest();
+		CHIRONPiedDyDualParityTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {

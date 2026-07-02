@@ -361,6 +361,32 @@ bool chiron_incdrop_scale_copy(float* dst, float alpha,
                                float lo, float hi,
                                cudaStream_t stream = 0);
 
+// Dual-output dy hand-off (perf pass 2026-07-02): masked FP32 dy + BF16-RN
+// mirror in one pass.  The trainer registers the pair via
+// register_fast16bf_constant so the B^T·dy FAST_16BF GEMM skips its
+// per-layer [T×m] re-cast (bit-identical input — RN matches
+// cast_f32_to_bf16, the dp-mirror precedent).
+bool chiron_incdrop_scale_copy_dual(float* dst, unsigned short* dst_bf,
+                                    float alpha,
+                                    const float* src, int n,
+                                    unsigned int key, unsigned int thr,
+                                    float lo, float hi,
+                                    cudaStream_t stream = 0);
+
+// Masked dual-output commit (perf pass 2026-07-02): the iter 70 fused
+// FP32 + BF16-SR write with eta folded in — the --bf16-residual-p path pays
+// no extra [T×m] SR-cast pass while PIED is active.  Bit-identical to the
+// (chiron_scfa_axpy2_masked then cast_f32_to_bf16_stochastic) pair at equal
+// (srBaseSeed, srStepIdx).
+bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
+                                     float alpha,
+                                     const float* a, const float* b, int n,
+                                     unsigned int key, unsigned int thr,
+                                     float lo, float hi,
+                                     unsigned int srBaseSeed,
+                                     unsigned int srStepIdx,
+                                     cudaStream_t stream = 0);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -849,6 +875,13 @@ inline bool chiron_scfa_axpy2_masked(float*, float, const float*, const float*, 
                                      unsigned int, unsigned int, float, float) { return false; }
 inline bool chiron_incdrop_scale_copy(float*, float, const float*, int,
                                       unsigned int, unsigned int, float, float) { return false; }
+inline bool chiron_scfa_axpy2_masked_dual_p(float*, unsigned short*, float,
+                                            const float*, const float*, int,
+                                            unsigned int, unsigned int, float, float,
+                                            unsigned int, unsigned int) { return false; }
+inline bool chiron_incdrop_scale_copy_dual(float*, unsigned short*, float,
+                                           const float*, int,
+                                           unsigned int, unsigned int, float, float) { return false; }
 inline bool chiron_rot_backward_invwalk(const float*, const float*,
                                          float*, float*,
                                          const float*, const float*,

@@ -19245,3 +19245,154 @@ void CHIRONPiedGpuParityTest()
 	std::printf("  [PIED GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+void CHIRONPiedDualPParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PIED dual_p parity] no CUDA device — skipped\n");
+		return;
+	}
+	// The fused masked dual-output commit must be bit-identical to the
+	// (masked axpy2 then cast_f32_to_bf16_stochastic) pair at equal
+	// (srBaseSeed, srStepIdx) — the iter 70 contract with eta folded in.
+	const unsigned int n = 1u << 16;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(1337u ^ 0x50494544u);
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+	const unsigned int srSeed = 0xC0FFEE42u, srStep = 7u;
+
+	std::vector<float> p(n), ypar(n), yperp(n);
+	LCG rng(31u);
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		p[i] = 45.0f * rng.next_unit();
+		ypar[i] = rng.next_unit();
+		yperp[i] = 0.3f * rng.next_unit();
+	}
+
+	glades::gpu::GpuBuffer<float> dP1, dP2, dA, dB;
+	glades::gpu::GpuBuffer<unsigned short> dM1, dM2;
+	dA.allocate(n); dA.upload(&ypar[0], n);
+	dB.allocate(n); dB.upload(&yperp[0], n);
+	dP1.allocate(n); dP1.upload(&p[0], n); dM1.allocate(n);
+	dP2.allocate(n); dP2.upload(&p[0], n); dM2.allocate(n);
+
+	// Path 1: unfused pair.
+	glades::gpu::chiron_scfa_axpy2_masked(dP1.data(), +1.0f, dA.data(), dB.data(),
+	                                      (int)n, key, thr, 0.0f, hi);
+	glades::gpu::cast_f32_to_bf16_stochastic(dP1.data(), dM1.data(), (size_t)n,
+	                                         srSeed, srStep);
+	// Path 2: fused masked dual_p.
+	glades::gpu::chiron_scfa_axpy2_masked_dual_p(dP2.data(), dM2.data(), +1.0f,
+	                                             dA.data(), dB.data(), (int)n,
+	                                             key, thr, 0.0f, hi, srSeed, srStep);
+
+	std::vector<float> p1(n), p2(n);
+	std::vector<unsigned short> m1(n), m2(n);
+	dP1.download(&p1[0], n); dP2.download(&p2[0], n);
+	dM1.download(&m1[0], n); dM2.download(&m2[0], n);
+	unsigned int fp32Diff = 0, bf16Diff = 0;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		if (p1[i] != p2[i]) ++fp32Diff;
+		if (m1[i] != m2[i]) ++bf16Diff;
+	}
+	std::printf("  [PIED dual_p parity] fp32Diff=%u bf16Diff=%u over %u elems (bar 0/0)\n",
+	            fp32Diff, bf16Diff, n);
+	ASSERT("PIED masked dual_p FP32 output != unfused pair", fp32Diff == 0);
+	ASSERT("PIED masked dual_p BF16-SR mirror != unfused pair", bf16Diff == 0);
+#else
+	std::printf("  [PIED dual_p parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+void CHIRONPiedDyDualParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PIED dy-dual parity] no CUDA device — skipped\n");
+		return;
+	}
+	// The dual-output dy copy must produce (i) FP32 bit-identical to the
+	// plain masked scale-copy and (ii) a BF16 mirror bit-identical to
+	// cast_f32_to_bf16 (RN) of that FP32 — the register_fast16bf_constant
+	// substitution contract.
+	const unsigned int n = 1u << 16;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(2026u ^ 0x50494544u);
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+
+	std::vector<float> src(n);
+	LCG rng(53u);
+	for (unsigned int i = 0; i < n; ++i) src[i] = 3.0f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> dSrc, dDst1, dDst2;
+	glades::gpu::GpuBuffer<unsigned short> dBf1, dBf2;
+	dSrc.allocate(n); dSrc.upload(&src[0], n);
+	dDst1.allocate(n); dDst2.allocate(n); dBf1.allocate(n); dBf2.allocate(n);
+
+	std::vector<float> d1recheck(n, 0.0f); // pre-allocated so the recheck itself doesn't shift heap layout
+	// Path 1: plain masked copy + RN cast.
+	glades::gpu::chiron_incdrop_scale_copy(dDst1.data(), -1.0f, dSrc.data(), (int)n,
+	                                       key, thr, 0.0f, hi);
+	glades::gpu::cast_f32_to_bf16(dDst1.data(), dBf1.data(), (size_t)n);
+	// Path 2: fused dual copy.
+	glades::gpu::chiron_incdrop_scale_copy_dual(dDst2.data(), dBf2.data(), -1.0f,
+	                                            dSrc.data(), (int)n, key, thr, 0.0f, hi);
+
+	std::vector<float> d1(n), d2(n);
+	std::vector<unsigned short> b1(n), b2(n);
+	// Download return values are asserted: a silently-failed download leaves
+	// stale heap contents in the host vector and produces a maddening
+	// moving-boundary "corruption" (observed 2026-07-02 during this test's
+	// bring-up; every device-side probe was oracle-clean).
+	ASSERT("PIED dy-dual d1 download failed", dDst1.download(&d1[0], n));
+	ASSERT("PIED dy-dual d2 download failed", dDst2.download(&d2[0], n));
+	ASSERT("PIED dy-dual b1 download failed", dBf1.download(&b1[0], n));
+	ASSERT("PIED dy-dual b2 download failed", dBf2.download(&b2[0], n));
+	unsigned int fp32Diff = 0, bf16Diff = 0, shown = 0;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		if (d1[i] != d2[i])
+		{
+			++fp32Diff;
+			if (shown < 3)
+			{
+				union { float f; unsigned int u; } u1, u2;
+				u1.f = d1[i]; u2.f = d2[i];
+				const float etaH = glades::chiron::chiron_pied_eta(key, i, thr, 0.0f, hi);
+				std::printf("    diff i=%u src=%.9g d1=%.9g(0x%08x) d2=%.9g(0x%08x) cpuRef=%.9g\n",
+				            i, src[i], d1[i], u1.u, d2[i], u2.u, -1.0f * (etaH * src[i]));
+				++shown;
+			}
+		}
+		if (b1[i] != b2[i]) ++bf16Diff;
+	}
+	std::printf("  [PIED dy-dual parity] fp32Diff=%u bf16Diff=%u over %u elems (bar 0/0)\n",
+	            fp32Diff, bf16Diff, n);
+	// Primary assertion: the fused dual output vs the CPU oracle, on a fresh
+	// end-of-test download (device ground truth, independent of any host-
+	// vector staleness).
+	{
+		ASSERT("PIED dy-dual recheck download failed", dDst1.download(&d1recheck[0], n));
+		unsigned devBad = 0;
+		for (unsigned int i = 0; i < n; ++i)
+		{
+			const float e = glades::chiron::chiron_pied_eta(key, i, thr, 0.0f, hi);
+			const float expv = -1.0f * (e * src[i]);
+			if (d1recheck[i] != expv) ++devBad;
+		}
+		std::printf("  [PIED dy-dual device-vs-cpuRef] diffs=%u (bar 0)\n", devBad);
+		ASSERT("PIED dy-dual plain copy != CPU oracle on device", devBad == 0);
+	}
+	ASSERT("PIED dy-dual FP32 output != plain masked copy", fp32Diff == 0);
+	ASSERT("PIED dy-dual BF16-RN mirror != cast_f32_to_bf16", bf16Diff == 0);
+#else
+	std::printf("  [PIED dy-dual parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

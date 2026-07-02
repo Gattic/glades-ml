@@ -220,6 +220,7 @@ __global__ void chiron_incdrop_scale_copy_kernel(float* __restrict__ dst, float 
 	dst[i] = alpha * (eta * src[i]);
 }
 
+
 // iter 63 (Arc 2, BF16 residual-p — 2026-05-16): BF16-p storage variants.
 // Per PARADIGM_BF16_RESIDUAL_P_DESIGN.md §4.2:
 //   p̂ := round_RN( bf16_to_fp32(p̂) + α·(a + b) )           (axpy2)
@@ -363,6 +364,58 @@ __global__ void chiron_scfa_axpy2_dual_p_kernel(float* __restrict__ p_fp32,
 	// FMA decisions, producing ULP-scale FP32 drift (iter 50 pattern).
 	float p_val = p_fp32[i];
 	p_val += alpha * (a[i] + b[i]);
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// PIED perf pass (2026-07-02): masked variant of the iter 70 dual-output
+// commit — the fused FP32+BF16-SR write with the PIED eta folded in, so the
+// --bf16-residual-p path pays no extra [T×m] SR-cast pass while PIED is
+// active.  FP32 arithmetic form matches chiron_scfa_axpy2_masked_kernel
+// exactly (p += alpha*(eta*(a+b))) and the SR hash matches
+// chiron_scfa_axpy2_dual_p, so the fused call is bit-identical to the
+// (masked axpy2 then cast_f32_to_bf16_stochastic) pair at equal
+// (srBaseSeed, srStepIdx) — guarded by the chiron-pied unit test.
+// PIED perf pass (2026-07-02): dual-output dy hand-off — writes the masked
+// FP32 dy AND its BF16 round-to-nearest mirror in one pass.  The trainer
+// registers (dy_fp32, dy_bf16) via register_fast16bf_constant so the
+// downstream B^T·dy FAST_16BF GEMM skips its per-layer re-cast of the full
+// [T×m] buffer (the castElimDy once-per-backward dp mirror cannot apply
+// under PIED because dy = eta⊙dp changes per layer).  RN cast matches
+// cast_f32_to_bf16 (the dp-mirror precedent) so the GEMM input is
+// bit-identical to the unregistered path.  FP32 arithmetic matches
+// chiron_incdrop_scale_copy exactly.
+__global__ void chiron_incdrop_scale_copy_dual_kernel(float* __restrict__ dst,
+                                                      unsigned short* __restrict__ dst_bf,
+                                                      float alpha,
+                                                      const float* __restrict__ src, int n,
+                                                      unsigned int key, unsigned int thr,
+                                                      float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	const float v = alpha * (eta * src[i]);
+	dst[i] = v;
+	dst_bf[i] = fp32_to_bf16_rn_dev(v);
+}
+
+__global__ void chiron_scfa_axpy2_masked_dual_p_kernel(float* __restrict__ p_fp32,
+                                                       unsigned short* __restrict__ p_bf16,
+                                                       float alpha,
+                                                       const float* __restrict__ a,
+                                                       const float* __restrict__ b,
+                                                       int n,
+                                                       unsigned int key, unsigned int thr,
+                                                       float lo, float hi,
+                                                       uint32_t srBaseSeed,
+                                                       uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	float p_val = p_fp32[i];
+	p_val += alpha * (eta * (a[i] + b[i]));
 	p_fp32[i] = p_val;
 	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
 }
@@ -652,6 +705,42 @@ bool chiron_scfa_axpy2_dual_p(float* p_fp32, unsigned short* p_bf16,
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_scfa_axpy2_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
 	    p_fp32, p_bf16, alpha, a, b, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED dual-output dy hand-off (see kernel comment above).
+bool chiron_incdrop_scale_copy_dual(float* dst, unsigned short* dst_bf,
+                                    float alpha,
+                                    const float* src, int n,
+                                    unsigned int key, unsigned int thr,
+                                    float lo, float hi,
+                                    cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_dual_kernel<<<grid, kBlockElem, 0, s>>>(
+	    dst, dst_bf, alpha, src, n, key, thr, lo, hi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked dual-output commit (see kernel comment above).
+bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
+                                     float alpha,
+                                     const float* a, const float* b, int n,
+                                     unsigned int key, unsigned int thr,
+                                     float lo, float hi,
+                                     unsigned int srBaseSeed,
+                                     unsigned int srStepIdx,
+                                     cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, key, thr, lo, hi, srBaseSeed, srStepIdx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

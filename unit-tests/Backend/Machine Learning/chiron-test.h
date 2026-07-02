@@ -130,6 +130,8 @@ void WhiSCInvWalkBackwardParityTest();
 void CHIRONPiedMaskCpuTest();
 void CHIRONPiedCommitInverseCpuTest();
 void CHIRONPiedGpuParityTest();
+void CHIRONPiedDualPParityTest();
+void CHIRONPiedDyDualParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
