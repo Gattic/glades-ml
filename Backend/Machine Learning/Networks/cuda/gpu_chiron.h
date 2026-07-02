@@ -287,10 +287,11 @@ bool chiron_rot_forward(float* q, float* p, const float* a, const float* c,
 //   Backward adjoint of the rotation. Computes:
 //   - dq_in, dp_in: gradients w.r.t. q_in, p_in
 //   - dphi: ACCUMULATES gradient w.r.t. phi via the coefficient chain
-//   Internally: (1) per-element kernel writes dq_in, dp_in + per-element da_el, dc_el;
-//   (2) column reduction to da, dc via chiron_col_accumulate;
-//   (3) coefficient chain kernel maps (da, dc, phi) -> dphi accumulation.
-//   scratch_da, scratch_dc: caller-owned [m] scratch buffers.
+//   Internally: two-pass fused reduction — (1) per-element kernel writes dq_in, dp_in
+//   and register-accumulates per-channel da/dc into [ROT_NCHUNK*m] internal scratch
+//   (function-static GpuBuffer, ~256 KB, no T*m allocation);
+//   (2) chain kernel sums ROT_NCHUNK partials and maps (da, dc, phi) -> dphi.
+//   scratch_da, scratch_dc: accepted but unused (kept for ABI stability).
 // chiron_rot_backward: whisc_a is optional (pass NULL for the SORC path).
 //   When non-NULL, the coefficient chain scales da by whisc_a[i]^2 and dc by
 //   1/whisc_a[i]^2 before computing dphi, implementing the folded WhiSC dtheta

@@ -31,12 +31,17 @@ top-1 ~doubled; 4-batch windows)** — the largest matched jump in the lineage.
 - **Stability**: 0 grad-skips, 0 NaN over 30k steps; one isolated recovered ‖g‖
   spike (10.8 @step 9001). The `[whisc]` monitor showed ρ_eff→~4100 absorbed by the
   whitening (a→0.125, clamp-binding); maxTheta 0.067 < the 0.07 cap.
-- **Perf**: **~22,900 tok/s** (vs ~28,500 no-coupling: −19.5%, ×1.24/step) after two
-  perf passes: coefficient folding (+24%, eliminated the explicit whiten/unwhiten
-  passes = 19.1% GPU time) + coalesced stats reduction (+3.7%). Residual = the
-  inherent rotation kernels. **Build gotcha: the trainer links the glades CUDA
-  kernels STATICALLY — after any glades-ml kernel change, `make install` alone does
-  NOT update the trainer; rebuild it (`bash build.sh`).**
+- **Perf**: **~25,750 tok/s** (vs ~28,500 no-coupling: **−9.7%**, ×1.11/step) after
+  four perf passes (cumulative +43.6% from the first WhiSC binary's 17,930/−37%):
+  (1) coefficient folding +24% (eliminated the explicit whiten/unwhiten passes,
+  19.1% GPU time); (2) coalesced stats reduction +3.7%; (3) fused da/dc column
+  reduction into the rot pre-backward +10.9% (killed ~536 MB/layer-µstep of
+  [T×m] scratch traffic, `chiron_rot_fused_backward`); (4) fused inverse-walk
+  +1.1% (`chiron_rot_backward_invwalk` — the backward walk + adjoint in one
+  pass; grad/dphi bit-exact vs the two-call path). Residual ≈ the inherent
+  rotation forward + DRAM-bound stats. **Build gotcha: the trainer links the
+  glades CUDA kernels STATICALLY — after any glades-ml kernel change,
+  `make install` alone does NOT update the trainer; rebuild it (`bash build.sh`).**
 - **Verified three ways**: trainer wide 32-batch val 1.639/1.819; trainer 4-batch
   final-val 1.3753/acc1 0.633; **chiron_infer teacher-forcing 1.4655/top1 0.626**
   (serving parity, see below).

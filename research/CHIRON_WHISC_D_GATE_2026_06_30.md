@@ -24,9 +24,16 @@ serves it (auto-injecting `--whisc-coupling --rot-theta-max 0.07`).
   binary: **22,945 tok/s** — coalesce adds **+3.7%** over fold-only (22,130). Corrected progression:
   explicit 17,930 (−37%) → folding 22,130 (−22.3%) → **fold+coalesce 22,945 (−19.5%, ×1.24)** vs
   no-coupling 28,500. (E4 itself ran fold+old-stats — correctness unaffected.)
+- **Perf passes 3+4 (2026-07-01, post-ship):** (3) fused the da/dc column reduction into the rot
+  pre-backward (`chiron_rot_fused_backward`, deterministic two-pass [32×m] partials, kills the
+  [T×m] da_el/dc_el scratch round-trip) → **+10.9% (25,457 tok/s)**; (4) fused the backward
+  inverse-walk into the same kernel (`chiron_rot_backward_invwalk`, walk + adjoint in one pass;
+  new GPU parity test: grad/dphi bit-exact vs the two-call path, state 6e-8; E0 10.7816 exact)
+  → **+1.1% (25,747 tok/s)**. **Final: 25,747 tok/s = −9.7% vs no-coupling** (from −37% at first
+  build; cumulative +43.6%). Stopped per the <2%-yield rule — residual is the inherent rotation
+  forward + DRAM-bound stats.
 - **Open follow-ups:** multi-seed confirm; 60k base + flat-3e-5 finish schedule (untried upside);
-  WhiSC-M/T upgrades; further perf (rot backward fusion — pre_backward+col_accumulate materialize
-  ~536 MB/layer-microstep of da/dc scratch traffic).
+  WhiSC-M/T upgrades.
 
 ---
 
