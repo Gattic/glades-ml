@@ -313,6 +313,21 @@ bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
 //   a[i] *= wa[i]^2 ; c[i] /= wa[i]^2. Eliminates separate whiten/unwhiten passes.
 bool chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, int m);
 
+// chiron_rot_backward_invwalk: fused inverse-walk + backward in one [T*m] pass.
+// Takes the POST-coupling state (q2,p1) in the q/p buffers, recovers pre-coupling
+// (q0,p0) per-element in registers (3 negated shears), writes them back, then
+// runs the standard 3-shear backward. Eliminates the separate chiron_rot_forward(sign=-1)
+// call. Signature mirrors chiron_rot_backward except q/p are float* (writeable).
+// ABI: new function; chiron_rot_backward is unchanged (unit tests + SORC path use it).
+bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
+                                  float* q, float* p,
+                                  const float* a, const float* c,
+                                  const float* phi, float theta_max, float s_warm,
+                                  int T, int m,
+                                  float* dq_in, float* dp_in, float* dphi,
+                                  float* scratch_da, float* scratch_dc,
+                                  const float* whisc_a = NULL);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -797,6 +812,13 @@ inline bool chiron_rot_backward(const float*, const float*,
 inline bool chiron_whisc_scale(float*, float*, const float*, float, int, int) { return false; }
 inline bool chiron_whisc_update_stats(const float*, const float*, int, int, float, float, float, float*, float*, float*) { return false; }
 inline bool chiron_whisc_fold_coeffs(float*, float*, const float*, int) { return false; }
+inline bool chiron_rot_backward_invwalk(const float*, const float*,
+                                         float*, float*,
+                                         const float*, const float*,
+                                         const float*, float, float,
+                                         int, int,
+                                         float*, float*, float*, float*, float*,
+                                         const float* = NULL) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

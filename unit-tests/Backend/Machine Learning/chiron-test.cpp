@@ -18943,3 +18943,127 @@ void WhiSCFoldBackwardParityTest()
 	std::printf("  [WhiSC fold backward parity] GLADES_HAVE_CUDA not defined -- skipped\n");
 #endif
 }
+
+// WhiSC invwalk backward parity: chiron_rot_backward_invwalk (fused inverse-walk + backward)
+// vs the two-call reference (chiron_rot_forward(-1) + chiron_rot_backward) at rho=45.
+// Asserts: (i) recovered (q,p) matches original pre-coupling (q0,p0) to <1e-4 absolute;
+//          (ii) dq/dp/dphi match the two-call reference to <1e-4 relative.
+// Uses folded coeffs with whisc_a for realism (same as WhiSCFoldBackwardParityTest).
+void WhiSCInvWalkBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [WhiSC invwalk backward parity] no CUDA device -- skipped\n");
+		return;
+	}
+	const int T = 8, m = 3;
+	const float theta_max = 0.07f, sw = 1.0f, RHO = 45.0f;
+
+	// Build random-ish inputs
+	std::vector<float> phi(m), q0(T*m), p0(T*m), wa(m), cot_q(T*m), cot_p(T*m);
+	for (int i = 0; i < m; ++i) { phi[i] = 0.2f*(float)i - 0.3f; wa[i] = powf(1.0f/(RHO*RHO), 0.25f); }
+	for (int k = 0; k < T*m; ++k) { q0[k] = sinf(0.4f*(float)k); p0[k] = RHO*cosf(0.27f*(float)k); cot_q[k] = sinf(0.13f*(float)k+1.0f); cot_p[k] = cosf(0.31f*(float)k); }
+
+	// Build folded coeffs on GPU: rot_coeffs then whisc_fold_coeffs
+	glades::gpu::GpuBuffer<float> dPhi, dA, dC, dWa;
+	dPhi.allocate(m); dPhi.upload(&phi[0], m);
+	dA.allocate(m); dC.allocate(m);
+	dWa.allocate(m); dWa.upload(&wa[0], m);
+	ASSERT("chiron_rot_coeffs (invwalk test)", glades::gpu::chiron_rot_coeffs(dPhi.data(), theta_max, sw, m, dA.data(), dC.data()));
+	ASSERT("chiron_whisc_fold_coeffs (invwalk test)", glades::gpu::chiron_whisc_fold_coeffs(dA.data(), dC.data(), dWa.data(), m));
+
+	// CPU forward with folded coeffs to get post-coupling state (q2, p1)
+	std::vector<float> rc_a(m), rc_c(m); float th_dum;
+	for (int i = 0; i < m; ++i) {
+		glades::chiron::rot_coeffs(phi[i], theta_max, sw, rc_a[i], rc_c[i], th_dum);
+		float wa2 = wa[i]*wa[i]; rc_a[i] *= wa2; rc_c[i] /= wa2;
+	}
+	std::vector<float> q2_cpu(q0), p1_cpu(p0);
+	glades::chiron::rot_forward(&q2_cpu[0], &p1_cpu[0], &rc_a[0], &rc_c[0], T, m);
+
+	// === Test path: chiron_rot_backward_invwalk ===
+	glades::gpu::GpuBuffer<float> dQ, dP, dDQO, dDPO, dDQI, dDPI, dDPHI, dSda, dSdc;
+	dQ.allocate(T*m); dQ.upload(&q2_cpu[0], T*m);  // post-coupling q2
+	dP.allocate(T*m); dP.upload(&p1_cpu[0], T*m);  // post-coupling p1
+	dDQO.allocate(T*m); dDQO.upload(&cot_q[0], T*m);
+	dDPO.allocate(T*m); dDPO.upload(&cot_p[0], T*m);
+	dDQI.allocate(T*m); dDPI.allocate(T*m);
+	dDPHI.allocate(m); dDPHI.zero();
+	dSda.allocate(m); dSdc.allocate(m);
+
+	ASSERT("chiron_rot_backward_invwalk failed",
+	       glades::gpu::chiron_rot_backward_invwalk(
+	           dDQO.data(), dDPO.data(),
+	           dQ.data(), dP.data(),          // post-coupling in; pre-coupling out
+	           dA.data(), dC.data(),
+	           dPhi.data(), theta_max, sw, T, m,
+	           dDQI.data(), dDPI.data(), dDPHI.data(),
+	           dSda.data(), dSdc.data(),
+	           dWa.data()));
+
+	// (i) Check recovered (q,p) matches original pre-coupling (q0,p0)
+	std::vector<float> q_rec(T*m), p_rec(T*m);
+	dQ.download(&q_rec[0], T*m);
+	dP.download(&p_rec[0], T*m);
+	float worst_state = 0.0f;
+	for (int k = 0; k < T*m; ++k) {
+		float eq = fabsf(q_rec[k] - q0[k]);
+		float ep = fabsf(p_rec[k] - p0[k]);
+		if (eq > worst_state) worst_state = eq;
+		if (ep > worst_state) worst_state = ep;
+	}
+	ASSERT("invwalk: recovered (q,p) != original pre-coupling state", worst_state < 1e-4f);
+
+	// === Reference path: chiron_rot_forward(-1) + chiron_rot_backward ===
+	glades::gpu::GpuBuffer<float> dQ_ref, dP_ref, dDQI_ref, dDPI_ref, dDPHI_ref;
+	dQ_ref.allocate(T*m); dQ_ref.upload(&q2_cpu[0], T*m);
+	dP_ref.allocate(T*m); dP_ref.upload(&p1_cpu[0], T*m);
+	dDQI_ref.allocate(T*m); dDQI_ref.upload(&cot_q[0], T*m);
+	dDPI_ref.allocate(T*m); dDPI_ref.upload(&cot_p[0], T*m);
+	dDPHI_ref.allocate(m); dDPHI_ref.zero();
+
+	ASSERT("chiron_rot_forward(-1) ref failed",
+	       glades::gpu::chiron_rot_forward(dQ_ref.data(), dP_ref.data(), dA.data(), dC.data(), -1.0f, T, m));
+	ASSERT("chiron_rot_backward ref failed",
+	       glades::gpu::chiron_rot_backward(
+	           dDQI_ref.data(), dDPI_ref.data(),
+	           dQ_ref.data(), dP_ref.data(),
+	           dA.data(), dC.data(),
+	           dPhi.data(), theta_max, sw, T, m,
+	           dDQI_ref.data(), dDPI_ref.data(), dDPHI_ref.data(),
+	           dSda.data(), dSdc.data(),
+	           dWa.data()));
+
+	// (ii) Compare dq/dp
+	std::vector<float> dq_new(T*m), dp_new(T*m), dq_ref(T*m), dp_ref(T*m);
+	dDQI.download(&dq_new[0], T*m);
+	dDPI.download(&dp_new[0], T*m);
+	dDQI_ref.download(&dq_ref[0], T*m);
+	dDPI_ref.download(&dp_ref[0], T*m);
+	float worst_grad = 0.0f;
+	for (int k = 0; k < T*m; ++k) {
+		float rq = fabsf(dq_new[k] - dq_ref[k]) / (fabsf(dq_ref[k]) + 1e-4f);
+		float rp = fabsf(dp_new[k] - dp_ref[k]) / (fabsf(dp_ref[k]) + 1e-4f);
+		if (rq > worst_grad) worst_grad = rq;
+		if (rp > worst_grad) worst_grad = rp;
+	}
+	ASSERT("invwalk: dq/dp != two-call reference", worst_grad < 1e-4f);
+
+	// (iii) Compare dphi
+	std::vector<float> dphi_new(m), dphi_ref_v(m);
+	dDPHI.download(&dphi_new[0], m);
+	dDPHI_ref.download(&dphi_ref_v[0], m);
+	float worst_dphi = 0.0f;
+	for (int i = 0; i < m; ++i) {
+		float r = fabsf(dphi_new[i] - dphi_ref_v[i]) / (fabsf(dphi_ref_v[i]) + 1e-4f);
+		if (r > worst_dphi) worst_dphi = r;
+	}
+	ASSERT("invwalk: dphi != two-call reference", worst_dphi < 1e-4f);
+
+	std::printf("  [WhiSC invwalk backward parity] state_err=%.2e grad_err=%.2e dphi_err=%.2e  PASS\n",
+	            worst_state, worst_grad, worst_dphi);
+#else
+	std::printf("  [WhiSC invwalk backward parity] GLADES_HAVE_CUDA not defined -- skipped\n");
+#endif
+}

@@ -1411,6 +1411,96 @@ bool chiron_rot_backward(const float* dq_out, const float* dp_out,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Pass-4 perf: fused inverse-walk + backward in one [T*m] pass.
+//
+// chiron_rot_backward_invwalk takes the POST-coupling state (q2, p1) in the
+// q/p buffers (as they stand after the forward pass), performs the 3-shear
+// inverse walk entirely in registers, writes back the recovered pre-coupling
+// (q0, p0), then runs the standard 3-shear backward. Eliminates the separate
+// chiron_rot_forward(sign=-1) pass — one T*m read+write pass per layer saved.
+//
+// The intermediate q1 and p1 needed by the backward are FREE — they arise
+// naturally during the inverse walk, so no recompute is required.
+// ---------------------------------------------------------------------------
+
+__global__ void chiron_rot_invwalk_backward_kernel(
+        float* __restrict__ q_io,           // in: post-coupling q2; out: pre-coupling q0
+        float* __restrict__ p_io,           // in: post-coupling p1; out: pre-coupling p0
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ a_coeff, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int cx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (cx >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	float ai = a_coeff[cx], ci = c_coeff[cx];
+	float local_da = 0.0f, local_dc = 0.0f;
+	for (int t = t_start; t < t_end; ++t) {
+		long k = (long)t * m + cx;
+		// Inverse walk in registers: (q2, p1) -> (q1, p0, q0).
+		// Negated shears in reverse order (see rot_inverse in transformer_chiron_ops.h).
+		float q2  = q_io[k];
+		float p1  = p_io[k];
+		float q1  = q2 - ai * p1;     // shear3 inv: q1 = q2 - a*p1
+		float p0  = p1 - ci * q1;     // shear2 inv: p0 = p1 - c*q1
+		float q0  = q1 - ai * p0;     // shear1 inv: q0 = q1 - a*p0
+		q_io[k] = q0; p_io[k] = p0;   // write back recovered pre-coupling state
+		// Standard 3-shear backward (same math as chiron_rot_fused_backward).
+		// q0, p0, q1, p1 are already in registers — no recompute needed.
+		float dq2 = dqo[k], dp1a = dpo[k];
+		float dq1 = dq2; float dp1b = dp1a + ai*dq2; float dael = p1*dq2;   // shear3 bwd
+		float dp0 = dp1b; dq1 += ci*dp1b; float dcel = q1*dp1b;             // shear2 bwd
+		float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;                     // shear1 bwd
+		dqi[k] = dq0; dpi[k] = dp0;
+		local_da += dael; local_dc += dcel;
+	}
+	partialDa[(long)by*m + cx] = local_da;
+	partialDc[(long)by*m + cx] = local_dc;
+}
+
+bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
+                                  float* q, float* p,
+                                  const float* a, const float* c,
+                                  const float* phi, float theta_max, float s_warm,
+                                  int T, int m,
+                                  float* dq_in, float* dp_in, float* dphi,
+                                  float* scratch_da, float* scratch_dc,
+                                  const float* whisc_a) {
+	if (T <= 0 || m <= 0) return true;
+	(void)scratch_da; (void)scratch_dc;  // kept for ABI symmetry with chiron_rot_backward
+
+	static glades::gpu::GpuBuffer<float> partialDa_buf, partialDc_buf;
+	size_t need = (size_t)ROT_NCHUNK * m;
+	if (partialDa_buf.size() < need) {
+		partialDa_buf.allocate(need);
+		partialDc_buf.allocate(need);
+	}
+
+	// Pass 1: per-element inverse-walk + backward + partial column reduction.
+	int chunk = (T + ROT_NCHUNK - 1) / ROT_NCHUNK;
+	int blk = 256;
+	dim3 grid1((m + blk - 1) / blk, ROT_NCHUNK);
+	chiron_rot_invwalk_backward_kernel<<<grid1, blk, 0, computeStream()>>>(
+	    q, p, dq_out, dp_out, a, c, T, m, chunk,
+	    dq_in, dp_in, partialDa_buf.data(), partialDc_buf.data());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Pass 2: finalize partials + chain rule -> dphi (ACCUMULATE).
+	int grid2 = (m + blk - 1) / blk;
+	chiron_rot_fused_chain_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialDa_buf.data(), partialDc_buf.data(),
+	    phi, theta_max, s_warm, m, ROT_NCHUNK,
+	    dphi, whisc_a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
 // ===========================================================================
 //  WhiSC: per-channel whitening scale + EMA second-moment stats.
 // ===========================================================================
