@@ -19067,3 +19067,181 @@ void WhiSCInvWalkBackwardParityTest()
 	std::printf("  [WhiSC invwalk backward parity] GLADES_HAVE_CUDA not defined -- skipped\n");
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// PIED — Phase-Increment Ensemble Dropout tests (2026-07-01).
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md
+// E1 ladder items: mask determinism + mean-one statistics, commit/inverse
+// reconstruction at synthetic rho=45, commit/dy eta-field agreement, and
+// CPU/GPU parity (bit-exact eta field; value-level bar for the FMA-fused
+// arithmetic).
+// ---------------------------------------------------------------------------
+
+void CHIRONPiedMaskCpuTest()
+{
+	const unsigned int n = 1u << 20;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(1337u ^ 0x50494544u);
+
+	// Bernoulli arm at pi = 0.1: thr = floor(pi*2^32), lo = 0, hi = 1/(1-pi).
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+
+	// (a) determinism: two evaluations are bit-identical.
+	// (b) mean-one: |mean(eta) - 1| within 4 sigma, sigma^2 = pi/(1-pi)/n.
+	// (c) keep fraction within 4 sigma of (1-pi).
+	double sum = 0.0; unsigned int kept = 0;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float e1 = glades::chiron::chiron_pied_eta(key, i, thr, 0.0f, hi);
+		const float e2 = glades::chiron::chiron_pied_eta(key, i, thr, 0.0f, hi);
+		ASSERT("PIED eta not deterministic", e1 == e2);
+		sum += (double)e1;
+		if (e1 != 0.0f) ++kept;
+	}
+	const double meanErr = fabs(sum / (double)n - 1.0);
+	const double sigMean = sqrt((double)(pi / (1.0f - pi)) / (double)n);
+	std::printf("  [PIED mask mean-one] |mean-1|=%.2e (4sigma=%.2e)\n", meanErr, 4.0 * sigMean);
+	ASSERT("PIED Bernoulli mask mean != 1 beyond 4sigma", meanErr < 4.0 * sigMean);
+	const double fracErr = fabs((double)kept / (double)n - (double)(1.0f - pi));
+	const double sigFrac = sqrt((double)(pi * (1.0f - pi)) / (double)n);
+	std::printf("  [PIED mask keep-rate] |frac-(1-pi)|=%.2e (4sigma=%.2e)\n", fracErr, 4.0 * sigFrac);
+	ASSERT("PIED keep fraction off beyond 4sigma", fracErr < 4.0 * sigFrac);
+
+	// (d) symmetric arm: thr = 2^31, lo = 1-amp, hi = 1+amp; mean-one, two-point support.
+	const float amp = sqrtf(pi / (1.0f - pi));
+	double sum2 = 0.0;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float e = glades::chiron::chiron_pied_eta(key, i, 0x80000000u, 1.0f - amp, 1.0f + amp);
+		ASSERT("PIED symmetric eta off two-point support",
+		       e == 1.0f - amp || e == 1.0f + amp);
+		sum2 += (double)e;
+	}
+	const double meanErr2 = fabs(sum2 / (double)n - 1.0);
+	const double sigMean2 = (double)amp / sqrt((double)n);
+	std::printf("  [PIED symmetric mean-one] |mean-1|=%.2e (4sigma=%.2e)\n", meanErr2, 4.0 * sigMean2);
+	ASSERT("PIED symmetric mask mean != 1 beyond 4sigma", meanErr2 < 4.0 * sigMean2);
+
+	// (e) zero-rate identity: thr = 0 => eta == hi always; with hi = 1 the masked
+	// commit is bit-identical to the unmasked math (x*1.0f == x exactly).
+	const unsigned int nz = 4096;
+	std::vector<float> pm(nz), pu(nz), av(nz), bv(nz);
+	LCG rng(7u);
+	for (unsigned int i = 0; i < nz; ++i) { pm[i] = pu[i] = rng.next_unit(); av[i] = rng.next_unit(); bv[i] = rng.next_unit(); }
+	glades::chiron::chiron_scfa_axpy2_masked_cpu(&pm[0], -1.0f, &av[0], &bv[0], nz, key, 0u, 0.0f, 1.0f);
+	for (unsigned int i = 0; i < nz; ++i) pu[i] += -1.0f * (av[i] + bv[i]);
+	for (unsigned int i = 0; i < nz; ++i)
+		ASSERT("PIED zero-rate masked commit != unmasked math", pm[i] == pu[i]);
+	std::printf("  [PIED zero-rate identity] bit-exact over %u elems  PASS\n", nz);
+}
+
+void CHIRONPiedCommitInverseCpuTest()
+{
+	// Synthetic rho = 45 regime: p ~ 45x the increment scale (the trained-in
+	// asymmetry).  Commit (+1) then inverse-commit (-1) with the same key must
+	// reconstruct p to the shear tolerance class; q is untouched by definition.
+	const unsigned int T = 64, m = 32, n = T * m;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(2024u ^ 0x50494544u);
+	const float pi = 0.3f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+
+	std::vector<float> p(n), p0, ypar(n), yperp(n);
+	LCG rng(42u);
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		p[i] = 45.0f * rng.next_unit();
+		ypar[i] = rng.next_unit();
+		yperp[i] = 0.3f * rng.next_unit();
+	}
+	p0 = p;
+	glades::chiron::chiron_scfa_axpy2_masked_cpu(&p[0], +1.0f, &ypar[0], &yperp[0], n, key, thr, 0.0f, hi);
+	glades::chiron::chiron_scfa_axpy2_masked_cpu(&p[0], -1.0f, &ypar[0], &yperp[0], n, key, thr, 0.0f, hi);
+	float worst = 0.0f;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float rel = fabsf(p[i] - p0[i]) / (1.0f + fabsf(p0[i]));
+		if (rel > worst) worst = rel;
+	}
+	std::printf("  [PIED commit/inverse @rho=45] maxRelErr=%.2e (bar 1e-5)\n", worst);
+	ASSERT("PIED commit+inverse does not reconstruct p at rho=45", worst < 1e-5f);
+
+	// dy hand-off consistency: the eta field applied by the commit must equal
+	// the one applied by the scale-copy (same key).  With p=0, alpha=1, b=0 the
+	// commit yields eta.*ypar; the scale-copy on ypar must match bit-for-bit.
+	std::vector<float> viaCommit(n, 0.0f), viaCopy(n);
+	glades::chiron::chiron_scfa_axpy2_masked_cpu(&viaCommit[0], +1.0f, &ypar[0], &yperp[0], n, key, thr, 0.0f, hi);
+	glades::chiron::chiron_incdrop_scale_copy_cpu(&viaCopy[0], +1.0f, &ypar[0], n, key, thr, 0.0f, hi);
+	// viaCommit = eta.*(ypar+yperp); recompute the copy on (ypar+yperp) summed on host.
+	std::vector<float> ysum(n);
+	for (unsigned int i = 0; i < n; ++i) ysum[i] = ypar[i] + yperp[i];
+	glades::chiron::chiron_incdrop_scale_copy_cpu(&viaCopy[0], +1.0f, &ysum[0], n, key, thr, 0.0f, hi);
+	for (unsigned int i = 0; i < n; ++i)
+		ASSERT("PIED commit/dy eta fields disagree", viaCommit[i] == viaCopy[i]);
+	std::printf("  [PIED commit/dy eta agreement] bit-exact over %u elems  PASS\n", n);
+}
+
+void CHIRONPiedGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PIED GPU parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 128, m = 64, n = T * m;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(1337u ^ 0x50494544u);
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+
+	std::vector<float> p(n), ypar(n), yperp(n), ones(n, 1.0f);
+	LCG rng(9u);
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		p[i] = 45.0f * rng.next_unit();
+		ypar[i] = rng.next_unit();
+		yperp[i] = 0.3f * rng.next_unit();
+	}
+
+	// (a) eta-field bit-parity: scale_copy(alpha=1, src=ones) emits eta exactly
+	// (pure multiplies by 1.0f — no FMA contraction possible).
+	std::vector<float> etaCpu(n), etaGpu(n);
+	glades::chiron::chiron_incdrop_scale_copy_cpu(&etaCpu[0], 1.0f, &ones[0], n, key, thr, 0.0f, hi);
+	glades::gpu::GpuBuffer<float> dOnes, dEta, dP, dA, dB;
+	dOnes.allocate(n); dOnes.upload(&ones[0], n);
+	dEta.allocate(n);
+	glades::gpu::chiron_incdrop_scale_copy(dEta.data(), 1.0f, dOnes.data(), (int)n, key, thr, 0.0f, hi);
+	dEta.download(&etaGpu[0], n);
+	for (unsigned int i = 0; i < n; ++i)
+		ASSERT("PIED eta field CPU/GPU mismatch", etaCpu[i] == etaGpu[i]);
+	std::printf("  [PIED eta CPU/GPU parity] bit-exact over %u elems  PASS\n", n);
+
+	// (b) masked commit value parity (FMA-tolerance bar).
+	std::vector<float> pCpu = p, pGpu(n);
+	glades::chiron::chiron_scfa_axpy2_masked_cpu(&pCpu[0], +1.0f, &ypar[0], &yperp[0], n, key, thr, 0.0f, hi);
+	dP.allocate(n); dP.upload(&p[0], n);
+	dA.allocate(n); dA.upload(&ypar[0], n);
+	dB.allocate(n); dB.upload(&yperp[0], n);
+	glades::gpu::chiron_scfa_axpy2_masked(dP.data(), +1.0f, dA.data(), dB.data(), (int)n, key, thr, 0.0f, hi);
+	dP.download(&pGpu[0], n);
+	float me = 0.0f;
+	for (unsigned int i = 0; i < n; ++i) me = fmaxf(me, fabsf(pGpu[i] - pCpu[i]));
+	std::printf("  [PIED masked commit CPU/GPU parity] maxErr=%.2e (bar 1e-4)\n", me);
+	char msg[128]; std::snprintf(msg, sizeof(msg), "PIED masked commit CPU/GPU parity (maxErr=%.2e)", me);
+	ASSERT(msg, me < 1e-4f);
+
+	// (c) GPU commit + GPU inverse reconstructs (same key regenerated device-side).
+	glades::gpu::chiron_scfa_axpy2_masked(dP.data(), -1.0f, dA.data(), dB.data(), (int)n, key, thr, 0.0f, hi);
+	dP.download(&pGpu[0], n);
+	float mr = 0.0f;
+	for (unsigned int i = 0; i < n; ++i)
+		mr = fmaxf(mr, fabsf(pGpu[i] - p[i]) / (1.0f + fabsf(p[i])));
+	std::printf("  [PIED GPU commit/inverse @rho=45] maxRelErr=%.2e (bar 1e-5)\n", mr);
+	char msg2[128]; std::snprintf(msg2, sizeof(msg2), "PIED GPU commit+inverse reconstruction (maxRelErr=%.2e)", mr);
+	ASSERT(msg2, mr < 1e-5f);
+#else
+	std::printf("  [PIED GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

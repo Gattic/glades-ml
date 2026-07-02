@@ -160,6 +160,66 @@ __global__ void chiron_scfa_scaled_copy_kernel(float* __restrict__ c,
 	if (i < n) c[i] = alpha * a[i];
 }
 
+// ---------------------------------------------------------------------------
+// PIED — Phase-Increment Ensemble Dropout (2026-07-01).
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md
+//
+// Mean-one two-point mask on the SCFA attention increment at the shear
+// commit: p += alpha * eta_i * (a[i] + b[i]), with eta regenerated from a
+// stateless counter hash — no RNG state, no stored masks.  The inverse walk
+// calls the same kernel with -alpha: fl((-alpha)*x) == -fl(alpha*x) exactly
+// (IEEE sign flip), so the subtracted increment is bit-identical to the
+// added one and p-reconstruction matches the unmasked shear's tolerance
+// class.  The backward dy hand-off uses the scale-copy variant with the
+// same key so the increment-branch adjoint sees the identical eta field.
+//
+//   eta_i = (mix32(key ^ i*0x9E3779B9) >= thr) ? hi : lo
+//   Bernoulli arm:  thr = floor(pi * 2^32), lo = 0,      hi = 1/(1-pi)
+//   Symmetric arm:  thr = 0x80000000,       lo = 1-amp,  hi = 1+amp
+//
+// Must stay bit-identical to the CPU reference (transformer_chiron_ops.h
+// glades::chiron::chiron_pied_eta) — guarded by the chiron-pied E1 parity
+// unit test.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ unsigned int chiron_pied_mix32_dev(unsigned int x)
+{
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__device__ __forceinline__ float chiron_pied_eta_dev(unsigned int key, unsigned int i,
+                                                     unsigned int thr, float lo, float hi)
+{
+	const unsigned int h = chiron_pied_mix32_dev(key ^ (i * 0x9E3779B9u));
+	return (h >= thr) ? hi : lo;
+}
+
+__global__ void chiron_scfa_axpy2_masked_kernel(float* __restrict__ p, float alpha,
+                                                const float* __restrict__ a,
+                                                const float* __restrict__ b, int n,
+                                                unsigned int key, unsigned int thr,
+                                                float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	p[i] += alpha * (eta * (a[i] + b[i]));
+}
+
+__global__ void chiron_incdrop_scale_copy_kernel(float* __restrict__ dst, float alpha,
+                                                 const float* __restrict__ src, int n,
+                                                 unsigned int key, unsigned int thr,
+                                                 float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	dst[i] = alpha * (eta * src[i]);
+}
+
 // iter 63 (Arc 2, BF16 residual-p — 2026-05-16): BF16-p storage variants.
 // Per PARADIGM_BF16_RESIDUAL_P_DESIGN.md §4.2:
 //   p̂ := round_RN( bf16_to_fp32(p̂) + α·(a + b) )           (axpy2)
@@ -460,6 +520,38 @@ bool chiron_scfa_axpy2(float* p, float alpha,
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked shear-commit (see kernel comment above).
+bool chiron_scfa_axpy2_masked(float* p, float alpha,
+                              const float* a, const float* b, int n,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n,
+	                                                            key, thr, lo, hi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked dy hand-off (see kernel comment above).
+bool chiron_incdrop_scale_copy(float* dst, float alpha,
+                               const float* src, int n,
+                               unsigned int key, unsigned int thr,
+                               float lo, float hi,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_kernel<<<grid, kBlockElem, 0, s>>>(dst, alpha, src, n,
+	                                                             key, thr, lo, hi);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

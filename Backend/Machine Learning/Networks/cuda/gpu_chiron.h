@@ -330,6 +330,38 @@ bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
                                   const float* whisc_a = NULL);
 
 // ---------------------------------------------------------------------------
+// PIED — Phase-Increment Ensemble Dropout (2026-07-01, default-off).
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md
+//
+// Mean-one two-point mask on the SCFA attention increment, regenerated from a
+// stateless counter hash (no RNG state, no stored masks; forward, inverse walk
+// and backward evaluate the identical pure function of (key, i)):
+//   eta_i = (mix32(key ^ i*0x9E3779B9) >= thr) ? hi : lo
+//   Bernoulli arm:  thr = floor(pi * 2^32), lo = 0,      hi = 1/(1-pi)
+//   Symmetric arm:  thr = 0x80000000,       lo = 1-amp,  hi = 1+amp
+// CPU reference: glades::chiron::chiron_pied_eta (transformer_chiron_ops.h);
+// bit-parity guarded by the chiron-pied unit test.
+// ---------------------------------------------------------------------------
+
+// Masked shear-commit: p[i] += alpha * eta_i * (a[i] + b[i]).  The inverse
+// walk passes -alpha (exact IEEE sign flip of the identical product), so the
+// subtracted increment is bit-identical to the added one.
+bool chiron_scfa_axpy2_masked(float* p, float alpha,
+                              const float* a, const float* b, int n,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              cudaStream_t stream = 0);
+
+// Masked dy hand-off for the backward increment branch:
+// dst[i] = alpha * eta_i * src[i].  Same key as the commit so the adjoint sees
+// the identical eta field; the through-going dp is never masked.
+bool chiron_incdrop_scale_copy(float* dst, float alpha,
+                               const float* src, int n,
+                               unsigned int key, unsigned int thr,
+                               float lo, float hi,
+                               cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
 //
@@ -813,6 +845,10 @@ inline bool chiron_rot_backward(const float*, const float*,
 inline bool chiron_whisc_scale(float*, float*, const float*, float, int, int) { return false; }
 inline bool chiron_whisc_update_stats(const float*, const float*, int, int, float, float, float, float*, float*, float*) { return false; }
 inline bool chiron_whisc_fold_coeffs(float*, float*, const float*, int) { return false; }
+inline bool chiron_scfa_axpy2_masked(float*, float, const float*, const float*, int,
+                                     unsigned int, unsigned int, float, float) { return false; }
+inline bool chiron_incdrop_scale_copy(float*, float, const float*, int,
+                                      unsigned int, unsigned int, float, float) { return false; }
 inline bool chiron_rot_backward_invwalk(const float*, const float*,
                                          float*, float*,
                                          const float*, const float*,

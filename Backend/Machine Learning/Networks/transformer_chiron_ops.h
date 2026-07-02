@@ -362,6 +362,65 @@ inline void chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, unsign
 }
 
 // ------------------------------------------------------------------
+// PIED — Phase-Increment Ensemble Dropout (CPU reference, 2026-07-01).
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md
+//
+// Mean-one two-point mask on the SCFA attention increment at the shear
+// commit (p += eta ⊙ Y_l(q)), regenerated from a stateless counter hash —
+// no RNG state, no stored masks.  Forward, inverse walk, and backward
+// evaluate the identical pure function of (key, i):
+//   eta_i = (mix32(key ^ i*0x9E3779B9) >= thr) ? hi : lo
+//   Bernoulli arm:  thr = floor(pi * 2^32), lo = 0,      hi = 1/(1-pi)
+//   Symmetric arm:  thr = 0x80000000,       lo = 1-amp,  hi = 1+amp
+// Must stay bit-identical to the GPU kernels (gpu_chiron.cu
+// chiron_pied_eta_dev) — guarded by the chiron-pied parity unit test.
+
+inline unsigned int chiron_pied_mix32(unsigned int x)
+{
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+inline float chiron_pied_eta(unsigned int key, unsigned int i,
+                             unsigned int thr, float lo, float hi)
+{
+	const unsigned int h = chiron_pied_mix32(key ^ (i * 0x9E3779B9u));
+	return (h >= thr) ? hi : lo;
+}
+
+// Masked shear-commit: p[i] += alpha * eta_i * (a[i] + b[i]).  The inverse
+// walk passes -alpha (exact IEEE sign flip of the identical product), so the
+// subtracted increment is bit-identical to the added one.
+inline void chiron_scfa_axpy2_masked_cpu(float* p, float alpha,
+                                         const float* a, const float* b,
+                                         unsigned int n,
+                                         unsigned int key, unsigned int thr,
+                                         float lo, float hi)
+{
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float eta = chiron_pied_eta(key, i, thr, lo, hi);
+		p[i] += alpha * (eta * (a[i] + b[i]));
+	}
+}
+
+// Masked dy hand-off: dst[i] = alpha * eta_i * src[i].  Same key as the
+// commit so the increment-branch adjoint sees the identical eta field.
+inline void chiron_incdrop_scale_copy_cpu(float* dst, float alpha,
+                                          const float* src, unsigned int n,
+                                          unsigned int key, unsigned int thr,
+                                          float lo, float hi)
+{
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float eta = chiron_pied_eta(key, i, thr, lo, hi);
+		dst[i] = alpha * (eta * src[i]);
+	}
+}
+
+// ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //
 // To prevent BF16 round-off from compounding across the block-inverse

@@ -281,6 +281,12 @@ int main(int argc, char* argv[])
 		WhiSCFoldBackwardParityTest();
 		WhiSCInvWalkBackwardParityTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-pied") == 0 || strcmp(argv[1], "pied") == 0)
+	    {
+		CHIRONPiedMaskCpuTest();
+		CHIRONPiedCommitInverseCpuTest();
+		CHIRONPiedGpuParityTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {
 		CHIRONSpectralNormTest();

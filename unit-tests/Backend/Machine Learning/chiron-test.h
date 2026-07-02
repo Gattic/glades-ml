@@ -125,6 +125,12 @@ void WhiSCBackwardParityTest();
 void WhiSCFoldBackwardParityTest();
 void WhiSCInvWalkBackwardParityTest();
 
+// PIED increment dropout (2026-07-01,
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md).
+void CHIRONPiedMaskCpuTest();
+void CHIRONPiedCommitInverseCpuTest();
+void CHIRONPiedGpuParityTest();
+
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
 
