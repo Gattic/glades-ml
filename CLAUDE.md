@@ -2,9 +2,76 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384 (WhiSC-D ship 2026-07-01)
+## Current Production Flagship — CHIRON 1B @ T=16384 (PIED ship 2026-07-03)
 
-The current production LLM flagship is **CHIRON 1B WhiSC-D 30k**
+The current production LLM flagship is **CHIRON 1B PIED 30k**
+(checkpoint `database/checkpoints/chiron_1B_pied_e4/chiron_1B_pied_e4.final`).
+It is a **perplexity flagship**: **wide 32-batch val NLL 1.1788 / 1.3019 (two 33.5M-token
+windows) vs the prior WhiSC-D ship's 1.6390 / 1.8191 at matched windows — Δ −0.46/−0.52
+nat, top-1 +10.6/+10.9 points**, at the identical 30k-step/1.97B-token budget and recipe.
+Matched 4-batch final-val **1.0259 / acc@1 0.7224 vs whisc30k's 1.3753 / 0.633
+(Δ −0.349 nat)**; the gap **widens with training** (−0.16@3k → −0.44@21k) and PIED crossed
+the WhiSC-D ship's *final* quality at step ~15k (half the budget).
+
+- **Shape**: identical to the WhiSC-D ship (m=2048, L=24, nH=16, dH=256, V=32000 BPE,
+  T=16384; 870.94M params + 384 QK-Norm γ + 24×2048 rot_phi, CHRF bit 1024). **PIED adds
+  NO parameters and NO checkpoint state** — the checkpoint is standard WhiSC-D format.
+- **The mechanism — PIED (`--inc-dropout 0.1`)**: Phase-Increment Ensemble Dropout, the
+  CHIRON-native dropout — a mean-one two-point Bernoulli mask `η ∈ {0, 1/(1−π)}` on the
+  SCFA attention increment at the shear commit (`p += sign·η⊙(y_par+y_perp)`), i.i.d. per
+  (layer, µstep, token, channel), regenerated from a stateless counter hash (no RNG state;
+  exactly invertible in the inverse walk; states never masked; training passes only —
+  val/inference never mask). Exact ensemble semantics on the linear p-accumulator; the
+  implicit regularizer is a Fisher-weighted increment-energy penalty whose distinctive
+  content is **anti-cancellation across depth** (taxes co-adapted cancelling increments;
+  complementary to SIRA). Chosen by a 3-candidate design study over WhiSK (whitened
+  symplectic kicks) and SFD (spectral gating); LayerDrop's three failure causes are each
+  structurally addressed (increments not states; compensation exact by linearity, never
+  through reln; per-token masks keep Adam moments at baseline statistics).
+- **Stack/recipe**: the WhiSC-D ship recipe **PLUS `--inc-dropout 0.1`**, 30k steps at
+  constant lr 3e-4 (accum 4, seed 1337). No finish anneal (still an untried upside).
+- **Stability**: 0 grad-skips, 0 NaN over 30k steps / 1.97B tokens. The lineage's step-9001
+  hard-batch spike (whisc30k's only anomaly, ‖g‖ 10.8) recurred at the identical batch
+  **damped to 4.9** — in-vivo evidence of PIED's conditioning effect (also seen at E3:
+  treatment max ‖g‖ 2.958 < baseline 3.211).
+- **Perf**: **−1.87% wall vs no-PIED at the same binary** (E4 ran ~25,105 tok/s), after a
+  perf pass: fused masked dual_p commit (`chiron_scfa_axpy2_masked_dual_p`, bit-identical
+  to the unfused pair) + dual-output dy copy (`chiron_incdrop_scale_copy_dual`) with a
+  `register_fast16bf_constant` BF16-RN mirror so the B^T·dy GEMM skips its per-layer
+  re-cast. PIED is training-only: inference throughput is unchanged.
+- **Verified three ways**: trainer 4-batch final-val 1.0259/0.7224; trainer wide-32
+  1.1788/1.3019 (lr=0 + `--whisc-ema 1.0` resume trick); **chiron_infer teacher-forcing
+  1.0897 / top1 0.7176** (serving parity, via `runner.sh --flagship`).
+- **Serving**: **zero PIED-specific changes** — the checkpoint needs only the WhiSC flags
+  (`--whisc-coupling --rot-theta-max 0.07`), which `runner.sh --flagship` injects
+  automatically (prefers the PIED checkpoint since 2026-07-03; the `*pied*` path case was
+  added to the flag-injection match).
+- **Reproduce training**: the WhiSC-D ship command + `--inc-dropout 0.1`:
+  `cd ~/dev/glades-trainer && sh run.sh flagship --steps 30000 --accum 4 --lr 3e-4
+  --warmup 750 --sira-warmup 250 --zloss-coef 1e-4 --qk-norm --sira-coef 1e-2
+  --sira-energy-weight 1.0 --sira-balance-weight 0.25 --sira-action-weight 0.0
+  --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0 --reln-reanchor
+  --whisc-coupling --rot-theta-max 0.07 --inc-dropout 0.1 --save-every 6000 --seed 1337`.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
+- **Ship record / evidence**: `research/CHIRON_PIED_E4_GATE_2026_07_03.md` (E4 + wide-32 +
+  TF parity); `research/CHIRON_PIED_E3_GATE_2026_07_02.md` (matched-pair stability gate —
+  fresh baseline, gap negative from step 1k); `research/CHIRON_PIED_IMPLEMENTATION_2026_07_01.md`
+  (E0/E1 + kernels). Design:
+  `docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md`.
+- **Caveats**:
+  - **Single-seed (1337) ship — multi-seed (≥3) NOT run (same precedent as the WhiSC-D and
+    reanchor ships).** The wide-32 matched-window numbers are the banked ship-metric claim.
+  - **Era-drift attribution**: the E4 baseline is the whisc30k run (2026-07-01 binary), not
+    a same-binary paired arm; measured drift scale ~0.10–0.15 nat — the margins are 3–5×
+    beyond it, and the E3 paired arms bound PIED's own effect from below.
+  - **Perplexity flagship, not a generator** — inherited from the lineage (see the WhiSC-D
+    section's generation caveat; PIED's anti-repetition conjecture is untested).
+  - Open follow-ups: π sweep, `--inc-dropout-symmetric` mechanism-separation arm, per-head
+    (B2) / spectral (SFD-G1) variants, multi-seed, 60k+finish schedule.
+
+## Prior WhiSC-D Flagship — CHIRON 1B @ T=16384 (WhiSC-D ship 2026-07-01, kept for context)
+
+The prior flagship **CHIRON 1B WhiSC-D 30k**
 (checkpoint `database/checkpoints/chiron_1B_T16384_whisc30k/chiron_1B_T16384_whisc30k.final`).
 It is a **perplexity flagship**: **wide 32-batch val NLL ~1.64–1.82 (two 33.5M-token
 windows), vs the prior reanchor ship's wide 1.92** — i.e. better than the prior
@@ -47,7 +114,8 @@ top-1 ~doubled; 4-batch windows)** — the largest matched jump in the lineage.
   (serving parity, see below).
 - **Serving (chiron_infer, 2026-07-01)**: WhiSC checkpoints need
   `--whisc-coupling --rot-theta-max 0.07` — **`runner.sh --flagship` injects these
-  automatically** (prefers the whisc30k checkpoint since 2026-07-01). Two serving
+  automatically** (prefers the PIED ship since 2026-07-03; whisc30k is the first
+  fallback). Two serving
   parameters are NOT in the checkpoint: the whitening scale (recomputed per-batch at
   inference, ema=1.0) and theta_max (CLI; 0.07 = the flagship recipe value).
   chiron_infer **hard-errors** (exit 7) on a bit-1024 checkpoint without the flags
@@ -58,7 +126,8 @@ top-1 ~doubled; 4-batch windows)** — the largest matched jump in the lineage.
   --qk-norm --sira-coef 1e-2 --sira-energy-weight 1.0 --sira-balance-weight 0.25
   --sira-action-weight 0.0 --grad-clip 0.5 --dq-layer-clamp 1.0 --dq-embed-clamp 1.0
   --reln-reanchor --whisc-coupling --rot-theta-max 0.07 --save-every 6000 --seed 1337`.
-- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
+- **Run inference**: load `chiron_1B_T16384_whisc30k.final` explicitly
+  (`runner.sh --flagship` prefers the PIED ship since 2026-07-03).
 - **Ship record / evidence**: `research/CHIRON_WHISC_D_GATE_2026_06_30.md` (E3
   divergence gate + E4 30k gate + wide-val + perf + serving). Design/plan:
   `docs/superpowers/specs/2026-06-30-chiron-whitened-frame-coupling-design.md`,

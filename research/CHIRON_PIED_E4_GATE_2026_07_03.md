@@ -100,14 +100,20 @@ crossed whisc30k's *final* quality at step ~15k (half the budget).
    is untouched by this gate; PIED's anti-repetition conjecture (secondary endpoint) has not
    been evaluated here.
 
-## Disposition
+## Disposition — SHIPPED 2026-07-03 (owner decision)
 
-- **E4 PASS → PIED is ship-eligible** on the lineage's own standard (single-seed, wide-32
-  banked, matched recipe). Promotion to production flagship is an **owner decision**.
-- **Serving:** zero changes needed — PIED is parameter-free and training-only; the checkpoint
-  is a standard WhiSC bit-1024 checkpoint (`runner.sh` WhiSC flags apply as usual). A
-  chiron_infer teacher-forcing parity check on `chiron_1B_pied_e4.final` is recommended
-  before any ship (the WhiSC ship precedent).
+- **E4 PASS → owner shipped PIED as the production flagship** (single-seed, wide-32 banked,
+  matched recipe — the lineage's own standard).
+- **TF parity check (pre-ship, PASS):** chiron_infer teacher-forcing on
+  `chiron_1B_pied_e4.final` via `runner.sh --flagship`: **nll 1.0897 / top1 0.7176**
+  (vs trainer final-val 1.0259/0.7224; prior whisc30k ship TF was 1.4655/0.626).
+  QK-Norm exact-γ + WhiSC rot_phi auto-loaded; forward verdict CORRECT.
+- **Serving promotion:** `runner.sh --flagship` now prefers
+  `chiron_1B_pied_e4/chiron_1B_pied_e4.final` (whisc30k = first fallback), and the WhiSC
+  flag-injection case was extended to `*whisc*|*pied*` (the PIED checkpoint is WhiSC
+  bit-1024 format; without the extension chiron_infer would exit-7). End-to-end smoke via
+  `runner.sh --flagship --tf-check` verified.
+- **CLAUDE.md promoted** (PIED section at top; WhiSC-D demoted to prior-flagship context).
 - Open follow-ups (from the design §14): mechanism-separation arm (`--inc-dropout-symmetric`),
   per-head (B2) / spectral (SFD-G1) variants, π sweep, multi-seed, gen-metrics read on the
   E4 checkpoint.
