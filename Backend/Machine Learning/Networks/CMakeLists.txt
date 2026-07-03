@@ -12,6 +12,7 @@ set(Networks_src_files
 	checkpoint_persistence.cpp
 	chiron_checkpoint.cpp
 	chiron_serving.cpp
+	chiron_generate.cpp
 	sgd_dff.cpp
 	sgd_rnn.cpp
 	sgd_gru.cpp
