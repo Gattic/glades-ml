@@ -35,6 +35,7 @@ vesta-test.cpp
 helios-test.cpp
 chiron-test.cpp
 chiron-model-test.cpp
+chiron-generate-test.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sfa-parity-test.cpp
