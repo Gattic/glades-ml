@@ -1,0 +1,143 @@
+// chiron_checkpoint.h — CHRN/CHRF checkpoint format: single source of truth.
+//
+// Owns: the flag-bit registry, version rules, block codecs, the serving
+// reader (model sections only), and model-section writer helpers.  The
+// trainer (glades-trainer) composes its optimizer sections (Adam/Kahan/FACE)
+// around these helpers; chiron_infer consumes the reader wholesale.
+//
+// Canonical CHRF section order (writer contract — reader depends on it):
+//   magic 'CHRF' | version u32 | hdr i32[6]={T,m,L,nH,dH,V}
+//   | step i32 | slcLastTransitionStep i32 | runtimeT i32 | runtimeL i32
+//   | runtimeSasAlpha f32 | flags u32 | faceStepCount i32
+//   | weights blob (E, then per layer Wq,Wk,Wv,Wo,gamma,beta[,gamma_p,beta_p])
+//   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
+//   | [bit 256] QK-Norm gamma: L*nH f32
+//   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
+//   | [bit 512] a_drift: L*m f32
+//   | [bit 1024] rot_phi: L*m f32       <-- MUST STAY LAST (EOF-tail read)
+// Version rules: v4 iff bit 64 (bf16-on-disk); else v3 iff bit 8 (gamma_p);
+// else v2.  CHRN (legacy) v1..3; v3 prepends a u32 flags word (bits below).
+//
+// C++98.
+
+#ifndef _GLADES_CHIRON_CHECKPOINT_H_
+#define _GLADES_CHIRON_CHECKPOINT_H_
+
+#include <cstdio>
+#include <stdint.h>
+#include <string>
+#include <vector>
+#include "cuda/gpu_buffer.h"
+
+namespace glades {
+namespace chiron {
+
+// CHRF flags word bits (both binaries compile against this one registry).
+enum ChironCkptBits
+{
+	CKPT_BIT_FACE         = 1,
+	CKPT_BIT_BF16_ADAM    = 2,
+	CKPT_BIT_KAHAN        = 4,
+	CKPT_BIT_GAMMA_P      = 8,
+	CKPT_BIT_INT8_ADAM    = 16,
+	CKPT_BIT_FP32_ADAM    = 32,
+	CKPT_BIT_BF16_DISK    = 64,
+	CKPT_BIT_SCFA         = 128,
+	CKPT_BIT_QKNORM_GAMMA = 256,
+	CKPT_BIT_A_DRIFT      = 512,
+	CKPT_BIT_ROT_PHI      = 1024
+};
+// All bits the current format defines (reader hard-errors on anything above:
+// an unknown section would corrupt the rot_phi EOF-tail read).
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0x7FFu;  // == 2047 == bits 1..1024
+
+// CHRN v3 legacy flags word bits.
+enum ChironChrnBits
+{
+	CHRN_BIT_BF16_WEIGHTS = 1,
+	CHRN_BIT_HAS_GAMMA_P  = 2
+};
+
+struct ChironModelDims
+{
+	int T, m, L, nH, dH, V, dModel;
+	ChironModelDims() : T(0), m(0), L(0), nH(0), dH(0), V(0), dModel(0) {}
+};
+
+struct ChironScfaState
+{
+	int k;
+	int w;
+	bool present;   // SCFA forward active (resolve-time)
+	bool dLoaded;   // D came from the checkpoint
+	glades::gpu::GpuBuffer<float> B;                 // [T,k] DCT-II basis (recomputed, not stored)
+	std::vector<glades::gpu::GpuBuffer<float>*> D;   // [L][m*(w+1)]
+	ChironScfaState();
+	~ChironScfaState();   // deletes D[i]
+private:
+	ChironScfaState(const ChironScfaState&);
+	ChironScfaState& operator=(const ChironScfaState&);
+};
+
+struct ChironModelWeights
+{
+	glades::gpu::GpuBuffer<float> E;                       // [V,m]
+	std::vector<glades::gpu::GpuBuffer<float>*> Wq, Wk, Wv, Wo;  // [m,dModel]/[dModel,m]
+	std::vector<glades::gpu::GpuBuffer<float>*> gamma, beta;     // [m]
+	std::vector<glades::gpu::GpuBuffer<float>*> gamma_p, beta_p; // [m]; empty if absent
+	ChironScfaState scfa;
+	std::vector<float> qknormGamma;  // L*nH iff bit 256, else empty
+	std::vector<float> rotPhi;       // L*m  iff bit 1024, else empty
+	bool hasADrift;                  // bit 512 seen (payload NOT parsed — serve-refusal signal)
+	ChironModelWeights();
+	~ChironModelWeights();  // deletes all per-layer buffers
+private:
+	ChironModelWeights(const ChironModelWeights&);
+	ChironModelWeights& operator=(const ChironModelWeights&);
+};
+
+// ---- Block codecs (shared framing helpers) ----
+// Read n weight elements (fp32, or bf16 widened to fp32 when bf16OnDisk).
+bool chiron_read_block(std::FILE* fp, std::vector<float>& fp32buf, size_t n, bool bf16OnDisk);
+// Write n elements from fp32buf (as fp32, or truncation-rounded bf16).
+bool chiron_write_block(std::FILE* fp, const std::vector<float>& fp32buf, size_t n, bool bf16OnDisk);
+// Optimizer-group codecs (uint16 bf16 pairs / int8 quads / fp32 pairs), ported
+// verbatim from the trainer.  Exact signatures are fixed in Task 3 to match
+// the trainer originals (chiron_main.cpp:5584-5740) minus `static`.
+
+// ---- Header ----
+struct ChironCkptHeader
+{
+	ChironModelDims dims;
+	int32_t step;
+	int32_t slcLastTransitionStep;
+	int32_t runtimeT, runtimeL;
+	float runtimeSasAlpha;
+	uint32_t flags;
+	int32_t faceStepCount;
+	ChironCkptHeader() : step(0), slcLastTransitionStep(-1), runtimeT(0),
+	                     runtimeL(0), runtimeSasAlpha(0.0f), flags(0), faceStepCount(0) {}
+};
+// Writes magic+version+hdr+meta+flags.  version derived from flags (see top).
+bool chiron_write_header(std::FILE* fp, const ChironCkptHeader& h);
+
+// ---- Model-section writers (byte layout owned here; data sourcing is caller's) ----
+bool chiron_write_scfa_section(std::FILE* fp, int k, int w,
+                               const std::vector<const float*>& D_host, size_t D_sz);
+bool chiron_write_qknorm_section(std::FILE* fp, const float* gammaHost, size_t n); // n = L*nH
+bool chiron_write_f32_tail_section(std::FILE* fp, const float* vals, size_t n);    // a_drift / rot_phi
+
+// ---- Serving reader ----
+// Loads model sections of a CHRN/CHRF checkpoint straight to GPU buffers.
+// Returns true on success.  On failure: err gets a printable message and
+// errCode gets 4 (load/parse failure) — callers map to their exit codes.
+// Behavior is verbatim chiron_infer::loadCheckpoint (2026-07-03):
+// sequential header/weights/SCFA/qknorm reads, rot_phi from the EOF tail,
+// CHRN-v3 gamma_p file-size fallback, hard-error on flags & ~CKPT_KNOWN_BITS_MASK.
+bool chiron_load_model(const std::string& path, ChironModelDims& dims,
+                       ChironModelWeights& w, std::string& err, int& errCode);
+
+} // namespace chiron
+} // namespace glades
+
+#endif

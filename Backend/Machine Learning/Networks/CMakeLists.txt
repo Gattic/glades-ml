@@ -10,6 +10,7 @@ set(Networks_src_files
 	model_persistence.cpp
 	tokenizer_artifacts.cpp
 	checkpoint_persistence.cpp
+	chiron_checkpoint.cpp
 	sgd_dff.cpp
 	sgd_rnn.cpp
 	sgd_gru.cpp
