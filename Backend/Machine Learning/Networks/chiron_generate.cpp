@@ -1,5 +1,6 @@
 // chiron_generate.cpp — CHIRON token generation, sampling, TF eval.
-// Stub implementation: Task 2 skeleton.  Full implementations in Tasks 3–6.
+// Ports of the pre-2026-07-03 chiron_infer implementations (see header for the
+// bit-parity contracts; MT19937/canonical-double is toolchain-coupled).
 // C++98.
 
 #include "chiron_generate.h"
