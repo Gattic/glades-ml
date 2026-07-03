@@ -303,8 +303,9 @@ bool chiron_generate(const ChironModelDims& dims,
     // Working buffer: starts as prompt, grows one token per generation step.
     std::vector<int> tokens(promptTokens);
 
-    // Seed the engine exactly once at entry (matches the old rng(seed) at
-    // generate-lambda entry — each chiron_generate call is independent).
+    // Seeded per generate call. NOTE: the pre-2026-07-03 CLI seeded one
+    // process-level mt19937 shared across REPL prompts; one-shot paths are
+    // identical, multi-prompt REPL streams differ (acknowledged behavior change).
     ChironMt19937 rng(gp.seed);
 
     std::vector<int>   input((size_t)dims.T, 0);

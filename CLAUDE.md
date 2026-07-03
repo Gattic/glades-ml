@@ -665,7 +665,7 @@ cd unit-tests/build && sh .configure.sh cuda # compile with cuda
 cd unit-tests && bash test.sh nnall    # run all tests
 ```
 
-**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`
+**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`, `chiron-generate`
 
 **Install**: `cd build && make install` (installs to `~/.local`; also installs the ML header tree to `~/.local/include/glades/Backend/Machine Learning/` — required by the trainer since the vendored `include/` was removed)
 
@@ -712,6 +712,18 @@ Glades-ml owns CHIRON checkpoint I/O and serving since 2026-07-03:
   when trained/nonzero — zero-valued co-allocation is served with an info line) +
   `ChironEvalScratch` / `chiron_eval_forward` (kernel-sequence-identical to old forwardInfer).
 - **Unit suite**: `bash test.sh chiron-model` (roundtrips, resolve table, eval-forward parity).
+- `chiron_generate.{h,cpp}` — all CHIRON generation and evaluation logic (2026-07-03):
+  `ChironMt19937` (C++98 MT19937 + libstdc++-13.3.0-compatible canonical double —
+  **TOOLCHAIN-COUPLED**, pinned by golden-stream unit tests; do not change the RNG
+  implementation without re-pinning goldens), `chiron_sample_token` (temperature/top-k/top-p
+  + repetition penalty), `chiron_generate` (window-slide loop, sink streaming),
+  `chiron_tf_eval` (**single source of truth for TF-NLL** — used by both chiron_parity and
+  chiron_infer; do not duplicate this logic), `chiron_degeneration_metrics`.
+  Per-call RNG seeding: the pre-2026-07-03 CLI used one process-level mt19937 shared
+  across REPL prompts; one-shot/tokens-file paths are identical, multi-prompt REPL streams differ
+  (acknowledged behavior change).
+- **Unit suite**: `bash test.sh chiron-generate` (615+ asserts: RNG/sampler goldens, stochastic
+  draw-parity, TF-eval correctness).
 
 **Rebuild order** (static kernel link — `make install` alone does NOT update the trainer):
 ```
