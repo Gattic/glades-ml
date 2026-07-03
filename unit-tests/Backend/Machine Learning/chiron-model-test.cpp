@@ -13,6 +13,7 @@
 #include "chiron-model-test.h"
 #include "../../unit-test.h"
 #include "../../../Backend/Machine Learning/Networks/chiron_checkpoint.h"
+#include "../../../Backend/Machine Learning/Networks/chiron_serving.h"
 
 #include <cstdio>
 #include <cstring>
@@ -638,6 +639,379 @@ static void CHIRONCkptRoundtripTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 4: chiron_resolve_serving — 12 decision-table cases.
+//
+// Tiny shape: T=64, m=4, L=2, nH=1, dH=4, V=16, dModel=4.
+// We build ChironModelWeights in-memory (no file I/O) and call
+// chiron_resolve_serving directly.
+// ---------------------------------------------------------------------------
+
+// Helper: allocate a GpuBuffer<float> of size n and fill with value v.
+// Returns a heap-allocated pointer (caller owns).
+static glades::gpu::GpuBuffer<float>* srv_alloc_buf(size_t n, float v)
+{
+    glades::gpu::GpuBuffer<float>* buf = new glades::gpu::GpuBuffer<float>();
+    std::vector<float> data(n, v);
+    bool ok = buf->allocate(n) && buf->upload(&data[0], n);
+    ASSERT("srv_alloc_buf ok", ok);
+    return buf;
+}
+
+// Helper: build minimal dims for resolve tests.
+static glades::chiron::ChironModelDims srv_dims()
+{
+    glades::chiron::ChironModelDims d;
+    d.T      = 64;
+    d.m      = 4;
+    d.L      = 2;
+    d.nH     = 1;
+    d.dH     = 4;
+    d.V      = 16;
+    d.dModel = 4;
+    return d;
+}
+
+// Helper: populate per-layer weight vectors on w with minimal non-null GpuBuffers.
+// Allocates Wq/Wk/Wv/Wo/gamma/beta for each layer; fills with dummy zeros.
+static void srv_fill_layer_weights(glades::chiron::ChironModelWeights& w,
+                                   const glades::chiron::ChironModelDims& d)
+{
+    const size_t Wqkv_sz = (size_t)d.m * d.dModel;
+    const size_t Wo_sz   = (size_t)d.dModel * d.m;
+    for (int l = 0; l < d.L; ++l)
+    {
+        w.Wq.push_back(srv_alloc_buf(Wqkv_sz, 0.0f));
+        w.Wk.push_back(srv_alloc_buf(Wqkv_sz, 0.0f));
+        w.Wv.push_back(srv_alloc_buf(Wqkv_sz, 0.0f));
+        w.Wo.push_back(srv_alloc_buf(Wo_sz,   0.0f));
+        w.gamma.push_back(srv_alloc_buf((size_t)d.m, 1.0f));
+        w.beta.push_back( srv_alloc_buf((size_t)d.m, 0.0f));
+    }
+}
+
+void CHIRONResolveServingTest()
+{
+    // ---- Case 1: rotPhi present + !o.whiscCoupling → return 7 ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // Put something in rotPhi to signal WhiSC checkpoint.
+        w.rotPhi.assign((size_t)dims.L * dims.m, 0.01f);
+
+        glades::chiron::ChironServingOverrides o;
+        o.whiscCoupling = false;  // NOT passed
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case1 returns 7", rc == 7);
+        ASSERT("case1 err not empty", !err.empty());
+    }
+
+    // ---- Case 2: rotPhi empty + o.whiscCoupling → return 7 ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // rotPhi is empty (no WhiSC state).
+
+        glades::chiron::ChironServingOverrides o;
+        o.whiscCoupling = true;  // --whisc-coupling passed but checkpoint lacks it
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case2 returns 7", rc == 7);
+        ASSERT("case2 err not empty", !err.empty());
+    }
+
+    // ---- Case 3: w.hasADrift → return 7, err mentions a_drift ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        w.hasADrift = true;
+
+        glades::chiron::ChironServingOverrides o;
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case3 returns 7", rc == 7);
+        ASSERT("case3 err mentions a_drift", err.find("a_drift") != std::string::npos);
+    }
+
+    // ---- Case 4: gamma_p empty + fuse unset → cfg.fuseAttnPerLayer == false ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // gamma_p empty, scfa.dLoaded=false (no SCFA)
+
+        glades::chiron::ChironServingOverrides o;
+        o.fuseAttnPerLayer = -1;  // unset
+        o.scfaForceMode    = -1;  // force SCFA off so we don't fail on B alloc
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case4 returns 0", rc == 0);
+        ASSERT("case4 fuseAttnPerLayer disabled", !cfg.fuseAttnPerLayer);
+    }
+
+    // ---- Case 5: gamma_p empty + scfa.dLoaded + !o.fuseAttnReln → cfg.fuseAttnReln == true ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // gamma_p empty, scfa.dLoaded=true
+        w.scfa.dLoaded = true;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+        // Allocate D for the loaded scfa
+        const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+        for (int l = 0; l < dims.L; ++l)
+            w.scfa.D.push_back(srv_alloc_buf(D_sz, 0.0f));
+
+        glades::chiron::ChironServingOverrides o;
+        o.fuseAttnReln  = false;
+        o.scfaForceMode = 1;  // --scfa (force on with loaded D)
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case5 returns 0", rc == 0);
+        ASSERT("case5 fuseAttnReln auto-enabled", cfg.fuseAttnReln);
+    }
+
+    // ---- Case 6: WhiSC + gamma_p at dead init + scfa.dLoaded + fuse unset →
+    //              fuseAttnPerLayer=false, fuseAttnReln=true ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // rotPhi non-empty (WhiSC checkpoint)
+        w.rotPhi.assign((size_t)dims.L * dims.m, 0.01f);
+        // gamma_p at dead init: gamma_p[i]=1.0, beta_p[i]=0.0
+        for (int l = 0; l < dims.L; ++l)
+        {
+            w.gamma_p.push_back(srv_alloc_buf((size_t)dims.m, 1.0f));
+            w.beta_p.push_back( srv_alloc_buf((size_t)dims.m, 0.0f));
+        }
+        // SCFA loaded
+        w.scfa.dLoaded = true;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+        const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+        for (int l = 0; l < dims.L; ++l)
+            w.scfa.D.push_back(srv_alloc_buf(D_sz, 0.0f));
+
+        glades::chiron::ChironServingOverrides o;
+        o.whiscCoupling    = true;   // matches checkpoint
+        o.fuseAttnPerLayer = -1;     // unset
+        o.scfaForceMode    = 1;      // --scfa
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case6 returns 0", rc == 0);
+        // Dead-gamma_p guard: per-layer fuse disabled, reln-fuse enabled
+        ASSERT("case6 fuseAttnPerLayer false", !cfg.fuseAttnPerLayer);
+        ASSERT("case6 fuseAttnReln true", cfg.fuseAttnReln);
+    }
+
+    // ---- Case 7: Same but gamma_p[0][0]=1.5 (trained) → per-layer fuse kept ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // rotPhi non-empty (WhiSC checkpoint)
+        w.rotPhi.assign((size_t)dims.L * dims.m, 0.01f);
+        // gamma_p layer 0 has value 1.5 (trained, NOT dead init)
+        std::vector<float> gp0((size_t)dims.m, 1.5f);
+        glades::gpu::GpuBuffer<float>* gp0_buf = new glades::gpu::GpuBuffer<float>();
+        bool ok0 = gp0_buf->allocate((size_t)dims.m) && gp0_buf->upload(&gp0[0], (size_t)dims.m);
+        ASSERT("case7 gp0 upload", ok0);
+        w.gamma_p.push_back(gp0_buf);
+        for (int l = 1; l < dims.L; ++l)
+            w.gamma_p.push_back(srv_alloc_buf((size_t)dims.m, 1.0f));
+        for (int l = 0; l < dims.L; ++l)
+            w.beta_p.push_back(srv_alloc_buf((size_t)dims.m, 0.0f));
+        // SCFA loaded
+        w.scfa.dLoaded = true;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+        const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+        for (int l = 0; l < dims.L; ++l)
+            w.scfa.D.push_back(srv_alloc_buf(D_sz, 0.0f));
+
+        glades::chiron::ChironServingOverrides o;
+        o.whiscCoupling    = true;
+        o.fuseAttnPerLayer = -1;  // unset
+        o.scfaForceMode    = 1;   // --scfa
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case7 returns 0", rc == 0);
+        // Trained gamma_p: per-layer fuse kept ON (guard path: warn, not switch)
+        ASSERT("case7 fuseAttnPerLayer true", cfg.fuseAttnPerLayer);
+    }
+
+    // ---- Case 8: qknormGamma sized L*nH + !o.qkNorm → auto-enable + exact-γ scale ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // Exact per-head gamma: L*nH = 2*1 = 2 floats
+        w.qknormGamma.resize((size_t)dims.L * dims.nH);
+        w.qknormGamma[0] = 2.0f;
+        w.qknormGamma[1] = 3.0f;
+
+        glades::chiron::ChironServingOverrides o;
+        o.qkNorm      = false;   // NOT explicitly enabled
+        o.scfaForceMode = -1;   // no SCFA
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case8 returns 0", rc == 0);
+        ASSERT("case8 qkNorm auto-enabled", cfg.qkNorm);
+        ASSERT("case8 gammaScale size", (int)cfg.qknormGammaScale.size() == dims.L * dims.nH);
+        const float sqrtDh = std::sqrt((float)dims.dH);  // sqrt(4)=2
+        ASSERT("case8 gammaScale[0]", cfg.qknormGammaScale[0] == w.qknormGamma[0] * sqrtDh);
+        ASSERT("case8 gammaScale[1]", cfg.qknormGammaScale[1] == w.qknormGamma[1] * sqrtDh);
+    }
+
+    // ---- Case 9: qknormGamma empty + o.qkNorm → approx gamma=log2(T) used ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // qknormGamma empty (no bit 256 in checkpoint)
+
+        glades::chiron::ChironServingOverrides o;
+        o.qkNorm      = true;   // operator explicitly passes --qk-norm
+        o.qkNormGamma = 0.0f;  // auto → will use log2(T)=6
+        o.scfaForceMode = -1;  // no SCFA
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case9 returns 0", rc == 0);
+        ASSERT("case9 qkNorm enabled", cfg.qkNorm);
+        ASSERT("case9 gammaScale size", (int)cfg.qknormGammaScale.size() == dims.L * dims.nH);
+        const float expectedGamma = std::log((float)dims.T) / std::log(2.0f);  // log2(64)=6
+        const float sqrtDh = std::sqrt((float)dims.dH);
+        const float expected = expectedGamma * sqrtDh;
+        // Allow small floating point tolerance
+        ASSERT("case9 gammaScale approx", std::fabs(cfg.qknormGammaScale[0] - expected) < 1e-5f);
+    }
+
+    // ---- Case 10: scfa.dLoaded + auto mode → useScfa=true;
+    //              scfaForceMode==-1 → false ----
+    {
+        // Sub-case 10a: auto mode with dLoaded → useScfa=true
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        w.scfa.dLoaded = true;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+        const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+        for (int l = 0; l < dims.L; ++l)
+            w.scfa.D.push_back(srv_alloc_buf(D_sz, 0.0f));
+
+        glades::chiron::ChironServingOverrides o;
+        o.scfaForceMode = 0;  // auto
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case10a returns 0", rc == 0);
+        ASSERT("case10a useScfa true", cfg.useScfa);
+    }
+    {
+        // Sub-case 10b: scfaForceMode==-1 → useScfa=false
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        w.scfa.dLoaded = true;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+        const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+        for (int l = 0; l < dims.L; ++l)
+            w.scfa.D.push_back(srv_alloc_buf(D_sz, 0.0f));
+
+        glades::chiron::ChironServingOverrides o;
+        o.scfaForceMode = -1;  // --no-scfa
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case10b returns 0", rc == 0);
+        ASSERT("case10b useScfa false", !cfg.useScfa);
+    }
+
+    // ---- Case 11: o.seqLen=4 (< T=64) → dims.T == 4 ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();  // T=64
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+
+        glades::chiron::ChironServingOverrides o;
+        o.seqLen        = 4;
+        o.scfaForceMode = -1;  // no SCFA
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case11 returns 0", rc == 0);
+        ASSERT("case11 dims.T == 4", dims.T == 4);
+    }
+
+    // ---- Case 12: SCFA on with no loaded D → D allocated+zeroed, B allocated,
+    //              k/w defaulted to T/16 (min 4) and 8; returns 0 ----
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();  // T=64
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        // scfa.dLoaded = false, D is empty
+
+        glades::chiron::ChironServingOverrides o;
+        o.scfaForceMode    = 1;   // --scfa: force on
+        o.scfaKOverride    = 0;   // use defaults
+        o.scfaWOverride    = -1;  // use defaults
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case12 returns 0", rc == 0);
+        ASSERT("case12 useScfa true", cfg.useScfa);
+        // k defaults to T/16 = 64/16 = 4
+        ASSERT("case12 scfa.k == 4", w.scfa.k == 4);
+        // w defaults to 8
+        ASSERT("case12 scfa.w == 8", w.scfa.w == 8);
+        // B should be allocated
+        ASSERT("case12 B allocated", w.scfa.B.allocated());
+        // D should be allocated for each layer
+        ASSERT("case12 D size", (int)w.scfa.D.size() == dims.L);
+        for (int l = 0; l < dims.L; ++l)
+        {
+            ASSERT("case12 D[l] not null", w.scfa.D[l] != 0);
+            ASSERT("case12 D[l] allocated", w.scfa.D[l]->allocated());
+            // Verify it was zeroed
+            const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
+            std::vector<float> dbuf(D_sz, 99.0f);
+            ASSERT("case12 D[l] download", w.scfa.D[l]->download(&dbuf[0], D_sz));
+            for (size_t i = 0; i < D_sz; ++i)
+                ASSERT("case12 D[l] zero", dbuf[i] == 0.0f);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 
@@ -646,4 +1020,5 @@ void CHIRONModelUnitTest()
 	CHIRONCkptBlockCodecTest();
 	CHIRONCkptBf16RneDiscriminatingTest();
 	CHIRONCkptRoundtripTest();
+	CHIRONResolveServingTest();
 }

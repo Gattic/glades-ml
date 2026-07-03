@@ -11,6 +11,7 @@ set(Networks_src_files
 	tokenizer_artifacts.cpp
 	checkpoint_persistence.cpp
 	chiron_checkpoint.cpp
+	chiron_serving.cpp
 	sgd_dff.cpp
 	sgd_rnn.cpp
 	sgd_gru.cpp
