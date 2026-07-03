@@ -11,6 +11,7 @@ void CHIRONMt19937GoldenTest();     // canonical doubles bit-exact vs Task-1 gol
 void CHIRONSamplerGoldenTest();     // chiron_sample_token picks bit-exact vs G2 goldens
 void CHIRONDegenMetricsTest();      // chiron_degeneration_metrics: 4 cases
 void CHIRONTfEvalTest();            // chiron_tf_eval: NLL/acc bit-equal + logitsAllOut exact
+void CHIRONGenerateStochasticDrawParityTest(); // draw-count parity: full-softmax, draw-dependent picks
 
 // Aggregate entry point, wired into unit-tests/main.cpp as "chiron-generate".
 void CHIRONGenerateUnitTest();

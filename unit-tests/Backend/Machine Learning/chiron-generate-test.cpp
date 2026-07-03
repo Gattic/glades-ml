@@ -633,8 +633,11 @@ static void gen_reference_loop(
 // Test 6a: chiron_generate topK=1 determinism.
 // Prompt {1,3,5}, maxTokens=6, topK=1.
 // Compare API output against reference loop built from the same primitives.
-// topK=1 makes CDF pick draw-independent; both loops consume one draw/token
-// in lockstep so this also validates draw-count parity.
+// topK=1 collapses the distribution to one prob-1.0 candidate, making the
+// CDF pick draw-independent: the correct token is always selected regardless
+// of the draw value.  This validates deterministic loop mechanics
+// (window/clamp/slide) but NOT draw-count parity — see
+// CHIRONGenerateStochasticDrawParityTest for that.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateTopK1Test()
 {
@@ -800,6 +803,60 @@ void CHIRONGenerateClampTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 6e: chiron_generate stochastic draw-parity.
+// Same tiny fixture, gp.topK=0 / topP=1.0 / temperature=1.0 (full-softmax CDF
+// sampling — every pick genuinely depends on the draw value).  Any draw-count
+// divergence inside chiron_generate's loop desynchronises the RNG stream and
+// produces mismatched tokens.  This is the discriminating test that topK=1
+// cases cannot provide (topK=1 picks are draw-independent, so a double- or
+// zero-draw bug passes silently there).
+// ---------------------------------------------------------------------------
+void CHIRONGenerateStochasticDrawParityTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK        = 0;
+	gp.topP        = 1.0f;
+	gp.temperature = 1.0f;
+	gp.maxTokens   = 6;
+	gp.seed        = 1337u;
+
+	const int promptArr[] = {1, 3, 5};
+	std::vector<int> prompt(promptArr, promptArr + 3);
+
+	// Two independent scratches — API and reference must not share state.
+	glades::chiron::ChironEvalScratch sApi;
+	ASSERT("stoch api scratch alloc", sApi.allocate(d, w, cfg));
+	glades::chiron::ChironEvalScratch sRef;
+	ASSERT("stoch ref scratch alloc", sRef.allocate(d, w, cfg));
+
+	// Run chiron_generate.
+	std::vector<int> outTokens;
+	bool ok = glades::chiron::chiron_generate(d, w, cfg, sApi, prompt, gp, NULL, NULL, &outTokens);
+	ASSERT("stoch generate returns true", ok);
+	ASSERT("stoch outTokens size == 6", (int)outTokens.size() == gp.maxTokens);
+
+	// Run reference loop with the same gp/seed on an independent scratch.
+	std::vector<int> refTokens;
+	gen_reference_loop(d, w, cfg, sRef, prompt, gp, gp.maxTokens, refTokens);
+	ASSERT("stoch refTokens size == 6", (int)refTokens.size() == gp.maxTokens);
+
+	// Token-by-token equality.  With full-softmax CDF sampling, any draw-count
+	// mismatch in chiron_generate desynchronises the RNG stream and fails here.
+	for (int i = 0; i < gp.maxTokens; ++i)
+	{
+		char msg[64]; std::sprintf(msg, "stoch token[%d] match", i);
+		ASSERT(msg, outTokens[i] == refTokens[i]);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateUnitTest()
@@ -813,4 +870,5 @@ void CHIRONGenerateUnitTest()
 	CHIRONGenerateWindowSlideTest();
 	CHIRONGenerateSinkStopTest();
 	CHIRONGenerateClampTest();
+	CHIRONGenerateStochasticDrawParityTest();
 }
