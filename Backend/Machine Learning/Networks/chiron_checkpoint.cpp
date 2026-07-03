@@ -265,47 +265,397 @@ bool chiron_load_fp32_adam_group(std::FILE* fp,
 }
 
 // ---------------------------------------------------------------------------
-// Header writer stub
+// Header writer
 // ---------------------------------------------------------------------------
 
-bool chiron_write_header(std::FILE* /*fp*/, const ChironCkptHeader& /*h*/)
+// Writes CHRF magic + version (derived from flags) + hdr[6] + metadata + flags.
+// Version rule (mirrors trainer save_full_checkpoint chiron_main.cpp:6059):
+//   bit 64 (BF16_DISK) → v4; else bit 8 (GAMMA_P) → v3; else v2.
+bool chiron_write_header(std::FILE* fp, const ChironCkptHeader& h)
 {
-    return false;
+    const char magic[4] = {'C','H','R','F'};
+    const uint32_t version = (h.flags & (uint32_t)CKPT_BIT_BF16_DISK) ? 4u
+                           : (h.flags & (uint32_t)CKPT_BIT_GAMMA_P)   ? 3u
+                           :                                              2u;
+    const int32_t hdr[6]      = { h.dims.T, h.dims.m, h.dims.L,
+                                   h.dims.nH, h.dims.dH, h.dims.V };
+    const int32_t step        = h.step;
+    const int32_t slcLast     = h.slcLastTransitionStep;
+    const int32_t runtimeT    = h.runtimeT;
+    const int32_t runtimeL    = h.runtimeL;
+    const float   runtimeAlpha= h.runtimeSasAlpha;
+    const uint32_t flags      = h.flags;
+    const int32_t faceStep    = h.faceStepCount;
+
+    if (std::fwrite(magic,        1,              4, fp) != 4) return false;
+    if (std::fwrite(&version,     sizeof(uint32_t), 1, fp) != 1) return false;
+    if (std::fwrite(hdr,          sizeof(int32_t),  6, fp) != 6) return false;
+    if (std::fwrite(&step,        sizeof(int32_t),  1, fp) != 1) return false;
+    if (std::fwrite(&slcLast,     sizeof(int32_t),  1, fp) != 1) return false;
+    if (std::fwrite(&runtimeT,    sizeof(int32_t),  1, fp) != 1) return false;
+    if (std::fwrite(&runtimeL,    sizeof(int32_t),  1, fp) != 1) return false;
+    if (std::fwrite(&runtimeAlpha,sizeof(float),    1, fp) != 1) return false;
+    if (std::fwrite(&flags,       sizeof(uint32_t), 1, fp) != 1) return false;
+    if (std::fwrite(&faceStep,    sizeof(int32_t),  1, fp) != 1) return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Model-section writer stubs
+// Model-section writers
 // ---------------------------------------------------------------------------
 
-bool chiron_write_scfa_section(std::FILE* /*fp*/, int /*k*/, int /*w*/,
-                               const std::vector<const float*>& /*D_host*/,
-                               size_t /*D_sz*/)
+// SCFA section (bit 128): k i32, w i32, then L × D[m*(w+1)] FP32 rows.
+// D_host must have D_host.size() == L pointers, each pointing to D_sz floats.
+bool chiron_write_scfa_section(std::FILE* fp, int k, int w,
+                               const std::vector<const float*>& D_host,
+                               size_t D_sz)
 {
-    return false;
+    const int32_t scfaK = k;
+    const int32_t scfaW = w;
+    if (std::fwrite(&scfaK, sizeof(int32_t), 1, fp) != 1) return false;
+    if (std::fwrite(&scfaW, sizeof(int32_t), 1, fp) != 1) return false;
+    for (size_t l = 0; l < D_host.size(); ++l)
+    {
+        if (std::fwrite(D_host[l], sizeof(float), D_sz, fp) != D_sz) return false;
+    }
+    return true;
 }
 
-bool chiron_write_qknorm_section(std::FILE* /*fp*/, const float* /*gammaHost*/,
-                                 size_t /*n*/)
+// QK-Norm gamma section (bit 256): n = L*nH FP32 values, flat row-major.
+bool chiron_write_qknorm_section(std::FILE* fp, const float* gammaHost, size_t n)
 {
-    return false;
+    return std::fwrite(gammaHost, sizeof(float), n, fp) == n;
 }
 
-bool chiron_write_f32_tail_section(std::FILE* /*fp*/, const float* /*vals*/,
-                                   size_t /*n*/)
+// Generic FP32 tail section — used for both a_drift (bit 512) and rot_phi (bit 1024).
+// rot_phi MUST be written last (reader seeks from EOF).
+bool chiron_write_f32_tail_section(std::FILE* fp, const float* vals, size_t n)
 {
-    return false;
+    return std::fwrite(vals, sizeof(float), n, fp) == n;
 }
 
 // ---------------------------------------------------------------------------
-// Serving reader stub
+// Serving reader — port of chiron_infer::loadCheckpoint (2026-07-03).
+//
+// Mechanical transformations from the original:
+//   * readBlock lambda → chiron_read_block(fp, buf, n, weightsBf16)
+//   * fprintf(stderr,...)/return false → snprintf into err, errCode=4, fclose, return false
+//   * printf("[chiron-infer] ...") → printf("[chiron-ckpt] ...") (text after tag identical)
+//   * Bit constants → ChironCkptBits enum
+//   * hasADrift set from CKPT_BIT_A_DRIFT (new — not in original reader)
+//   * Output params → ChironModelWeights members
 // ---------------------------------------------------------------------------
 
-bool chiron_load_model(const std::string& /*path*/, ChironModelDims& /*dims*/,
-                       ChironModelWeights& /*w*/, std::string& err, int& errCode)
+bool chiron_load_model(const std::string& path, ChironModelDims& dims,
+                       ChironModelWeights& w, std::string& err, int& errCode)
 {
-    err     = "unimplemented";
+#ifdef GLADES_HAVE_CUDA
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp)
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb), "chiron_infer: cannot open %s\n", path.c_str());
+        err = eb; errCode = 4; return false;
+    }
+
+    char magic[4]; int version = 0; int hdr[6];
+    if (std::fread(magic, 1, 4, fp) != 4)
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb), "chiron_infer: short magic in %s\n", path.c_str());
+        err = eb; errCode = 4; std::fclose(fp); return false;
+    }
+    const bool isFull   = (std::memcmp(magic, "CHRF", 4) == 0);
+    const bool isLegacy = (std::memcmp(magic, "CHRN", 4) == 0);
+    if (!isFull && !isLegacy)
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb),
+            "chiron_infer: bad magic in %s [%c%c%c%c]\n",
+            path.c_str(), magic[0], magic[1], magic[2], magic[3]);
+        err = eb; errCode = 4; std::fclose(fp); return false;
+    }
+    const int maxVer = isFull ? 4 : 3;
+    const int minVer = isFull ? 2 : 1;
+    if (std::fread(&version, sizeof(int), 1, fp) != 1
+        || version < minVer || version > maxVer)
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb),
+            "chiron_infer: bad version %d (expected %d-%d for %s)\n",
+            version, minVer, maxVer, isFull ? "CHRF" : "CHRN");
+        err = eb; errCode = 4; std::fclose(fp); return false;
+    }
+    // CHRN v3 prepends a flags word before the hdr; older CHRN versions don't.
+    bool     weightsBf16           = false;
+    uint32_t chrnFlags             = 0;
+    bool     chrnFlagsHasGammaPBit = false;
+    if (!isFull && version >= 3)
+    {
+        if (std::fread(&chrnFlags, sizeof(uint32_t), 1, fp) != 1)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: short CHRN flags\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        weightsBf16           = (chrnFlags & 0x1u) != 0;
+        chrnFlagsHasGammaPBit = (chrnFlags & 0x2u) != 0;
+    }
+
+    if (std::fread(hdr, sizeof(int), 6, fp) != 6)
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb), "chiron_infer: short header\n");
+        err = eb; errCode = 4; std::fclose(fp); return false;
+    }
+    // CHRF: 7×4-byte metadata block between dim-hdr and weights.
+    // Skip 5 i32 (step, slcLast, runtimeT, runtimeL, runtimeAlpha), read flags u32, skip 1 i32.
+    uint32_t chrfFlags = 0;
+    if (isFull)
+    {
+        std::fseek(fp, 5 * (int)sizeof(int32_t), SEEK_CUR);
+        if (std::fread(&chrfFlags, sizeof(uint32_t), 1, fp) != 1)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: short CHRF flags\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        std::fseek(fp, 1 * (int)sizeof(int32_t), SEEK_CUR);
+        weightsBf16 = (chrfFlags & 64u) != 0;
+        std::printf("[chiron-ckpt] CHRF format detected (v=%d), flags=0x%x\n",
+                    version, chrfFlags);
+        // Hard-error on any bit above the known mask: a future section would corrupt
+        // the rot_phi EOF-tail read (bit 1024 must stay last).
+        if ((chrfFlags & ~CKPT_KNOWN_BITS_MASK) != 0)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb),
+                "chiron_infer: unknown CHRF flags 0x%x — checkpoint format is newer than\n"
+                "  this binary. The rot_phi EOF-tail read (bit 1024) may be wrong.\n"
+                "  Rebuild chiron_infer against the matching trainer.\n", chrfFlags);
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+    }
+    if (weightsBf16)
+        std::printf("[chiron-ckpt] weights are bf16 on disk (2x smaller)\n");
+
+    // Determine whether per-layer gamma_p/beta_p are present.
+    bool hasPerLayerGammaP = isFull
+        ? (version >= 3 && (chrfFlags & 8u) != 0)
+        : (version >= 3 ? chrnFlagsHasGammaPBit : (version >= 2));
+    // CHRN v3 file-size fallback for old checkpoints written before the bit was added.
+    if (!isFull && version >= 3 && !chrnFlagsHasGammaPBit)
+    {
+        long curPos = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_END);
+        long fileSize = std::ftell(fp);
+        std::fseek(fp, curPos, SEEK_SET);
+        const size_t elemSize = weightsBf16 ? 2 : 4;
+        const long long Esz = (long long)hdr[5] * hdr[1] * (long long)elemSize;
+        const long long perLayerBase = (long long)elemSize *
+            (3LL * hdr[1] * hdr[3] * hdr[4]
+             + (long long)hdr[3] * hdr[4] * hdr[1]
+             + 2LL * hdr[1]);
+        const long long perLayerGammaP = 2LL * (long long)elemSize * hdr[1];
+        const long long sizeWithout = curPos + Esz + (long long)hdr[2] * perLayerBase;
+        const long long sizeWith    = sizeWithout + (long long)hdr[2] * perLayerGammaP;
+        if      (fileSize == sizeWith)    hasPerLayerGammaP = true;
+        else if (fileSize == sizeWithout) hasPerLayerGammaP = false;
+        else std::fprintf(stderr,
+            "chiron_infer: CHRN v=3 file-size mismatch (%lld vs %lld w/ or %lld w/o gamma_p)"
+            " — defaulting to %s\n",
+            (long long)fileSize, sizeWith, sizeWithout,
+            hasPerLayerGammaP ? "with" : "without");
+    }
+
+    dims.T      = hdr[0]; dims.m  = hdr[1]; dims.L  = hdr[2];
+    dims.nH     = hdr[3]; dims.dH = hdr[4]; dims.V  = hdr[5];
+    dims.dModel = dims.nH * dims.dH;
+
+    std::printf("[chiron-ckpt] checkpoint dims: T=%d m=%d L=%d nH=%d dH=%d V=%d dModel=%d\n",
+                dims.T, dims.m, dims.L, dims.nH, dims.dH, dims.V, dims.dModel);
+
+    // Load E [V, m].
+    const size_t Esize = (size_t)dims.V * dims.m;
+    std::vector<float> buf;
+    if (!chiron_read_block(fp, buf, Esize, weightsBf16))
+    {
+        char eb[512];
+        std::snprintf(eb, sizeof(eb), "chiron_infer: short read on E\n");
+        err = eb; errCode = 4; std::fclose(fp); return false;
+    }
+    if (!w.E.allocate(Esize))
+    {
+        err = "chiron_infer: E allocate failed"; errCode = 4; std::fclose(fp); return false;
+    }
+    w.E.upload(&buf[0], Esize);
+
+    // Load per-layer weights.
+    const size_t Wqkv_size = (size_t)dims.m * dims.dModel;
+    const size_t Wo_size   = (size_t)dims.dModel * dims.m;
+    std::vector<float> gbuf;
+    w.Wq.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    w.Wk.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    w.Wv.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    w.Wo.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    w.gamma.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    w.beta.assign(dims.L,  (glades::gpu::GpuBuffer<float>*)0);
+    if (hasPerLayerGammaP)
+    {
+        w.gamma_p.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+        w.beta_p.assign(dims.L,  (glades::gpu::GpuBuffer<float>*)0);
+    }
+    else { w.gamma_p.clear(); w.beta_p.clear(); }
+
+    for (int l = 0; l < dims.L; ++l)
+    {
+        w.Wq[l]    = new glades::gpu::GpuBuffer<float>(); w.Wq[l]->allocate(Wqkv_size);
+        w.Wk[l]    = new glades::gpu::GpuBuffer<float>(); w.Wk[l]->allocate(Wqkv_size);
+        w.Wv[l]    = new glades::gpu::GpuBuffer<float>(); w.Wv[l]->allocate(Wqkv_size);
+        w.Wo[l]    = new glades::gpu::GpuBuffer<float>(); w.Wo[l]->allocate(Wo_size);
+        w.gamma[l] = new glades::gpu::GpuBuffer<float>(); w.gamma[l]->allocate(dims.m);
+        w.beta[l]  = new glades::gpu::GpuBuffer<float>(); w.beta[l]->allocate(dims.m);
+
+        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        { err = "chiron_infer: short read (Wq)"; errCode = 4; std::fclose(fp); return false; }
+        w.Wq[l]->upload(&buf[0], Wqkv_size);
+        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        { err = "chiron_infer: short read (Wk)"; errCode = 4; std::fclose(fp); return false; }
+        w.Wk[l]->upload(&buf[0], Wqkv_size);
+        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        { err = "chiron_infer: short read (Wv)"; errCode = 4; std::fclose(fp); return false; }
+        w.Wv[l]->upload(&buf[0], Wqkv_size);
+        if (!chiron_read_block(fp, buf, Wo_size, weightsBf16))
+        { err = "chiron_infer: short read (Wo)"; errCode = 4; std::fclose(fp); return false; }
+        w.Wo[l]->upload(&buf[0], Wo_size);
+        if (!chiron_read_block(fp, gbuf, (size_t)dims.m, weightsBf16))
+        { err = "chiron_infer: short read (gamma)"; errCode = 4; std::fclose(fp); return false; }
+        w.gamma[l]->upload(&gbuf[0], (size_t)dims.m);
+        if (!chiron_read_block(fp, gbuf, (size_t)dims.m, weightsBf16))
+        { err = "chiron_infer: short read (beta)"; errCode = 4; std::fclose(fp); return false; }
+        w.beta[l]->upload(&gbuf[0], (size_t)dims.m);
+
+        if (hasPerLayerGammaP)
+        {
+            w.gamma_p[l] = new glades::gpu::GpuBuffer<float>(); w.gamma_p[l]->allocate(dims.m);
+            w.beta_p[l]  = new glades::gpu::GpuBuffer<float>(); w.beta_p[l]->allocate(dims.m);
+            if (!chiron_read_block(fp, gbuf, (size_t)dims.m, weightsBf16))
+            { err = "chiron_infer: short read (gamma_p)"; errCode = 4; std::fclose(fp); return false; }
+            w.gamma_p[l]->upload(&gbuf[0], (size_t)dims.m);
+            if (!chiron_read_block(fp, gbuf, (size_t)dims.m, weightsBf16))
+            { err = "chiron_infer: short read (beta_p)"; errCode = 4; std::fclose(fp); return false; }
+            w.beta_p[l]->upload(&gbuf[0], (size_t)dims.m);
+        }
+    }
+
+    // Optional SCFA blob (CHRF bit 128).
+    // Layout: scfa_k i32, scfa_w i32, then per layer D[m*(w+1)] FP32.
+    if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_SCFA) != 0)
+    {
+        int32_t scfaK = 0, scfaW = 0;
+        if (std::fread(&scfaK, sizeof(int32_t), 1, fp) != 1
+            || std::fread(&scfaW, sizeof(int32_t), 1, fp) != 1)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: short SCFA header\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        w.scfa.k = scfaK;
+        w.scfa.w = scfaW;
+        const size_t D_sz = (size_t)dims.m * (size_t)(scfaW + 1);
+        w.scfa.D.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+        std::vector<float> Dh(D_sz);
+        for (int l = 0; l < dims.L; ++l)
+        {
+            if (std::fread(&Dh[0], sizeof(float), D_sz, fp) != D_sz)
+            {
+                char eb[512];
+                std::snprintf(eb, sizeof(eb), "chiron_infer: short SCFA D[%d]\n", l);
+                err = eb; errCode = 4; std::fclose(fp); return false;
+            }
+            w.scfa.D[l] = new glades::gpu::GpuBuffer<float>();
+            w.scfa.D[l]->allocate(D_sz);
+            w.scfa.D[l]->upload(&Dh[0], D_sz);
+        }
+        w.scfa.present = true;
+        w.scfa.dLoaded = true;
+        std::printf("[chiron-ckpt] loaded SCFA state (k=%d w=%d, %.1f MB)\n",
+                    scfaK, scfaW,
+                    (double)((size_t)dims.L * D_sz * sizeof(float)) / (1024.0 * 1024.0));
+    }
+
+    // Optional per-head QK-Norm gamma (CHRF bit 256), L*nH FP32.
+    if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_QKNORM_GAMMA) != 0)
+    {
+        w.qknormGamma.assign((size_t)dims.L * dims.nH, 0.0f);
+        if (std::fread(&w.qknormGamma[0], sizeof(float), w.qknormGamma.size(), fp)
+                != w.qknormGamma.size())
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: short QK-Norm gamma blob\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        std::printf("[chiron-ckpt] loaded per-head QK-Norm gamma (L=%d nH=%d)"
+                    " -- exact (not gamma~14 approx)\n",
+                    dims.L, dims.nH);
+    }
+
+    // bit 512: a_drift payload NOT parsed — serve-refusal signal only.
+    // (rot_phi reads from EOF tail, skipping it automatically.)
+    w.hasADrift = isFull && (chrfFlags & (uint32_t)CKPT_BIT_A_DRIFT) != 0;
+
+    // Optional WhiSC-D rot_phi (CHRF bit 1024), L*m FP32 — read from EOF tail.
+    // save_full always writes this section LAST; we seek from EOF to skip all
+    // intermediate sections (Adam / Kahan / FACE / a_drift) without parsing them.
+    if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_ROT_PHI) != 0)
+    {
+        const size_t nRot = (size_t)dims.L * dims.m;
+        w.rotPhi.assign(nRot, 0.0f);
+        if (std::fseek(fp, 0, SEEK_END) != 0)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: seek(END) failed for rot_phi\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        const long fileSize = std::ftell(fp);
+        const long need     = (long)(nRot * sizeof(float));
+        if (fileSize < need)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb),
+                "chiron_infer: file too small for rot_phi (%ld < %ld)\n", fileSize, need);
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        if (std::fseek(fp, fileSize - need, SEEK_SET) != 0)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: seek to rot_phi tail failed\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        if (std::fread(&w.rotPhi[0], sizeof(float), nRot, fp) != nRot)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb),
+                "chiron_infer: short read on rot_phi (bit 1024)\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        std::printf("[chiron-ckpt] loaded WhiSC-D rot_phi angle (L=%d m=%d, bit 1024)"
+                    " -- read from EOF tail\n", dims.L, dims.m);
+    }
+
+    std::fclose(fp);
+    std::printf("[chiron-ckpt] loaded %d layers + embedding (%.1f MB)\n",
+                dims.L,
+                (double)((size_t)Esize + (size_t)dims.L
+                          * (3u * Wqkv_size + Wo_size + 2u * (size_t)dims.m))
+                * 4.0 / (1024.0 * 1024.0));
+    return true;
+#else
+    (void)path; (void)dims; (void)w;
+    err     = "CUDA required";
     errCode = 4;
     return false;
+#endif
 }
 
 } // namespace chiron
