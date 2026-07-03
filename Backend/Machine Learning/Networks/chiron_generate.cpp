@@ -4,9 +4,12 @@
 
 #include "chiron_generate.h"
 
+#include <cstdio>     // snprintf
 #include <cstring>    // memset
-#include <cmath>      // nextafter, std::exp
+#include <cmath>      // nextafter, std::exp, std::log
 #include <algorithm>  // std::partial_sort, std::sort
+#include <set>
+#include <string>
 #include <vector>
 
 namespace glades {
@@ -278,30 +281,108 @@ bool chiron_generate(const ChironModelDims& /*dims*/,
 }
 
 // ---------------------------------------------------------------------------
-// chiron_tf_eval — stub.
+// chiron_tf_eval — verbatim port of chiron_infer.cpp tf-check block (536-581).
+// One forward over the padded window; per-position argmax + double-precision
+// log-sum-exp NLL.  logitsAllOut receives the full [T,V] host logits when
+// non-null (for --dump-logits callers), avoiding a second forward.
 // ---------------------------------------------------------------------------
 
-bool chiron_tf_eval(const ChironModelDims& /*dims*/,
-                    const ChironModelWeights& /*w*/,
-                    const ChironServingConfig& /*cfg*/,
-                    ChironEvalScratch& /*s*/,
-                    const std::vector<int>& /*tokens*/,
-                    ChironTfResult& /*out*/,
-                    std::vector<float>* /*logitsAllOut*/)
+bool chiron_tf_eval(const ChironModelDims& dims,
+                    const ChironModelWeights& w,
+                    const ChironServingConfig& cfg,
+                    ChironEvalScratch& s,
+                    const std::vector<int>& tokens,
+                    ChironTfResult& out,
+                    std::vector<float>* logitsAllOut)
 {
+#ifndef GLADES_HAVE_CUDA
+    (void)dims; (void)w; (void)cfg; (void)s;
+    (void)tokens; (void)out; (void)logitsAllOut;
     return false;
+#else
+    // Pad / truncate to T.
+    const int useLen = ((int)tokens.size() < dims.T) ? (int)tokens.size() : dims.T;
+    std::vector<int> input(dims.T, 0);
+    for (int i = 0; i < useLen; ++i) input[i] = tokens[i];
+
+    if (!s.d_tokens.upload(&input[0], (size_t)dims.T)) return false;
+    if (!chiron_eval_forward(dims, w, cfg, s)) return false;
+
+    // Download the full [T, V] logits to host — either into *logitsAllOut or a
+    // local buffer.  The NLL loop reads from whichever vector was filled.
+    const size_t nLogits = (size_t)dims.T * (size_t)dims.V;
+    std::vector<float>* hostPtr;
+    std::vector<float>  localBuf;
+    if (logitsAllOut)
+    {
+        logitsAllOut->resize(nLogits);
+        if (!s.logits.download(&(*logitsAllOut)[0], nLogits)) return false;
+        hostPtr = logitsAllOut;
+    }
+    else
+    {
+        localBuf.resize(nLogits);
+        if (!s.logits.download(&localBuf[0], nLogits)) return false;
+        hostPtr = &localBuf;
+    }
+
+    // Per-position argmax + double-precision log-sum-exp NLL.
+    // Matches chiron_infer.cpp:562-574 exactly (same scan order, same types).
+    long correct = 0, total = 0;
+    double nllSum = 0.0;
+    for (int i = 0; i < useLen - 1; ++i)
+    {
+        const float* row = &(*hostPtr)[(size_t)i * dims.V];
+        int am = 0; float best = row[0];
+        double mx = row[0];
+        for (int v = 1; v < dims.V; ++v) if (row[v] > mx) mx = row[v];
+        double Z = 0.0;
+        for (int v = 0; v < dims.V; ++v) Z += std::exp((double)row[v] - mx);
+        for (int v = 1; v < dims.V; ++v) if (row[v] > best) { best = row[v]; am = v; }
+        const int tgt = tokens[i + 1];
+        if (am == tgt) ++correct;
+        nllSum += -((double)row[tgt] - mx - std::log(Z));
+        ++total;
+    }
+
+    out.positions = total;
+    out.top1Acc   = total ? (double)correct / (double)total : 0.0;
+    out.meanNll   = total ? nllSum / (double)total : 0.0;
+    return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// chiron_degeneration_metrics — stub.
+// chiron_degeneration_metrics — verbatim port of chiron_infer.cpp:57-77.
+//   distinct4 = unique 4-grams / total 4-grams  (low => repetitive/collapsed)
+//   maxRun    = longest run of identical consecutive tokens (high => stuck)
+// Edge cases match the source exactly: empty → distinct4=1.0 maxRun=0;
+//   <4 tokens → distinct4=1.0 (no 4-grams).
 // ---------------------------------------------------------------------------
 
-void chiron_degeneration_metrics(const std::vector<int>& /*gen*/,
+void chiron_degeneration_metrics(const std::vector<int>& gen,
                                  double& distinct4,
                                  int& maxRun)
 {
-    distinct4 = 0.0;
-    maxRun = 0;
+    maxRun = gen.empty() ? 0 : 1;
+    int run = 1;
+    for (size_t i = 1; i < gen.size(); ++i)
+    {
+        if (gen[i] == gen[i - 1]) { ++run; if (run > maxRun) maxRun = run; }
+        else run = 1;
+    }
+    if (gen.size() < 4) { distinct4 = 1.0; return; }
+    std::set<std::string> seen;
+    long total = 0;
+    char buf[64];
+    for (size_t i = 0; i + 3 < gen.size(); ++i)
+    {
+        snprintf(buf, sizeof(buf), "%d,%d,%d,%d",
+                 gen[i], gen[i + 1], gen[i + 2], gen[i + 3]);
+        seen.insert(std::string(buf));
+        ++total;
+    }
+    distinct4 = total ? (double)seen.size() / (double)total : 1.0;
 }
 
 } // namespace chiron

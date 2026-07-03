@@ -25,12 +25,17 @@
 #include "chiron-generate-test.h"
 #include "../../unit-test.h"
 #include "../../../Backend/Machine Learning/Networks/chiron_generate.h"
+#include "../../../Backend/Machine Learning/Networks/chiron_serving.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_chiron.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 
 #include <cstdio>
 #include <cstring>   // memcmp
 #include <cstdlib>   // strtod
 #include <stdint.h>
-#include <cmath>     // std::sin
+#include <cmath>     // std::sin, std::exp, std::log, std::sqrt
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Task-1 goldens: std::uniform_real_distribution<double>(0,1)(std::mt19937(s))
@@ -391,6 +396,182 @@ void CHIRONSamplerGoldenTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 4: CHIRONDegenMetricsTest — chiron_degeneration_metrics.
+// Four cases from the task brief + CHIRON_INFER_SELFTEST block.
+// ---------------------------------------------------------------------------
+void CHIRONDegenMetricsTest()
+{
+	// Case 1: 40 copies of token 2 → maxRun >= 30, distinct4 < 0.1
+	{
+		std::vector<int> rep;
+		for (int i = 0; i < 40; ++i) rep.push_back(2);
+		double d4 = 0.0; int run = 0;
+		glades::chiron::chiron_degeneration_metrics(rep, d4, run);
+		ASSERT("degen rep distinct4 < 0.1", d4 < 0.1);
+		ASSERT("degen rep maxRun >= 30",    run >= 30);
+	}
+
+	// Case 2: varied (i*7+3)%50 sequence → distinct4 > 0.8, maxRun <= 2
+	{
+		std::vector<int> coh;
+		for (int i = 0; i < 40; ++i) coh.push_back((i * 7 + 3) % 50);
+		double d4 = 0.0; int run = 0;
+		glades::chiron::chiron_degeneration_metrics(coh, d4, run);
+		ASSERT("degen coh distinct4 > 0.8", d4 > 0.8);
+		ASSERT("degen coh maxRun <= 2",      run <= 2);
+	}
+
+	// Case 3: empty → distinct4 == 1.0, maxRun == 0
+	{
+		std::vector<int> empty;
+		double d4 = 0.0; int run = -1;
+		glades::chiron::chiron_degeneration_metrics(empty, d4, run);
+		ASSERT("degen empty distinct4 == 1.0", d4 == 1.0);
+		ASSERT("degen empty maxRun == 0",       run == 0);
+	}
+
+	// Case 4: <4 tokens → distinct4 == 1.0
+	{
+		std::vector<int> short3;
+		short3.push_back(7); short3.push_back(3); short3.push_back(7);
+		double d4 = 0.0; int run = 0;
+		glades::chiron::chiron_degeneration_metrics(short3, d4, run);
+		ASSERT("degen short distinct4 == 1.0", d4 == 1.0);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tiny-model fixture helpers for CHIRONTfEvalTest.
+// Replicated from chiron-model-test.cpp (ev_* helpers) — do NOT refactor that
+// file; these are an independent copy, as required by the task brief.
+// ---------------------------------------------------------------------------
+
+static const int TF_T  = 8;
+static const int TF_M  = 4;
+static const int TF_L  = 2;
+static const int TF_NH = 1;
+static const int TF_DH = 4;
+static const int TF_V  = 16;
+static const int TF_DM = 4;  // nH * dH
+
+static glades::gpu::GpuBuffer<float>* tf_alloc_buf(size_t n, float base, float step)
+{
+	glades::gpu::GpuBuffer<float>* buf = new glades::gpu::GpuBuffer<float>();
+	std::vector<float> h(n);
+	for (size_t i = 0; i < n; ++i) h[i] = std::sin(step * (float)i + base);
+	bool ok = buf->allocate(n) && buf->upload(&h[0], n);
+	ASSERT("tf_alloc_buf ok", ok);
+	return buf;
+}
+
+static void tf_fill_core_weights(glades::chiron::ChironModelWeights& w,
+                                 const glades::chiron::ChironModelDims& d)
+{
+	const size_t Esize   = (size_t)d.V * d.m;
+	const size_t Wqkv_sz = (size_t)d.m * d.dModel;
+	const size_t Wo_sz   = (size_t)d.dModel * d.m;
+	std::vector<float> e(Esize);
+	for (size_t i = 0; i < Esize; ++i) e[i] = std::sin(0.05f * (float)i);
+	ASSERT("tf E alloc", w.E.allocate(Esize) && w.E.upload(&e[0], Esize));
+	for (int l = 0; l < d.L; ++l)
+	{
+		float off = 0.3f + (float)l * 0.7f;
+		w.Wq.push_back(tf_alloc_buf(Wqkv_sz, off + 0.0f, 0.017f));
+		w.Wk.push_back(tf_alloc_buf(Wqkv_sz, off + 0.1f, 0.019f));
+		w.Wv.push_back(tf_alloc_buf(Wqkv_sz, off + 0.2f, 0.023f));
+		w.Wo.push_back(tf_alloc_buf(Wo_sz,   off + 0.3f, 0.029f));
+		w.gamma.push_back(tf_alloc_buf((size_t)d.m, off + 0.4f, 0.03f));
+		w.beta.push_back( tf_alloc_buf((size_t)d.m, off + 0.5f, 0.04f));
+	}
+}
+
+static glades::chiron::ChironModelDims tf_dims()
+{
+	glades::chiron::ChironModelDims d;
+	d.T = TF_T; d.m = TF_M; d.L = TF_L; d.nH = TF_NH;
+	d.dH = TF_DH; d.V = TF_V; d.dModel = TF_DM;
+	return d;
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: CHIRONTfEvalTest — chiron_tf_eval parity.
+//
+// Tiny shape: T=8, m=4, L=2, nH=1, dH=4, V=16, dModel=4.
+// Dense path + fuseAttnReln (same as CHIRONEvalForwardParityTest Case 1).
+// Fixed 8-token window: {1,3,5,7,2,4,6,0}.
+// ---------------------------------------------------------------------------
+void CHIRONTfEvalTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+
+	// Dense path + fuseAttnReln (the production serving path for PIED/WhiSC).
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+	// useScfa=false, qkNorm=false, whiscCoupling=false, fuseAttnPerLayer=false
+
+	// Fixed 8-token window.
+	const int tokArr[] = {1, 3, 5, 7, 2, 4, 6, 0};
+	std::vector<int> tokens(tokArr, tokArr + TF_T);
+
+	// Allocate eval scratch + run chiron_tf_eval with logitsAllOut.
+	glades::chiron::ChironEvalScratch s;
+	ASSERT("tf scratch alloc", s.allocate(d, w, cfg));
+	std::vector<float> logitsAllOut;
+	glades::chiron::ChironTfResult result;
+	ASSERT("tf_eval returns true", glades::chiron::chiron_tf_eval(d, w, cfg, s, tokens, result, &logitsAllOut));
+
+	// Reference: run chiron_eval_forward directly, download logits, compute
+	// NLL/top1 with the same double-precision log-sum-exp loop.
+	glades::chiron::ChironEvalScratch rs;
+	ASSERT("tf ref scratch alloc", rs.allocate(d, w, cfg));
+	// Pad window (useLen = min(tokens.size(), T) = 8 = T).
+	const int useLen = (int)tokens.size() < d.T ? (int)tokens.size() : d.T;
+	std::vector<int> input(d.T, 0);
+	for (int i = 0; i < useLen; ++i) input[i] = tokens[i];
+	ASSERT("tf ref tokens upload", rs.d_tokens.upload(&input[0], d.T));
+	ASSERT("tf ref forward", glades::chiron::chiron_eval_forward(d, w, cfg, rs));
+	const size_t nLogits = (size_t)d.T * d.V;
+	std::vector<float> refLogits(nLogits);
+	ASSERT("tf ref logits download", rs.logits.download(&refLogits[0], nLogits));
+
+	// Hand-loop: per-position argmax + double log-sum-exp NLL (same order as chiron_tf_eval).
+	long refCorrect = 0, refTotal = 0;
+	double refNllSum = 0.0;
+	for (int i = 0; i < useLen - 1; ++i)
+	{
+		const float* row = &refLogits[(size_t)i * d.V];
+		int am = 0; float best = row[0];
+		double mx = row[0];
+		for (int v = 1; v < d.V; ++v) if (row[v] > mx) mx = row[v];
+		double Z = 0.0;
+		for (int v = 0; v < d.V; ++v) Z += std::exp((double)row[v] - mx);
+		for (int v = 1; v < d.V; ++v) if (row[v] > best) { best = row[v]; am = v; }
+		const int tgt = tokens[i + 1];
+		if (am == tgt) ++refCorrect;
+		refNllSum += -((double)row[tgt] - mx - std::log(Z));
+		++refTotal;
+	}
+	const double refTop1Acc = refTotal ? (double)refCorrect / (double)refTotal : 0.0;
+	const double refMeanNll = refTotal ? refNllSum / (double)refTotal : 0.0;
+
+	// Structural checks.
+	ASSERT("tf positions == 7",        result.positions == 7);
+	ASSERT("tf refTotal == 7",         refTotal == 7);
+
+	// Bit-exact equality (same math, same order → same double result).
+	ASSERT("tf meanNll bit-equal",     result.meanNll  == refMeanNll);
+	ASSERT("tf top1Acc bit-equal",     result.top1Acc  == refTop1Acc);
+
+	// logitsAllOut must equal the direct download element-exact.
+	ASSERT("tf logitsAllOut size", logitsAllOut.size() == nLogits);
+	for (size_t i = 0; i < nLogits; ++i)
+		ASSERT("tf logitsAllOut element", logitsAllOut[i] == refLogits[i]);
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateUnitTest()
@@ -398,4 +579,6 @@ void CHIRONGenerateUnitTest()
 	CHIRONMt19937RawTest();
 	CHIRONMt19937GoldenTest();
 	CHIRONSamplerGoldenTest();
+	CHIRONDegenMetricsTest();
+	CHIRONTfEvalTest();
 }

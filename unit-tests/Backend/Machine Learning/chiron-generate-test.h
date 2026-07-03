@@ -6,9 +6,11 @@
 #define _UT_CHIRON_GENERATE
 
 // Individual cases.
-void CHIRONMt19937RawTest();     // core generator: seed 5489 -> published u32s
-void CHIRONMt19937GoldenTest();  // canonical doubles bit-exact vs Task-1 goldens
-void CHIRONSamplerGoldenTest();  // chiron_sample_token picks bit-exact vs G2 goldens
+void CHIRONMt19937RawTest();        // core generator: seed 5489 -> published u32s
+void CHIRONMt19937GoldenTest();     // canonical doubles bit-exact vs Task-1 goldens
+void CHIRONSamplerGoldenTest();     // chiron_sample_token picks bit-exact vs G2 goldens
+void CHIRONDegenMetricsTest();      // chiron_degeneration_metrics: 4 cases
+void CHIRONTfEvalTest();            // chiron_tf_eval: NLL/acc bit-equal + logitsAllOut exact
 
 // Aggregate entry point, wired into unit-tests/main.cpp as "chiron-generate".
 void CHIRONGenerateUnitTest();
