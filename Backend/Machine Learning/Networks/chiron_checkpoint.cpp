@@ -600,9 +600,51 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
                     dims.L, dims.nH);
     }
 
-    // bit 512: a_drift payload NOT parsed — serve-refusal signal only.
-    // (rot_phi reads from EOF tail, skipping it automatically.)
+    // bit 512: OBSD per-layer drift gate a_drift (L*m FP32) — read from EOF tail.
+    // a_drift is written immediately BEFORE rot_phi (bit 1024, which is always LAST).
+    // Locate it by EOF arithmetic, mirroring the rot_phi tail read below:
+    //   offset = fileSize - (rot_phi present ? 2 : 1) * L*m*4
+    // Loading the values lets the serving resolver distinguish a genuinely
+    // drift-TRAINED checkpoint (nonzero -> refuse) from the zero-init a_drift that
+    // --whisc-coupling co-allocates (all-zero -> exact no-op, serve normally).
     w.hasADrift = isFull && (chrfFlags & (uint32_t)CKPT_BIT_A_DRIFT) != 0;
+    if (w.hasADrift)
+    {
+        const size_t nDrift     = (size_t)dims.L * dims.m;
+        const bool   rotPresent = (chrfFlags & (uint32_t)CKPT_BIT_ROT_PHI) != 0;
+        w.aDrift.assign(nDrift, 0.0f);
+        if (std::fseek(fp, 0, SEEK_END) != 0)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: seek(END) failed for a_drift\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        const long fileSize = std::ftell(fp);
+        const long secBytes = (long)(nDrift * sizeof(float));
+        const long need     = (rotPresent ? 2 : 1) * secBytes;  // bytes from a_drift start to EOF
+        if (fileSize < need)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb),
+                "chiron_infer: file too small for a_drift (%ld < %ld)\n", fileSize, need);
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        if (std::fseek(fp, fileSize - need, SEEK_SET) != 0)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb), "chiron_infer: seek to a_drift tail failed\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        if (std::fread(&w.aDrift[0], sizeof(float), nDrift, fp) != nDrift)
+        {
+            char eb[512];
+            std::snprintf(eb, sizeof(eb),
+                "chiron_infer: short read on a_drift (bit 512)\n");
+            err = eb; errCode = 4; std::fclose(fp); return false;
+        }
+        std::printf("[chiron-ckpt] loaded OBSD a_drift gate (L=%d m=%d, bit 512)"
+                    " -- read from EOF tail\n", dims.L, dims.m);
+    }
 
     // Optional WhiSC-D rot_phi (CHRF bit 1024), L*m FP32 — read from EOF tail.
     // save_full always writes this section LAST; we seek from EOF to skip all

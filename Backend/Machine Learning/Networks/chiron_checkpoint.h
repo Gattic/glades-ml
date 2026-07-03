@@ -88,7 +88,8 @@ struct ChironModelWeights
 	ChironScfaState scfa;
 	std::vector<float> qknormGamma;  // L*nH iff bit 256, else empty
 	std::vector<float> rotPhi;       // L*m  iff bit 1024, else empty
-	bool hasADrift;                  // bit 512 seen (payload NOT parsed — serve-refusal signal)
+	std::vector<float> aDrift;       // L*m  iff bit 512 (OBSD per-layer drift gate); loaded from EOF tail; empty if absent
+	bool hasADrift;                  // bit 512 seen (aDrift is loaded; nonzero => refuse to serve)
 	ChironModelWeights();
 	~ChironModelWeights();  // deletes all per-layer buffers
 private:

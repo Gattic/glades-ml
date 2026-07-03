@@ -352,7 +352,7 @@ static bool rt_write_chrn_v3(std::FILE* fp, const RTWeightData& d, uint32_t chrn
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: Full reader + writer roundtrip (7 cases).
+// Test 3: Full reader + writer roundtrip (cases 1-7, incl. 6b a_drift-last).
 // ---------------------------------------------------------------------------
 
 static void CHIRONCkptRoundtripTest()
@@ -547,14 +547,17 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 6: bit 512 (a_drift) + bit 1024 (rot_phi) — hasADrift=true ----
+	// ---- Case 6: bit 512 (a_drift) + bit 1024 (rot_phi) ----
+	// a_drift is the SECOND-to-last section (rot_phi is last).  The reader locates
+	// a_drift by EOF arithmetic: offset = fileSize - 2*L*m*4.  Assert BOTH sections
+	// load element-exact.
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
 
 		const size_t aDrift_n = (size_t)RT_L * RT_M;  // 8 floats
 		std::vector<float> aDriftPayload(aDrift_n);
-		rt_fill(&aDriftPayload[0], aDrift_n, 60.0f);
+		rt_fill(&aDriftPayload[0], aDrift_n, 60.0f);  // known pattern
 
 		const size_t rotphi_n = (size_t)RT_L * RT_M;  // 8 floats (must be LAST)
 		std::vector<float> rotPhiSrc(rotphi_n);
@@ -570,7 +573,7 @@ static void CHIRONCkptRoundtripTest()
 		ASSERT("rt6 fopen", fp != 0);
 		ASSERT("rt6 write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
 		ASSERT("rt6 write_weights", rt_write_weights(fp, src, false, false));
-		// Write a_drift payload before rot_phi; reader skips it via EOF-tail seek.
+		// a_drift written BEFORE rot_phi; reader finds it via the (bit1024?2:1) EOF arithmetic.
 		ASSERT("rt6 write_adrift",  glades::chiron::chiron_write_f32_tail_section(fp, &aDriftPayload[0], aDrift_n));
 		// rot_phi MUST be LAST.
 		ASSERT("rt6 write_rotphi",  glades::chiron::chiron_write_f32_tail_section(fp, &rotPhiSrc[0], rotphi_n));
@@ -581,9 +584,49 @@ static void CHIRONCkptRoundtripTest()
 		std::string err; int errCode = 0;
 		ASSERT("rt6 load",      glades::chiron::chiron_load_model(path, dims, w, err, errCode));
 		ASSERT("rt6 hasADrift", w.hasADrift);
+		// a_drift loaded element-exact (2-section-tail arithmetic).
+		ASSERT("rt6 adrift size", w.aDrift.size() == aDrift_n);
+		for (size_t i = 0; i < aDrift_n; ++i)
+			ASSERT("rt6 adrift val", w.aDrift[i] == aDriftPayload[i]);
 		ASSERT("rt6 rotphi size", w.rotPhi.size() == rotphi_n);
 		for (size_t i = 0; i < rotphi_n; ++i)
 			ASSERT("rt6 rotphi val", w.rotPhi[i] == rotPhiSrc[i]);
+
+		unlink(path.c_str());
+	}
+
+	// ---- Case 6b: bit 512 (a_drift) with bit 1024 CLEAR — a_drift is the LAST section ----
+	// Proves the (bit1024?2:1) EOF arithmetic the OTHER way: offset = fileSize - 1*L*m*4.
+	{
+		RTWeightData src;
+		rt_fill_weights(src, false);
+
+		const size_t aDrift_n = (size_t)RT_L * RT_M;  // 8 floats
+		std::vector<float> aDriftPayload(aDrift_n);
+		rt_fill(&aDriftPayload[0], aDrift_n, 80.0f);  // known pattern
+
+		const uint32_t flags = (uint32_t)glades::chiron::CKPT_BIT_A_DRIFT;  // NO rot_phi (bit 1024 clear)
+
+		std::string path = rt_tmppath();
+		ASSERT("rt6b tmppath", !path.empty());
+
+		std::FILE* fp = std::fopen(path.c_str(), "wb");
+		ASSERT("rt6b fopen", fp != 0);
+		ASSERT("rt6b write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
+		ASSERT("rt6b write_weights", rt_write_weights(fp, src, false, false));
+		// a_drift is the LAST section (no rot_phi tail after it).
+		ASSERT("rt6b write_adrift",  glades::chiron::chiron_write_f32_tail_section(fp, &aDriftPayload[0], aDrift_n));
+		std::fclose(fp);
+
+		glades::chiron::ChironModelDims     dims;
+		glades::chiron::ChironModelWeights  w;
+		std::string err; int errCode = 0;
+		ASSERT("rt6b load",       glades::chiron::chiron_load_model(path, dims, w, err, errCode));
+		ASSERT("rt6b hasADrift",  w.hasADrift);
+		ASSERT("rt6b no rotphi",  w.rotPhi.empty());
+		ASSERT("rt6b adrift size", w.aDrift.size() == aDrift_n);
+		for (size_t i = 0; i < aDrift_n; ++i)
+			ASSERT("rt6b adrift val", w.aDrift[i] == aDriftPayload[i]);
 
 		unlink(path.c_str());
 	}
@@ -642,7 +685,7 @@ static void CHIRONCkptRoundtripTest()
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: chiron_resolve_serving — 12 decision-table cases.
+// Test 4: chiron_resolve_serving — decision-table cases (3 split into 3a/3b).
 //
 // Tiny shape: T=64, m=4, L=2, nH=1, dH=4, V=16, dModel=4.
 // We build ChironModelWeights in-memory (no file I/O) and call
@@ -729,20 +772,45 @@ void CHIRONResolveServingTest()
         ASSERT("case2 err not empty", !err.empty());
     }
 
-    // ---- Case 3: w.hasADrift → return 7, err mentions a_drift ----
+    // ---- Case 3a: hasADrift + NONZERO a_drift → return 7, err mentions a_drift ----
+    // A genuinely drift-TRAINED checkpoint must be refused: the eval forward does
+    // not apply per-layer drift, so serving would be silently wrong.
     {
         glades::chiron::ChironModelDims   dims = srv_dims();
         glades::chiron::ChironModelWeights w;
         srv_fill_layer_weights(w, dims);
         w.hasADrift = true;
+        // L*m a_drift with at least one nonzero element (exact != 0.0f scan).
+        w.aDrift.assign((size_t)dims.L * dims.m, 0.0f);
+        w.aDrift[3] = 0.7f;  // a trained value is far from zero
 
         glades::chiron::ChironServingOverrides o;
 
         glades::chiron::ChironServingConfig cfg;
         std::string err;
         int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
-        ASSERT("case3 returns 7", rc == 7);
-        ASSERT("case3 err mentions a_drift", err.find("a_drift") != std::string::npos);
+        ASSERT("case3a returns 7", rc == 7);
+        ASSERT("case3a err mentions a_drift", err.find("a_drift") != std::string::npos);
+    }
+
+    // ---- Case 3b: hasADrift + ALL-ZERO a_drift → return 0, err untouched ----
+    // The zero-init a_drift that --whisc-coupling co-allocates is an exact no-op;
+    // serving proceeds (this is the production PIED / WhiSC-D case).
+    {
+        glades::chiron::ChironModelDims   dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        w.hasADrift = true;
+        w.aDrift.assign((size_t)dims.L * dims.m, 0.0f);  // all-zero, sized L*m
+
+        glades::chiron::ChironServingOverrides o;
+        o.scfaForceMode = -1;  // force SCFA off so we don't fail on B alloc
+
+        glades::chiron::ChironServingConfig cfg;
+        std::string err = "SENTINEL";  // prove the all-zero path does NOT touch err
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case3b returns 0", rc == 0);
+        ASSERT("case3b err untouched", err == "SENTINEL");
     }
 
     // ---- Case 4: gamma_p empty + fuse unset → cfg.fuseAttnPerLayer == false ----

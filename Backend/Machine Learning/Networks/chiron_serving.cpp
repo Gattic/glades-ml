@@ -80,15 +80,32 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
         return 7;
     }
 
-    // --- bit-512 (a_drift) note ---
-    // a_drift is allocated in lockstep with rot_phi (bit 1024) whenever
-    // --rot-coupling / --whisc-coupling is used, even when --per-layer-drift is
-    // NOT active (a_drift stays at zero-init and is a no-op in the forward).
-    // The old chiron_infer had no a_drift refusal and achieved TF parity on
-    // production WhiSC-D / PIED checkpoints that carry bit 512.  Do not refuse
-    // here — the eval forward correctly ignores zero a_drift, and an operator
-    // who genuinely trained with --per-layer-drift on a non-WhiSC checkpoint
-    // would get wrong logits either way (the drift forward is not implemented).
+    // --- bit-512 (a_drift) interlock (2026-07-03: refines commit 1ad8baeb2) ---
+    // a_drift (the OBSD per-layer symplectic drift gate) is co-allocated with
+    // rot_phi (bit 1024) whenever --rot-coupling / --whisc-coupling is used, even
+    // when --per-layer-drift is NOT active — in which case it stays at zero-init
+    // and is an EXACT no-op (OBSD drift is q += a(x)tanh(...), so a=0 => identity).
+    // Production WhiSC-D and PIED checkpoints carry bit 512 with a_drift ALL-ZERO.
+    // Commit 1ad8baeb2 removed the blanket refusal (which bricked PIED serving) but
+    // reopened the real hazard: a genuinely drift-TRAINED checkpoint (nonzero
+    // a_drift) would serve silently WRONG, since the eval forward does not apply
+    // per-layer drift.  Refuse ONLY that case; serve the zero-init case normally.
+    if (w.hasADrift)
+    {
+        bool anyNonzero = false;
+        for (size_t i = 0; i < w.aDrift.size(); ++i)
+            if (w.aDrift[i] != 0.0f) { anyNonzero = true; break; }
+        if (anyNonzero)
+        {
+            err = "FATAL — checkpoint carries TRAINED OBSD a_drift (CHRF flag bit 512, nonzero).\n"
+                  "  The eval forward does NOT apply the per-layer drift, so serving would produce\n"
+                  "  silently WRONG logits.  OBSD (per-layer symplectic drift) is a CLOSED NO-GO arc —\n"
+                  "  no production checkpoint should carry trained a_drift.  Refusing to serve (code 7).";
+            return 7;
+        }
+        std::printf("[chiron-serving] a_drift present but all-zero (bit 512 co-allocated by rot "
+                    "coupling) -- serving without drift is exact\n");
+    }
 
     // --- gamma_p auto-disable of per-layer fuse ---
     // fuseAttnPerLayer: -1 = unset (default-on heuristic), 0 = forced off, 1 = forced on.
