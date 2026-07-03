@@ -235,7 +235,7 @@ install(FILES
 # include convention.
 install(DIRECTORY "Backend/Machine Learning/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/glades/Backend/Machine Learning"
-    FILES_MATCHING PATTERN "*.h")
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.inc")
 target_include_directories(glades INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/glades>)
 
