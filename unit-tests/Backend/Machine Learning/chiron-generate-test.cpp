@@ -572,6 +572,234 @@ void CHIRONTfEvalTest()
 }
 
 // ---------------------------------------------------------------------------
+// Sink early-stop helper (C++98: static function + plain int context).
+// Counts down from initial value; returns true while count > 0 AFTER decrement.
+// So with initial count=2: call 1 → true (count=1), call 2 → false (count=0).
+// ---------------------------------------------------------------------------
+static bool sinkCountdown(void* ctx, int /*token*/)
+{
+	int* pCount = static_cast<int*>(ctx);
+	return --(*pCount) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Reference generation loop: same window/slide/clamp/sample logic as
+// chiron_generate, run on a SEPARATE scratch so the two paths are independent.
+// outRef receives only generated tokens (maxSteps of them).
+// ---------------------------------------------------------------------------
+static void gen_reference_loop(
+	const glades::chiron::ChironModelDims& dims,
+	const glades::chiron::ChironModelWeights& w,
+	const glades::chiron::ChironServingConfig& cfg,
+	glades::chiron::ChironEvalScratch& s,
+	const std::vector<int>& promptTokens,
+	const glades::chiron::ChironGenParams& gp,
+	int maxSteps,
+	std::vector<int>& outRef)
+{
+	outRef.clear();
+	std::vector<int>   tokens(promptTokens);
+	glades::chiron::ChironMt19937 rng(gp.seed);
+	std::vector<int>   input((size_t)dims.T, 0);
+	std::vector<float> logitsAll((size_t)dims.T * (size_t)dims.V);
+	std::vector<float> logitsRow((size_t)dims.V);
+
+	for (int gen = 0; gen < maxSteps; ++gen)
+	{
+		const int useLen = (int)tokens.size() < dims.T ? (int)tokens.size() : dims.T;
+		for (int i = 0; i < dims.T; ++i) input[i] = 0;
+		const int offset = (int)tokens.size() - useLen;
+		for (int i = 0; i < useLen; ++i)
+		{
+			int tk = tokens[offset + i];
+			if (tk < 0 || tk >= dims.V) tk = 0;
+			input[i] = tk;
+		}
+		ASSERT("ref upload ok",   s.d_tokens.upload(&input[0], (size_t)dims.T));
+		ASSERT("ref forward ok",  glades::chiron::chiron_eval_forward(dims, w, cfg, s));
+		ASSERT("ref download ok", s.logits.download(&logitsAll[0], logitsAll.size()));
+
+		const int lastPos = useLen - 1;
+		for (int v = 0; v < dims.V; ++v)
+			logitsRow[v] = logitsAll[(size_t)lastPos * (size_t)dims.V + v];
+
+		int next = glades::chiron::chiron_sample_token(logitsRow, gp, tokens, rng);
+		tokens.push_back(next);
+		outRef.push_back(next);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 6a: chiron_generate topK=1 determinism.
+// Prompt {1,3,5}, maxTokens=6, topK=1.
+// Compare API output against reference loop built from the same primitives.
+// topK=1 makes CDF pick draw-independent; both loops consume one draw/token
+// in lockstep so this also validates draw-count parity.
+// ---------------------------------------------------------------------------
+void CHIRONGenerateTopK1Test()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK      = 1;
+	gp.maxTokens = 6;
+	gp.seed      = 1337u;
+
+	const int promptArr[] = {1, 3, 5};
+	std::vector<int> prompt(promptArr, promptArr + 3);
+
+	// Two independent scratches — API and reference must not share state.
+	glades::chiron::ChironEvalScratch sApi;
+	ASSERT("topK1 api scratch alloc", sApi.allocate(d, w, cfg));
+	glades::chiron::ChironEvalScratch sRef;
+	ASSERT("topK1 ref scratch alloc", sRef.allocate(d, w, cfg));
+
+	// Run chiron_generate.
+	std::vector<int> outTokens;
+	bool ok = glades::chiron::chiron_generate(d, w, cfg, sApi, prompt, gp, NULL, NULL, &outTokens);
+	ASSERT("topK1 generate returns true", ok);
+	ASSERT("topK1 outTokens size == 6", (int)outTokens.size() == gp.maxTokens);
+
+	// Run reference.
+	std::vector<int> refTokens;
+	gen_reference_loop(d, w, cfg, sRef, prompt, gp, gp.maxTokens, refTokens);
+	ASSERT("topK1 refTokens size == 6", (int)refTokens.size() == gp.maxTokens);
+
+	// Token-by-token equality.
+	for (int i = 0; i < gp.maxTokens; ++i)
+	{
+		char msg[64]; std::sprintf(msg, "topK1 token[%d] match", i);
+		ASSERT(msg, outTokens[i] == refTokens[i]);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 6b: chiron_generate window slide.
+// Prompt of 12 tokens (> T=8), maxTokens=3.  Exercises offset = size - T > 0.
+// ---------------------------------------------------------------------------
+void CHIRONGenerateWindowSlideTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK      = 1;
+	gp.maxTokens = 3;
+	gp.seed      = 1337u;
+
+	// 12-token prompt with all IDs in [0, V=16).
+	std::vector<int> prompt;
+	for (int i = 0; i < 12; ++i) prompt.push_back(i % TF_V);
+
+	glades::chiron::ChironEvalScratch sApi;
+	ASSERT("slide api scratch alloc", sApi.allocate(d, w, cfg));
+	glades::chiron::ChironEvalScratch sRef;
+	ASSERT("slide ref scratch alloc", sRef.allocate(d, w, cfg));
+
+	std::vector<int> outTokens;
+	bool ok = glades::chiron::chiron_generate(d, w, cfg, sApi, prompt, gp, NULL, NULL, &outTokens);
+	ASSERT("slide generate returns true", ok);
+	ASSERT("slide outTokens size == 3", (int)outTokens.size() == gp.maxTokens);
+
+	std::vector<int> refTokens;
+	gen_reference_loop(d, w, cfg, sRef, prompt, gp, gp.maxTokens, refTokens);
+	ASSERT("slide refTokens size == 3", (int)refTokens.size() == gp.maxTokens);
+
+	for (int i = 0; i < gp.maxTokens; ++i)
+	{
+		char msg[64]; std::sprintf(msg, "slide token[%d] match", i);
+		ASSERT(msg, outTokens[i] == refTokens[i]);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 6c: chiron_generate sink early-stop.
+// Sink returns false after the 2nd token.  The 2nd token IS in outTokens
+// (already appended before sink is called) but no further iterations run.
+// With maxTokens=6, outTokens->size() == 2 proves early stop.
+// ---------------------------------------------------------------------------
+void CHIRONGenerateSinkStopTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK      = 1;
+	gp.maxTokens = 6;
+	gp.seed      = 1337u;
+
+	const int promptArr[] = {1, 3, 5};
+	std::vector<int> prompt(promptArr, promptArr + 3);
+
+	glades::chiron::ChironEvalScratch sApi;
+	ASSERT("sink api scratch alloc", sApi.allocate(d, w, cfg));
+
+	// count=2: call 1 returns true (count→1), call 2 returns false (count→0).
+	int count = 2;
+	std::vector<int> outTokens;
+	bool ok = glades::chiron::chiron_generate(d, w, cfg, sApi, prompt, gp,
+	                                           sinkCountdown, &count, &outTokens);
+	ASSERT("sink generate returns true", ok);
+	ASSERT("sink outTokens size == 2 (early stop)", (int)outTokens.size() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6d: chiron_generate token-id clamp.
+// Prompt {-5, 20, 1}: -5 (< 0) and 20 (>= V=16) both clamp to 0.
+// Reference applies the same clamp, so both loops must agree.
+// ---------------------------------------------------------------------------
+void CHIRONGenerateClampTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln      = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK      = 1;
+	gp.maxTokens = 3;
+	gp.seed      = 1337u;
+
+	const int promptArr[] = {-5, 20, 1};
+	std::vector<int> prompt(promptArr, promptArr + 3);
+
+	glades::chiron::ChironEvalScratch sApi;
+	ASSERT("clamp api scratch alloc", sApi.allocate(d, w, cfg));
+	glades::chiron::ChironEvalScratch sRef;
+	ASSERT("clamp ref scratch alloc", sRef.allocate(d, w, cfg));
+
+	std::vector<int> outTokens;
+	bool ok = glades::chiron::chiron_generate(d, w, cfg, sApi, prompt, gp, NULL, NULL, &outTokens);
+	ASSERT("clamp generate returns true", ok);
+	ASSERT("clamp outTokens size == 3", (int)outTokens.size() == gp.maxTokens);
+
+	std::vector<int> refTokens;
+	gen_reference_loop(d, w, cfg, sRef, prompt, gp, gp.maxTokens, refTokens);
+	ASSERT("clamp refTokens size == 3", (int)refTokens.size() == gp.maxTokens);
+
+	for (int i = 0; i < gp.maxTokens; ++i)
+	{
+		char msg[64]; std::sprintf(msg, "clamp token[%d] match", i);
+		ASSERT(msg, outTokens[i] == refTokens[i]);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateUnitTest()
@@ -581,4 +809,8 @@ void CHIRONGenerateUnitTest()
 	CHIRONSamplerGoldenTest();
 	CHIRONDegenMetricsTest();
 	CHIRONTfEvalTest();
+	CHIRONGenerateTopK1Test();
+	CHIRONGenerateWindowSlideTest();
+	CHIRONGenerateSinkStopTest();
+	CHIRONGenerateClampTest();
 }

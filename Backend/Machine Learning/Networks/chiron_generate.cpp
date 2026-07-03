@@ -4,7 +4,8 @@
 
 #include "chiron_generate.h"
 
-#include <cstdio>     // snprintf
+#include <cstdio>     // snprintf, printf
+#include <cstdlib>    // getenv
 #include <cstring>    // memset
 #include <cmath>      // nextafter, std::exp, std::log
 #include <algorithm>  // std::partial_sort, std::sort
@@ -264,20 +265,104 @@ int chiron_sample_token(const std::vector<float>& logitsIn,
 }
 
 // ---------------------------------------------------------------------------
-// chiron_generate — stub.
+// chiron_generate — generation loop.
+// Ported from chiron_infer.cpp generate-lambda (lines 416-483), minus CLI
+// concerns (BPE decode, printf, dumpTokens, genMetrics).
+// C++98: lambda comparators become functor structs.
 // ---------------------------------------------------------------------------
 
-bool chiron_generate(const ChironModelDims& /*dims*/,
-                     const ChironModelWeights& /*w*/,
-                     const ChironServingConfig& /*cfg*/,
-                     ChironEvalScratch& /*s*/,
-                     const std::vector<int>& /*promptTokens*/,
-                     const ChironGenParams& /*gp*/,
-                     ChironTokenSink /*sink*/,
-                     void* /*sinkCtx*/,
-                     std::vector<int>* /*outTokens*/)
+namespace {
+// Descending float comparator for the CHIRON_DBG top-5 partial_sort.
+struct CmpByFloatDesc {
+    const std::vector<float>& v;
+    explicit CmpByFloatDesc(const std::vector<float>& vec) : v(vec) {}
+    bool operator()(int a, int b) const { return v[a] > v[b]; }
+};
+} // anonymous namespace
+
+bool chiron_generate(const ChironModelDims& dims,
+                     const ChironModelWeights& w,
+                     const ChironServingConfig& cfg,
+                     ChironEvalScratch& s,
+                     const std::vector<int>& promptTokens,
+                     const ChironGenParams& gp,
+                     ChironTokenSink sink,
+                     void* sinkCtx,
+                     std::vector<int>* outTokens)
 {
+#ifndef GLADES_HAVE_CUDA
+    (void)dims; (void)w; (void)cfg; (void)s;
+    (void)promptTokens; (void)gp; (void)sink; (void)sinkCtx; (void)outTokens;
     return false;
+#else
+    // Empty prompt is unsupported — matches chiron_infer CLI behavior.
+    if (promptTokens.empty()) return false;
+
+    if (outTokens) outTokens->clear();
+
+    // Working buffer: starts as prompt, grows one token per generation step.
+    std::vector<int> tokens(promptTokens);
+
+    // Seed the engine exactly once at entry (matches the old rng(seed) at
+    // generate-lambda entry — each chiron_generate call is independent).
+    ChironMt19937 rng(gp.seed);
+
+    std::vector<int>   input((size_t)dims.T, 0);
+    std::vector<float> logitsAll((size_t)dims.T * (size_t)dims.V);
+    std::vector<float> logitsRow((size_t)dims.V);
+
+    for (int gen = 0; gen < gp.maxTokens; ++gen)
+    {
+        // Fill window: pad to T zeros, then place the last min(|tokens|,T)
+        // tokens (clamped to [0,V)) starting at position 0.
+        const int useLen = (int)tokens.size() < dims.T ? (int)tokens.size() : dims.T;
+        for (int i = 0; i < dims.T; ++i) input[i] = 0;
+        const int offset = (int)tokens.size() - useLen;
+        for (int i = 0; i < useLen; ++i)
+        {
+            int tk = tokens[offset + i];
+            if (tk < 0 || tk >= dims.V) tk = 0;
+            input[i] = tk;
+        }
+
+        if (!s.d_tokens.upload(&input[0], (size_t)dims.T)) return false;
+        if (!chiron_eval_forward(dims, w, cfg, s)) return false;
+
+        // Extract logits row for the last valid position (useLen-1).
+        if (!s.logits.download(&logitsAll[0], logitsAll.size())) return false;
+        const int lastPos = useLen - 1;
+        for (int v = 0; v < dims.V; ++v)
+            logitsRow[v] = logitsAll[(size_t)lastPos * (size_t)dims.V + v];
+
+        // CHIRON_DBG: env-gated top-5 logit dump (harmless in lib; matches
+        // chiron_infer.cpp lines 462-471 with lambda → functor).
+        if (std::getenv("CHIRON_DBG") && gen < 4)
+        {
+            std::vector<int> idx(dims.V);
+            for (int v = 0; v < dims.V; ++v) idx[v] = v;
+            const int top5 = dims.V < 5 ? dims.V : 5;
+            CmpByFloatDesc cmp(logitsRow);
+            std::partial_sort(idx.begin(), idx.begin() + top5, idx.end(), cmp);
+            std::printf("[dbg-gen %d] pos=%d top5: ", gen, lastPos);
+            for (int j = 0; j < top5; ++j)
+                std::printf("tok%d=%.3g  ", idx[j], logitsRow[idx[j]]);
+            std::printf("\n");
+        }
+
+        // Sample: passes the FULL accumulated tokens (prompt + generated so
+        // far) as context — exactly what chiron_infer passed as `context`.
+        const int next = chiron_sample_token(logitsRow, gp, tokens, rng);
+
+        // Append to working buffer and record in output.
+        tokens.push_back(next);
+        if (outTokens) outTokens->push_back(next);
+
+        // Emit to sink.  The refused token is already appended/recorded above;
+        // no further iterations run if sink returns false.
+        if (sink && !sink(sinkCtx, next)) break;
+    }
+    return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
