@@ -665,9 +665,9 @@ cd unit-tests/build && sh .configure.sh cuda # compile with cuda
 cd unit-tests && bash test.sh nnall    # run all tests
 ```
 
-**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`
+**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`
 
-**Install**: `cd build && make install` (installs to `~/.local`)
+**Install**: `cd build && make install` (installs to `~/.local`; also installs the ML header tree to `~/.local/include/glades/Backend/Machine Learning/` — required by the trainer since the vendored `include/` was removed)
 
 ## Project Overview
 
@@ -699,6 +699,30 @@ Each network type has a dedicated SGD implementation file: `sgd_dff.cpp`, `sgd_r
 - `transformer_ops.h` includes `transformer_kernels.h` for SIMD helpers
 - `training_config.h` — transformer configuration (RoPE/sinusoidal, LayerNorm/RMSNorm, MLP/SwiGLU, KV-cache dtypes)
 - `transformer_public_api.h` — stable C++98 wrapper for generation APIs
+
+### CHIRON Serving Modules (2026-07-03)
+
+Glades-ml owns CHIRON checkpoint I/O and serving since 2026-07-03:
+
+- `chiron_checkpoint.{h,cpp}` — CHRN/CHRF format single source of truth: `ChironCkptBits`
+  registry, block codecs, serving reader (rot_phi/a_drift EOF-tail reads), model-section
+  writers. Section-order contract: a_drift immediately before rot_phi, rot_phi LAST.
+- `chiron_serving.{h,cpp}` — `chiron_resolve_serving` decision table (WhiSC interlocks,
+  fuse/QK-Norm/SCFA auto-enables, dead-gamma_p guard; CHRF bit 512 / a_drift refused only
+  when trained/nonzero — zero-valued co-allocation is served with an info line) +
+  `ChironEvalScratch` / `chiron_eval_forward` (kernel-sequence-identical to old forwardInfer).
+- **Unit suite**: `bash test.sh chiron-model` (roundtrips, resolve table, eval-forward parity).
+
+**Rebuild order** (static kernel link — `make install` alone does NOT update the trainer):
+```
+cd ~/dev/glades-ml/build && make install
+cd ~/dev/glades-trainer && bash build.sh
+```
+
+**One-time shmea header setup** (shmea never installs headers):
+```
+cp -r ~/dev/ShmeaDB/Backend/{Database,Networking,Plotter} ~/.local/include/Backend/
+```
 
 ### Public API Entry Point
 `Backend/Machine Learning/main.h` defines the `glades` namespace with `train()`, `test()`, `trainOwned()`, `testOwned()` overloads. `glades::init()` must be called first.
