@@ -52,6 +52,69 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
                            const ChironServingOverrides& o,
                            ChironServingConfig& cfg, std::string& err);
 
+// ---------------------------------------------------------------------------
+// Eval forward (Task 6).  Ported 1:1 from chiron_infer.cpp Scratch (359-457) /
+// forwardInfer (580-740) with the kernel call sequence preserved exactly — the
+// later bit-parity gate depends on it.
+// ---------------------------------------------------------------------------
+
+// Per-forward scratch.  Recomputes q from d_tokens each call (q is overwritten),
+// so the caller uploads d_tokens and downloads logits between forwards.
+struct ChironEvalScratch
+{
+    glades::gpu::GpuBuffer<int>   d_tokens;   // [T] caller uploads
+    glades::gpu::GpuBuffer<float> q;          // [T, m]
+    glades::gpu::GpuBuffer<float> p;          // [T, m]
+    glades::gpu::GpuBuffer<float> q_tmp;      // [T, m]
+    glades::gpu::GpuBuffer<float> stats;      // [L, T, 2]
+    // Dense-attention scratch (allocated when SCFA is OFF).
+    glades::gpu::GpuBuffer<float> sQ, sK, sV, sO;  // [T, dModel]
+    glades::gpu::GpuBuffer<float> scratch_P;       // [nH, T, T]
+    glades::gpu::GpuBuffer<float> logits;          // [T, V] caller downloads
+    // paradigm #32 fuse-attn-per-layer scratch.
+    glades::gpu::GpuBuffer<float> p_norm;          // [T, m]
+    glades::gpu::GpuBuffer<float> stats_p;         // [L, T, 2]
+    // SCFA scratch (allocated when SCFA is ON).
+    glades::gpu::GpuBuffer<float> scfa_qcompr;  // [k, m]
+    glades::gpu::GpuBuffer<float> scfa_qpar;    // [T, m]
+    glades::gpu::GpuBuffer<float> scfa_qperp;   // [T, m]
+    glades::gpu::GpuBuffer<float> scfa_yperp;   // [T, m]
+    glades::gpu::GpuBuffer<float> scfa_ycompr;  // [k, m]
+    glades::gpu::GpuBuffer<float> scfa_ypar;    // [T, m]
+    glades::gpu::GpuBuffer<float> scfa_inner_p; // [k, m]
+    glades::gpu::GpuBuffer<float> scfa_inner_sQ;
+    glades::gpu::GpuBuffer<float> scfa_inner_sK;
+    glades::gpu::GpuBuffer<float> scfa_inner_sV;
+    glades::gpu::GpuBuffer<float> scfa_inner_sO;  // each [k, dModel]
+    glades::gpu::GpuBuffer<float> scfa_inner_sP;  // [nH, k, k]
+    glades::gpu::GpuBuffer<float> qknorm_invNorm;     // [k*nH] throwaway
+    glades::gpu::GpuBuffer<float> qknorm_gamma_scale; // [L*nH] = gamma*sqrt(dH), prefilled
+    // WhiSC-D coupling scratch (CHRF bit 1024).  Each [m]; ema=1.0 so reused per layer/step.
+    glades::gpu::GpuBuffer<float> rot_a;       // [m] SORC coeff a (folded in place)
+    glades::gpu::GpuBuffer<float> rot_c;       // [m] SORC coeff c (folded in place)
+    glades::gpu::GpuBuffer<float> whisc_Pbar;  // [m] E[p^2]
+    glades::gpu::GpuBuffer<float> whisc_Qbar;  // [m] E[q^2]
+    glades::gpu::GpuBuffer<float> whisc_a;     // [m] per-channel whitening scale
+    // Owned per-layer rot_phi angle buffers [m], uploaded from w.rotPhi when whisc.
+    std::vector<glades::gpu::GpuBuffer<float>*> rotPhiGpu;
+
+    ChironEvalScratch();
+    ~ChironEvalScratch();   // deletes rotPhiGpu[i]
+
+    // Allocates all scratch and uploads qknormGammaScale + rot_phi.  Returns true
+    // on success.  useScfa/scfaK/whisc are taken from cfg/w.
+    bool allocate(const ChironModelDims& d, const ChironModelWeights& w,
+                  const ChironServingConfig& cfg);
+private:
+    ChironEvalScratch(const ChironEvalScratch&);
+    ChironEvalScratch& operator=(const ChironEvalScratch&);
+};
+
+// Forward pass: q_0 = embed(tokens) -> logits [T, V] in s.logits.  Preserves the
+// exact glades::gpu call sequence of chiron_infer.cpp::forwardInfer.
+bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
+                         const ChironServingConfig& cfg, ChironEvalScratch& s);
+
 } // namespace chiron
 } // namespace glades
 

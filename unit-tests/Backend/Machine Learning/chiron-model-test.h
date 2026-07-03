@@ -8,6 +8,7 @@
 // Individual cases.
 void CHIRONCkptBlockCodecTest();
 void CHIRONResolveServingTest();
+void CHIRONEvalForwardParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp as "chiron-model".
 void CHIRONModelUnitTest();

@@ -5,11 +5,15 @@
 // C++98.
 
 #include "chiron_serving.h"
-#include "cuda/gpu_kernels.h"  // scfa_dct_basis_init
+#include "cuda/gpu_kernels.h"  // scfa_dct_basis_init, embedding_gather, axpy, qknorm, device_memcpy_d2d
+#include "cuda/gpu_chiron.h"   // chiron_attention_shear_tiled, chiron_reln_forward, rot/whisc kernels
+#include "cuda/gpu_blas.h"     // sgemm_rowmajor / _atb / _abt
 
 #include <cstdio>
+#include <cstdlib>  // std::getenv
 #include <cmath>
 #include <cstring>
+#include <algorithm>  // std::min, std::max
 
 namespace glades {
 namespace chiron {
@@ -267,6 +271,370 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
     cfg.epsReln          = 1e-4f;
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ChironEvalScratch — ported from chiron_infer.cpp Scratch (359-457).
+// ---------------------------------------------------------------------------
+
+ChironEvalScratch::ChironEvalScratch()
+{
+}
+
+ChironEvalScratch::~ChironEvalScratch()
+{
+    for (size_t i = 0; i < rotPhiGpu.size(); ++i) delete rotPhiGpu[i];
+    rotPhiGpu.clear();
+}
+
+bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeights& w,
+                                 const ChironServingConfig& cfg)
+{
+    const int T = d.T, m = d.m, L = d.L, dModel = d.dModel;
+    const bool useScfa = cfg.useScfa;
+    const int  scfaK   = w.scfa.k;
+    const bool whisc   = cfg.whiscCoupling;
+
+    if (!d_tokens.allocate(T)) return false;
+    if (!q.allocate((size_t)T * m)) return false;
+    if (!p.allocate((size_t)T * m)) return false;
+    if (!q_tmp.allocate((size_t)T * m)) return false;
+    if (!stats.allocate((size_t)L * T * 2u)) return false;
+    if (!logits.allocate((size_t)T * d.V)) return false;
+    if (!p_norm.allocate((size_t)T * m)) return false;
+    if (!stats_p.allocate((size_t)L * T * 2u)) return false;
+    if (useScfa)
+    {
+        const size_t Tm  = (size_t)T * (size_t)m;
+        const size_t km  = (size_t)scfaK * (size_t)m;
+        const size_t kdM = (size_t)scfaK * (size_t)dModel;
+        const size_t Skk = (size_t)d.nH * (size_t)scfaK * (size_t)scfaK;
+        if (!scfa_qcompr.allocate(km)) return false;
+        if (!scfa_qpar.allocate(Tm)) return false;
+        if (!scfa_qperp.allocate(Tm)) return false;
+        if (!scfa_yperp.allocate(Tm)) return false;
+        if (!scfa_ycompr.allocate(km)) return false;
+        if (!scfa_ypar.allocate(Tm)) return false;
+        if (!scfa_inner_p.allocate(km)) return false;
+        if (!scfa_inner_sQ.allocate(kdM)) return false;
+        if (!scfa_inner_sK.allocate(kdM)) return false;
+        if (!scfa_inner_sV.allocate(kdM)) return false;
+        if (!scfa_inner_sO.allocate(kdM)) return false;
+        if (!scfa_inner_sP.allocate(Skk)) return false;
+        if (!qknorm_invNorm.allocate((size_t)scfaK * d.nH)) return false;
+        if (!qknorm_gamma_scale.allocate((size_t)d.L * d.nH)) return false;  // per-layer gamma*sqrt(dH)
+    }
+    else
+    {
+        if (!sQ.allocate((size_t)T * dModel)) return false;
+        if (!sK.allocate((size_t)T * dModel)) return false;
+        if (!sV.allocate((size_t)T * dModel)) return false;
+        if (!sO.allocate((size_t)T * dModel)) return false;
+        if (!scratch_P.allocate((size_t)d.nH * T * T)) return false;
+    }
+    if (whisc)
+    {
+        if (!rot_a.allocate((size_t)m)) return false;
+        if (!rot_c.allocate((size_t)m)) return false;
+        if (!whisc_Pbar.allocate((size_t)m)) return false;
+        if (!whisc_Qbar.allocate((size_t)m)) return false;
+        if (!whisc_a.allocate((size_t)m)) return false;
+        // Init Pbar/Qbar to a finite 1.0 (ema=1.0 zeroes their weight, but a
+        // finite value avoids any 0*NaN from uninitialized device memory).
+        std::vector<float> ones((size_t)m, 1.0f);
+        if (!whisc_Pbar.upload(&ones[0], (size_t)m)) return false;
+        if (!whisc_Qbar.upload(&ones[0], (size_t)m)) return false;
+    }
+
+    // QK-Norm: upload the prefilled per-layer per-head gamma*sqrt(dH) scale
+    // (resolve fills cfg.qknormGammaScale host-side).  Port of chiron_infer.cpp:1231.
+    // The buffer is only allocated on the SCFA path (where qkNorm is consumed);
+    // the .allocated() guard preserves chiron_infer's behavior for the never-used
+    // dense+qkNorm combo (where its upload return was ignored — dense attention
+    // never reads the scale), instead of failing scratch allocation.
+    if (!cfg.qknormGammaScale.empty() && qknorm_gamma_scale.allocated())
+    {
+        if (!qknorm_gamma_scale.upload(&cfg.qknormGammaScale[0], cfg.qknormGammaScale.size()))
+            return false;
+    }
+
+    // 2026-07-01: upload WhiSC-D rot_phi angles to per-layer GPU buffers [m].
+    // rotPhi is L*m layer-major.  Port of chiron_infer.cpp:1238-1259 (tag rebranded
+    // to [chiron-serving]; glyphs ASCII-normalized).
+    if (whisc)
+    {
+        rotPhiGpu.assign(d.L, (glades::gpu::GpuBuffer<float>*)0);
+        double rotAbsSum = 0.0; float rotAbsMax = 0.0f;
+        for (int l = 0; l < d.L; ++l)
+        {
+            rotPhiGpu[l] = new glades::gpu::GpuBuffer<float>();
+            if (!rotPhiGpu[l]->allocate((size_t)d.m))
+            { std::fprintf(stderr, "chiron_serving: rot_phi GPU alloc failed (layer %d)\n", l); return false; }
+            if (!w.rotPhi.empty())
+            {
+                if (!rotPhiGpu[l]->upload(&w.rotPhi[(size_t)l * d.m], (size_t)d.m)) return false;
+                for (int i = 0; i < d.m; ++i)
+                { float v = std::fabs(w.rotPhi[(size_t)l * d.m + i]); rotAbsSum += v; if (v > rotAbsMax) rotAbsMax = v; }
+            }
+        }
+        std::printf("[chiron-serving] WhiSC-D coupling ENABLED (theta_max=%.4g clamp=%.4g) -- "
+                    "rot_phi |.|max=%.4g mean=%.4g (nonzero confirms angles loaded)\n",
+                    cfg.rotThetaMax, cfg.whiscClamp, rotAbsMax, rotAbsSum / ((double)d.L * d.m));
+        if (rotAbsMax == 0.0f)
+            std::fprintf(stderr, "[chiron-serving] WARNING: rot_phi is all-zero -- coupling is identity "
+                         "(checkpoint may predate WhiSC-D training or loaded wrong region)\n");
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// scfa_shear_eval — ported from chiron_infer.cpp scfa_shear_infer (484-577).
+// Same glades::gpu calls, same order, same args.
+// ---------------------------------------------------------------------------
+
+static void dbg_mag(int layer, const char* tag, const glades::gpu::GpuBuffer<float>& b, size_t n)
+{
+    if (layer != 0 || !std::getenv("CHIRON_DBG")) return;
+    size_t s = std::min(n, (size_t)8192);
+    std::vector<float> h(s);
+    const_cast<glades::gpu::GpuBuffer<float>&>(b).download(&h[0], s);
+    float mx = 0; double sum = 0;
+    for (size_t i = 0; i < s; ++i) { mx = std::max(mx, std::fabs(h[i])); sum += std::fabs(h[i]); }
+    std::printf("[dbg-scfa L%02d]   %-10s |.|max=%.4g mean=%.4g\n", layer, tag, mx, sum / s);
+}
+
+static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
+                            const float* Wq, const float* Wk,
+                            const float* Wv, const float* Wo,
+                            int layer, int T, int m, int nH, int dH,
+                            bool invert, bool qkNorm)
+{
+    const int k = scfa.k;
+    const int w = scfa.w;
+    const int dModel = nH * dH;
+    const size_t Tm = (size_t)T * (size_t)m;
+    const size_t km = (size_t)k * (size_t)m;
+
+    // 1. q_compr[k, m] = B^T[k, T] . q[T, m]
+    if (!glades::gpu::sgemm_rowmajor_atb(
+            k, m, T, 1.0f,
+            scfa.B.data(), k,
+            s.q.data(),    m,
+            0.0f,
+            s.scfa_qcompr.data(), m)) return false;
+    dbg_mag(layer, "q_in", s.q, Tm);
+    dbg_mag(layer, "q_compr", s.scfa_qcompr, km);
+
+    // 2. q_par[T, m] = B[T, k] . q_compr[k, m]
+    if (!glades::gpu::sgemm_rowmajor(
+            T, m, k, 1.0f,
+            scfa.B.data(),         k,
+            s.scfa_qcompr.data(),  m,
+            0.0f,
+            s.scfa_qpar.data(),    m)) return false;
+
+    // 3. q_perp = q - q_par.
+    glades::gpu::device_memcpy_d2d(s.scfa_qperp.data(), s.q.data(), sizeof(float) * Tm);
+    if (!glades::gpu::axpy(-1.0f, s.scfa_qpar.data(), s.scfa_qperp.data(), (int)Tm)) return false;
+
+    // 4. y_perp = D . q_perp (depthwise causal conv).
+    if (!glades::gpu::scfa_depthwise_causal_conv_fwd(
+            s.scfa_qperp.data(), scfa.D[layer]->data(),
+            T, m, w, s.scfa_yperp.data())) return false;
+
+    // 5. Inner attention on compressed length k.
+    if (!s.scfa_inner_p.zero()) return false;
+    if (qkNorm)
+    {
+        // QK-Norm decomposed path (replicates chiron_main.cpp:8734-8787 FP32 split).
+        if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
+                s.scfa_qcompr.data(), m, Wq, dModel, 0.0f, s.scfa_inner_sQ.data(), dModel)) return false;
+        if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
+                s.scfa_qcompr.data(), m, Wk, dModel, 0.0f, s.scfa_inner_sK.data(), dModel)) return false;
+        if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
+                s.scfa_qcompr.data(), m, Wv, dModel, 0.0f, s.scfa_inner_sV.data(), dModel)) return false;
+        if (!glades::gpu::qknorm_forward_gpu(s.scfa_inner_sQ.data(), s.qknorm_invNorm.data(), k, nH, dH, 1e-6f)) return false;
+        if (!glades::gpu::qknorm_forward_gpu(s.scfa_inner_sK.data(), s.qknorm_invNorm.data(), k, nH, dH, 1e-6f)) return false;
+        if (!glades::gpu::scale_q_per_head(s.scfa_inner_sQ.data(), s.qknorm_gamma_scale.data() + (size_t)layer * nH, k, nH, dH)) return false;
+        if (!glades::gpu::flash_attention_cublas_tiled(
+                s.scfa_inner_sQ.data(), s.scfa_inner_sK.data(), s.scfa_inner_sV.data(),
+                k, nH, dH, dModel, /*causal=*/true,
+                s.scfa_inner_sO.data(), s.scfa_inner_sP.data())) return false;
+        if (!glades::gpu::sgemm_rowmajor(k, m, dModel, 1.0f,
+                s.scfa_inner_sO.data(), dModel, Wo, m, 0.0f, s.scfa_inner_p.data(), m)) return false;
+    }
+    else if (!glades::gpu::chiron_attention_shear_tiled(
+            s.scfa_qcompr.data(), s.scfa_inner_p.data(),
+            Wq, Wk, Wv, Wo,
+            k, m, nH, dH, /*causal=*/true, /*invert=*/false,
+            s.scfa_inner_sQ.data(), s.scfa_inner_sK.data(),
+            s.scfa_inner_sV.data(), s.scfa_inner_sO.data(),
+            s.scfa_inner_sP.data())) return false;
+    glades::gpu::device_memcpy_d2d(s.scfa_ycompr.data(), s.scfa_inner_p.data(),
+                                    sizeof(float) * km);
+    dbg_mag(layer, "q_par", s.scfa_qpar, Tm);
+    dbg_mag(layer, "q_perp", s.scfa_qperp, Tm);
+    dbg_mag(layer, "y_perp", s.scfa_yperp, Tm);
+    dbg_mag(layer, "y_compr", s.scfa_ycompr, km);
+
+    // 6. y_par[T, m] = B . y_compr[k, m].
+    if (!glades::gpu::sgemm_rowmajor(
+            T, m, k, 1.0f,
+            scfa.B.data(),          k,
+            s.scfa_ycompr.data(),   m,
+            0.0f,
+            s.scfa_ypar.data(),     m)) return false;
+
+    dbg_mag(layer, "y_par", s.scfa_ypar, Tm);
+
+    // 7-8. p +- (y_par + y_perp).
+    const float sign = invert ? -1.0f : 1.0f;
+    if (!glades::gpu::axpy(1.0f, s.scfa_yperp.data(), s.scfa_ypar.data(), (int)Tm)) return false;
+    if (!glades::gpu::axpy(sign, s.scfa_ypar.data(), s.p.data(), (int)Tm)) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// chiron_eval_forward — ported from chiron_infer.cpp forwardInfer (580-740).
+// The glades::gpu call sequence (including device_memcpy_d2d and .zero()) is
+// preserved verbatim; the later refactored-inference bit-parity gate depends
+// on it.  CHIRON_DBG env-gated debug blocks are kept.
+// ---------------------------------------------------------------------------
+
+bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
+                         const ChironServingConfig& cfg, ChironEvalScratch& s)
+{
+    const int T = d.T, m = d.m, V = d.V, L = d.L, nH = d.nH, dH = d.dH;
+
+    // Fuse is only active if requested AND the checkpoint provided per-layer params.
+    const bool applyFuse = cfg.fuseAttnPerLayer
+                           && !w.gamma_p.empty() && !w.beta_p.empty()
+                           && (int)w.gamma_p.size() == L && (int)w.beta_p.size() == L;
+    // 2026-07-03 divergence-fix vs chiron_infer's plain 1/sqrt(L): on the SCFA
+    // forward path the per-layer fuse alpha adopts the trainer's k/T-damped
+    // formula, replicated EXACTLY from glades-trainer chiron_main.cpp:13304-13306
+    // (non-SFA-swap SCFA branch):
+    //     alpha = (1/sqrt(L)) * (scfa_k / T)
+    // The dense path keeps the plain 1/sqrt(L).  NOTE: fuse-attn-per-layer is OFF
+    // for all production checkpoints (they serve --no-fuse-attn --fuse-attn-reln),
+    // so this does NOT affect the bit-parity gate; it aligns eval with training
+    // whenever per-layer fuse IS used.
+    float fuseAlpha = 0.0f;
+    if (applyFuse)
+    {
+        if (w.scfa.present)
+            fuseAlpha = (1.0f / std::sqrt((float)L)) * ((float)w.scfa.k / (float)T);
+        else
+            fuseAlpha = 1.0f / std::sqrt((float)L);
+    }
+
+    // q_0 = embed(tokens); p_0 = 0.
+    if (!glades::gpu::embedding_gather(w.E.data(), s.d_tokens.data(), T, V, m, s.q.data())) return false;
+    if (!s.p.zero()) return false;
+
+    if (std::getenv("CHIRON_DBG"))
+    {
+        std::vector<int> tk(T);
+        s.d_tokens.download(&tk[0], (size_t)T);
+        std::vector<float> qfull((size_t)T * m);
+        s.q.download(&qfull[0], (size_t)T * m);
+        const int positions[4] = {0, 5000, 10000, 16000};
+        for (int pi = 0; pi < 4; ++pi)
+        {
+            int pos = positions[pi]; if (pos >= T) pos = T - 1;
+            const float* row = &qfull[(size_t)pos * m];
+            std::printf("[dbg-embed] pos=%5d tok=%6d  q[0..4]=%.4g,%.4g,%.4g,%.4g,%.4g\n",
+                        pos, tk[pos], row[0], row[1], row[2], row[3], row[4]);
+        }
+    }
+
+    for (int l = 0; l < L; ++l)
+    {
+        if (w.scfa.present)
+        {
+            if (!scfa_shear_eval(s, w.scfa,
+                                 w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
+                                 l, T, m, nH, dH, /*invert=*/false, cfg.qkNorm)) return false;
+        }
+        else if (!glades::gpu::chiron_attention_shear_tiled(
+                s.q.data(), s.p.data(),
+                w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
+                T, m, nH, dH, /*causal=*/true, /*invert=*/false,
+                s.sQ.data(), s.sK.data(), s.sV.data(), s.sO.data(),
+                s.scratch_P.data())) return false;
+
+        // Single-layer fuse: at layer L-1 only, q += p BEFORE the final q-reln.
+        if (cfg.fuseAttnReln && l == L - 1)
+        {
+            if (!glades::gpu::axpy(1.0f, s.p.data(), s.q.data(), T * m)) return false;
+        }
+
+        // Paradigm #32 fuse-attn-per-layer: at every layer, before the q-reln,
+        //   p_norm = reln_p(p, gamma_p[l], beta_p[l]); q += fuseAlpha * p_norm.
+        if (applyFuse)
+        {
+            if (!glades::gpu::chiron_reln_forward(
+                    s.p.data(), s.p_norm.data(),
+                    s.stats_p.data() + (size_t)l * T * 2u,
+                    w.gamma_p[l]->data(), w.beta_p[l]->data(),
+                    T, m, cfg.epsReln)) return false;
+            if (!glades::gpu::axpy(fuseAlpha, s.p_norm.data(), s.q.data(), T * m)) return false;
+        }
+
+        // 2026-07-01: WhiSC-D coupling (CHRF bit 1024) — AFTER the attention shear
+        // + fuse and BEFORE the q-reln.  s_warm=1 (no warmup ramp), ema=1.0.
+        //   1. rot_coeffs: learned angle rot_phi[l] -> SORC coeffs (rot_a, rot_c)
+        //   2. update_stats (ema=1.0): per-channel a = clamp((E[q^2]/E[p^2])^0.25)
+        //   3. fold: absorb whitening into the coeffs (rot_a*=a^2, rot_c/=a^2)
+        //   4. rot_forward(+1): the folded 3-shear W^-1 R(theta) W in one pass, in place
+        if (cfg.whiscCoupling)
+        {
+            if (!glades::gpu::chiron_rot_coeffs(
+                    s.rotPhiGpu[l]->data(), cfg.rotThetaMax, /*s_warm=*/1.0f, m,
+                    s.rot_a.data(), s.rot_c.data())) return false;
+            if (!glades::gpu::chiron_whisc_update_stats(
+                    s.q.data(), s.p.data(), T, m,
+                    /*ema=*/1.0f, /*eps=*/1e-12f, cfg.whiscClamp,
+                    s.whisc_Pbar.data(), s.whisc_Qbar.data(), s.whisc_a.data())) return false;
+            if (!glades::gpu::chiron_whisc_fold_coeffs(
+                    s.rot_a.data(), s.rot_c.data(), s.whisc_a.data(), m)) return false;
+            if (!glades::gpu::chiron_rot_forward(
+                    s.q.data(), s.p.data(), s.rot_a.data(), s.rot_c.data(),
+                    /*sign=*/+1.0f, T, m)) return false;
+        }
+
+        if (!glades::gpu::chiron_reln_forward(
+                s.q.data(), s.q_tmp.data(),
+                s.stats.data() + (size_t)l * T * 2u,
+                w.gamma[l]->data(), w.beta[l]->data(),
+                T, m, cfg.epsReln)) return false;
+        glades::gpu::device_memcpy_d2d(s.q.data(), s.q_tmp.data(), sizeof(float) * T * m);
+
+        if (std::getenv("CHIRON_DBG"))
+        {
+            std::vector<float> hq(64), hp(64);
+            s.q.download(&hq[0], 64); s.p.download(&hp[0], 64);
+            float qmx=0,pmx=0; double qs=0,ps=0;
+            for (int i=0;i<64;++i){ qmx=std::max(qmx,std::fabs(hq[i])); pmx=std::max(pmx,std::fabs(hp[i])); qs+=std::fabs(hq[i]); ps+=std::fabs(hp[i]); }
+            std::printf("[dbg] L%02d  |q|max=%.4g mean=%.4g   |p|max=%.4g mean=%.4g   q[0..3]=%.3g,%.3g,%.3g,%.3g\n",
+                        l, qmx, qs/64, pmx, ps/64, hq[0],hq[1],hq[2],hq[3]);
+        }
+    }
+
+    // Readout: logits = q_L . E^T
+    if (!glades::gpu::sgemm_rowmajor_abt(
+        T, V, m, 1.0f,
+        s.q.data(), m, w.E.data(), m,
+        0.0f, s.logits.data(), V)) return false;
+    if (std::getenv("CHIRON_DBG"))
+    {
+        std::vector<float> lg(d.V);
+        s.logits.download(&lg[0], d.V);
+        int am=0; float mx=lg[0]; for (int v=1;v<d.V;++v) if(lg[v]>mx){mx=lg[v];am=v;}
+        double mean=0; for(int v=0;v<d.V;++v) mean+=lg[v];
+        std::printf("[dbg] logits[pos0]: max=%.4g argmax=%d mean=%.4g\n", mx, am, mean/d.V);
+    }
+    return true;
 }
 
 } // namespace chiron
