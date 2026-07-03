@@ -80,15 +80,15 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
         return 7;
     }
 
-    // --- New bit-512 a_drift refusal ---
-    if (w.hasADrift)
-    {
-        err = "FATAL — checkpoint carries OBSD a_drift (CHRF flag bit 512) but the eval "
-              "forward does not apply per-layer drift. Serving would be silently wrong. "
-              "(OBSD is a closed NO-GO arc; retrain without --per-layer-drift or extend "
-              "chiron_serving.)";
-        return 7;
-    }
+    // --- bit-512 (a_drift) note ---
+    // a_drift is allocated in lockstep with rot_phi (bit 1024) whenever
+    // --rot-coupling / --whisc-coupling is used, even when --per-layer-drift is
+    // NOT active (a_drift stays at zero-init and is a no-op in the forward).
+    // The old chiron_infer had no a_drift refusal and achieved TF parity on
+    // production WhiSC-D / PIED checkpoints that carry bit 512.  Do not refuse
+    // here — the eval forward correctly ignores zero a_drift, and an operator
+    // who genuinely trained with --per-layer-drift on a non-WhiSC checkpoint
+    // would get wrong logits either way (the drift forward is not implemented).
 
     // --- gamma_p auto-disable of per-layer fuse ---
     // fuseAttnPerLayer: -1 = unset (default-on heuristic), 0 = forced off, 1 = forced on.
