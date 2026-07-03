@@ -30,6 +30,7 @@
 #include <cstring>   // memcmp
 #include <cstdlib>   // strtod
 #include <stdint.h>
+#include <cmath>     // std::sin
 
 // ---------------------------------------------------------------------------
 // Task-1 goldens: std::uniform_real_distribution<double>(0,1)(std::mt19937(s))
@@ -300,10 +301,101 @@ void CHIRONMt19937GoldenTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 3: chiron_sample_token golden picks (G2 gate).
+// V=64 logits sin(0.37*i)*4, initial history {3,7,3,9,3,7}, 6 configs,
+// fresh ChironMt19937(1337) per config, 16 sequential picks each appended
+// to the history copy.
+// Goldens transcribed from:
+//   ~/dev/glades-trainer/logs/chiron-unify-goldens/gen/rng_and_sampler.txt
+//   lines 196-201 (cfg NAME: p0 p1 ... p15).
+// ---------------------------------------------------------------------------
+void CHIRONSamplerGoldenTest()
+{
+	const int V = 64;
+	std::vector<float> logits(V);
+	for (int i = 0; i < V; ++i)
+		logits[i] = (float)(std::sin(0.37 * i) * 4.0);
+
+	const int initHist[] = {3, 7, 3, 9, 3, 7};
+	const int nHist = 6;
+
+	// Struct holds one config + 16 golden picks.
+	struct SamplerCfg {
+		const char* name;
+		float  temperature;
+		int    topK;
+		float  topP;
+		int    repWindow;
+		float  repPenalty;
+		float  freqPenalty;
+		float  presPenalty;
+		int    noRepeatN;
+		int    golden[16];
+	};
+
+	// 6 configs from the task brief; goldens from rng_and_sampler.txt lines 196-201.
+	static const SamplerCfg kCfgs[] = {
+		// cfg defaults: 38 6 37 4 21 40 22 20 23 55 5 39 56 19 56 54
+		{ "defaults",       0.8f,  40, 0.95f, 256, 1.0f, 1.2f, 0.4f, 3,
+		  {38, 6, 37, 4, 21, 40, 22, 20, 23, 55, 5, 39, 56, 19, 56, 54} },
+		// cfg no-penalties: 37 5 37 3 6 38 21 19 20 54 4 21 40 5 55 54
+		{ "no-penalties",   0.8f,  40, 0.95f,   0, 1.0f, 0.0f, 0.0f, 0,
+		  {37, 5, 37, 3, 6, 38, 21, 19, 20, 54, 4, 21, 40, 5, 55, 54} },
+		// cfg topk1: 55 38 21 4 5 22 39 56 54 37 20 6 23 40 57 53
+		{ "topk1",          0.8f,   1, 0.95f, 256, 1.0f, 1.2f, 0.4f, 3,
+		  {55, 38, 21, 4, 5, 22, 39, 56, 54, 37, 20, 6, 23, 40, 57, 53} },
+		// cfg topp-only: 22 5 39 4 37 55 21 20 38 56 6 40 54 19 57 53
+		{ "topp-only",      0.8f,   0, 0.50f, 256, 1.0f, 1.2f, 0.4f, 3,
+		  {22, 5, 39, 4, 37, 55, 21, 20, 38, 56, 6, 40, 54, 19, 57, 53} },
+		// cfg hot-ngram2: 38 5 39 4 21 54 22 23 37 56 6 36 55 19 57 53
+		{ "hot-ngram2",     1.5f,   8, 1.00f, 256, 1.5f, 0.7f, 0.2f, 2,
+		  {38, 5, 39, 4, 21, 54, 22, 23, 37, 56, 6, 36, 55, 19, 57, 53} },
+		// cfg cold-heavy-pen: 38 5 37 4 21 54 38 22 5 55 4 21 39 5 55 38
+		{ "cold-heavy-pen", 0.2f,  64, 0.99f,   4, 1.0f, 2.0f, 1.0f, 0,
+		  {38, 5, 37, 4, 21, 54, 38, 22, 5, 55, 4, 21, 39, 5, 55, 38} },
+	};
+	const int nCfgs = 6;
+
+	for (int c = 0; c < nCfgs; ++c)
+	{
+		const SamplerCfg& sc = kCfgs[c];
+
+		// Build gen params, override relevant fields.
+		glades::chiron::ChironGenParams gp;
+		gp.temperature  = sc.temperature;
+		gp.topK         = sc.topK;
+		gp.topP         = sc.topP;
+		gp.repWindow    = sc.repWindow;
+		gp.repPenalty   = sc.repPenalty;
+		gp.freqPenalty  = sc.freqPenalty;
+		gp.presPenalty  = sc.presPenalty;
+		gp.noRepeatN    = sc.noRepeatN;
+
+		// Fresh RNG per config (seed 1337).
+		glades::chiron::ChironMt19937 rng(1337u);
+
+		// History copy, extended one pick at a time.
+		std::vector<int> hist(initHist, initHist + nHist);
+
+		for (int pick = 0; pick < 16; ++pick)
+		{
+			int got = glades::chiron::chiron_sample_token(logits, gp, hist, rng);
+			char msg[160];
+			std::sprintf(msg,
+				"sampler cfg=%s pick[%d]: got %d want %d",
+				sc.name, pick, got, sc.golden[pick]);
+			ASSERT(msg, got == sc.golden[pick]);
+			hist.push_back(got);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateUnitTest()
 {
 	CHIRONMt19937RawTest();
 	CHIRONMt19937GoldenTest();
+	CHIRONSamplerGoldenTest();
 }

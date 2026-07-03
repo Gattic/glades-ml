@@ -4,8 +4,10 @@
 
 #include "chiron_generate.h"
 
-#include <cstring>  // memset
-#include <cmath>    // nextafter
+#include <cstring>    // memset
+#include <cmath>      // nextafter, std::exp
+#include <algorithm>  // std::partial_sort, std::sort
+#include <vector>
 
 namespace glades {
 namespace chiron {
@@ -127,15 +129,135 @@ ChironGenParams::ChironGenParams()
 }
 
 // ---------------------------------------------------------------------------
-// chiron_sample_token — stub.
+// chiron_sample_token — verbatim port of chiron_infer::sampleToken (lines 80-182).
+// C++98: lambda comparators become functor structs.
 // ---------------------------------------------------------------------------
 
-int chiron_sample_token(const std::vector<float>& /*logitsIn*/,
-                        const ChironGenParams& /*gp*/,
-                        const std::vector<int>& /*context*/,
-                        ChironMt19937& /*rng*/)
+namespace {
+// Comparator: sort int indices by descending probability in p[].
+// Used by both std::partial_sort (top-k) and std::sort (top-p).
+struct CmpByProbDesc {
+    const std::vector<double>& p;
+    explicit CmpByProbDesc(const std::vector<double>& v) : p(v) {}
+    bool operator()(int a, int b) const { return p[a] > p[b]; }
+};
+} // anonymous namespace
+
+int chiron_sample_token(const std::vector<float>& logitsIn,
+                        const ChironGenParams& gp,
+                        const std::vector<int>& context,
+                        ChironMt19937& rng)
 {
-    return 0;
+    const int V = (int)logitsIn.size();
+
+    // Repetition handling over the last repWindow tokens of the context.
+    // Counters CHIRON's runaway repetition attractor (a generated token's logit
+    // climbs with each repeat). Frequency penalty (subtractive, xcount) is the
+    // key — it scales with the growing logit, unlike the multiplicative form.
+    std::vector<float> logits(logitsIn);
+    if (gp.repWindow > 0 &&
+        (gp.repPenalty != 1.0f || gp.freqPenalty != 0.0f || gp.presPenalty != 0.0f) &&
+        !context.empty())
+    {
+        std::vector<unsigned char> seen(V, 0);
+        int start = (int)context.size() - gp.repWindow;
+        if (start < 0) start = 0;
+        for (int i = start; i < (int)context.size(); ++i)
+        {
+            int v = context[i]; if (v < 0 || v >= V) continue;
+            logits[v] -= gp.freqPenalty;                 // per occurrence
+            if (!seen[v])
+            {
+                seen[v] = 1;
+                logits[v] -= gp.presPenalty;             // once if present
+                if (gp.repPenalty != 1.0f)
+                    logits[v] = (logits[v] > 0.0f)
+                                ? logits[v] / gp.repPenalty
+                                : logits[v] * gp.repPenalty;
+            }
+        }
+    }
+
+    // No-repeat n-gram: forbid any token that would re-form an n-gram already
+    // in the context. The robust cure for phrase loops the frequency penalty
+    // can't fully break.
+    if (gp.noRepeatN > 1 && (int)context.size() >= gp.noRepeatN)
+    {
+        const int plen = gp.noRepeatN - 1;
+        const int csz  = (int)context.size();
+        for (int i = 0; i + gp.noRepeatN <= csz; ++i)
+        {
+            bool match = true;
+            for (int j = 0; j < plen; ++j)
+                if (context[i + j] != context[csz - plen + j]) { match = false; break; }
+            if (match)
+            {
+                int b = context[i + plen];
+                if (b >= 0 && b < V) logits[b] = -1e30f;
+            }
+        }
+    }
+
+    // Apply temperature.
+    std::vector<float> adj(V);
+    const float invT = (gp.temperature > 0.0f) ? 1.0f / gp.temperature : 1.0f;
+    float maxL = -1e30f;
+    for (int i = 0; i < V; ++i)
+    {
+        adj[i] = logits[i] * invT;
+        if (adj[i] > maxL) maxL = adj[i];
+    }
+    // Softmax.
+    double Z = 0.0;
+    std::vector<double> p(V);
+    for (int i = 0; i < V; ++i) { p[i] = std::exp((double)(adj[i] - maxL)); Z += p[i]; }
+    for (int i = 0; i < V; ++i) p[i] /= Z;
+
+    // Top-K filter.
+    if (gp.topK > 0 && gp.topK < V)
+    {
+        std::vector<int> idx(V);
+        for (int i = 0; i < V; ++i) idx[i] = i;
+        CmpByProbDesc cmp(p);
+        std::partial_sort(idx.begin(), idx.begin() + gp.topK, idx.end(), cmp);
+        std::vector<double> kept(V, 0.0);
+        for (int i = 0; i < gp.topK; ++i) kept[idx[i]] = p[idx[i]];
+        double s = 0.0;
+        for (int i = 0; i < V; ++i) s += kept[i];
+        if (s > 0.0) for (int i = 0; i < V; ++i) kept[i] /= s;
+        p.swap(kept);
+    }
+
+    // Top-P (nucleus) filter.
+    if (gp.topP > 0.0f && gp.topP < 1.0f)
+    {
+        std::vector<int> idx(V);
+        for (int i = 0; i < V; ++i) idx[i] = i;
+        CmpByProbDesc cmp(p);
+        std::sort(idx.begin(), idx.end(), cmp);
+        double cum = 0.0;
+        std::vector<double> kept(V, 0.0);
+        for (int i = 0; i < V; ++i)
+        {
+            kept[idx[i]] = p[idx[i]];
+            cum += p[idx[i]];
+            if (cum >= (double)gp.topP) break;
+        }
+        double s = 0.0;
+        for (int i = 0; i < V; ++i) s += kept[i];
+        if (s > 0.0) for (int i = 0; i < V; ++i) kept[i] /= s;
+        p.swap(kept);
+    }
+
+    // Sample: single canonical draw + CDF walk.
+    double u = rng.next_canonical_double();
+    double cum = 0.0;
+    for (int i = 0; i < V; ++i)
+    {
+        cum += p[i];
+        if (u < cum) return i;
+    }
+    return V - 1;
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 // Individual cases.
 void CHIRONMt19937RawTest();     // core generator: seed 5489 -> published u32s
 void CHIRONMt19937GoldenTest();  // canonical doubles bit-exact vs Task-1 goldens
+void CHIRONSamplerGoldenTest();  // chiron_sample_token picks bit-exact vs G2 goldens
 
 // Aggregate entry point, wired into unit-tests/main.cpp as "chiron-generate".
 void CHIRONGenerateUnitTest();
