@@ -229,6 +229,16 @@ install(FILES
     "Backend/Machine Learning/GMath/wasserstein.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning/GMath")
 
+# Install the full ML public header tree (namespaced under include/glades/) so
+# downstream consumers (glades-trainer) compile against the installed headers
+# instead of vendored copies.  Layout preserves the "Backend/Machine Learning/…"
+# include convention.
+install(DIRECTORY "Backend/Machine Learning/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/glades/Backend/Machine Learning"
+    FILES_MATCHING PATTERN "*.h")
+target_include_directories(glades INTERFACE
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/glades>)
+
 #make fmt
 add_custom_target(fmt
 	COMMAND ./clang-format-all
