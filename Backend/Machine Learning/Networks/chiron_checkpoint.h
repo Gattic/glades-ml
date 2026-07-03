@@ -98,12 +98,41 @@ private:
 
 // ---- Block codecs (shared framing helpers) ----
 // Read n weight elements (fp32, or bf16 widened to fp32 when bf16OnDisk).
+// fp32buf is resized to n on success.
 bool chiron_read_block(std::FILE* fp, std::vector<float>& fp32buf, size_t n, bool bf16OnDisk);
-// Write n elements from fp32buf (as fp32, or truncation-rounded bf16).
+// Write n elements from fp32buf (as fp32, or RNE-rounded bf16).
 bool chiron_write_block(std::FILE* fp, const std::vector<float>& fp32buf, size_t n, bool bf16OnDisk);
-// Optimizer-group codecs (uint16 bf16 pairs / int8 quads / fp32 pairs), ported
-// verbatim from the trainer.  Exact signatures are fixed in Task 3 to match
-// the trainer originals (chiron_main.cpp:5584-5740) minus `static`.
+
+// ---- Optimizer-group codecs (ported from trainer chiron_main.cpp:5584-5740) ----
+// uint16 bf16 group: u32 count sentinel + n uint16 values.
+bool chiron_save_bf16_group_with_count(std::FILE* fp,
+                                       const glades::gpu::GpuBuffer<uint16_t>* buf,
+                                       size_t n);
+bool chiron_load_bf16_group_with_count(std::FILE* fp,
+                                       glades::gpu::GpuBuffer<uint16_t>* buf,
+                                       size_t expected_n);
+// int8 Adam group: u32 count_main, count_main*(int8+uint8), u32 count_scales, count_scales*(f32+f32).
+bool chiron_save_int8_adam_group(std::FILE* fp,
+                                 const glades::gpu::GpuBuffer<int8_t>*  mI,
+                                 const glades::gpu::GpuBuffer<uint8_t>* vI,
+                                 const glades::gpu::GpuBuffer<float>*   mS,
+                                 const glades::gpu::GpuBuffer<float>*   vS,
+                                 size_t n);
+bool chiron_load_int8_adam_group(std::FILE* fp,
+                                 glades::gpu::GpuBuffer<int8_t>*  mI,
+                                 glades::gpu::GpuBuffer<uint8_t>* vI,
+                                 glades::gpu::GpuBuffer<float>*   mS,
+                                 glades::gpu::GpuBuffer<float>*   vS,
+                                 size_t expected_n);
+// fp32 Adam group: u32 count + count*(float m) + count*(float v).
+bool chiron_save_fp32_adam_group(std::FILE* fp,
+                                 const glades::gpu::GpuBuffer<float>* mF,
+                                 const glades::gpu::GpuBuffer<float>* vF,
+                                 size_t n);
+bool chiron_load_fp32_adam_group(std::FILE* fp,
+                                 glades::gpu::GpuBuffer<float>* mF,
+                                 glades::gpu::GpuBuffer<float>* vF,
+                                 size_t expected_n);
 
 // ---- Header ----
 struct ChironCkptHeader

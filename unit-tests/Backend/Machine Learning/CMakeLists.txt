@@ -34,6 +34,7 @@ atlas-alt-bench.cpp
 vesta-test.cpp
 helios-test.cpp
 chiron-test.cpp
+chiron-model-test.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sfa-parity-test.cpp

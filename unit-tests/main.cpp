@@ -45,6 +45,7 @@
 #include "Backend/Machine Learning/vesta-test.h"
 #include "Backend/Machine Learning/helios-test.h"
 #include "Backend/Machine Learning/chiron-test.h"
+#include "Backend/Machine Learning/chiron-model-test.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
@@ -289,6 +290,8 @@ int main(int argc, char* argv[])
 		CHIRONPiedDualPParityTest();
 		CHIRONPiedDyDualParityTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-model") == 0)
+		CHIRONModelUnitTest();
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
 	    {
 		CHIRONSpectralNormTest();
