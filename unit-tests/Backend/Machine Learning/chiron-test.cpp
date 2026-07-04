@@ -19396,3 +19396,536 @@ void CHIRONPiedDyDualParityTest()
 	std::printf("  [PIED dy-dual parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// PACT — Profile Anti-Cancellation Tax (2026-07-04).  E1 reference math:
+// gate goldens, exact orthogonality, FD gradient correspondence (unclamped),
+// Huber clamp path, rho-independence, scale-freedom.
+// ---------------------------------------------------------------------------
+
+// Frozen-chi penalty value for one (t,i): chi held at chiFrozen, A recomputed
+// from u (Dsq is frozen — independent of u).  Used only by the FD check.
+static double pact_value_frozen(const float* u, const float* Dcol, int L,
+                                float sigma, float kappa, float chiFrozen)
+{
+	float A = 0.0f, Dsq = 0.0f;
+	for (int l = 0; l < L; ++l) { A += Dcol[l] * u[l]; Dsq += Dcol[l] * Dcol[l]; }
+	const float sg = (sigma > glades::chiron::PACT_EPS0) ? sigma : glades::chiron::PACT_EPS0;
+	double acc = 0.0;
+	for (int l = 0; l < L; ++l)
+	{
+		const float res = u[l] - A * Dcol[l] / Dsq;
+		acc += (double)glades::chiron::chiron_pact_huber(res / sg, kappa);
+	}
+	return (double)chiFrozen * acc / (double)Dsq;
+}
+
+void CHIRONPactRefMathTest()
+{
+	using namespace glades::chiron;
+
+	// (a) Gate goldens (M0-probe hand values).
+	// u = {+1,-1}, D = 1, L = 2: A = 0, M = 2, Dsq = 2, sigma = 1:
+	//   chi = (4-0)/(4 + 1*2*1) = 4/6 = 2/3.
+	{
+		const float chi = chiron_pact_chi(0.0f, 2.0f, 2.0f, 1.0f, 1);
+		std::printf("  [PACT gate] pure-pair chi=%.6f (expect 0.6667)\n", chi);
+		ASSERT("PACT pure-cancel gate != 2/3", fabsf(chi - 2.0f / 3.0f) < 1e-5f);
+	}
+	// One-hot u = {c,0}: M = |A| => chi = 0 exactly.
+	{
+		const float u[2] = { 1.7f, 0.0f }, D[2] = { 0.97f, 0.98f };
+		float A, M, Dsq; chiron_pact_profile_reduce(u, D, 2, &A, &M, &Dsq);
+		const float chi = chiron_pact_chi(A, M, Dsq, 0.5f, 1);
+		ASSERT("PACT one-hot gate != 0", chi == 0.0f);
+	}
+	// Sign-consistent (all same sign): M = |A| => chi = 0.
+	{
+		const float u[4] = { 0.3f, 1.1f, 0.05f, 0.7f }, D[4] = { 0.95f, 0.96f, 0.98f, 1.0f };
+		float A, M, Dsq; chiron_pact_profile_reduce(u, D, 4, &A, &M, &Dsq);
+		const float chi = chiron_pact_chi(A, M, Dsq, 0.4f, 1);
+		std::printf("  [PACT gate] sign-consistent chi=%.3e (expect 0)\n", chi);
+		ASSERT("PACT sign-consistent gate != 0", chi < 1e-6f);
+	}
+	// Dead-zone: tiny mass releases the gate (M^2 << epsM*Dsq*sigma^2).
+	{
+		const float u[2] = { 1e-9f, -1e-9f }, D[2] = { 1.0f, 1.0f };
+		float A, M, Dsq; chiron_pact_profile_reduce(u, D, 2, &A, &M, &Dsq);
+		const float chi = chiron_pact_chi(A, M, Dsq, 1.0f, 1);
+		ASSERT("PACT dead-zone gate not released", chi < 1e-12f);
+	}
+	// Gate off => chi == 1 regardless.
+	ASSERT("PACT gate-off chi != 1", chiron_pact_chi(0.0f, 2.0f, 2.0f, 1.0f, 0) == 1.0f);
+
+	// (b) Exact orthogonality (unclamped): sum_l D_l * g_l == 0 for random
+	// profiles with D in [0.945, 1].  coef arbitrary; kappa huge (no clamp).
+	{
+		const int L = 24;
+		LCG rng(0x9111u);
+		float u[24], D[24], g[24];
+		double worst = 0.0;
+		for (int trial = 0; trial < 64; ++trial)
+		{
+			for (int l = 0; l < L; ++l)
+			{
+				u[l] = 2.0f * rng.next_unit();
+				D[l] = 0.945f + 0.055f * (0.5f * (rng.next_unit() + 1.0f));
+			}
+			chiron_pact_field_L(u, D, L, /*sigma=*/0.7f, /*coef=*/2.0f,
+			                    /*kappa=*/1e9f, /*gateOn=*/1, g);
+			double dot = 0.0, nrm = 0.0;
+			for (int l = 0; l < L; ++l) { dot += (double)D[l] * g[l]; nrm += (double)g[l] * g[l]; }
+			const double rel = (nrm > 0.0) ? fabs(dot) / sqrt(nrm) : fabs(dot);
+			if (rel > worst) worst = rel;
+		}
+		std::printf("  [PACT orthogonality] max |sum D*g|/||g|| = %.2e (bar 1e-5)\n", worst);
+		ASSERT("PACT field not orthogonal to damping dir (unclamped)", worst < 1e-5);
+	}
+
+	// (c) FD gradient correspondence (unclamped): with coef = 2 the field is
+	// exactly d/du_l of the frozen-chi penalty value (A differentiated, chi
+	// frozen).  Central difference, eps = 1e-3.
+	{
+		const int L = 24;
+		LCG rng(0x5150u);
+		float u[24], D[24], g[24];
+		double worst = 0.0;
+		for (int trial = 0; trial < 20; ++trial)
+		{
+			for (int l = 0; l < L; ++l)
+			{
+				u[l] = 1.5f * rng.next_unit();
+				D[l] = 0.945f + 0.055f * (0.5f * (rng.next_unit() + 1.0f));
+			}
+			const float sigma = 0.6f;
+			float A, M, Dsq; chiron_pact_profile_reduce(u, D, L, &A, &M, &Dsq);
+			const float chiFrozen = chiron_pact_chi(A, M, Dsq, sigma, 1);
+			chiron_pact_field_L(u, D, L, sigma, /*coef=*/2.0f, /*kappa=*/1e9f, 1, g);
+			double gmax = 0.0;
+			for (int l = 0; l < L; ++l) if (fabs((double)g[l]) > gmax) gmax = fabs((double)g[l]);
+			for (int l = 0; l < L; ++l)
+			{
+				const float eps = 1e-3f;
+				float up[24]; for (int j = 0; j < L; ++j) up[j] = u[j];
+				up[l] = u[l] + eps;
+				const double vp = pact_value_frozen(up, D, L, sigma, 1e9f, chiFrozen);
+				up[l] = u[l] - eps;
+				const double vm = pact_value_frozen(up, D, L, sigma, 1e9f, chiFrozen);
+				const double fd = (vp - vm) / (2.0 * (double)eps);
+				const double d = fabs(fd - (double)g[l]);
+				if (d > worst) worst = d;
+			}
+			(void)gmax;
+		}
+		std::printf("  [PACT FD gradient] max|g_fd - g_ref| = %.2e (bar 1e-3)\n", worst);
+		ASSERT("PACT field != gradient of value (unclamped)", worst < 1e-3);
+	}
+
+	// (d) Huber clamp path: at kappa = 0.5 the field saturates at
+	// coef*chi*kappa/(Dsq*sigma) where |res/sigma| > kappa; value uses the
+	// linear Huber tail.  Check field matches the closed form and that
+	// orthogonality degrades but stays bounded by the clamp-tail.
+	{
+		const int L = 8;
+		const float u[8] = { 3.0f, -3.0f, 0.1f, -0.05f, 2.0f, -2.0f, 0.02f, -0.03f };
+		float D[8]; for (int l = 0; l < L; ++l) D[l] = 0.95f + 0.006f * l;
+		const float sigma = 0.3f, kappa = 0.5f, coef = 2.0f;
+		float A, M, Dsq; chiron_pact_profile_reduce(u, D, L, &A, &M, &Dsq);
+		const float chi = chiron_pact_chi(A, M, Dsq, sigma, 1);
+		int clamped = 0;
+		float g[8];
+		chiron_pact_field_L(u, D, L, sigma, coef, kappa, 1, g);
+		for (int l = 0; l < L; ++l)
+		{
+			const float res = u[l] - A * D[l] / Dsq;
+			float rc = res / sigma; if (rc > kappa) rc = kappa; if (rc < -kappa) rc = -kappa;
+			if (fabsf(res / sigma) > kappa) ++clamped;
+			const float gexp = coef * chi * rc / (Dsq * sigma);
+			ASSERT("PACT clamped field != closed form", fabsf(g[l] - gexp) < 1e-5f);
+		}
+		std::printf("  [PACT Huber clamp] %d/%d elems clamped; field matches closed form\n", clamped, L);
+		ASSERT("PACT clamp path did not exercise clamps", clamped >= 2);
+	}
+
+	// (e) rho-independence: the field is a pure function of (u, D, sigma).  A
+	// synthetic p-magnitude rho = 45 is not an input; recomputing with the
+	// identical (u,D,sigma) yields byte-identical g.  Structural documentation
+	// assert (there is no rho in the API to vary).
+	{
+		const int L = 24;
+		LCG rng(0x2024u);
+		float u[24], D[24], g1[24], g2[24];
+		for (int l = 0; l < L; ++l) { u[l] = rng.next_unit(); D[l] = 0.95f + 0.05f * (0.5f*(rng.next_unit()+1.0f)); }
+		chiron_pact_field_L(u, D, L, 0.5f, 2.0f, 4.0f, 1, g1);
+		chiron_pact_field_L(u, D, L, 0.5f, 2.0f, 4.0f, 1, g2); // 'rho'-agnostic recompute
+		for (int l = 0; l < L; ++l) ASSERT("PACT field not rho-independent/deterministic", g1[l] == g2[l]);
+	}
+
+	// (f) scale-freedom: chi is invariant and g scales as 1/c under
+	// u -> c*u, sigma -> c*sigma (c = 32).  Field g(cu, c sigma) == g(u,sigma)/c.
+	{
+		const int L = 16;
+		LCG rng(0x3333u);
+		float u[16], cu[16], D[16], g[16], gc[16];
+		const float c = 32.0f;
+		for (int l = 0; l < L; ++l) { u[l] = 2.0f*rng.next_unit(); cu[l] = c*u[l]; D[l] = 0.95f + 0.05f*(0.5f*(rng.next_unit()+1.0f)); }
+		float A, M, Dsq; chiron_pact_profile_reduce(u, D, L, &A, &M, &Dsq);
+		float Ac, Mc, Dsqc; chiron_pact_profile_reduce(cu, D, L, &Ac, &Mc, &Dsqc);
+		const float chi = chiron_pact_chi(A, M, Dsq, 0.5f, 1);
+		const float chic = chiron_pact_chi(Ac, Mc, Dsqc, c * 0.5f, 1);
+		ASSERT("PACT gate not scale-invariant", fabsf(chi - chic) < 1e-5f);
+		chiron_pact_field_L(u, D, L, 0.5f, 2.0f, 1e9f, 1, g);       // unclamped
+		chiron_pact_field_L(cu, D, L, c * 0.5f, 2.0f, 1e9f, 1, gc);
+		double worst = 0.0;
+		for (int l = 0; l < L; ++l)
+		{
+			const double d = fabs((double)gc[l] - (double)g[l] / (double)c);
+			const double sc = fabs((double)g[l] / (double)c) + 1e-6;
+			if (d / sc > worst) worst = d / sc;
+		}
+		std::printf("  [PACT scale-freedom] max rel |g(cu,c s) - g(u,s)/c| = %.2e (bar 1e-4)\n", worst);
+		ASSERT("PACT field not degree(-1) homogeneous", worst < 1e-4);
+	}
+
+	std::printf("  [PACT ref math] all reference-level asserts PASS\n");
+}
+
+void CHIRONPactDampSigmaParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PACT damp/sigma parity] no CUDA device — skipped\n");
+		return;
+	}
+	using namespace glades::chiron;
+	const int L = 24, m = 64;
+	const float thetaMax = 0.07f;
+	LCG rng(0x7A57u);
+	std::vector<float> phiFlat((size_t)L * m);
+	std::vector<const float*> phiPtr(L);
+	for (int l = 0; l < L; ++l)
+	{
+		for (int i = 0; i < m; ++i) phiFlat[(size_t)l * m + i] = 2.0f * rng.next_unit();
+		phiPtr[l] = &phiFlat[(size_t)l * m];
+	}
+
+	// CPU reference D/Dsq/D1.
+	std::vector<float> Dref((size_t)L * m), DsqRef(m), D1Ref(m);
+	chiron_pact_damp_ref(&phiPtr[0], L, m, thetaMax, &Dref[0], &DsqRef[0], &D1Ref[0]);
+
+	// GPU: cos rows then finalize.
+	glades::gpu::GpuBuffer<float> dPhi, dCos, dD, dDsq, dD1;
+	dPhi.allocate((size_t)L * m); dPhi.upload(&phiFlat[0], (size_t)L * m);
+	dCos.allocate((size_t)L * m);
+	for (int l = 0; l < L; ++l)
+		glades::gpu::chiron_pact_cos_row(dPhi.data() + (size_t)l * m, thetaMax,
+		                                 dCos.data() + (size_t)l * m, m);
+	dD.allocate((size_t)L * m); dDsq.allocate(m); dD1.allocate(m);
+	glades::gpu::chiron_pact_damp_finalize(dCos.data(), L, m, dD.data(), dDsq.data(), dD1.data());
+	std::vector<float> Dg((size_t)L * m), DsqG(m), D1G(m);
+	dD.download(&Dg[0], (size_t)L * m); dDsq.download(&DsqG[0], m); dD1.download(&D1G[0], m);
+	float wD = 0.0f, wS = 0.0f, w1 = 0.0f;
+	for (size_t j = 0; j < Dg.size(); ++j) wD = fmaxf(wD, fabsf(Dg[j] - Dref[j]));
+	for (int i = 0; i < m; ++i) { wS = fmaxf(wS, fabsf(DsqG[i] - DsqRef[i])); w1 = fmaxf(w1, fabsf(D1G[i] - D1Ref[i])); }
+	std::printf("  [PACT damp parity] maxErr D=%.2e Dsq=%.2e D1=%.2e (bar 1e-5)\n", wD, wS, w1);
+	ASSERT("PACT D table CPU/GPU mismatch", wD < 1e-5f);
+	ASSERT("PACT Dsq CPU/GPU mismatch", wS < 1e-4f);
+	ASSERT("PACT D1 CPU/GPU mismatch", w1 < 1e-4f);
+
+	// sigma update: firstTouch then one EMA step.
+	const int T = 32;
+	std::vector<float> Macc((size_t)T * m);
+	for (size_t j = 0; j < Macc.size(); ++j) Macc[j] = 0.5f * (rng.next_unit() + 1.2f); // positive
+	glades::gpu::GpuBuffer<float> dMacc, dSigma;
+	dMacc.allocate((size_t)T * m); dMacc.upload(&Macc[0], (size_t)T * m);
+	dSigma.allocate(m);
+	const float beta = 0.05f, eps0 = PACT_EPS0;
+	// CPU ref.
+	std::vector<float> sigRef(m);
+	for (int i = 0; i < m; ++i)
+	{
+		double acc = 0.0; for (int t = 0; t < T; ++t) acc += (double)Macc[(size_t)t * m + i];
+		float s = (float)((acc / (double)T) / (double)D1Ref[i]);
+		sigRef[i] = (s < eps0) ? eps0 : s;
+	}
+	glades::gpu::chiron_pact_sigma_update(dMacc.data(), dD1.data(), T, m, beta, eps0, /*firstTouch=*/1, dSigma.data());
+	std::vector<float> sigG(m); dSigma.download(&sigG[0], m);
+	float wSig = 0.0f;
+	for (int i = 0; i < m; ++i) wSig = fmaxf(wSig, fabsf(sigG[i] - sigRef[i]) / (1.0f + fabsf(sigRef[i])));
+	std::printf("  [PACT sigma firstTouch] maxRelErr=%.2e (bar 1e-5)\n", wSig);
+	ASSERT("PACT sigma firstTouch CPU/GPU mismatch", wSig < 1e-5f);
+	// One EMA step (reuse same Macc): sigRef2 = (1-beta)*sigRef + beta*sigRef = sigRef (same input),
+	// so perturb Macc x1.5 to make it meaningful.
+	for (size_t j = 0; j < Macc.size(); ++j) Macc[j] *= 1.5f;
+	dMacc.upload(&Macc[0], (size_t)T * m);
+	std::vector<float> sigRef2(m);
+	for (int i = 0; i < m; ++i)
+	{
+		double acc = 0.0; for (int t = 0; t < T; ++t) acc += (double)Macc[(size_t)t * m + i];
+		float s = (float)((acc / (double)T) / (double)D1Ref[i]);
+		float v = (1.0f - beta) * sigRef[i] + beta * s;
+		sigRef2[i] = (v < eps0) ? eps0 : v;
+	}
+	glades::gpu::chiron_pact_sigma_update(dMacc.data(), dD1.data(), T, m, beta, eps0, /*firstTouch=*/0, dSigma.data());
+	dSigma.download(&sigG[0], m);
+	float wSig2 = 0.0f;
+	for (int i = 0; i < m; ++i) wSig2 = fmaxf(wSig2, fabsf(sigG[i] - sigRef2[i]) / (1.0f + fabsf(sigRef2[i])));
+	std::printf("  [PACT sigma EMA step] maxRelErr=%.2e (bar 1e-5)\n", wSig2);
+	ASSERT("PACT sigma EMA CPU/GPU mismatch", wSig2 < 1e-5f);
+#else
+	std::printf("  [PACT damp/sigma parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+void CHIRONPactCommitParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PACT commit parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T = 128, m = 64, n = T * m;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(1337u ^ 0x50414354u);
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+	const unsigned int srSeed = 0xBEEF01u, srStep = 3u;
+
+	std::vector<float> p0(n), ypar(n), yperp(n), Drow(m);
+	LCG rng(0x1234u);
+	for (int i = 0; i < n; ++i) { p0[i] = 45.0f * rng.next_unit(); ypar[i] = rng.next_unit(); yperp[i] = 0.3f * rng.next_unit(); }
+	for (int i = 0; i < m; ++i) Drow[i] = 0.945f + 0.055f * (0.5f * (rng.next_unit() + 1.0f));
+
+	glades::gpu::GpuBuffer<float> dP_ref, dP_pact, dA, dB, dDrow, dAacc, dMacc;
+	glades::gpu::GpuBuffer<unsigned short> dPbf_ref, dPbf_pact;
+	dA.allocate(n); dA.upload(&ypar[0], n);
+	dB.allocate(n); dB.upload(&yperp[0], n);
+	dDrow.allocate(m); dDrow.upload(&Drow[0], m);
+	dP_ref.allocate(n); dP_ref.upload(&p0[0], n); dPbf_ref.allocate(n);
+	dP_pact.allocate(n); dP_pact.upload(&p0[0], n); dPbf_pact.allocate(n);
+	dAacc.allocate(n); dAacc.zero(); dMacc.allocate(n); dMacc.zero();
+
+	// Reference (non-PACT) fused commit.
+	glades::gpu::chiron_scfa_axpy2_masked_dual_p(dP_ref.data(), dPbf_ref.data(), +1.0f,
+	    dA.data(), dB.data(), n, key, thr, 0.0f, hi, srSeed, srStep);
+	// PACT variant — same eta/SR sequence.
+	glades::gpu::chiron_scfa_axpy2_masked_dual_p_pact(dP_pact.data(), dPbf_pact.data(), +1.0f,
+	    dA.data(), dB.data(), n, m, key, thr, 0.0f, hi, srSeed, srStep,
+	    dDrow.data(), dAacc.data(), dMacc.data());
+
+	std::vector<float> pRef(n), pPact(n); std::vector<unsigned short> bRef(n), bPact(n);
+	dP_ref.download(&pRef[0], n); dP_pact.download(&pPact[0], n);
+	dPbf_ref.download(&bRef[0], n); dPbf_pact.download(&bPact[0], n);
+	unsigned pDiff = 0, bDiff = 0;
+	for (int i = 0; i < n; ++i) { if (pRef[i] != pPact[i]) ++pDiff; if (bRef[i] != bPact[i]) ++bDiff; }
+	std::printf("  [PACT commit p-parity] fp32Diff=%u bf16Diff=%u (bar 0/0)\n", pDiff, bDiff);
+	ASSERT("PACT commit fp32 output != non-PACT kernel", pDiff == 0);
+	ASSERT("PACT commit bf16 mirror != non-PACT kernel", bDiff == 0);
+
+	// A/M accumulation vs CPU (single layer).
+	std::vector<float> Ag(n), Mg(n); dAacc.download(&Ag[0], n); dMacc.download(&Mg[0], n);
+	float wA = 0.0f, wM = 0.0f;
+	for (int i = 0; i < n; ++i)
+	{
+		const float u = ypar[i] + yperp[i];
+		const float d = Drow[i % m];
+		wA = fmaxf(wA, fabsf(Ag[i] - d * u));
+		wM = fmaxf(wM, fabsf(Mg[i] - d * fabsf(u)));
+	}
+	std::printf("  [PACT commit A/M] maxErr A=%.2e M=%.2e (bar 1e-4)\n", wA, wM);
+	ASSERT("PACT A accumulation mismatch", wA < 1e-4f);
+	ASSERT("PACT M accumulation mismatch", wM < 1e-4f);
+
+	// Two sequential layers accumulate (same buffers, second layer different Drow).
+	std::vector<float> ypar2(n), Drow2(m);
+	for (int i = 0; i < n; ++i) ypar2[i] = rng.next_unit();
+	for (int i = 0; i < m; ++i) Drow2[i] = 0.945f + 0.055f * (0.5f * (rng.next_unit() + 1.0f));
+	glades::gpu::GpuBuffer<float> dA2, dDrow2; glades::gpu::GpuBuffer<unsigned short> dbf2;
+	dA2.allocate(n); dA2.upload(&ypar2[0], n);
+	dDrow2.allocate(m); dDrow2.upload(&Drow2[0], m); dbf2.allocate(n);
+	glades::gpu::chiron_scfa_axpy2_masked_dual_p_pact(dP_pact.data(), dbf2.data(), +1.0f,
+	    dA2.data(), dB.data(), n, m, key, thr, 0.0f, hi, srSeed, srStep + 1u,
+	    dDrow2.data(), dAacc.data(), dMacc.data());
+	dAacc.download(&Ag[0], n); dMacc.download(&Mg[0], n);
+	float wA2 = 0.0f;
+	for (int i = 0; i < n; ++i)
+	{
+		const float u1 = ypar[i] + yperp[i], u2 = ypar2[i] + yperp[i];
+		const float expA = Drow[i % m] * u1 + Drow2[i % m] * u2;
+		wA2 = fmaxf(wA2, fabsf(Ag[i] - expA));
+	}
+	std::printf("  [PACT commit 2-layer accum] maxErr A=%.2e (bar 1e-4)\n", wA2);
+	ASSERT("PACT 2-layer A accumulation mismatch", wA2 < 1e-4f);
+#else
+	std::printf("  [PACT commit parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+void CHIRONPactFieldParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [PACT field parity] no CUDA device — skipped\n");
+		return;
+	}
+	using namespace glades::chiron;
+	const int L = 24, T = 8, m = 16, n = T * m;
+	const unsigned int key = glades::chiron::chiron_pied_mix32(2024u ^ 0x50414354u);
+	const float pi = 0.1f;
+	const unsigned int thr = (unsigned int)(pi * 4294967296.0);
+	const float hi = 1.0f / (1.0f - pi);
+	LCG rng(0x9A9Au);
+
+	// Per-layer increments (a = u, b = 0), damping, A/M on host.
+	std::vector< std::vector<float> > u(L, std::vector<float>(n));
+	std::vector<float> Drow((size_t)L * m), Dsq(m), D1(m), sigma(m);
+	for (int i = 0; i < m; ++i)
+	{
+		float dsq = 0.0f, d1 = 0.0f;
+		for (int l = 0; l < L; ++l)
+		{
+			const float d = 0.945f + 0.055f * (0.5f * (rng.next_unit() + 1.0f));
+			Drow[(size_t)l * m + i] = d; dsq += d * d; d1 += d;
+		}
+		Dsq[i] = dsq; D1[i] = d1; sigma[i] = 0.4f + 0.3f * (0.5f * (rng.next_unit() + 1.0f));
+	}
+	std::vector<float> A(n, 0.0f), M(n, 0.0f);
+	for (int l = 0; l < L; ++l)
+		for (int idx = 0; idx < n; ++idx)
+		{
+			u[l][idx] = 1.5f * rng.next_unit();
+			const float d = Drow[(size_t)l * m + (idx % m)];
+			A[idx] += d * u[l][idx];
+			M[idx] += d * fabsf(u[l][idx]);
+		}
+
+	glades::gpu::GpuBuffer<float> dSrc, dA, dB, dAacc, dMacc, dDrow, dDsq, dSig, dDst;
+	glades::gpu::GpuBuffer<unsigned short> dDstBf;
+	std::vector<float> zeros(n, 0.0f);
+	dSrc.allocate(n); dSrc.upload(&zeros[0], n);       // src = 0 => dyt = 0, dst = pure field
+	dB.allocate(n); dB.upload(&zeros[0], n);           // b = 0
+	dAacc.allocate(n); dAacc.upload(&A[0], n);
+	dMacc.allocate(n); dMacc.upload(&M[0], n);
+	dDrow.allocate((size_t)L * m); dDrow.upload(&Drow[0], (size_t)L * m);
+	dDsq.allocate(m); dDsq.upload(&Dsq[0], m);
+	dSig.allocate(m); dSig.upload(&sigma[0], m);
+	dA.allocate(n); dDst.allocate(n); dDstBf.allocate(n);
+
+	const float coef = 2.0f, epsM = PACT_EPSM, eps0 = PACT_EPS0;
+
+	// (i) coef = 0 => dst bit-identical to chiron_incdrop_scale_copy_dual on a
+	// nonzero src.
+	{
+		std::vector<float> src(n); for (int i = 0; i < n; ++i) src[i] = rng.next_unit();
+		glades::gpu::GpuBuffer<float> dS2, dRef; glades::gpu::GpuBuffer<unsigned short> dRefBf, dPactBf;
+		dS2.allocate(n); dS2.upload(&src[0], n);
+		dRef.allocate(n); dRefBf.allocate(n); dPactBf.allocate(n);
+		dA.upload(&u[0][0], n); // a = layer-0 u (irrelevant at coef 0)
+		glades::gpu::chiron_incdrop_scale_copy_dual(dRef.data(), dRefBf.data(), +1.0f, dS2.data(), n, key, thr, 0.0f, hi);
+		glades::gpu::chiron_incdrop_scale_copy_dual_pact(dDst.data(), dPactBf.data(), +1.0f, dS2.data(),
+		    dA.data(), dB.data(), dAacc.data(), dMacc.data(), dDrow.data(), dDsq.data(), dSig.data(),
+		    /*coef=*/0.0f, /*kappa=*/4.0f, epsM, eps0, /*gateOn=*/1, n, m, key, thr, 0.0f, hi, /*stats4=*/0);
+		std::vector<float> vr(n), vp(n); std::vector<unsigned short> br(n), bp(n);
+		dRef.download(&vr[0], n); dDst.download(&vp[0], n); dRefBf.download(&br[0], n); dPactBf.download(&bp[0], n);
+		// At coef=0 the field g==+0.0f, so out=dyt+0.0f is numerically identical
+		// to dyt EXCEPT it normalizes -0.0f -> +0.0f (eta=0 on a negative src).
+		// fp32 compares equal (-0.0f == +0.0f); the only admissible bf16 diff is
+		// the zero-sign bit (both decode to numeric 0).  coef=0 is a defensive
+		// path — production always dispatches with coef>0.
+		unsigned d = 0, dbSignZero = 0, dbReal = 0;
+		for (int i = 0; i < n; ++i)
+		{
+			if (vr[i] != vp[i]) ++d;
+			if (br[i] != bp[i])
+			{
+				const bool bothZero = ((br[i] & 0x7FFFu) == 0) && ((bp[i] & 0x7FFFu) == 0);
+				if (bothZero) ++dbSignZero; else ++dbReal;
+			}
+		}
+		std::printf("  [PACT field coef=0] fp32Diff=%u bf16 signZeroDiff=%u realDiff=%u (bar 0/*/0)\n",
+		            d, dbSignZero, dbReal);
+		ASSERT("PACT coef=0 field not numerically identity vs non-PACT dy", d == 0);
+		ASSERT("PACT coef=0 bf16 mirror differs beyond sign-of-zero", dbReal == 0);
+	}
+
+	// (ii)+(iii)+(v) per-layer GPU field vs CPU ref, and in-vivo orthogonality.
+	std::vector<float> gAll((size_t)L * n); // gAll[l*n + idx]
+	for (int gate = 1; gate >= 0; --gate) // gate=1 then gateOff
+	{
+		float worst = 0.0f;
+		for (int l = 0; l < L; ++l)
+		{
+			dA.upload(&u[l][0], n);
+			glades::gpu::chiron_incdrop_scale_copy_dual_pact(dDst.data(), dDstBf.data(), +1.0f, dSrc.data(),
+			    dA.data(), dB.data(), dAacc.data(), dMacc.data(), dDrow.data() + (size_t)l * m,
+			    dDsq.data(), dSig.data(), coef, /*kappa=*/1e9f, epsM, eps0, gate, n, m, key, thr, 0.0f, hi, 0);
+			std::vector<float> g(n); dDst.download(&g[0], n);
+			for (int idx = 0; idx < n; ++idx)
+			{
+				const int i = idx % m;
+				const float gexp = chiron_pact_field(u[l][idx], A[idx], M[idx],
+				    Drow[(size_t)l * m + i], Dsq[i], sigma[i], coef, 1e9f, gate);
+				worst = fmaxf(worst, fabsf(g[idx] - gexp));
+				if (gate == 1) gAll[(size_t)l * n + idx] = g[idx];
+			}
+		}
+		std::printf("  [PACT field vs CPU ref gate=%d] maxErr=%.2e (bar 1e-4)\n", gate, worst);
+		ASSERT("PACT GPU field != CPU ref", worst < 1e-4f);
+	}
+	// (iii) in-vivo orthogonality: sum_l Drow[l,i]*g[l] per (t,i), gate=1, unclamped.
+	{
+		float worst = 0.0f;
+		for (int idx = 0; idx < n; ++idx)
+		{
+			const int i = idx % m;
+			double dot = 0.0, nrm = 0.0;
+			for (int l = 0; l < L; ++l)
+			{
+				const float g = gAll[(size_t)l * n + idx];
+				dot += (double)Drow[(size_t)l * m + i] * g;
+				nrm += (double)g * g;
+			}
+			const float rel = (nrm > 0.0) ? (float)(fabs(dot) / sqrt(nrm)) : (float)fabs(dot);
+			worst = fmaxf(worst, rel);
+		}
+		std::printf("  [PACT field in-vivo orthogonality] max |sum D*g|/||g|| = %.2e (bar 1e-4)\n", worst);
+		ASSERT("PACT in-vivo field not orthogonal to damping dir", worst < 1e-4f);
+	}
+
+	// (iv) clamp path + stats4: kappa = 0.5 forces clamps; check clamp count and
+	// that field matches the clamped CPU ref.
+	{
+		const float kappa = 0.5f;
+		glades::gpu::GpuBuffer<float> dStats; dStats.allocate(4); dStats.zero();
+		long cpuClamped = 0; float worst = 0.0f;
+		for (int l = 0; l < L; ++l)
+		{
+			dA.upload(&u[l][0], n);
+			glades::gpu::chiron_incdrop_scale_copy_dual_pact(dDst.data(), dDstBf.data(), +1.0f, dSrc.data(),
+			    dA.data(), dB.data(), dAacc.data(), dMacc.data(), dDrow.data() + (size_t)l * m,
+			    dDsq.data(), dSig.data(), coef, kappa, epsM, eps0, /*gateOn=*/1, n, m, key, thr, 0.0f, hi, dStats.data());
+			std::vector<float> g(n); dDst.download(&g[0], n);
+			for (int idx = 0; idx < n; ++idx)
+			{
+				const int i = idx % m;
+				const float gexp = chiron_pact_field(u[l][idx], A[idx], M[idx],
+				    Drow[(size_t)l * m + i], Dsq[i], sigma[i], coef, kappa, 1);
+				worst = fmaxf(worst, fabsf(g[idx] - gexp));
+				const float sg = (sigma[i] > eps0) ? sigma[i] : eps0;
+				const float res = u[l][idx] - A[idx] * Drow[(size_t)l * m + i] / Dsq[i];
+				if (fabsf(res / sg) > kappa) ++cpuClamped;
+			}
+		}
+		float stats[4]; dStats.download(&stats[0], 4);
+		std::printf("  [PACT field clamp] maxErr=%.2e gpuClampCount=%.0f cpuClampCount=%ld\n", worst, stats[1], cpuClamped);
+		ASSERT("PACT clamped GPU field != CPU ref", worst < 1e-4f);
+		ASSERT("PACT clamp path did not clamp", cpuClamped > 0);
+		ASSERT("PACT stats4 clamp count mismatch", fabsf(stats[1] - (float)cpuClamped) < 0.5f);
+	}
+#else
+	std::printf("  [PACT field parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

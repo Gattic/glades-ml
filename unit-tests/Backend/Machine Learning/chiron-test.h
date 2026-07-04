@@ -133,6 +133,13 @@ void CHIRONPiedGpuParityTest();
 void CHIRONPiedDualPParityTest();
 void CHIRONPiedDyDualParityTest();
 
+// PACT — Profile Anti-Cancellation Tax (2026-07-04,
+// docs/superpowers/specs/2026-07-04-chiron-pact-anti-cancellation-design.md).
+void CHIRONPactRefMathTest();
+void CHIRONPactDampSigmaParityTest();
+void CHIRONPactCommitParityTest();
+void CHIRONPactFieldParityTest();
+
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
 

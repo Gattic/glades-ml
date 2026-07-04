@@ -745,6 +745,232 @@ bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// PACT — Profile Anti-Cancellation Tax kernels (2026-07-04).  See gpu_chiron.h
+// and transformer_chiron_ops.h (CPU refs / spec of record).
+// ---------------------------------------------------------------------------
+
+__global__ void chiron_pact_cos_row_kernel(const float* __restrict__ phi,
+                                           float thetaMax, float* __restrict__ cosRow,
+                                           int m)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	cosRow[i] = cosf(thetaMax * tanhf(phi[i]));
+}
+
+// One thread per channel; walks layers L-1..0 accumulating the suffix product.
+__global__ void chiron_pact_damp_finalize_kernel(const float* __restrict__ cosTable,
+                                                 int L, int m,
+                                                 float* __restrict__ D,
+                                                 float* __restrict__ Dsq,
+                                                 float* __restrict__ D1)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	double suffix = 1.0;
+	double dsq = 0.0, d1 = 0.0;
+	for (int l = L - 1; l >= 0; --l)
+	{
+		suffix *= (double)cosTable[(size_t)l * (size_t)m + (size_t)i];
+		const float d = (float)suffix;
+		D[(size_t)l * (size_t)m + (size_t)i] = d;
+		dsq += (double)d * (double)d;
+		d1 += (double)d;
+	}
+	Dsq[i] = (float)dsq;
+	D1[i] = (float)d1;
+}
+
+// One thread per channel; sequential T-loop (deterministic, atomic-free).
+__global__ void chiron_pact_sigma_update_kernel(const float* __restrict__ Macc,
+                                                const float* __restrict__ D1,
+                                                int T, int m, float beta,
+                                                float eps0, int firstTouch,
+                                                float* __restrict__ sigma)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	double acc = 0.0;
+	for (int t = 0; t < T; ++t) acc += (double)Macc[(size_t)t * (size_t)m + (size_t)i];
+	const double colmean = acc / (double)T;
+	const float d1 = D1[i];
+	float s = (d1 > 0.0f) ? (float)(colmean / (double)d1) : 0.0f;
+	if (firstTouch) sigma[i] = s;
+	else            sigma[i] = (1.0f - beta) * sigma[i] + beta * s;
+	if (sigma[i] < eps0) sigma[i] = eps0;
+}
+
+// Fused masked dual-p commit + A/M accumulation.  The p-path statements are
+// textually identical to chiron_scfa_axpy2_masked_dual_p_kernel (bit-parity).
+__global__ void chiron_scfa_axpy2_masked_dual_p_pact_kernel(
+    float* __restrict__ p_fp32, unsigned short* __restrict__ p_bf16, float alpha,
+    const float* __restrict__ a, const float* __restrict__ b, int n, int m,
+    unsigned int key, unsigned int thr, float lo, float hi,
+    uint32_t srBaseSeed, uint32_t srStepIdx,
+    const float* __restrict__ Drow, float* __restrict__ Aacc, float* __restrict__ Macc)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	float p_val = p_fp32[i];
+	p_val += alpha * (eta * (a[i] + b[i]));
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+	// PACT accumulation on the CLEAN increment (pre-mask).
+	const float u = a[i] + b[i];
+	const float d = Drow[i % m];
+	Aacc[i] += d * u;
+	Macc[i] += d * fabsf(u);
+}
+
+// Fused dy hand-off + PACT field.  The task branch (dyt, BF16-RN mirror) is
+// textually identical to chiron_incdrop_scale_copy_dual_kernel.  stats4 (may
+// be NULL) reduced per-block in shared memory then one atomicAdd per block.
+__global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
+    float* __restrict__ dst, unsigned short* __restrict__ dst_bf, float alpha,
+    const float* __restrict__ src, const float* __restrict__ a,
+    const float* __restrict__ b, const float* __restrict__ Aacc,
+    const float* __restrict__ Macc, const float* __restrict__ Drow,
+    const float* __restrict__ Dsq, const float* __restrict__ sigma,
+    float coef, float kappa, float epsM, float eps0, int gateOn,
+    int n, int m, unsigned int key, unsigned int thr, float lo, float hi,
+    float* __restrict__ stats4)
+{
+	__shared__ double sh[4];
+	if (threadIdx.x == 0) { sh[0] = 0.0; sh[1] = 0.0; sh[2] = 0.0; sh[3] = 0.0; }
+	__syncthreads();
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	double c0 = 0.0, c1 = 0.0, c2 = 0.0, c3 = 0.0;
+	if (i < n)
+	{
+		const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+		const float dyt = alpha * (eta * src[i]);
+		const int ch = i % m;
+		const float u = a[i] + b[i];
+		const float A = Aacc[i];
+		const float M = Macc[i];
+		const float Dl = Drow[ch];
+		const float dsq = Dsq[ch];
+		float sg = sigma[ch];
+		if (sg < eps0) sg = eps0;
+		const float res = u - A * Dl / dsq;
+		const float r = res / sg;
+		float rc = r;
+		if (rc > kappa) rc = kappa;
+		if (rc < -kappa) rc = -kappa;
+		float chi = 1.0f;
+		if (gateOn)
+		{
+			const float num = M * M - A * A;
+			const float den = M * M + epsM * dsq * (sg * sg);
+			chi = (den > 0.0f) ? (num / den) : 0.0f;
+			if (chi < 0.0f) chi = 0.0f;
+			if (chi > 1.0f) chi = 1.0f;
+		}
+		const float g = coef * chi * rc / (dsq * sg);
+		const float out = dyt + g;
+		dst[i] = out;
+		dst_bf[i] = fp32_to_bf16_rn_dev(out);
+		if (stats4)
+		{
+			const float ar = (r < 0.0f) ? -r : r;
+			const float H = (ar <= kappa) ? (r * r) : (kappa * (2.0f * ar - kappa));
+			c0 = (double)(chi * H / dsq);
+			c1 = (ar > kappa) ? 1.0 : 0.0;
+			c2 = (double)g * (double)g;
+			c3 = (double)dyt * (double)dyt;
+		}
+	}
+	if (stats4)
+	{
+		atomicAdd(&sh[0], c0); atomicAdd(&sh[1], c1);
+		atomicAdd(&sh[2], c2); atomicAdd(&sh[3], c3);
+		__syncthreads();
+		if (threadIdx.x == 0)
+		{
+			atomicAdd(&stats4[0], (float)sh[0]);
+			atomicAdd(&stats4[1], (float)sh[1]);
+			atomicAdd(&stats4[2], (float)sh[2]);
+			atomicAdd(&stats4[3], (float)sh[3]);
+		}
+	}
+}
+
+bool chiron_pact_cos_row(const float* phi, float thetaMax, float* cosRow,
+                         int m, cudaStream_t stream)
+{
+	if (m <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_cos_row_kernel<<<grid, kBlockElem, 0, s>>>(phi, thetaMax, cosRow, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_pact_damp_finalize(const float* cosTable, int L, int m,
+                               float* D, float* Dsq, float* D1, cudaStream_t stream)
+{
+	if (m <= 0 || L <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_damp_finalize_kernel<<<grid, kBlockElem, 0, s>>>(cosTable, L, m, D, Dsq, D1);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_pact_sigma_update(const float* Macc, const float* D1, int T, int m,
+                              float beta, float eps0, int firstTouch,
+                              float* sigma, cudaStream_t stream)
+{
+	if (m <= 0 || T <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_sigma_update_kernel<<<grid, kBlockElem, 0, s>>>(
+	    Macc, D1, T, m, beta, eps0, firstTouch, sigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2_masked_dual_p_pact(float* p_fp32, unsigned short* p_bf16,
+                                          float alpha, const float* a, const float* b,
+                                          int n, int m, unsigned int key, unsigned int thr,
+                                          float lo, float hi, unsigned int srBaseSeed,
+                                          unsigned int srStepIdx, const float* Drow,
+                                          float* Aacc, float* Macc, cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_dual_p_pact_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, m, key, thr, lo, hi, srBaseSeed, srStepIdx,
+	    Drow, Aacc, Macc);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_incdrop_scale_copy_dual_pact(float* dst, unsigned short* dst_bf,
+                                         float alpha, const float* src,
+                                         const float* a, const float* b,
+                                         const float* Aacc, const float* Macc,
+                                         const float* Drow, const float* Dsq,
+                                         const float* sigma, float coef, float kappa,
+                                         float epsM, float eps0, int gateOn,
+                                         int n, int m, unsigned int key, unsigned int thr,
+                                         float lo, float hi, float* stats4,
+                                         cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_dual_pact_kernel<<<grid, kBlockElem, 0, s>>>(
+	    dst, dst_bf, alpha, src, a, b, Aacc, Macc, Drow, Dsq, sigma,
+	    coef, kappa, epsM, eps0, gateOn, n, m, key, thr, lo, hi, stats4);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool chiron_scfa_scaled_copy_bf16p_sr(unsigned short* c_bf, float alpha,
                                        const float* a, int n,
                                        unsigned int srBaseSeed,

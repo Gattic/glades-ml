@@ -421,6 +421,136 @@ inline void chiron_incdrop_scale_copy_cpu(float* dst, float alpha,
 }
 
 // ------------------------------------------------------------------
+// PACT — Profile Anti-Cancellation Tax (2026-07-04): CPU references.
+//
+// Design: docs/superpowers/specs/2026-07-04-chiron-pact-anti-cancellation-design.md §5.
+// A deterministic, gated penalty on the null component of each (token,channel)
+// depth profile Y = u ∈ R^L (u_l = clean increment at layer l), taxing only
+// actual sign-cancellation, function-preserving in the damped sum A.
+//   A     = sum_l D_l·u_l          (damped signal;  D_l = D[l,i] > 0)
+//   M     = sum_l D_l·|u_l|        (damped mass)
+//   Dsq   = sum_l D_l^2 ,  D1 = sum_l D_l
+//   res_l = u_l − A·D_l/Dsq        (component orthogonal to the damping dir)
+//   chi   = clamp01((M^2−A^2)/(M^2+epsM·Dsq·sigma^2))   (detached; 1 if gate off)
+//   r_l   = res_l/sigma ,  H(r) = r^2 if |r|<=kappa else kappa(2|r|−kappa)
+//   penalty(t,i) = chi·(1/Dsq)·sum_l H(r_l) ;  L += (lambda/(T·m))·sum_{t,i} penalty
+//   field  g_l   = coef·chi·clamp(r_l,±kappa)/(Dsq·sigma) ,  coef = 2·lambda/(T·m)
+// Exact identity: sum_l D_l·g_l = 0 (function-preserving).  Must stay
+// bit-parity with the GPU kernels — guarded by the chiron-pact unit test.
+
+static const float PACT_EPS0 = 1e-6f;   // sigma floor
+static const float PACT_EPSM = 1.0f;    // gate floor multiplier
+
+// Damping table from per-layer angles phi[l] (each length m):
+//   D[l*m+i]  = prod_{l'>=l} cos(thetaMax·tanh(phi[l'][i]))
+//   Dsq[i]    = sum_l D[l*m+i]^2 ,  D1[i] = sum_l D[l*m+i]
+inline void chiron_pact_damp_ref(const float* const* phi, int L, int m,
+                                 float thetaMax, float* D, float* Dsq, float* D1)
+{
+	for (int i = 0; i < m; ++i) { Dsq[i] = 0.0f; D1[i] = 0.0f; }
+	for (int i = 0; i < m; ++i)
+	{
+		double suffix = 1.0; // prod_{l'>l} cos(theta_{l'})
+		for (int l = L - 1; l >= 0; --l)
+		{
+			const double th = (double)thetaMax * (double)tanhf(phi[l][i]);
+			const double c = cos(th);
+			const float d = (float)(suffix * c);
+			D[(size_t)l * (size_t)m + (size_t)i] = d;
+			Dsq[i] += d * d;
+			D1[i] += d;
+			suffix *= c;
+		}
+	}
+}
+
+// Detached sign-coherence gate for one (t,i).  gateOn==0 => returns 1.
+inline float chiron_pact_chi(float A, float M, float Dsq_i, float sigma_i, int gateOn)
+{
+	if (!gateOn) return 1.0f;
+	const float sg = (sigma_i > PACT_EPS0) ? sigma_i : PACT_EPS0;
+	const float num = M * M - A * A;
+	const float den = M * M + PACT_EPSM * Dsq_i * (sg * sg);
+	float chi = (den > 0.0f) ? (num / den) : 0.0f;
+	if (chi < 0.0f) chi = 0.0f;
+	if (chi > 1.0f) chi = 1.0f;
+	return chi;
+}
+
+// Huber value H(r) and derivative H'(r) = 2·clamp(r,±kappa).
+inline float chiron_pact_huber(float r, float kappa)
+{
+	const float ar = (r < 0.0f) ? -r : r;
+	return (ar <= kappa) ? (r * r) : (kappa * (2.0f * ar - kappa));
+}
+inline float chiron_pact_huber_d(float r, float kappa)
+{
+	float rc = r;
+	if (rc > kappa) rc = kappa;
+	if (rc < -kappa) rc = -kappa;
+	return 2.0f * rc;
+}
+
+// Field for one element (layer l, channel i) given the profile summaries A,M
+// (over the full depth) and the detached scale sigma_i:
+//   g = coef·chi·clamp(res/sigma, ±kappa) / (Dsq·sigma) ,  res = u − A·Dl/Dsq
+inline float chiron_pact_field(float u, float A, float M,
+                               float Dl, float Dsq_i, float sigma_i,
+                               float coef, float kappa, int gateOn)
+{
+	const float sg = (sigma_i > PACT_EPS0) ? sigma_i : PACT_EPS0;
+	const float chi = chiron_pact_chi(A, M, Dsq_i, sg, gateOn);
+	const float res = u - A * Dl / Dsq_i;
+	float rc = res / sg;
+	if (rc > kappa) rc = kappa;
+	if (rc < -kappa) rc = -kappa;
+	return coef * chi * rc / (Dsq_i * sg);
+}
+
+// Length-carrying profile helpers (used by the unit tests and as the spec of
+// record for the fused GPU kernels).  penalty value for one (t,i) is
+// chi·(1/Dsq)·sum_l H(res_l/sigma); caller scales the sum over (t,i) by
+// lambda/(T·m).
+inline void chiron_pact_profile_reduce(const float* u, const float* Dcol, int L,
+                                       float* A, float* M, float* Dsq)
+{
+	float a = 0.0f, mm = 0.0f, dsq = 0.0f;
+	for (int l = 0; l < L; ++l)
+	{
+		a += Dcol[l] * u[l];
+		mm += Dcol[l] * ((u[l] < 0.0f) ? -u[l] : u[l]);
+		dsq += Dcol[l] * Dcol[l];
+	}
+	*A = a; *M = mm; *Dsq = dsq;
+}
+
+inline double chiron_pact_value_L(const float* u, const float* Dcol, int L,
+                                  float sigma_i, float kappa, int gateOn)
+{
+	float A, M, Dsq;
+	chiron_pact_profile_reduce(u, Dcol, L, &A, &M, &Dsq);
+	const float sg = (sigma_i > PACT_EPS0) ? sigma_i : PACT_EPS0;
+	const float chi = chiron_pact_chi(A, M, Dsq, sg, gateOn);
+	double acc = 0.0;
+	for (int l = 0; l < L; ++l)
+	{
+		const float res = u[l] - A * Dcol[l] / Dsq;
+		acc += (double)chiron_pact_huber(res / sg, kappa);
+	}
+	return (double)chi * acc / (double)Dsq;
+}
+
+inline void chiron_pact_field_L(const float* u, const float* Dcol, int L,
+                                float sigma_i, float coef, float kappa, int gateOn,
+                                float* g)
+{
+	float A, M, Dsq;
+	chiron_pact_profile_reduce(u, Dcol, L, &A, &M, &Dsq);
+	for (int l = 0; l < L; ++l)
+		g[l] = chiron_pact_field(u[l], A, M, Dcol[l], Dsq, sigma_i, coef, kappa, gateOn);
+}
+
+// ------------------------------------------------------------------
 // Sketch residual correction (framework §4.4).
 //
 // To prevent BF16 round-off from compounding across the block-inverse

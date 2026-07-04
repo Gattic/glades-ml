@@ -388,6 +388,69 @@ bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
                                      cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
+// PACT — Profile Anti-Cancellation Tax (2026-07-04).  Deterministic gated
+// anti-cancellation penalty on the p-bus increment assembly.  Design:
+// docs/superpowers/specs/2026-07-04-chiron-pact-anti-cancellation-design.md.
+// CPU refs: glades::chiron::chiron_pact_* (transformer_chiron_ops.h); parity
+// guarded by the chiron-pact unit test.  All kernels are training-only and
+// default-off (dispatched only when --pact-coef > 0).
+// ---------------------------------------------------------------------------
+
+// Per-layer cos row: cosRow[i] = cos(thetaMax * tanh(phi[i])).  Grid-stride m.
+bool chiron_pact_cos_row(const float* phi, float thetaMax, float* cosRow,
+                         int m, cudaStream_t stream = 0);
+
+// Suffix products over layers (one thread per channel; deterministic):
+//   D[l*m+i] = prod_{l'>=l} cosTable[l'*m+i]
+//   Dsq[i]   = sum_l D[l*m+i]^2 ,  D1[i] = sum_l D[l*m+i]
+bool chiron_pact_damp_finalize(const float* cosTable, int L, int m,
+                               float* D, float* Dsq, float* D1,
+                               cudaStream_t stream = 0);
+
+// Detached per-channel scale EMA from the mass accumulator (one thread per
+// channel; sequential T-loop, deterministic):
+//   colmean_i = (1/T) sum_t Macc[t*m+i] ; s_i = colmean_i / D1[i]
+//   sigma[i]  = firstTouch ? s_i : (1-beta)*sigma[i] + beta*s_i , floored eps0
+bool chiron_pact_sigma_update(const float* Macc, const float* D1, int T, int m,
+                              float beta, float eps0, int firstTouch,
+                              float* sigma, cudaStream_t stream = 0);
+
+// PACT variant of the masked dual-p commit: identical p_fp32/p_bf16 writes
+// (SAME eta and SR sequence — bit-identical to chiron_scfa_axpy2_masked_dual_p)
+// plus per-element A[idx] += Drow[i]*u, M[idx] += Drow[i]*|u|, u = a+b (clean,
+// pre-mask), i = idx % m.  Forward (alpha = +1) only.
+bool chiron_scfa_axpy2_masked_dual_p_pact(float* p_fp32, unsigned short* p_bf16,
+                                          float alpha,
+                                          const float* a, const float* b,
+                                          int n, int m,
+                                          unsigned int key, unsigned int thr,
+                                          float lo, float hi,
+                                          unsigned int srBaseSeed,
+                                          unsigned int srStepIdx,
+                                          const float* Drow,
+                                          float* Aacc, float* Macc,
+                                          cudaStream_t stream = 0);
+
+// PACT variant of the dual dy hand-off: dst = alpha*eta*src + g, g the clamped
+// gated field; dst_bf = BF16-RN(dst).  stats4 (monitor-only, may be NULL):
+//   {sum chi*H(r)/Dsq, clamp count, sum g^2, sum (alpha*eta*src)^2}.
+// At coef == 0 the field is zero => dst/dst_bf bit-identical to
+// chiron_incdrop_scale_copy_dual (defensive; the trainer guards dispatch).
+bool chiron_incdrop_scale_copy_dual_pact(float* dst, unsigned short* dst_bf,
+                                         float alpha, const float* src,
+                                         const float* a, const float* b,
+                                         const float* Aacc, const float* Macc,
+                                         const float* Drow, const float* Dsq,
+                                         const float* sigma,
+                                         float coef, float kappa,
+                                         float epsM, float eps0, int gateOn,
+                                         int n, int m,
+                                         unsigned int key, unsigned int thr,
+                                         float lo, float hi,
+                                         float* stats4,
+                                         cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
 //

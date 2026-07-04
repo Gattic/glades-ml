@@ -291,6 +291,13 @@ int main(int argc, char* argv[])
 		CHIRONPiedDualPParityTest();
 		CHIRONPiedDyDualParityTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-pact") == 0 || strcmp(argv[1], "pact") == 0)
+	    {
+		CHIRONPactRefMathTest();
+		CHIRONPactDampSigmaParityTest();
+		CHIRONPactCommitParityTest();
+		CHIRONPactFieldParityTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-model") == 0)
 		CHIRONModelUnitTest();
 	    else if (strcmp(argv[1], "chiron-generate") == 0)
