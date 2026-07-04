@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The current production LLM flagship is **CHIRON 1B PIED 30k**
 (checkpoint `database/checkpoints/chiron_1B_pied_e4/chiron_1B_pied_e4.final`).
+**Checkpoint purge 2026-07-04 (owner-directed): ALL other checkpoints were deleted
+(~93 GB) — every "remains loadable"/"archived at" claim in the prior-flagship sections
+below is now historical record only. The only checkpoints on disk are the PIED flagship
+dir and the tiny CHRN interlock-test fixture `test_fixture_nowhisc` (regeneration
+command in `scripts/chiron_serving_interlocks.sh`'s commit).**
 It is a **perplexity flagship**: **wide 32-batch val NLL 1.1788 / 1.3019 (two 33.5M-token
 windows) vs the prior WhiSC-D ship's 1.6390 / 1.8191 at matched windows — Δ −0.46/−0.52
 nat, top-1 +10.6/+10.9 points**, at the identical 30k-step/1.97B-token budget and recipe.
