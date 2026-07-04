@@ -19010,8 +19010,11 @@ void WhiSCInvWalkBackwardParityTest()
 		std::printf("  [WhiSC invwalk backward parity] no CUDA device -- skipped\n");
 		return;
 	}
-	const int T = 8, m = 3;
 	const float theta_max = 0.07f, sw = 1.0f, RHO = 45.0f;
+	const int T = 8;
+	const int m_cases[2] = { 8, 3 };  // 8 -> exercises float4 lanes; 3 -> exercises scalar tail
+	for (int mci = 0; mci < 2; ++mci) {
+	const int m = m_cases[mci];
 
 	// Build random-ish inputs
 	std::vector<float> phi(m), q0(T*m), p0(T*m), wa(m), cot_q(T*m), cot_p(T*m);
@@ -19114,8 +19117,9 @@ void WhiSCInvWalkBackwardParityTest()
 	}
 	ASSERT("invwalk: dphi != two-call reference", worst_dphi < 1e-4f);
 
-	std::printf("  [WhiSC invwalk backward parity] state_err=%.2e grad_err=%.2e dphi_err=%.2e  PASS\n",
-	            worst_state, worst_grad, worst_dphi);
+	std::printf("  [WhiSC invwalk backward parity] m=%d state_err=%.2e grad_err=%.2e dphi_err=%.2e  PASS\n",
+	            m, worst_state, worst_grad, worst_dphi);
+	}  // for mci
 #else
 	std::printf("  [WhiSC invwalk backward parity] GLADES_HAVE_CUDA not defined -- skipped\n");
 #endif

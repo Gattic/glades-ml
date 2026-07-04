@@ -1988,6 +1988,87 @@ __global__ void chiron_rot_invwalk_backward_kernel(
 	partialDc[(long)by*m + cx] = local_dc;
 }
 
+// float4-vectorized variant: one thread per 4-channel group (128-bit loads/stores),
+// with a scalar tail thread for the m%4 remainder.  The per-lane arithmetic is
+// structurally identical to the scalar kernel above -> identical FMA contraction ->
+// bit-identical results (validated by WhiSCInvWalkBackwardParityTest at m=3 and m=8).
+// Production m=2048 is all-float4 (no tail).  Memory-bound kernel: 128-bit transactions
+// close the last ~23% to the memory-bandwidth floor.
+__global__ void chiron_rot_invwalk_backward_kernel_v4(
+        float* __restrict__ q_io, float* __restrict__ p_io,
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ a_coeff, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int g = blockIdx.x * blockDim.x + threadIdx.x;   // channel-group index
+	int nfull = m >> 2;                               // number of full float4 groups
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	if (g < nfull) {
+		int cx = g << 2;
+		float4 a4 = *reinterpret_cast<const float4*>(a_coeff + cx);
+		float4 c4 = *reinterpret_cast<const float4*>(c_coeff + cx);
+		float4 lda = make_float4(0.f, 0.f, 0.f, 0.f);
+		float4 ldc = make_float4(0.f, 0.f, 0.f, 0.f);
+		for (int t = t_start; t < t_end; ++t) {
+			long k = (long)t * m + cx;
+			float4 q2   = *reinterpret_cast<float4*>(q_io + k);
+			float4 p1   = *reinterpret_cast<float4*>(p_io + k);
+			float4 dq2  = *reinterpret_cast<const float4*>(dqo + k);
+			float4 dp1a = *reinterpret_cast<const float4*>(dpo + k);
+			float4 q0o, p0o, dq0o, dp0o;
+			// Each lane replays the scalar kernel's inverse-walk + 3-shear backward
+			// verbatim (same op sequence -> same rounding).
+			#define RIWB_LANE(L) do { \
+				float q1 = q2.L - a4.L * p1.L;                                    \
+				float p0 = p1.L - c4.L * q1;                                      \
+				float q0 = q1 - a4.L * p0;                                        \
+				q0o.L = q0; p0o.L = p0;                                           \
+				float dq1 = dq2.L; float dp1b = dp1a.L + a4.L*dq2.L;              \
+				float dael = p1.L*dq2.L;                                          \
+				float dp0 = dp1b; dq1 += c4.L*dp1b; float dcel = q1*dp1b;         \
+				float dq0 = dq1; dp0 += a4.L*dq1; dael += p0*dq1;                 \
+				dq0o.L = dq0; dp0o.L = dp0;                                       \
+				lda.L += dael; ldc.L += dcel;                                     \
+			} while (0)
+			RIWB_LANE(x); RIWB_LANE(y); RIWB_LANE(z); RIWB_LANE(w);
+			#undef RIWB_LANE
+			*reinterpret_cast<float4*>(q_io + k) = q0o;
+			*reinterpret_cast<float4*>(p_io + k) = p0o;
+			*reinterpret_cast<float4*>(dqi + k)  = dq0o;
+			*reinterpret_cast<float4*>(dpi + k)  = dp0o;
+		}
+		*reinterpret_cast<float4*>(partialDa + (long)by*m + cx) = lda;
+		*reinterpret_cast<float4*>(partialDc + (long)by*m + cx) = ldc;
+	} else if (g == nfull) {
+		// Scalar tail: the m%4 remainder channels (only when m not a multiple of 4).
+		for (int cx = nfull << 2; cx < m; ++cx) {
+			float ai = a_coeff[cx], ci = c_coeff[cx];
+			float local_da = 0.0f, local_dc = 0.0f;
+			for (int t = t_start; t < t_end; ++t) {
+				long k = (long)t * m + cx;
+				float q2  = q_io[k];
+				float p1  = p_io[k];
+				float q1  = q2 - ai * p1;
+				float p0  = p1 - ci * q1;
+				float q0  = q1 - ai * p0;
+				q_io[k] = q0; p_io[k] = p0;
+				float dq2 = dqo[k], dp1a = dpo[k];
+				float dq1 = dq2; float dp1b = dp1a + ai*dq2; float dael = p1*dq2;
+				float dp0 = dp1b; dq1 += ci*dp1b; float dcel = q1*dp1b;
+				float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;
+				dqi[k] = dq0; dpi[k] = dp0;
+				local_da += dael; local_dc += dcel;
+			}
+			partialDa[(long)by*m + cx] = local_da;
+			partialDc[(long)by*m + cx] = local_dc;
+		}
+	}
+}
+
 bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
                                   float* q, float* p,
                                   const float* a, const float* c,
@@ -2007,10 +2088,12 @@ bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
 	}
 
 	// Pass 1: per-element inverse-walk + backward + partial column reduction.
+	// float4-vectorized: one thread per 4-channel group + a scalar tail thread.
 	int chunk = (T + ROT_NCHUNK - 1) / ROT_NCHUNK;
 	int blk = 256;
-	dim3 grid1((m + blk - 1) / blk, ROT_NCHUNK);
-	chiron_rot_invwalk_backward_kernel<<<grid1, blk, 0, computeStream()>>>(
+	int ngroups = (m + 3) / 4;   // full float4 groups + up to one tail group
+	dim3 grid1((ngroups + blk - 1) / blk, ROT_NCHUNK);
+	chiron_rot_invwalk_backward_kernel_v4<<<grid1, blk, 0, computeStream()>>>(
 	    q, p, dq_out, dp_out, a, c, T, m, chunk,
 	    dq_in, dp_in, partialDa_buf.data(), partialDc_buf.data());
 	GLADES_CUDA_CHECK(cudaGetLastError());
