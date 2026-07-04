@@ -492,8 +492,16 @@ inline float chiron_pact_huber_d(float r, float kappa)
 }
 
 // Field for one element (layer l, channel i) given the profile summaries A,M
-// (over the full depth) and the detached scale sigma_i:
-//   g = coef·chi·clamp(res/sigma, ±kappa) / (Dsq·sigma) ,  res = u − A·Dl/Dsq
+// (over the full depth) and the detached scale sigma_i (the Huber KNEE only —
+// NOT a magnitude normalizer):
+//   g = coef·chi·sigma·clamp(res/sigma, ±kappa) / Dsq ,  res = u − A·Dl/Dsq
+// The field is increment-ENERGY scaled: g ~ O(res) ~ O(‖increment‖), bounded
+// and vanishing as increments → 0 (safe at init), rho-free (sigma is the
+// increment scale, not p/q).  This is the gradient of the increment-energy
+// penalty phi = chi/Dsq · sum_l Huber_{kappa·sigma}(res_l) — see 2026-07-04
+// E2 refinement: the original scale-free phi = chi·‖P_⊥Y‖²/(Dsq·sigma²) had a
+// gradient ~1/sigma that diverged as increments → 0 (field/dy blew to 5.4 at
+// fresh init).  Energy scaling keeps the field O(increment), tunable by lambda.
 inline float chiron_pact_field(float u, float A, float M,
                                float Dl, float Dsq_i, float sigma_i,
                                float coef, float kappa, int gateOn)
@@ -504,7 +512,7 @@ inline float chiron_pact_field(float u, float A, float M,
 	float rc = res / sg;
 	if (rc > kappa) rc = kappa;
 	if (rc < -kappa) rc = -kappa;
-	return coef * chi * rc / (Dsq_i * sg);
+	return coef * chi * sg * rc / Dsq_i;
 }
 
 // Length-carrying profile helpers (used by the unit tests and as the spec of
@@ -535,9 +543,10 @@ inline double chiron_pact_value_L(const float* u, const float* Dcol, int L,
 	for (int l = 0; l < L; ++l)
 	{
 		const float res = u[l] - A * Dcol[l] / Dsq;
-		acc += (double)chiron_pact_huber(res / sg, kappa);
+		acc += (double)chiron_pact_huber(res / sg, kappa); // = (res/sg)^2 in the quad region
 	}
-	return (double)chi * acc / (double)Dsq;
+	// Energy penalty phi = chi/Dsq · sum_l sigma^2·H(res/sigma) (Huber knee kappa·sigma).
+	return (double)chi * (double)(sg * sg) * acc / (double)Dsq;
 }
 
 inline void chiron_pact_field_L(const float* u, const float* Dcol, int L,

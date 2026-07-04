@@ -19417,7 +19417,8 @@ static double pact_value_frozen(const float* u, const float* Dcol, int L,
 		const float res = u[l] - A * Dcol[l] / Dsq;
 		acc += (double)glades::chiron::chiron_pact_huber(res / sg, kappa);
 	}
-	return (double)chiFrozen * acc / (double)Dsq;
+	// Energy penalty: chi/Dsq · sum sigma^2·H(res/sigma).
+	return (double)chiFrozen * (double)(sg * sg) * acc / (double)Dsq;
 }
 
 void CHIRONPactRefMathTest()
@@ -19540,7 +19541,7 @@ void CHIRONPactRefMathTest()
 			const float res = u[l] - A * D[l] / Dsq;
 			float rc = res / sigma; if (rc > kappa) rc = kappa; if (rc < -kappa) rc = -kappa;
 			if (fabsf(res / sigma) > kappa) ++clamped;
-			const float gexp = coef * chi * rc / (Dsq * sigma);
+			const float gexp = coef * chi * sigma * rc / Dsq; // energy-scaled field
 			ASSERT("PACT clamped field != closed form", fabsf(g[l] - gexp) < 1e-5f);
 		}
 		std::printf("  [PACT Huber clamp] %d/%d elems clamped; field matches closed form\n", clamped, L);
@@ -19561,8 +19562,10 @@ void CHIRONPactRefMathTest()
 		for (int l = 0; l < L; ++l) ASSERT("PACT field not rho-independent/deterministic", g1[l] == g2[l]);
 	}
 
-	// (f) scale-freedom: chi is invariant and g scales as 1/c under
-	// u -> c*u, sigma -> c*sigma (c = 32).  Field g(cu, c sigma) == g(u,sigma)/c.
+	// (f) scale covariance: chi is scale-INVARIANT (dimensionless gate) but the
+	// energy-scaled field is degree(+1) homogeneous under u -> c*u, sigma ->
+	// c*sigma (the field scales WITH the increments, like task-dy — the E2
+	// refinement that bounds it as increments -> 0).  g(cu, c sigma) == c·g(u,s).
 	{
 		const int L = 16;
 		LCG rng(0x3333u);
@@ -19579,12 +19582,12 @@ void CHIRONPactRefMathTest()
 		double worst = 0.0;
 		for (int l = 0; l < L; ++l)
 		{
-			const double d = fabs((double)gc[l] - (double)g[l] / (double)c);
-			const double sc = fabs((double)g[l] / (double)c) + 1e-6;
+			const double d = fabs((double)gc[l] - (double)c * (double)g[l]);
+			const double sc = fabs((double)c * (double)g[l]) + 1e-6;
 			if (d / sc > worst) worst = d / sc;
 		}
-		std::printf("  [PACT scale-freedom] max rel |g(cu,c s) - g(u,s)/c| = %.2e (bar 1e-4)\n", worst);
-		ASSERT("PACT field not degree(-1) homogeneous", worst < 1e-4);
+		std::printf("  [PACT scale covariance] max rel |g(cu,c s) - c·g(u,s)| = %.2e (bar 1e-4)\n", worst);
+		ASSERT("PACT field not degree(+1) homogeneous", worst < 1e-4);
 	}
 
 	std::printf("  [PACT ref math] all reference-level asserts PASS\n");

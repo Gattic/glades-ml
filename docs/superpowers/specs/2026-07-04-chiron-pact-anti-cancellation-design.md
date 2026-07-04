@@ -1,7 +1,8 @@
 # CHIRON PACT — Profile Anti-Cancellation Tax
 
 **Date:** 2026-07-04
-**Status:** Design (approved for planning; pre-registration of the M0/E0–E4 ladder in §13)
+**Status:** M0 GO, **E0/E1/E2 PASS** (2026-07-04; E2 applied a field-scaling refinement of
+record — see §13). Next gate: E3 (matched 2500-step fresh pair). Ladder pre-registered in §13.
 **Author:** research-framework-design (3-candidate parallel synthesis)
 **Target:** the next CHIRON-native regularizer for the production flagship (CHIRON 1B PIED E4,
 `chiron_1B_pied_e4.final`), ship metric = matched-30k val NLL (E4), on the PIED recipe
@@ -609,15 +610,32 @@ the trainer (`bash build.sh`) after any kernel change; `make install` alone is n
   WhiSC q→p leak (sharpens failure mode #1; the field-RMS λ rule is the binding control).
   Record: `research/CHIRON_PACT_M0_2026_07_04.md`.**
 - **E0** — `--pact-coef 0`: step-1 bit-identical to the PIED flagship path. *Must pass.*
+  **RESULT (2026-07-04): PASS** — flag-off eval on `chiron_1B_pied_e4.final` reproduces the M0
+  baseline val NLL exactly (1.0891 / 1.1174 / 1.1909, 8-batch windows). All PACT training-path
+  code gated on `cfg.pactCoef != 0.0f`.
 - **E1** — units: CPU ≡ GPU field parity; FD gradient checks including the A-coupling at
   synthetic ρ = 45; `Σ_l D_l g_l = 0` to FP tolerance (unclamped); Huber-consistency (clamped
   field = gradient of the Huberized penalty); BF16-accumulator error bar (≤ 1e-2 relative vs
   FP64); gate values on constructed profiles (one-hot ⇒ χ = 0; pure cancelling pair ⇒ χ ≈ 1;
   dead-zone release); inverse-walk reconstruction bit-parity with PACT ON; determinism replay.
+  **RESULT (2026-07-04): PASS** — `test.sh chiron-pact` (4 tests, 0 asserts failed): orthogonality
+  residual 5.7e-7, FD-vs-analytic 4.2e-5, GPU field bit-exact vs CPU, Huber clamp count exact,
+  gate goldens, coef=0 numeric identity, degree(+1) scale covariance. chiron-pied / chiron-whisc
+  regressions green.
 - **E2** — small shape + calibration: set λ so field RMS = 3–5% of task-dy RMS at step ~1k
   (pre-registered candidates λ ∈ {3e-3, 1e-2}); numerically verify mask-expectation
   task-neutrality `E⟨task-dy, g⟩ ≈ 0`; penalty trajectory decreasing on a 500-step probe; perf
   bench ≤ 1.5%. **Kill:** field/dy ratio uncontrollable, or wall > 2%.
+  **RESULT (2026-07-04): PASS, with a field-scaling refinement of record.** The §5.2–5.3
+  **scale-free** penalty `ϕ = χ‖P_⊥Y‖²/(Dsq·σ²)` has a scale-**divergent** gradient (∝ 1/σ →
+  field/dy = 5.4 at fresh init). **Fix (superseding §5.2–5.3 on this point only):**
+  increment-**energy** scaling `ŵ = 1/Dsq` (drop the 1/σ²), giving
+  `g = coef·χ·σ·clamp(res/σ,±κ)/Dsq ~ O(‖increment‖)` — bounded, vanishing at init, still ρ-free
+  (σ = Huber knee only); degree(+1) homogeneous. Orthogonality, the gate, and function-preservation
+  are unchanged. Also: trainer normalization `2λ/(Tm) → 2λ/T` (token-mean). Calibrated **λ* = 3e-3**
+  (fresh-init field/dy ramps 1.1%→2.4% early → 3–5% band mid-training; 0 grad-skips; clampRate
+  <3%); λ=1e-2 ruled out (would exceed target). Full record:
+  `research/CHIRON_PACT_E0_E2_2026_07_04.md`.
 - **E3** — matched 2500-step pair at T = 16384, **fresh same-binary baseline arm mandatory**
   (era-drift 0.10–0.15 nat dwarfs 2500-step effects), flagship recipe ± `--pact-coef λ*`
   (~7 GPU-hr both arms). Predictions: 0 skips; ‖g‖ max ≤ 1.1× baseline arm; penalty falls ≥30%

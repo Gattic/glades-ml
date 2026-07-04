@@ -869,7 +869,9 @@ __global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
 			if (chi < 0.0f) chi = 0.0f;
 			if (chi > 1.0f) chi = 1.0f;
 		}
-		const float g = coef * chi * rc / (dsq * sg);
+		// Energy-scaled field: g ~ O(res) ~ O(increment) (2026-07-04 E2 refine —
+		// sigma is the Huber knee only, not a 1/sigma magnitude divisor).
+		const float g = coef * chi * sg * rc / dsq;
 		const float out = dyt + g;
 		dst[i] = out;
 		dst_bf[i] = fp32_to_bf16_rn_dev(out);
@@ -877,7 +879,7 @@ __global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
 		{
 			const float ar = (r < 0.0f) ? -r : r;
 			const float H = (ar <= kappa) ? (r * r) : (kappa * (2.0f * ar - kappa));
-			c0 = (double)(chi * H / dsq);
+			c0 = (double)(chi * (sg * sg) * H / dsq);
 			c1 = (ar > kappa) ? 1.0 : 0.0;
 			c2 = (double)g * (double)g;
 			c3 = (double)dyt * (double)dyt;
