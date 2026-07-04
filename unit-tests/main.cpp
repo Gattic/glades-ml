@@ -282,6 +282,7 @@ int main(int argc, char* argv[])
 		WhiSCBackwardParityTest();
 		WhiSCFoldBackwardParityTest();
 		WhiSCInvWalkBackwardParityTest();
+		CHIRONWhiscFuseRelnParityTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-pied") == 0 || strcmp(argv[1], "pied") == 0)
 	    {

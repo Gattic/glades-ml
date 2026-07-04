@@ -117,6 +117,7 @@ void CHIRONDriftBackwardParityTest();
 void CHIRONRotCpuTest();
 void CHIRONRotGpuParityTest();
 void CHIRONRotBackwardParityTest();
+void CHIRONWhiscFuseRelnParityTest();
 
 void WhiSCScaleCpuTest();
 void WhiSCStatsCpuTest();

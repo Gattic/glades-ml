@@ -1181,6 +1181,90 @@ __global__ void chiron_reln_forward_rows_dual(const float* __restrict__ q_in,
 	}
 }
 
+// Fused WhiSC rotation + q-side ReLN (dual: FP32 + BF16 mirror).  Perf pass
+// 2026-07-04: eliminates the separate chiron_rot_forward [T*m] pass.  Pass 0
+// applies the folded 3-shear rotation per channel (writing p_rot in place and
+// stashing q_rot in shared), then the standard 3-pass ReLN reads q_rot from
+// shared — so q never round-trips through global between rotation and ReLN.
+// BIT-IDENTICAL to { chiron_rot_forward_rows(+1); chiron_reln_forward_rows_dual }:
+// the per-channel shear math and FMA order match rot_forward_rows exactly, and
+// the ReLN reduction operates on the same rotated FP32 values.
+__global__ void chiron_rot_reln_forward_rows_dual(
+        float* __restrict__ q_io, float* __restrict__ p_io,
+        const float* __restrict__ rot_a, const float* __restrict__ rot_c,
+        const float* __restrict__ gamma, const float* __restrict__ beta,
+        float eps, int cols,
+        unsigned short* __restrict__ q_out_bf16,
+        float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	float* qRow = q_io + (size_t)row * cols;
+	float* pRow = p_io + (size_t)row * cols;
+	unsigned short* bRow = q_out_bf16 + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	float* sQrot = smem + 2 * (blockDim.x / 32 + 1);   // cols floats: rotated q row
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 0: folded 3-shear rotation.  q_rot -> shared, p_rot -> global.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float qv = qRow[i], pv = pRow[i], ai = rot_a[i], ci = rot_c[i];
+		qv += ai * pv;   // shear1: q1 = q0 + a*p0
+		pv += ci * qv;   // shear2: p1 = p0 + c*q1
+		qv += ai * pv;   // shear3: q2 = q1 + a*p1
+		pRow[i] = pv;    // write p_rot (in place; one thread per element)
+		sQrot[i] = qv;   // stash rotated q for the ReLN passes
+	}
+	__syncthreads();
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += sQrot[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = sQrot[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: normalize + affine, in-place q write + BF16 RNE mirror (encoding
+	// identical to chiron_reln_forward_rows_dual / k_cast_f32_to_bf16).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float o = gamma[i] * (sQrot[i] - mu) * inv_sigma + beta[i];
+		qRow[i] = o;
+		union { float f; uint32_t u; } enc;
+		enc.f = o;
+		if (isnan(o)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			bRow[i] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			bRow[i] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
 } // anonymous namespace
 
 bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
@@ -1216,6 +1300,25 @@ bool chiron_reln_forward_dual(const float* q_in, float* q_out,
 	// argument as chiron_reln_forward (iter 9 note above).
 	chiron_reln_forward_rows_dual<<<T, block, smemBytes, computeStream()>>>(
 		q_in, gamma, beta, eps, m, q_out, q_out_bf16, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Fused WhiSC rotation + q-side ReLN (dual).  In-place on q, p.  Replaces the
+// { chiron_rot_forward(+1); chiron_reln_forward_dual } pair — bit-identical,
+// one fewer [T*m] pass.  rot_a/rot_c are the already-folded WhiSC coefficients.
+bool chiron_rot_reln_forward_dual(float* q, float* p,
+                                  const float* rot_a, const float* rot_c,
+                                  const float* gamma, const float* beta,
+                                  float eps, int T, int m,
+                                  unsigned short* q_out_bf16, float* stats)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	// reduction scratch (2*(block/32+1) floats, +2 pad) + the rotated q row (m).
+	int smemBytes = ((block / 32 + 2) * 2 + m) * (int)sizeof(float);
+	chiron_rot_reln_forward_rows_dual<<<T, block, smemBytes, computeStream()>>>(
+		q, p, rot_a, rot_c, gamma, beta, eps, m, q_out_bf16, stats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

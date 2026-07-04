@@ -11490,6 +11490,7 @@ void CHIRONUnitTest()
 	CHIRONRotCpuTest();
 	CHIRONRotGpuParityTest();
 	CHIRONRotBackwardParityTest();
+	CHIRONWhiscFuseRelnParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 
@@ -18667,6 +18668,58 @@ void CHIRONRotGpuParityTest()
 	ASSERT(msg, mr<1e-5f);
 #else
 	std::printf("  [SORC rot GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// Perf-pass 2026-07-04: the fused WhiSC rotation + q-side ReLN kernel must be
+// BIT-IDENTICAL to the sequential { chiron_rot_forward(+1); chiron_reln_forward_dual }.
+void CHIRONWhiscFuseRelnParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [whisc fuse-reln parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T=6, m=128; const float theta_max=0.07f, sw=1.0f, eps=1e-5f;
+	std::vector<float> phi(m), a(m), c(m), q(T*m), p(T*m), gamma(m), beta(m);
+	for(int i=0;i<m;++i){ phi[i]=0.13f*i-0.5f; float th; glades::chiron::rot_coeffs(phi[i],theta_max,sw,a[i],c[i],th);
+	                      gamma[i]=0.8f+0.01f*i; beta[i]=0.05f*sinf(0.3f*i); }
+	for(int k=0;k<T*m;++k){ q[k]=0.4f*sinf(0.5f*k)+0.1f; p[k]=0.3f*cosf(0.2f*k)-0.2f; }
+
+	glades::gpu::GpuBuffer<float> dA,dC,dGamma,dBeta;
+	dA.allocate(m); dA.upload(&a[0],m); dC.allocate(m); dC.upload(&c[0],m);
+	dGamma.allocate(m); dGamma.upload(&gamma[0],m); dBeta.allocate(m); dBeta.upload(&beta[0],m);
+
+	// Path A: sequential rot_forward then reln_forward_dual (in-place on q).
+	glades::gpu::GpuBuffer<float> dQa,dPa,dStatsA; glades::gpu::GpuBuffer<unsigned short> dBfA;
+	dQa.allocate(T*m); dQa.upload(&q[0],T*m); dPa.allocate(T*m); dPa.upload(&p[0],T*m);
+	dStatsA.allocate(T*2u); dBfA.allocate(T*m);
+	glades::gpu::chiron_rot_forward(dQa.data(),dPa.data(),dA.data(),dC.data(),+1.f,T,m);
+	glades::gpu::chiron_reln_forward_dual(dQa.data(),dQa.data(),dBfA.data(),dStatsA.data(),dGamma.data(),dBeta.data(),T,m,eps);
+
+	// Path B: fused.
+	glades::gpu::GpuBuffer<float> dQb,dPb,dStatsB; glades::gpu::GpuBuffer<unsigned short> dBfB;
+	dQb.allocate(T*m); dQb.upload(&q[0],T*m); dPb.allocate(T*m); dPb.upload(&p[0],T*m);
+	dStatsB.allocate(T*2u); dBfB.allocate(T*m);
+	glades::gpu::chiron_rot_reln_forward_dual(dQb.data(),dPb.data(),dA.data(),dC.data(),dGamma.data(),dBeta.data(),eps,T,m,dBfB.data(),dStatsB.data());
+
+	std::vector<float> qa(T*m),pa(T*m),qb(T*m),pb(T*m),sa(T*2u),sb(T*2u);
+	std::vector<unsigned short> bfa(T*m),bfb(T*m);
+	dQa.download(&qa[0],T*m); dPa.download(&pa[0],T*m); dStatsA.download(&sa[0],T*2u); dBfA.download(&bfa[0],T*m);
+	dQb.download(&qb[0],T*m); dPb.download(&pb[0],T*m); dStatsB.download(&sb[0],T*2u); dBfB.download(&bfb[0],T*m);
+
+	float dq=0.f, dp=0.f, ds=0.f; int dbf=0;
+	for(int k=0;k<T*m;++k){ dq=fmaxf(dq,fabsf(qa[k]-qb[k])); dp=fmaxf(dp,fabsf(pa[k]-pb[k])); if(bfa[k]!=bfb[k])++dbf; }
+	for(int k=0;k<T*2;++k) ds=fmaxf(ds,fabsf(sa[k]-sb[k]));
+	std::printf("  [whisc fuse-reln parity] qDiff=%.2e pDiff=%.2e statsDiff=%.2e bf16Diff=%d (bar 0/0/0/0); seq sigma[0]=%.4f\n", dq,dp,ds,dbf,(double)sa[1]);
+	ASSERT("fused seq path produced valid sigma", sa[1] > 0.f);   // sanity: kernels ran
+	ASSERT("fused rot+reln q not bit-identical", dq==0.f);
+	ASSERT("fused rot+reln p not bit-identical", dp==0.f);
+	ASSERT("fused rot+reln stats not bit-identical", ds==0.f);
+	ASSERT("fused rot+reln bf16 mirror not bit-identical", dbf==0);
+#else
+	std::printf("  [whisc fuse-reln parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 

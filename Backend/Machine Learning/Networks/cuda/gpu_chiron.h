@@ -156,6 +156,17 @@ bool chiron_reln_forward_dual(const float* q_in, float* q_out,
                               const float* gamma, const float* beta,
                               int T, int m, float eps);
 
+// Fused WhiSC rotation + q-side ReLN (dual: FP32 q + BF16 mirror).  In-place on
+// q and p.  Bit-identical to { chiron_rot_forward(q,p,rot_a,rot_c,+1); then
+// chiron_reln_forward_dual(q,q,bf16,stats,gamma,beta) } but one fewer [T*m] pass
+// (q never round-trips through global between rotation and ReLN).  rot_a/rot_c
+// are the already-folded WhiSC coefficients.  Perf pass 2026-07-04.
+bool chiron_rot_reln_forward_dual(float* q, float* p,
+                                  const float* rot_a, const float* rot_c,
+                                  const float* gamma, const float* beta,
+                                  float eps, int T, int m,
+                                  unsigned short* q_out_bf16, float* stats);
+
 // Cast-elim Port C fwd slice (2026-06-12): library toggle for BF16-D
 // inner-attention forward projections (set once at trainer init).
 void set_cast_elim_inner_fwd(bool on);
@@ -891,6 +902,9 @@ inline bool chiron_reln_forward(const float*, float*, float*,
 inline bool chiron_reln_forward_dual(const float*, float*, unsigned short*,
                                       float*, const float*, const float*,
                                       int, int, float) { return false; }
+inline bool chiron_rot_reln_forward_dual(float*, float*, const float*, const float*,
+                                         const float*, const float*, float, int, int,
+                                         unsigned short*, float*) { return false; }
 inline void set_cast_elim_inner_fwd(bool) {}
 inline bool get_cast_elim_inner_fwd() { return false; }
 inline bool flash_attention_cublas_tiled_bf16_vpre_obf16(const float*, const float*, const unsigned short*, int, int, int, int, bool, unsigned short*, float*, unsigned short*, unsigned short*, unsigned short*) { return false; }
