@@ -103,13 +103,42 @@ above the target). Since the field scales linearly with λ, the ratio retargets 
 2. A, M accumulators are FP32 (2×128 MiB at flagship shape, within the ~0.86 GB headroom), not
    BF16 — for exactness; BF16 remains the perf fallback if VRAM ever binds.
 
-## 5. Perf / VRAM
+## 5. Perf / VRAM (measured — two perf passes, 2026-07-04)
 
 VRAM peak ~15.66 GB at flagship shape with PACT on (A/M add 128 MiB) — within the practical
-ceiling. Wall not separately A/B'd at production scale in E2 (the fresh runs were warmup-dominated);
-the kernels add two FMAs to the commit and the field to the dy copy (both DRAM-bound, fused, no
-new [T×m] round-trips), so the ~1–1.5% design estimate stands to be confirmed at E3. E3's tok/s
-vs a paired flag-off arm is the perf gate.
+ceiling.
+
+**Wall was A/B'd at flagship shape (T=16384, clean back-to-back same-binary runs), and the first
+measurement exposed a severe regression that two perf passes fixed:**
+
+| state | tok/s | vs no-PACT | note |
+|---|---:|---:|---|
+| no-PACT baseline | 25,231 | — | same binary |
+| PACT, initial | 14,900 | **−40%** | shipped-then-caught |
+| + warp-shuffle reduction (pass 1) | 22,538 | −10.7% | glades-ml `523a82745` |
+| + gate stats to log cadence (pass 2) | **23,510** | **−6.8%** | glades-trainer `2f4418c` |
+
+- **Root cause (nsys):** the field kernel `chiron_incdrop_scale_copy_dual_pact` took **17.8 ms/call
+  (39.3% of GPU time)** vs the commit kernel's 1.87 ms for the same [T×m] shape. The `stats4`
+  monitor reduction had all 256 threads/block `atomicAdd` doubles to 4 **shared** addresses;
+  shared double-atomics are CAS-emulated, so same-address contention serialized the kernel
+  ~quadratically.
+- **Pass 1** — warp-shuffle the reduction (in-register per warp → 1 global atomic/block). Field
+  output bit-identical; kernel 17.8 → ~1.35 ms. **−40% → −10.7%.**
+- **Pass 2** — the monitor is read only every `logEvery` steps, so gate `stats4` to log steps
+  (NULL otherwise; the kernel skips the stats block on NULL). Field bit-identical; `field/dy` at
+  step 1 reproduced exactly (1.1032e-02). Monitor normalization moved to per-log-step
+  (`perUstep = accumSteps`). **−10.7% → −6.8%.**
+- **Residual −6.8%** is inherent **FP32 A/M [T×m] accumulation traffic**: the PACT commit RMWs A
+  and M (1.87 ms vs the non-PACT commit's 0.96 ms) and the field reads them. BF16 A/M would ~halve
+  it (toward ~−3.5%) but **changes the field numerics** (§4 chose FP32 for exactness), so it is a
+  mechanism change requiring E1 re-validation + an E-gate — deferred, not a bit-identical perf pass.
+- For context: WhiSC-D shipped at −9.7% wall, PIED at −1.87%. PACT at −6.8% (training-only;
+  inference unchanged) is between them.
+- **These passes do not touch the field math** (field output bit-identical), so any efficacy data
+  measured on the pre-perf binary (the interrupted E3 arms, `logs/pact_e3_*.log`) remains valid —
+  the val gap is field-driven and the field is unchanged.
+- Harness: `scripts/pact_perf_probe.sh` (resolved-flag probe) in glades-trainer.
 
 ## 6. Disposition
 
