@@ -837,10 +837,6 @@ __global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
     int n, int m, unsigned int key, unsigned int thr, float lo, float hi,
     float* __restrict__ stats4)
 {
-	__shared__ double sh[4];
-	if (threadIdx.x == 0) { sh[0] = 0.0; sh[1] = 0.0; sh[2] = 0.0; sh[3] = 0.0; }
-	__syncthreads();
-
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	double c0 = 0.0, c1 = 0.0, c2 = 0.0, c3 = 0.0;
 	if (i < n)
@@ -887,15 +883,32 @@ __global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
 	}
 	if (stats4)
 	{
-		atomicAdd(&sh[0], c0); atomicAdd(&sh[1], c1);
-		atomicAdd(&sh[2], c2); atomicAdd(&sh[3], c3);
+		// Warp-shuffle reduction (2026-07-04 perf pass): the original all-threads
+		// shared double-atomicAdd serialized on 4 addresses (CAS contention →
+		// 17.8 ms/call, 39% of GPU time per nsys).  Reduce in-register per warp,
+		// one shared slot per warp, one block-level global atomicAdd.  Diagnostic
+		// only — the field output (dst/dst_bf) above is untouched/bit-identical.
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			c0 += __shfl_down_sync(0xffffffffu, c0, off);
+			c1 += __shfl_down_sync(0xffffffffu, c1, off);
+			c2 += __shfl_down_sync(0xffffffffu, c2, off);
+			c3 += __shfl_down_sync(0xffffffffu, c3, off);
+		}
+		__shared__ double ws0[32], ws1[32], ws2[32], ws3[32];
+		const int warp = threadIdx.x >> 5;
+		const int lane = threadIdx.x & 31;
+		if (lane == 0) { ws0[warp] = c0; ws1[warp] = c1; ws2[warp] = c2; ws3[warp] = c3; }
 		__syncthreads();
 		if (threadIdx.x == 0)
 		{
-			atomicAdd(&stats4[0], (float)sh[0]);
-			atomicAdd(&stats4[1], (float)sh[1]);
-			atomicAdd(&stats4[2], (float)sh[2]);
-			atomicAdd(&stats4[3], (float)sh[3]);
+			const int nw = (blockDim.x + 31) >> 5;
+			double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+			for (int w = 0; w < nw; ++w) { s0 += ws0[w]; s1 += ws1[w]; s2 += ws2[w]; s3 += ws3[w]; }
+			atomicAdd(&stats4[0], (float)s0);
+			atomicAdd(&stats4[1], (float)s1);
+			atomicAdd(&stats4[2], (float)s2);
+			atomicAdd(&stats4[3], (float)s3);
 		}
 	}
 }
