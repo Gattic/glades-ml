@@ -27,6 +27,22 @@ GPU RTX 4080 SUPER 16 GB.
 self-contained deliverable: the flags, the reservoir hook, the `[charge]` monitor, the matched
 2500-step pair, and the decision record.
 
+## Execution note (2026-07-05) — pivoted to a τ-sweep
+
+Tasks 1–2 were implemented and validated (E0 bit-clean; charge-side + `ρ_max` cap + `effNorm≤τ`
+invariant all confirmed in a 30-step smoke). **The smoke exposed that the discharge mechanism is
+inert in the real regime:** the global clip binds *every* step (‖g‖ chronically 0.8–4 vs τ=0.5), so
+the `gradNorm ≤ τ` discharge trigger essentially never fires — the reservoir pins at `ρ_max` and does
+nothing (the "never-calm regime" is the actual regime). Rather than run a 3.8 GPU-hr pair that would
+report a false "no effect," Task 3 was **pivoted (owner call) to a grad-clip sweep** that tests the
+*underlying* premise directly: matched 2500-step arms at **τ ∈ {0.5, 1.0, 2.0}**, seed 1337, ONLY
+`--grad-clip` varying (`scripts/tau_sweep.sh`). If a looser clip lowers val@2500 → the chronic clip
+is taxing perplexity and recapture has real headroom; if it raises val or adds grad-skips → the clip
+is load-bearing and recapture must be gentle (informs SIPHON's self-calibrating damping). The CHARGE
+scaffolding (Tasks 1–2) is held **uncommitted/dormant** pending the sweep verdict, at which point it
+is either finalized (bounded-ceiling or direction-biasing variant) or reverted. Tasks 1–2 below stand
+as the record of what was built.
+
 ## Global Constraints
 
 - **Design source of truth:** `~/dev/glades-ml/docs/superpowers/specs/2026-07-05-chiron-siphon-thermostat-energy-recapture-design.md` §3 (selection), §10 (Phase-0), App. A (CHARGE).
