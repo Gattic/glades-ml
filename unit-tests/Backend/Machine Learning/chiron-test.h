@@ -141,6 +141,13 @@ void CHIRONPactDampSigmaParityTest();
 void CHIRONPactCommitParityTest();
 void CHIRONPactFieldParityTest();
 
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md).
+void CHIRONEchoStatsCpuTest();
+void CHIRONEchoGradFDCpuTest();
+void CHIRONEchoGpuParityTest();
+void CHIRONEchoZlossZeroCoefBitParityTest();
+
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
 

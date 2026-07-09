@@ -299,6 +299,19 @@ int main(int argc, char* argv[])
 		CHIRONPactCommitParityTest();
 		CHIRONPactFieldParityTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-echo") == 0 || strcmp(argv[1], "echo") == 0)
+	    {
+		CHIRONEchoStatsCpuTest();
+		CHIRONEchoGradFDCpuTest();
+		CHIRONEchoGpuParityTest();
+		CHIRONEchoZlossZeroCoefBitParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-echo-cpu") == 0)
+	    {
+		// GPU-free subset (run while the GPU is occupied by training).
+		CHIRONEchoStatsCpuTest();
+		CHIRONEchoGradFDCpuTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-model") == 0)
 		CHIRONModelUnitTest();
 	    else if (strcmp(argv[1], "chiron-generate") == 0)

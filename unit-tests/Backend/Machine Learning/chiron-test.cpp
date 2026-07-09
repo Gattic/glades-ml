@@ -19989,3 +19989,388 @@ void CHIRONPactFieldParityTest()
 	std::printf("  [PACT field parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+// ===========================================================================
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
+// E1 unit suite: CPU-ref semantics, FD gradient, CPU/GPU parity, and the
+// zloss-kernel zero-coef bit-parity interlock.
+// ===========================================================================
+
+// FP32 row softmax (max-subtracted) + ECHO stats; returns R = sum_t Rrow[t]
+// accumulated in double.  Shared by the FD-gradient and shift-invariance
+// checks below.
+static double echoRFromLogits(const std::vector<float>& z,
+                              const std::vector<int>& tokens,
+                              const std::vector<int>& targets,
+                              int T, int V, int w, float kappa, float tau0,
+                              std::vector<float>* probsOut,
+                              std::vector<float>* paOut,
+                              std::vector<int>* idsOut,
+                              std::vector<int>* cntOut)
+{
+	std::vector<float> probs((size_t)T * V);
+	for (int t = 0; t < T; ++t)
+	{
+		float mx = -1e30f;
+		for (int v = 0; v < V; ++v) mx = std::max(mx, z[(size_t)t * V + v]);
+		float den = 0.0f;
+		for (int v = 0; v < V; ++v)
+		{
+			probs[(size_t)t * V + v] = expf(z[(size_t)t * V + v] - mx);
+			den += probs[(size_t)t * V + v];
+		}
+		for (int v = 0; v < V; ++v) probs[(size_t)t * V + v] /= den;
+	}
+	std::vector<float> PA(T), Rrow(T);
+	std::vector<int> ids((size_t)T * w, -1), cnt(T);
+	glades::chiron::chiron_echo_stats_cpu(&probs[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, &PA[0], &Rrow[0], &ids[0], &cnt[0]);
+	double R = 0.0;
+	for (int t = 0; t < T; ++t) R += (double)Rrow[t];
+	if (probsOut) *probsOut = probs;
+	if (paOut) *paOut = PA;
+	if (idsOut) *idsOut = ids;
+	if (cntOut) *cntOut = cnt;
+	return R;
+}
+
+void CHIRONEchoStatsCpuTest()
+{
+	// Semantics-contract vignettes: truth-gating, multi-occurrence margins,
+	// first-slot dedup, t<w prefix windows, active-id ordering, and the
+	// init-inactive property.  kappa=0.5, tau0=0.1, w=4 => margins:
+	// n=1 -> 0.225, n=2 -> 0.35, n=3 -> 0.475.
+	const int T = 8, V = 32, w = 4;
+	const float kappa = 0.5f, tau0 = 0.1f;
+	std::vector<float> probs((size_t)T * V, 0.001f);
+	std::vector<int> tokens(T), targets(T, 31);
+	tokens[0] = 5;  tokens[1] = 7;  tokens[2] = 5;  tokens[3] = 9;
+	tokens[4] = 11; tokens[5] = 11; tokens[6] = 11; tokens[7] = 13;
+
+	probs[0 * V + 5] = 0.4f;  targets[0] = 1;   // t=0 prefix window {5}
+	probs[2 * V + 5] = 0.5f;  targets[2] = 1;   // t=2 window {5,7,5}: n(5)=2
+	probs[2 * V + 7] = 0.23f;                    //   n(7)=1: 0.23 > 0.225
+	probs[3 * V + 5] = 0.30f;                    // t=3 {5,7,5,9}: 0.30 < 0.35
+	probs[3 * V + 7] = 0.30f;                    //   n=1: active
+	probs[3 * V + 9] = 0.50f; targets[3] = 9;   //   truth -> excluded
+	probs[6 * V + 11] = 0.44f; targets[6] = 1;  // t=6 {9,11,11,11}: n(11)=3,
+	probs[6 * V + 9] = 0.24f;                    //   m=0.475 -> inactive; 9 active
+
+	std::vector<float> PA(T), Rrow(T);
+	std::vector<int> ids((size_t)T * w, -7), cnt(T);
+	glades::chiron::chiron_echo_stats_cpu(&probs[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, &PA[0], &Rrow[0], &ids[0], &cnt[0]);
+
+	const float m1 = kappa * (1.0f / (float)w) + tau0;   // n=1 margin
+	const float m2 = kappa * (2.0f / (float)w) + tau0;   // n=2 margin
+
+	ASSERT("ECHO t=0 prefix-window active count", cnt[0] == 1);
+	ASSERT("ECHO t=0 active id", ids[0 * w + 0] == 5);
+	ASSERT("ECHO t=0 PA", fabsf(PA[0] - 0.4f) < 1e-6f);
+	ASSERT("ECHO t=0 Rrow", fabsf(Rrow[0] - (0.4f - m1)) < 1e-6f);
+
+	ASSERT("ECHO t=1 all-below-margin count", cnt[1] == 0);
+	ASSERT("ECHO t=1 PA zero", PA[1] == 0.0f);
+	ASSERT("ECHO t=1 Rrow zero", Rrow[1] == 0.0f);
+
+	ASSERT("ECHO t=2 dedup count (5 once + 7)", cnt[2] == 2);
+	ASSERT("ECHO t=2 id order slot0 first", ids[2 * w + 0] == 5 && ids[2 * w + 1] == 7);
+	ASSERT("ECHO t=2 PA counts dup id once", fabsf(PA[2] - 0.73f) < 1e-6f);
+	ASSERT("ECHO t=2 Rrow", fabsf(Rrow[2] - ((0.5f - m2) + (0.23f - m1))) < 1e-6f);
+
+	ASSERT("ECHO t=3 count", cnt[3] == 1);
+	ASSERT("ECHO t=3 truth excluded / margin holds", ids[3 * w + 0] == 7);
+	ASSERT("ECHO t=3 PA", fabsf(PA[3] - 0.30f) < 1e-6f);
+
+	ASSERT("ECHO t=6 n=3 margin protects, 9 active", cnt[6] == 1 && ids[6 * w + 0] == 9);
+	ASSERT("ECHO t=6 PA", fabsf(PA[6] - 0.24f) < 1e-6f);
+
+	ASSERT("ECHO t=4 inactive", cnt[4] == 0);
+	ASSERT("ECHO t=5 inactive", cnt[5] == 0);
+	ASSERT("ECHO t=7 inactive", cnt[7] == 0);
+	// ids beyond cnt untouched (sentinel preserved).
+	for (int t = 0; t < T; ++t)
+		for (int k = cnt[t]; k < w; ++k)
+			ASSERT("ECHO ids scribbled beyond activeCount", ids[(size_t)t * w + k] == -7);
+
+	// Init-inactive: uniform probs 1/V < tau0 => R identically zero.
+	std::vector<float> uni((size_t)T * V, 1.0f / (float)V);
+	glades::chiron::chiron_echo_stats_cpu(&uni[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, &PA[0], &Rrow[0], &ids[0], &cnt[0]);
+	for (int t = 0; t < T; ++t)
+	{
+		ASSERT("ECHO init-inactive count", cnt[t] == 0);
+		ASSERT("ECHO init-inactive PA", PA[t] == 0.0f);
+		ASSERT("ECHO init-inactive Rrow", Rrow[t] == 0.0f);
+	}
+	std::printf("  [ECHO stats CPU semantics] gate/margin/dedup/prefix/init  PASS\n");
+}
+
+void CHIRONEchoGradFDCpuTest()
+{
+	// FD check of dR/dz = pi .* (a - PA) per row (spec §5.2), plus logit-shift
+	// invariance and the per-row zero-sum identity.  Logits designed so no
+	// window-token prob sits within 5e-3 of its margin (no hinge flips under
+	// the FD perturbation).
+	const int T = 5, V = 16, w = 3;
+	const float kappa = 0.5f, tau0 = 0.05f;
+	std::vector<int> tokens(T), targets(T);
+	tokens[0] = 3; tokens[1] = 4; tokens[2] = 3; tokens[3] = 6; tokens[4] = 4;
+	targets[0] = 4; targets[1] = 4; targets[2] = 6; targets[3] = 1; targets[4] = 2;
+
+	std::vector<float> z((size_t)T * V, 0.0f);
+	z[1 * V + 4] = 2.0f;   // t=1: window token 4 over margin BUT == truth
+	z[2 * V + 3] = 3.0f;   // t=2: n(3)=2 in {3,4,3}; clearly over margin
+	z[3 * V + 6] = 2.5f;   // t=3: single-occurrence, over margin
+	z[3 * V + 4] = 1.0f;   // t=3: window token 4, below margin
+	z[4 * V + 4] = 2.2f;   // t=4: over margin, active
+	z[4 * V + 6] = -1.0f;  // t=4: below margin
+
+	std::vector<float> probs, PA;
+	std::vector<int> ids, cnt;
+	const double R0 = echoRFromLogits(z, tokens, targets, T, V, w, kappa, tau0,
+	                                  &probs, &PA, &ids, &cnt);
+	ASSERT("ECHO FD fixture has active hinges", R0 > 0.01);
+	ASSERT("ECHO FD fixture truth-gate live (t=1 inactive)", cnt[1] == 0);
+	ASSERT("ECHO FD fixture t=2 active", cnt[2] == 1 && ids[2 * w + 0] == 3);
+
+	// Design guard: every distinct window id sits > 5e-3 from its margin.
+	for (int t = 0; t < T; ++t)
+	{
+		const int wEff = (t + 1 < w) ? (t + 1) : w;
+		const int base = t - wEff + 1;
+		for (int s = 0; s < wEff; ++s)
+		{
+			const int v = tokens[base + s];
+			int n = 0;
+			for (int s2 = 0; s2 < wEff; ++s2) if (tokens[base + s2] == v) ++n;
+			const float m = kappa * ((float)n / (float)w) + tau0;
+			ASSERT("ECHO FD fixture too close to a hinge knee",
+			       fabsf(probs[(size_t)t * V + v] - m) > 5e-3f);
+		}
+	}
+
+	// Analytic gradient from the stats outputs.
+	std::vector<float> g((size_t)T * V);
+	for (int t = 0; t < T; ++t)
+		for (int v = 0; v < V; ++v)
+		{
+			int a = 0;
+			for (int k = 0; k < cnt[t]; ++k) if (ids[(size_t)t * w + k] == v) a = 1;
+			g[(size_t)t * V + v] = probs[(size_t)t * V + v] * ((float)a - PA[t]);
+		}
+
+	// Per-row zero-sum (shift direction).
+	for (int t = 0; t < T; ++t)
+	{
+		double s = 0.0;
+		for (int v = 0; v < V; ++v) s += (double)g[(size_t)t * V + v];
+		ASSERT("ECHO analytic row gradient does not sum to zero", fabs(s) < 1e-6);
+	}
+
+	// Central differences over every (t, v).
+	const float eps = 1e-3f;
+	float worst = 0.0f;
+	for (int t = 0; t < T; ++t)
+		for (int v = 0; v < V; ++v)
+		{
+			std::vector<float> zp = z, zm = z;
+			zp[(size_t)t * V + v] += eps;
+			zm[(size_t)t * V + v] -= eps;
+			const double Rp = echoRFromLogits(zp, tokens, targets, T, V, w, kappa, tau0, 0, 0, 0, 0);
+			const double Rm = echoRFromLogits(zm, tokens, targets, T, V, w, kappa, tau0, 0, 0, 0, 0);
+			const float fd = (float)((Rp - Rm) / (2.0 * (double)eps));
+			const float an = g[(size_t)t * V + v];
+			worst = std::max(worst, fabsf(fd - an) / std::max(1.0f, fabsf(an)));
+		}
+	std::printf("  [ECHO FD gradient] worst rel err=%.2e (bar 2e-3)\n", worst);
+	ASSERT("ECHO analytic gradient fails FD check", worst < 2e-3f);
+
+	// Logit-shift invariance: R(z + c) == R(z) up to fp32 softmax roundoff.
+	std::vector<float> zs = z;
+	for (size_t i = 0; i < zs.size(); ++i) zs[i] += 0.37f;
+	const double Rs = echoRFromLogits(zs, tokens, targets, T, V, w, kappa, tau0, 0, 0, 0, 0);
+	std::printf("  [ECHO shift invariance] |R(z+c)-R(z)|=%.2e (bar 1e-5)\n", fabs(Rs - R0));
+	ASSERT("ECHO not shift-invariant", fabs(Rs - R0) < 1e-5);
+}
+
+void CHIRONEchoGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ECHO GPU parity] no CUDA device — skipped\n");
+		return;
+	}
+	const int T = 64, V = 512, w = 16;
+	const float kappa = 0.5f, tau0 = 0.05f;
+	const float zlossCoef = 1e-4f, echoCoef = 0.1f;
+	const size_t n = (size_t)T * V;
+
+	// bf16-rounded probs (host mirror in fp32 for the CPU ref), random ids.
+	LCG rng(20260709u);
+	std::vector<unsigned short> probsBf(n);
+	std::vector<float> probsF(n);
+	std::vector<int> tokens(T), targets(T);
+	for (size_t i = 0; i < n; ++i)
+	{
+		const unsigned short b = glades::transformer_kernels::float_to_bf16_rn(0.3f * rng.next_unit());
+		probsBf[i] = b;
+		probsF[i] = glades::transformer_kernels::bf16_to_float(b);
+	}
+	for (int t = 0; t < T; ++t)
+	{
+		tokens[t] = (int)(rng.next_unit() * (float)V) % V;
+		targets[t] = (int)(rng.next_unit() * (float)V) % V;
+	}
+
+	// (a) stats parity — bit-exact (forced-rn margin math + ordered accumulation).
+	std::vector<float> paC(T), rC(T);
+	std::vector<int> idsC((size_t)T * w, -7), cntC(T);
+	glades::chiron::chiron_echo_stats_cpu(&probsF[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, &paC[0], &rC[0], &idsC[0], &cntC[0]);
+	int totalActive = 0;
+	for (int t = 0; t < T; ++t) totalActive += cntC[t];
+	ASSERT("ECHO GPU parity fixture has no active hinges", totalActive > 0);
+
+	glades::gpu::GpuBuffer<unsigned short> dProbs;
+	glades::gpu::GpuBuffer<int> dTok, dTgt, dIds, dCnt;
+	glades::gpu::GpuBuffer<float> dPA, dR;
+	dProbs.allocate(n); dProbs.upload(&probsBf[0], n);
+	dTok.allocate(T); dTok.upload(&tokens[0], T);
+	dTgt.allocate(T); dTgt.upload(&targets[0], T);
+	dPA.allocate(T); dR.allocate(T); dCnt.allocate(T);
+	std::vector<int> sent((size_t)T * w, -7);
+	dIds.allocate((size_t)T * w); dIds.upload(&sent[0], (size_t)T * w);
+	ASSERT("ECHO echo_repeat_stats dispatch failed",
+	       glades::gpu::echo_repeat_stats(dProbs.data(), dTok.data(), dTgt.data(),
+	           T, V, w, kappa, tau0, dPA.data(), dR.data(), dIds.data(), dCnt.data()));
+	std::vector<float> paG(T), rG(T);
+	std::vector<int> idsG((size_t)T * w), cntG(T);
+	ASSERT("ECHO PA download failed", dPA.download(&paG[0], T));
+	ASSERT("ECHO Rrow download failed", dR.download(&rG[0], T));
+	ASSERT("ECHO ids download failed", dIds.download(&idsG[0], (size_t)T * w));
+	ASSERT("ECHO cnt download failed", dCnt.download(&cntG[0], T));
+	for (int t = 0; t < T; ++t)
+	{
+		ASSERT("ECHO activeCount CPU/GPU mismatch", cntC[t] == cntG[t]);
+		ASSERT("ECHO PA CPU/GPU not bit-exact", paC[t] == paG[t]);
+		ASSERT("ECHO Rrow CPU/GPU not bit-exact", rC[t] == rG[t]);
+		for (int k = 0; k < w; ++k)
+			ASSERT("ECHO activeIds CPU/GPU mismatch",
+			       idsC[(size_t)t * w + k] == idsG[(size_t)t * w + k]);
+	}
+	std::printf("  [ECHO stats CPU/GPU parity] bit-exact over %d rows (%d active)  PASS\n",
+	            T, totalActive);
+
+	// (b) scatter-only parity — bit-exact (forced-rn ops both sides).
+	std::vector<unsigned short> dlBase(n);
+	for (size_t i = 0; i < n; ++i)
+		dlBase[i] = glades::transformer_kernels::float_to_bf16_rn(2.0f * rng.next_unit() - 1.0f);
+	std::vector<unsigned short> dlC = dlBase;
+	glades::chiron::chiron_echo_scatter_cpu(&probsBf[0], &idsC[0], &cntC[0],
+	    echoCoef, T, V, w, &dlC[0]);
+	glades::gpu::GpuBuffer<unsigned short> dDl;
+	dDl.allocate(n); dDl.upload(&dlBase[0], n);
+	ASSERT("ECHO scatter dispatch failed",
+	       glades::gpu::echo_scatter_bf16(dProbs.data(), dIds.data(), dCnt.data(),
+	           echoCoef, T, V, w, dDl.data()));
+	std::vector<unsigned short> dlG(n);
+	ASSERT("ECHO scatter download failed", dDl.download(&dlG[0], n));
+	size_t scatDiff = 0;
+	for (size_t i = 0; i < n; ++i) if (dlC[i] != dlG[i]) ++scatDiff;
+	std::printf("  [ECHO scatter CPU/GPU parity] %lu/%lu diffs (bar 0)\n",
+	            (unsigned long)scatDiff, (unsigned long)n);
+	ASSERT("ECHO scatter CPU/GPU not bit-exact", scatDiff == 0);
+
+	// (c) dense+scatter compose parity — <=1 bf16-ulp bar (the dense kernel
+	// mirrors the shipped zloss kernel's plain-ops source, so FMA contraction
+	// may differ from the host by 1 fp32 ulp before the bf16 round).
+	std::vector<float> logZ(T);
+	for (int t = 0; t < T; ++t) logZ[t] = 3.0f * rng.next_unit();
+	glades::gpu::GpuBuffer<float> dLogZ;
+	dLogZ.allocate(T); dLogZ.upload(&logZ[0], T);
+	std::vector<unsigned short> dl2C(n);
+	glades::chiron::chiron_echo_zloss_bwd_cpu(&probsBf[0], &targets[0], &logZ[0],
+	    zlossCoef, echoCoef, &paC[0], T, V, &dl2C[0]);
+	glades::chiron::chiron_echo_scatter_cpu(&probsBf[0], &idsC[0], &cntC[0],
+	    echoCoef, T, V, w, &dl2C[0]);
+	glades::gpu::GpuBuffer<unsigned short> dDl2;
+	dDl2.allocate(n);
+	ASSERT("ECHO zloss_echo dispatch failed",
+	       glades::gpu::softmax_cross_entropy_bwd_bf16_zloss_echo(dProbs.data(),
+	           dTgt.data(), dLogZ.data(), zlossCoef, echoCoef, dPA.data(),
+	           T, V, dDl2.data()));
+	ASSERT("ECHO scatter(2) dispatch failed",
+	       glades::gpu::echo_scatter_bf16(dProbs.data(), dIds.data(), dCnt.data(),
+	           echoCoef, T, V, w, dDl2.data()));
+	std::vector<unsigned short> dl2G(n);
+	ASSERT("ECHO compose download failed", dDl2.download(&dl2G[0], n));
+	float worst = 0.0f;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float a = glades::transformer_kernels::bf16_to_float(dl2C[i]);
+		const float b = glades::transformer_kernels::bf16_to_float(dl2G[i]);
+		const float bar = std::max(1e-3f, 0.0079f * std::max(fabsf(a), fabsf(b)));
+		worst = std::max(worst, fabsf(a - b) / bar);
+	}
+	std::printf("  [ECHO dense+scatter compose parity] worst err/ulp-bar=%.2f (bar 1)\n", worst);
+	ASSERT("ECHO composed backward beyond 1 bf16 ulp", worst <= 1.0f);
+#else
+	std::printf("  [ECHO GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+void CHIRONEchoZlossZeroCoefBitParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ECHO zloss zero-coef parity] no CUDA device — skipped\n");
+		return;
+	}
+	// echoCoef = 0 (with nonzero PA!) must be BIT-IDENTICAL to the shipped
+	// zloss kernel — the kernel-level half of the E0 interlock (the trainer
+	// additionally never dispatches the echo path at coef 0).
+	const int T = 64, V = 512;
+	const size_t n = (size_t)T * V;
+	LCG rng(777u);
+	std::vector<unsigned short> probsBf(n);
+	for (size_t i = 0; i < n; ++i)
+		probsBf[i] = glades::transformer_kernels::float_to_bf16_rn(rng.next_unit());
+	std::vector<int> targets(T);
+	std::vector<float> logZ(T), pa(T);
+	for (int t = 0; t < T; ++t)
+	{
+		targets[t] = (int)(rng.next_unit() * (float)V) % V;
+		logZ[t] = 3.0f * rng.next_unit();
+		pa[t] = rng.next_unit();   // nonzero: result must not depend on it
+	}
+	glades::gpu::GpuBuffer<unsigned short> dProbs, dDl1, dDl2;
+	glades::gpu::GpuBuffer<int> dTgt;
+	glades::gpu::GpuBuffer<float> dLogZ, dPA;
+	dProbs.allocate(n); dProbs.upload(&probsBf[0], n);
+	dTgt.allocate(T); dTgt.upload(&targets[0], T);
+	dLogZ.allocate(T); dLogZ.upload(&logZ[0], T);
+	dPA.allocate(T); dPA.upload(&pa[0], T);
+	dDl1.allocate(n); dDl2.allocate(n);
+	ASSERT("ECHO shipped zloss dispatch failed",
+	       glades::gpu::softmax_cross_entropy_bwd_bf16_zloss(dProbs.data(),
+	           dTgt.data(), dLogZ.data(), 1e-4f, T, V, dDl1.data()));
+	ASSERT("ECHO zloss_echo(0) dispatch failed",
+	       glades::gpu::softmax_cross_entropy_bwd_bf16_zloss_echo(dProbs.data(),
+	           dTgt.data(), dLogZ.data(), 1e-4f, 0.0f, dPA.data(),
+	           T, V, dDl2.data()));
+	std::vector<unsigned short> dl1(n), dl2(n);
+	ASSERT("ECHO dl1 download failed", dDl1.download(&dl1[0], n));
+	ASSERT("ECHO dl2 download failed", dDl2.download(&dl2[0], n));
+	size_t diffs = 0;
+	for (size_t i = 0; i < n; ++i) if (dl1[i] != dl2[i]) ++diffs;
+	std::printf("  [ECHO zloss zero-coef bit-parity] %lu/%lu diffs (bar 0)\n",
+	            (unsigned long)diffs, (unsigned long)n);
+	ASSERT("ECHO zloss_echo at coef 0 differs from shipped kernel", diffs == 0);
+#else
+	std::printf("  [ECHO zloss zero-coef parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

@@ -670,7 +670,7 @@ cd unit-tests/build && sh .configure.sh cuda # compile with cuda
 cd unit-tests && bash test.sh nnall    # run all tests
 ```
 
-**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`, `chiron-pact`, `chiron-generate`
+**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`, `chiron-pact`, `chiron-echo` (or `chiron-echo-cpu` for the GPU-free subset), `chiron-generate`
 
 **Install**: `cd build && make install` (installs to `~/.local`; also installs the ML header tree to `~/.local/include/glades/Backend/Machine Learning/` — required by the trainer since the vendored `include/` was removed)
 

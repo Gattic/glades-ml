@@ -4095,6 +4095,147 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
+// ---------------------------------------------------------------------------
+
+// Per-row excess-copy statistics.  One block per row, blockDim.x == w.
+// Slot s owns window token tokens[base+s] iff it is the id's FIRST slot;
+// margin math uses forced round-to-nearest separate ops and thread 0
+// accumulates in ascending slot order, so PA/Rrow/activeIds are bit-identical
+// to chiron_echo_stats_cpu (transformer_chiron_ops.h — the semantics
+// contract lives there).
+__global__ void echo_repeat_stats_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ tokens,
+    const int* __restrict__ targets,
+    int T, int V, int w, float kappa, float tau0,
+    float* __restrict__ PA,
+    float* __restrict__ Rrow,
+    int* __restrict__ activeIds,
+    int* __restrict__ activeCount)
+{
+	extern __shared__ float smemEcho[];
+	float* sP = smemEcho;                    // [w] active contribution p (else 0)
+	float* sR = smemEcho + w;                // [w] active contribution p - m
+	int* sId = (int*)(smemEcho + 2 * w);     // [w] active id (else -1)
+	int* sTok = sId + w;                     // [w] window token ids
+
+	const int t = blockIdx.x;
+	if (t >= T) return;
+	const int s = threadIdx.x;
+	const int wEff = (t + 1 < w) ? (t + 1) : w;
+	const int base = t - wEff + 1;
+
+	int v = -1;
+	if (s < wEff) v = tokens[base + s];
+	sTok[s] = v;
+	sP[s] = 0.0f;
+	sR[s] = 0.0f;
+	sId[s] = -1;
+	__syncthreads();
+
+	if (s < wEff && v >= 0 && v < V)
+	{
+		bool owner = true;
+		for (int s2 = 0; s2 < s; ++s2)
+			if (sTok[s2] == v) { owner = false; break; }
+		if (owner && v != targets[t])
+		{
+			int n = 0;
+			for (int s2 = 0; s2 < wEff; ++s2)
+				if (sTok[s2] == v) ++n;
+			const float ratio = (float)n / (float)w;
+			const float km = __fmul_rn(kappa, ratio);
+			const float m = __fadd_rn(km, tau0);
+			const float p = bf16_load(probs[(size_t)t * V + v]);
+			if (p > m)
+			{
+				sP[s] = p;
+				sR[s] = __fadd_rn(p, -m);
+				sId[s] = v;
+			}
+		}
+	}
+	__syncthreads();
+
+	if (s == 0)
+	{
+		float pa = 0.0f, r = 0.0f;
+		int cnt = 0;
+		for (int s2 = 0; s2 < wEff; ++s2)
+		{
+			if (sId[s2] < 0) continue;
+			pa = __fadd_rn(pa, sP[s2]);
+			r = __fadd_rn(r, sR[s2]);
+			activeIds[(size_t)t * w + cnt] = sId[s2];
+			++cnt;
+		}
+		PA[t] = pa;
+		Rrow[t] = r;
+		activeCount[t] = cnt;
+	}
+}
+
+// Dense ECHO term folded into the zloss CE backward: source is the shipped
+// softmax_cross_entropy_backward_bf16_zloss kernel with ONE appended
+// statement (v += eterm * p).  At echoCoef == 0, eterm*p is a signed zero
+// and v += (-0.0f) is the identity on every float, so the output is
+// bit-identical to the shipped kernel (unit-enforced by
+// CHIRONEchoZlossZeroCoefBitParityTest); the trainer additionally never
+// dispatches this kernel at echoCoef == 0.
+__global__ void softmax_cross_entropy_backward_bf16_zloss_echo(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    const float* __restrict__ logZ,
+    float zlossCoef,
+    float echoCoef,
+    const float* __restrict__ PA,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float lz = logZ[row];
+	const float zterm = 2.0f * zlossCoef * lz;
+	const float eterm = -echoCoef * PA[row];
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = bf16_load(pRow[i]);
+		float v = (i == target) ? (p - 1.0f) : p;
+		v += zterm * p;
+		v += eterm * p;
+		dRow[i] = bf16_store(v);
+	}
+}
+
+// Sparse ECHO scatter: dlogits[t, id] += echoCoef * probs[t, id] on the
+// active ids.  Ids within a row are distinct (stats dedup) — conflict-free
+// RMW; forced-rn ops mirror chiron_echo_scatter_cpu bit-for-bit.
+__global__ void echo_scatter_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ activeIds,
+    const int* __restrict__ activeCount,
+    float echoCoef, int V, int w,
+    unsigned short* __restrict__ dlogits)
+{
+	const int t = blockIdx.x;
+	const int cnt = activeCount[t];
+	for (int k = threadIdx.x; k < cnt; k += blockDim.x)
+	{
+		const int id = activeIds[(size_t)t * w + k];
+		if (id < 0 || id >= V) continue;
+		const size_t off = (size_t)t * V + id;
+		const float add = __fmul_rn(echoCoef, bf16_load(probs[off]));
+		const float d = __fadd_rn(bf16_load(dlogits[off]), add);
+		dlogits[off] = bf16_store(d);
+	}
+}
+
 __global__ void scale_array_bf16_kernel(unsigned short* __restrict__ x,
                                          float scale, int n)
 {
@@ -4277,6 +4418,51 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 	int block = rowBlockSize(cols);
 	softmax_cross_entropy_backward_bf16_zloss<<<rows, block, 0, computeStream()>>>(
 	    probs, targets, logZ, zlossCoef, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
+                       const int* targets, int T, int V, int w,
+                       float kappa, float tau0,
+                       float* PA, float* Rrow, int* activeIds, int* activeCount)
+{
+	if (T <= 0 || V <= 0) return true;
+	if (w < 1 || w > 1024) return false;
+	const int smem = w * 2 * (int)sizeof(float) + w * 2 * (int)sizeof(int);
+	echo_repeat_stats_kernel<<<T, w, smem, computeStream()>>>(
+	    probs, tokens, targets, T, V, w, kappa, tau0,
+	    PA, Rrow, activeIds, activeCount);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
+                                                const int* targets,
+                                                const float* logZ,
+                                                float zlossCoef,
+                                                float echoCoef,
+                                                const float* PA,
+                                                int rows, int cols,
+                                                unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_bf16_zloss_echo<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, echoCoef, PA, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
+                       const int* activeCount, float echoCoef,
+                       int rows, int cols, int w, unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	if (w < 1 || w > 1024) return false;
+	int block = (w < 32) ? 32 : ((w > 256) ? 256 : w);
+	echo_scatter_bf16_kernel<<<rows, block, 0, computeStream()>>>(
+	    probs, activeIds, activeCount, echoCoef, cols, w, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

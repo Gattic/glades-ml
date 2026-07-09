@@ -34,6 +34,9 @@
 #include <cstddef>
 #include <vector>
 
+#include "../rng.h"               // transformer_kernels.h depends on glades::rng
+#include "transformer_kernels.h"  // bf16 host helpers (ECHO CPU refs)
+
 namespace glades {
 namespace chiron {
 
@@ -1661,6 +1664,119 @@ inline float sira_loss_from_phase_trajectory(const float* pStates,
 	                            useBalance ? balanceWeight : 0.0f,
 	                            useAction ? actionWeight : 0.0f,
 	                            huberTau, safeEps);
+}
+
+// ---------------------------------------------------------------------------
+// ECHO — Excess-Copy Hinged Objective CPU references (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
+//
+// Semantics contract (the GPU kernels mirror this bit-for-bit):
+//   window W_t = tokens[max(0, t-w+1) .. t]  (wEff = min(w, t+1) slots,
+//   oldest slot first).  Each distinct id is OWNED by its first slot;
+//   occurrence count n(v) is taken over the whole window; the margin is
+//   m(v) = kappa*(n/w) + tau0 (divide by w, not wEff — conservative for
+//   early positions).  A window id is ACTIVE iff v != targets[t] (truth
+//   exclusion) and p_t(v) > m(v).  PA/Rrow accumulate and activeIds emit in
+//   ascending owner-slot order.  Margin math is kept as separate named
+//   statements (no FMA contraction) so CPU == GPU __f*_rn exactly.
+// ---------------------------------------------------------------------------
+inline void chiron_echo_stats_cpu(const float* probs, const int* tokens,
+                                  const int* targets, int T, int V, int w,
+                                  float kappa, float tau0,
+                                  float* PA, float* Rrow,
+                                  int* activeIds, int* activeCount)
+{
+	for (int t = 0; t < T; ++t)
+	{
+		const float* pRow = probs + (size_t)t * V;
+		const int tgt = targets[t];
+		const int wEff = (t + 1 < w) ? (t + 1) : w;
+		const int base = t - wEff + 1;
+		float pa = 0.0f, r = 0.0f;
+		int cnt = 0;
+		for (int s = 0; s < wEff; ++s)
+		{
+			const int v = tokens[base + s];
+			if (v < 0 || v >= V) continue;
+			bool owner = true;
+			for (int s2 = 0; s2 < s; ++s2)
+				if (tokens[base + s2] == v) { owner = false; break; }
+			if (!owner) continue;
+			if (v == tgt) continue;
+			int n = 0;
+			for (int s2 = 0; s2 < wEff; ++s2)
+				if (tokens[base + s2] == v) ++n;
+			const float ratio = (float)n / (float)w;
+			const float km = kappa * ratio;
+			const float m = km + tau0;
+			const float p = pRow[v];
+			if (p > m)
+			{
+				const float contrib = p - m;
+				pa += p;
+				r += contrib;
+				activeIds[(size_t)t * w + cnt] = v;
+				++cnt;
+			}
+		}
+		PA[t] = pa;
+		Rrow[t] = r;
+		activeCount[t] = cnt;
+	}
+}
+
+// Dense ECHO+Z-loss CE backward on BF16 storage.  Statement-for-statement
+// mirror of the GPU kernel (which itself mirrors the shipped zloss kernel
+// plus one appended eterm statement); GPU FMA contraction may differ from
+// the host by 1 fp32 ulp before the bf16 round — parity bar is 1 bf16 ulp.
+inline void chiron_echo_zloss_bwd_cpu(const unsigned short* probs,
+                                      const int* targets, const float* logZ,
+                                      float zlossCoef, float echoCoef,
+                                      const float* PA,
+                                      int T, int V, unsigned short* dlogits)
+{
+	for (int t = 0; t < T; ++t)
+	{
+		const unsigned short* pRow = probs + (size_t)t * V;
+		unsigned short* dRow = dlogits + (size_t)t * V;
+		const int target = targets[t];
+		const float zterm = 2.0f * zlossCoef * logZ[t];
+		const float eterm = -echoCoef * PA[t];
+		for (int i = 0; i < V; ++i)
+		{
+			const float p = transformer_kernels::bf16_to_float(pRow[i]);
+			float v = (i == target) ? (p - 1.0f) : p;
+			v += zterm * p;
+			v += eterm * p;
+			dRow[i] = transformer_kernels::float_to_bf16_rn(v);
+		}
+	}
+}
+
+// Sparse active-id scatter: dlogits[t, id] += echoCoef * probs[t, id] on the
+// <= activeCount[t] ids emitted by the stats pass.  Ids within a row are
+// distinct (dedup), so the RMW is conflict-free; separate mul/add statements
+// mirror the GPU __fmul_rn/__fadd_rn exactly (bit-exact parity).
+inline void chiron_echo_scatter_cpu(const unsigned short* probs,
+                                    const int* activeIds,
+                                    const int* activeCount,
+                                    float echoCoef, int T, int V, int w,
+                                    unsigned short* dlogits)
+{
+	for (int t = 0; t < T; ++t)
+	{
+		const unsigned short* pRow = probs + (size_t)t * V;
+		unsigned short* dRow = dlogits + (size_t)t * V;
+		const int cnt = activeCount[t];
+		for (int k = 0; k < cnt; ++k)
+		{
+			const int id = activeIds[(size_t)t * w + k];
+			if (id < 0 || id >= V) continue;
+			const float add = echoCoef * transformer_kernels::bf16_to_float(pRow[id]);
+			const float d = transformer_kernels::bf16_to_float(dRow[id]) + add;
+			dRow[id] = transformer_kernels::float_to_bf16_rn(d);
+		}
+	}
 }
 
 } // namespace chiron
