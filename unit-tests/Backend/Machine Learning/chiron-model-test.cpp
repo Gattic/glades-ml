@@ -520,12 +520,12 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 5: Unknown bit 2048 → reject with errCode=4 ----
+	// ---- Case 5: Unknown bit 4096 → reject with errCode=4 ----
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
 
-		const uint32_t flags = 2048u;  // bit beyond CKPT_KNOWN_BITS_MASK
+		const uint32_t flags = 4096u;  // bit beyond CKPT_KNOWN_BITS_MASK
 
 		std::string path = rt_tmppath();
 		ASSERT("rt5 tmppath", !path.empty());
@@ -547,13 +547,17 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 6: bit 512 (a_drift) + bit 1024 (rot_phi) ----
-	// a_drift is the SECOND-to-last section (rot_phi is last).  The reader locates
-	// a_drift by EOF arithmetic: offset = fileSize - 2*L*m*4.  Assert BOTH sections
-	// load element-exact.
+	// ---- Case 6: bit 2048 (trainer WhiSC) + bit 512 (a_drift) + bit 1024 (rot_phi) ----
+	// Serving ignores the trainer-owned WhiSC section.  a_drift remains the
+	// SECOND-to-last section and rot_phi remains last, so both EOF tails must
+	// still load element-exact.
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
+
+		const size_t whisc_n = 3u * (size_t)RT_L * RT_M;  // Pbar + Qbar + a
+		std::vector<float> whiscPayload(whisc_n);
+		rt_fill(&whiscPayload[0], whisc_n, 50.0f);
 
 		const size_t aDrift_n = (size_t)RT_L * RT_M;  // 8 floats
 		std::vector<float> aDriftPayload(aDrift_n);
@@ -564,7 +568,8 @@ static void CHIRONCkptRoundtripTest()
 		rt_fill(&rotPhiSrc[0], rotphi_n, 70.0f);
 
 		const uint32_t flags = (uint32_t)glades::chiron::CKPT_BIT_A_DRIFT
-		                     | (uint32_t)glades::chiron::CKPT_BIT_ROT_PHI;
+		                     | (uint32_t)glades::chiron::CKPT_BIT_ROT_PHI
+		                     | (uint32_t)glades::chiron::CKPT_BIT_WHISC_STATE;
 
 		std::string path = rt_tmppath();
 		ASSERT("rt6 tmppath", !path.empty());
@@ -573,6 +578,7 @@ static void CHIRONCkptRoundtripTest()
 		ASSERT("rt6 fopen", fp != 0);
 		ASSERT("rt6 write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
 		ASSERT("rt6 write_weights", rt_write_weights(fp, src, false, false));
+		ASSERT("rt6 write_whisc", std::fwrite(&whiscPayload[0], sizeof(float), whisc_n, fp) == whisc_n);
 		// a_drift written BEFORE rot_phi; reader finds it via the (bit1024?2:1) EOF arithmetic.
 		ASSERT("rt6 write_adrift",  glades::chiron::chiron_write_f32_tail_section(fp, &aDriftPayload[0], aDrift_n));
 		// rot_phi MUST be LAST.

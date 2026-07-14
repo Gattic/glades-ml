@@ -600,6 +600,13 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
                     dims.L, dims.nH);
     }
 
+    // bit 2048 is trainer-only WhiSC resume calibration state.  Serving always
+    // recalibrates Pbar/Qbar/a from the current window (ema=1), and the two
+    // model tails are found from EOF, so no sequential seek is needed here.
+    if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_WHISC_STATE) != 0)
+        std::printf("[chiron-ckpt] WhiSC calibration state present (trainer-resume section); "
+                    "serving will recalibrate from the current window\n");
+
     // bit 512: OBSD per-layer drift gate a_drift (L*m FP32) — read from EOF tail.
     // a_drift is written immediately BEFORE rot_phi (bit 1024, which is always LAST).
     // Locate it by EOF arithmetic, mirroring the rot_phi tail read below:

@@ -13,6 +13,7 @@
 //   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
 //   | [bit 256] QK-Norm gamma: L*nH f32
 //   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
+//   | [bit 2048] WhiSC calibration: Pbar[L*m], Qbar[L*m], a[L*m] f32 (trainer-owned)
 //   | [bit 512] a_drift: L*m f32
 //   | [bit 1024] rot_phi: L*m f32       <-- MUST STAY LAST (EOF-tail read)
 // Version rules: v4 iff bit 64 (bf16-on-disk); else v3 iff bit 8 (gamma_p);
@@ -45,11 +46,13 @@ enum ChironCkptBits
 	CKPT_BIT_SCFA         = 128,
 	CKPT_BIT_QKNORM_GAMMA = 256,
 	CKPT_BIT_A_DRIFT      = 512,
-	CKPT_BIT_ROT_PHI      = 1024
+	CKPT_BIT_ROT_PHI      = 1024,
+	CKPT_BIT_WHISC_STATE  = 2048
 };
-// All bits the current format defines (reader hard-errors on anything above:
-// an unknown section would corrupt the rot_phi EOF-tail read).
-static const uint32_t CKPT_KNOWN_BITS_MASK = 0x7FFu;  // == 2047 == bits 1..1024
+// All bits the current format defines.  The WhiSC section is trainer-owned and
+// sits before the two EOF tails, so serving may safely ignore it after checking
+// the bit.  Unknown future bits still hard-error to protect tail arithmetic.
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0xFFFu;  // == 4095 == bits 1..2048
 
 // CHRN v3 legacy flags word bits.
 enum ChironChrnBits
