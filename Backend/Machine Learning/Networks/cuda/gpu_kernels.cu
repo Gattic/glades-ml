@@ -4300,26 +4300,33 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss(
 // ---------------------------------------------------------------------------
 
 // Per-row excess-copy statistics.  One block per row, blockDim.x == w.
-// Slot s owns window token tokens[base+s] iff it is the id's FIRST slot;
-// margin math uses forced round-to-nearest separate ops and thread 0
-// accumulates in ascending slot order, so PA/Rrow/activeIds are bit-identical
-// to chiron_echo_stats_cpu (transformer_chiron_ops.h — the semantics
-// contract lives there).
+// A 2x-load-factor shared-memory hash builds counts + first-slot ownership in
+// expected O(w), avoiding the original O(w^2) duplicate/count scans.  Shared
+// atomics never escape the block; thread 0 still emits owner-slot order, so
+// outputs remain deterministic and CPU-reference comparable. huberDelta==0
+// is the exact hard hinge. For delta>0, sW=h'(p-margin), sP=p*sW is the
+// dense-gradient contribution, and sR is the Huberized loss.
 __global__ void echo_repeat_stats_kernel(
     const unsigned short* __restrict__ probs,
     const int* __restrict__ tokens,
     const int* __restrict__ targets,
-    int T, int V, int w, float kappa, float tau0,
+    int T, int V, int w, int hashSize,
+    float kappa, float tau0, float huberDelta,
     float* __restrict__ PA,
     float* __restrict__ Rrow,
     int* __restrict__ activeIds,
-    int* __restrict__ activeCount)
+    float* __restrict__ activeWeights,
+    int* __restrict__ activeCount,
+    float* __restrict__ maxActiveProb)
 {
 	extern __shared__ float smemEcho[];
-	float* sP = smemEcho;                    // [w] active contribution p (else 0)
-	float* sR = smemEcho + w;                // [w] active contribution p - m
-	int* sId = (int*)(smemEcho + 2 * w);     // [w] active id (else -1)
-	int* sTok = sId + w;                     // [w] window token ids
+	float* sP = smemEcho;                    // [w] p*h'(p-m), else 0
+	float* sR = smemEcho + w;                // [w] Huberized hinge loss
+	float* sW = smemEcho + 2 * w;            // [w] h'(p-m)
+	int* sId = (int*)(smemEcho + 3 * w);     // [w] active id (else -1)
+	int* hashKeys = sId + w;                  // [hashSize], -1 = empty
+	int* hashCounts = hashKeys + hashSize;    // [hashSize]
+	int* hashOwners = hashCounts + hashSize;  // [hashSize], minimum slot
 
 	const int t = blockIdx.x;
 	if (t >= T) return;
@@ -4329,30 +4336,66 @@ __global__ void echo_repeat_stats_kernel(
 
 	int v = -1;
 	if (s < wEff) v = tokens[base + s];
-	sTok[s] = v;
 	sP[s] = 0.0f;
 	sR[s] = 0.0f;
+	sW[s] = 0.0f;
 	sId[s] = -1;
+	for (int i = s; i < hashSize; i += blockDim.x)
+	{
+		hashKeys[i] = -1;
+		hashCounts[i] = 0;
+		hashOwners[i] = w;
+	}
 	__syncthreads();
 
 	if (s < wEff && v >= 0 && v < V)
 	{
-		bool owner = true;
-		for (int s2 = 0; s2 < s; ++s2)
-			if (sTok[s2] == v) { owner = false; break; }
-		if (owner && v != targets[t])
+		int h = (int)(((unsigned int)v * 2654435761u) & (unsigned int)(hashSize - 1));
+		for (int probe = 0; probe < hashSize; ++probe)
 		{
-			int n = 0;
-			for (int s2 = 0; s2 < wEff; ++s2)
-				if (sTok[s2] == v) ++n;
-			const float ratio = (float)n / (float)w;
+			const int old = atomicCAS(hashKeys + h, -1, v);
+			if (old == -1 || old == v)
+			{
+				atomicAdd(hashCounts + h, 1);
+				atomicMin(hashOwners + h, s);
+				break;
+			}
+			h = (h + 1) & (hashSize - 1);
+		}
+	}
+	__syncthreads();
+
+	if (s < wEff && v >= 0 && v < V && v != targets[t])
+	{
+		int h = (int)(((unsigned int)v * 2654435761u) & (unsigned int)(hashSize - 1));
+		for (int probe = 0; probe < hashSize && hashKeys[h] != v; ++probe)
+			h = (h + 1) & (hashSize - 1);
+		if (hashKeys[h] == v && hashOwners[h] == s)
+		{
+			const int n = hashCounts[h];
+			const float ratio = __fdiv_rn((float)n, (float)w);
 			const float km = __fmul_rn(kappa, ratio);
 			const float m = __fadd_rn(km, tau0);
 			const float p = bf16_load(probs[(size_t)t * V + v]);
 			if (p > m)
 			{
-				sP[s] = p;
-				sR[s] = __fadd_rn(p, -m);
+				const float x = __fadd_rn(p, -m);
+				float weight = 1.0f;
+				float contribution = x;
+				if (huberDelta > 0.0f && x < huberDelta)
+				{
+					weight = __fdiv_rn(x, huberDelta);
+					const float xw = __fmul_rn(x, weight);
+					contribution = __fmul_rn(0.5f, xw);
+				}
+				else if (huberDelta > 0.0f)
+				{
+					const float halfDelta = __fmul_rn(0.5f, huberDelta);
+					contribution = __fadd_rn(x, -halfDelta);
+				}
+				sP[s] = __fmul_rn(p, weight);
+				sR[s] = contribution;
+				sW[s] = weight;
 				sId[s] = v;
 			}
 		}
@@ -4361,19 +4404,24 @@ __global__ void echo_repeat_stats_kernel(
 
 	if (s == 0)
 	{
-		float pa = 0.0f, r = 0.0f;
+		float pa = 0.0f, r = 0.0f, pmax = 0.0f;
 		int cnt = 0;
 		for (int s2 = 0; s2 < wEff; ++s2)
 		{
 			if (sId[s2] < 0) continue;
 			pa = __fadd_rn(pa, sP[s2]);
 			r = __fadd_rn(r, sR[s2]);
-			activeIds[(size_t)t * w + cnt] = sId[s2];
+			const size_t slot = (size_t)t * w + cnt;
+			activeIds[slot] = sId[s2];
+			if (activeWeights) activeWeights[slot] = sW[s2];
+			const float p = bf16_load(probs[(size_t)t * V + sId[s2]]);
+			if (p > pmax) pmax = p;
 			++cnt;
 		}
 		PA[t] = pa;
 		Rrow[t] = r;
 		activeCount[t] = cnt;
+		if (maxActiveProb) maxActiveProb[t] = pmax;
 	}
 }
 
@@ -4412,12 +4460,12 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss_echo(
 	}
 }
 
-// Sparse ECHO scatter: dlogits[t, id] += echoCoef * probs[t, id] on the
-// active ids.  Ids within a row are distinct (stats dedup) — conflict-free
-// RMW; forced-rn ops mirror chiron_echo_scatter_cpu bit-for-bit.
+// Sparse ECHO scatter. activeWeights is null for the hard hinge and stores
+// h'(p-margin) for the optional Huberized knee.
 __global__ void echo_scatter_bf16_kernel(
     const unsigned short* __restrict__ probs,
     const int* __restrict__ activeIds,
+    const float* __restrict__ activeWeights,
     const int* __restrict__ activeCount,
     float echoCoef, int V, int w,
     unsigned short* __restrict__ dlogits)
@@ -4426,10 +4474,13 @@ __global__ void echo_scatter_bf16_kernel(
 	const int cnt = activeCount[t];
 	for (int k = threadIdx.x; k < cnt; k += blockDim.x)
 	{
-		const int id = activeIds[(size_t)t * w + k];
+		const size_t slot = (size_t)t * w + k;
+		const int id = activeIds[slot];
 		if (id < 0 || id >= V) continue;
 		const size_t off = (size_t)t * V + id;
-		const float add = __fmul_rn(echoCoef, bf16_load(probs[off]));
+		const float weight = activeWeights ? activeWeights[slot] : 1.0f;
+		const float weightedP = __fmul_rn(weight, bf16_load(probs[off]));
+		const float add = __fmul_rn(echoCoef, weightedP);
 		const float d = __fadd_rn(bf16_load(dlogits[off]), add);
 		dlogits[off] = bf16_store(d);
 	}
@@ -4627,19 +4678,33 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 	return true;
 }
 
+bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
+                             const int* targets, int T, int V, int w,
+                             float kappa, float tau0, float huberDelta,
+                             float* PA, float* Rrow, int* activeIds,
+                             float* activeWeights, int* activeCount,
+                             float* maxActiveProb)
+{
+	if (T <= 0 || V <= 0) return true;
+	if (w < 1 || w > 1024 || huberDelta < 0.0f) return false;
+	int hashSize = 2;
+	while (hashSize < 2 * w) hashSize <<= 1;
+	const int smem = w * 3 * (int)sizeof(float) + w * (int)sizeof(int)
+	               + hashSize * 3 * (int)sizeof(int);
+	echo_repeat_stats_kernel<<<T, w, smem, computeStream()>>>(
+	    probs, tokens, targets, T, V, w, hashSize, kappa, tau0, huberDelta,
+	    PA, Rrow, activeIds, activeWeights, activeCount, maxActiveProb);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
                        const int* targets, int T, int V, int w,
                        float kappa, float tau0,
                        float* PA, float* Rrow, int* activeIds, int* activeCount)
 {
-	if (T <= 0 || V <= 0) return true;
-	if (w < 1 || w > 1024) return false;
-	const int smem = w * 2 * (int)sizeof(float) + w * 2 * (int)sizeof(int);
-	echo_repeat_stats_kernel<<<T, w, smem, computeStream()>>>(
-	    probs, tokens, targets, T, V, w, kappa, tau0,
-	    PA, Rrow, activeIds, activeCount);
-	GLADES_CUDA_CHECK(cudaGetLastError());
-	return true;
+	return echo_repeat_stats_huber(probs, tokens, targets, T, V, w,
+	    kappa, tau0, 0.0f, PA, Rrow, activeIds, NULL, activeCount, NULL);
 }
 
 bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
@@ -4659,17 +4724,29 @@ bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
 	return true;
 }
 
-bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
-                       const int* activeCount, float echoCoef,
-                       int rows, int cols, int w, unsigned short* dlogits)
+bool echo_scatter_bf16_weighted(const unsigned short* probs,
+                                const int* activeIds,
+                                const float* activeWeights,
+                                const int* activeCount, float echoCoef,
+                                int rows, int cols, int w,
+                                unsigned short* dlogits)
 {
 	if (rows <= 0 || cols <= 0) return true;
 	if (w < 1 || w > 1024) return false;
 	int block = (w < 32) ? 32 : ((w > 256) ? 256 : w);
 	echo_scatter_bf16_kernel<<<rows, block, 0, computeStream()>>>(
-	    probs, activeIds, activeCount, echoCoef, cols, w, dlogits);
+	    probs, activeIds, activeWeights, activeCount,
+	    echoCoef, cols, w, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
+}
+
+bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
+                       const int* activeCount, float echoCoef,
+                       int rows, int cols, int w, unsigned short* dlogits)
+{
+	return echo_scatter_bf16_weighted(probs, activeIds, NULL, activeCount,
+	    echoCoef, rows, cols, w, dlogits);
 }
 
 bool scale_array_bf16(unsigned short* x, float scale, int n)

@@ -306,6 +306,7 @@ int main(int argc, char* argv[])
 	    {
 		CHIRONEchoStatsCpuTest();
 		CHIRONEchoGradFDCpuTest();
+		CHIRONEchoE2CpuTest();
 		CHIRONEchoGpuParityTest();
 		CHIRONEchoZlossZeroCoefBitParityTest();
 	    }
@@ -314,6 +315,7 @@ int main(int argc, char* argv[])
 		// GPU-free subset (run while the GPU is occupied by training).
 		CHIRONEchoStatsCpuTest();
 		CHIRONEchoGradFDCpuTest();
+		CHIRONEchoE2CpuTest();
 	    }
 	    else if (strcmp(argv[1], "chiron-model") == 0)
 		CHIRONModelUnitTest();

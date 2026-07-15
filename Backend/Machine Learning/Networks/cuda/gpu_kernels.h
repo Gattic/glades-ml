@@ -107,13 +107,23 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 // Semantics contract + bit-exact CPU references: chiron_echo_*_cpu in
 // transformer_chiron_ops.h.  Training-only readout regularizer; the trainer
 // dispatches none of these at --echo-coef 0 (E0 discipline).
-// Per-row excess-copy stats over the trailing w-token window: PA[T] (active
-// excess mass), Rrow[T] (hinge loss terms), activeIds[T*w] (first cnt slots
-// per row), activeCount[T].  blockDim == w; w in [1, 1024].
+// Per-row excess-copy stats over the trailing w-token window: PA[T] (dense
+// gradient mass), Rrow[T] (hinge loss terms), activeIds[T*w] (first cnt slots
+// per row), activeCount[T].  blockDim == w; w in [1, 1024].  The legacy entry
+// point is the exact hard hinge.  The Huber entry point implements
+// h_delta(x)=x^2/(2delta) for 0<x<delta and x-delta/2 for x>=delta;
+// activeWeights stores h'_delta(x), PA=sum(p*h'), and maxActiveProb is an
+// optional per-row diagnostic.  Nullable outputs avoid extra hard-hinge state.
 bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
                        const int* targets, int T, int V, int w,
                        float kappa, float tau0,
                        float* PA, float* Rrow, int* activeIds, int* activeCount);
+bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
+                             const int* targets, int T, int V, int w,
+                             float kappa, float tau0, float huberDelta,
+                             float* PA, float* Rrow, int* activeIds,
+                             float* activeWeights, int* activeCount,
+                             float* maxActiveProb);
 // Shipped zloss CE backward + the dense ECHO term (-echoCoef*PA[t])*probs;
 // bit-identical to softmax_cross_entropy_bwd_bf16_zloss at echoCoef == 0.
 bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
@@ -124,10 +134,17 @@ bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
                                                 const float* PA,
                                                 int rows, int cols,
                                                 unsigned short* dlogits);
-// Sparse ECHO scatter: dlogits[t, id] += echoCoef*probs[t, id] on active ids.
+// Sparse ECHO scatter.  Hard hinge adds echoCoef*probs[t,id]; the weighted
+// form additionally multiplies by activeWeights[t,k]=h'_delta(p-margin).
 bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
                        const int* activeCount, float echoCoef,
                        int rows, int cols, int w, unsigned short* dlogits);
+bool echo_scatter_bf16_weighted(const unsigned short* probs,
+                                const int* activeIds,
+                                const float* activeWeights,
+                                const int* activeCount, float echoCoef,
+                                int rows, int cols, int w,
+                                unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
@@ -1293,8 +1310,10 @@ inline bool softmax_forward_bf16_with_lse(const unsigned short*, int, int, unsig
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short*, const int*, const float*, float, int, int, unsigned short*) { return false; }
 inline bool echo_repeat_stats(const unsigned short*, const int*, const int*, int, int, int, float, float, float*, float*, int*, int*) { return false; }
+inline bool echo_repeat_stats_huber(const unsigned short*, const int*, const int*, int, int, int, float, float, float, float*, float*, int*, float*, int*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short*, const int*, const float*, float, float, const float*, int, int, unsigned short*) { return false; }
 inline bool echo_scatter_bf16(const unsigned short*, const int*, const int*, float, int, int, int, unsigned short*) { return false; }
+inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const float*, const int*, float, int, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }

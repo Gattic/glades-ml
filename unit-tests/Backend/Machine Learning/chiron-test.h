@@ -145,6 +145,7 @@ void CHIRONPactFieldParityTest();
 // docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md).
 void CHIRONEchoStatsCpuTest();
 void CHIRONEchoGradFDCpuTest();
+void CHIRONEchoE2CpuTest();
 void CHIRONEchoGpuParityTest();
 void CHIRONEchoZlossZeroCoefBitParityTest();
 

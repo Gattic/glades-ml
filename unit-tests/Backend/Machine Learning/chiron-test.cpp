@@ -20007,7 +20007,10 @@ static double echoRFromLogits(const std::vector<float>& z,
                               std::vector<float>* probsOut,
                               std::vector<float>* paOut,
                               std::vector<int>* idsOut,
-                              std::vector<int>* cntOut)
+                              std::vector<int>* cntOut,
+                              float huberDelta = 0.0f,
+                              std::vector<float>* weightsOut = NULL,
+                              std::vector<float>* pmaxOut = NULL)
 {
 	std::vector<float> probs((size_t)T * V);
 	for (int t = 0; t < T; ++t)
@@ -20022,16 +20025,19 @@ static double echoRFromLogits(const std::vector<float>& z,
 		}
 		for (int v = 0; v < V; ++v) probs[(size_t)t * V + v] /= den;
 	}
-	std::vector<float> PA(T), Rrow(T);
+	std::vector<float> PA(T), Rrow(T), weights((size_t)T * w, -1.0f), pmax(T);
 	std::vector<int> ids((size_t)T * w, -1), cnt(T);
-	glades::chiron::chiron_echo_stats_cpu(&probs[0], &tokens[0], &targets[0],
-	    T, V, w, kappa, tau0, &PA[0], &Rrow[0], &ids[0], &cnt[0]);
+	glades::chiron::chiron_echo_stats_cpu_huber(&probs[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, huberDelta, &PA[0], &Rrow[0], &ids[0],
+	    weightsOut ? &weights[0] : NULL, &cnt[0], pmaxOut ? &pmax[0] : NULL);
 	double R = 0.0;
 	for (int t = 0; t < T; ++t) R += (double)Rrow[t];
 	if (probsOut) *probsOut = probs;
 	if (paOut) *paOut = PA;
 	if (idsOut) *idsOut = ids;
 	if (cntOut) *cntOut = cnt;
+	if (weightsOut) *weightsOut = weights;
+	if (pmaxOut) *pmaxOut = pmax;
 	return R;
 }
 
@@ -20195,6 +20201,119 @@ void CHIRONEchoGradFDCpuTest()
 	ASSERT("ECHO not shift-invariant", fabs(Rs - R0) < 1e-5);
 }
 
+void CHIRONEchoE2CpuTest()
+{
+	// E2: exercise both branches of the optional Huber knee, verify its exact
+	// logit gradient by finite differences, the delta->0 hard-hinge limit,
+	// shift invariance, row-zero-sum, and lambda-linear field calibration.
+	const int T = 4, V = 12, w = 3;
+	const float kappa = 0.0f, tau0 = 0.10f, delta = 0.20f;
+	std::vector<int> tokens(T), targets(T, 11);
+	tokens[0] = 2; tokens[1] = 3; tokens[2] = 2; tokens[3] = 5;
+	std::vector<float> z((size_t)T * V, 0.0f);
+	z[0 * V + 2] = 0.8f;   // shallow excess: inside the Huber knee
+	z[1 * V + 3] = 3.0f;   // deep excess: linear Huber branch
+	z[2 * V + 2] = 2.0f;
+	z[3 * V + 5] = 1.2f;
+
+	std::vector<float> probs, PA, weights, pmax;
+	std::vector<int> ids, cnt;
+	const double Rh = echoRFromLogits(z, tokens, targets, T, V, w,
+	    kappa, tau0, &probs, &PA, &ids, &cnt, delta, &weights, &pmax);
+	ASSERT("ECHO Huber fixture inactive", Rh > 0.0);
+	bool sawKnee = false, sawLinear = false;
+	for (int t = 0; t < T; ++t)
+	{
+		float expectedMax = 0.0f;
+		for (int k = 0; k < cnt[t]; ++k)
+		{
+			const size_t slot = (size_t)t * w + k;
+			const float p = probs[(size_t)t * V + ids[slot]];
+			expectedMax = std::max(expectedMax, p);
+			if (weights[slot] > 0.0f && weights[slot] < 1.0f) sawKnee = true;
+			if (weights[slot] == 1.0f) sawLinear = true;
+		}
+		ASSERT("ECHO max-active diagnostic mismatch", fabsf(pmax[t] - expectedMax) < 1e-7f);
+	}
+	ASSERT("ECHO Huber fixture missed quadratic knee", sawKnee);
+	ASSERT("ECHO Huber fixture missed linear branch", sawLinear);
+
+	std::vector<float> g((size_t)T * V, 0.0f);
+	double echoSq = 0.0, ceSq = 0.0;
+	for (int t = 0; t < T; ++t)
+	{
+		double rowSum = 0.0;
+		for (int v = 0; v < V; ++v)
+		{
+			float b = 0.0f;
+			for (int k = 0; k < cnt[t]; ++k)
+				if (ids[(size_t)t * w + k] == v) b = weights[(size_t)t * w + k];
+			const float corr = probs[(size_t)t * V + v] * (b - PA[t]);
+			g[(size_t)t * V + v] = corr;
+			rowSum += corr;
+			echoSq += (double)corr * corr;
+			const float ce = probs[(size_t)t * V + v] - (v == targets[t] ? 1.0f : 0.0f);
+			ceSq += (double)ce * ce;
+		}
+		ASSERT("ECHO Huber row correction not shift-orthogonal", fabs(rowSum) < 1e-6);
+	}
+
+	const float eps = 1e-3f;
+	float worst = 0.0f;
+	for (int t = 0; t < T; ++t)
+		for (int v = 0; v < V; ++v)
+		{
+			std::vector<float> zp = z, zm = z;
+			zp[(size_t)t * V + v] += eps;
+			zm[(size_t)t * V + v] -= eps;
+			const double Rp = echoRFromLogits(zp, tokens, targets, T, V, w,
+			    kappa, tau0, NULL, NULL, NULL, NULL, delta);
+			const double Rm = echoRFromLogits(zm, tokens, targets, T, V, w,
+			    kappa, tau0, NULL, NULL, NULL, NULL, delta);
+			const float fd = (float)((Rp - Rm) / (2.0 * eps));
+			worst = std::max(worst, fabsf(fd - g[(size_t)t * V + v]));
+		}
+	std::printf("  [ECHO E2 Huber FD] worst abs err=%.2e (bar 2e-3)\n", worst);
+	ASSERT("ECHO Huber gradient fails FD", worst < 2e-3f);
+
+	std::vector<float> hardPA, tinyPA, tinyWeights;
+	std::vector<int> hardIds, hardCnt, tinyIds, tinyCnt;
+	const double R0 = echoRFromLogits(z, tokens, targets, T, V, w,
+	    kappa, tau0, NULL, &hardPA, &hardIds, &hardCnt);
+	const double Rt = echoRFromLogits(z, tokens, targets, T, V, w,
+	    kappa, tau0, NULL, &tinyPA, &tinyIds, &tinyCnt, 1e-7f, &tinyWeights);
+	int totalActive = 0;
+	for (int t = 0; t < T; ++t)
+	{
+		totalActive += hardCnt[t];
+		ASSERT("ECHO tiny-Huber active set differs from hard hinge",
+		       hardCnt[t] == tinyCnt[t]);
+		ASSERT("ECHO tiny-Huber dense mass differs from hard hinge",
+		       fabsf(hardPA[t] - tinyPA[t]) < 1e-7f);
+		for (int k = 0; k < tinyCnt[t]; ++k)
+			ASSERT("ECHO tiny-Huber derivative did not reach hard hinge",
+			       tinyWeights[(size_t)t * w + k] == 1.0f);
+	}
+	const double expectedGap = 0.5e-7 * (double)totalActive;
+	ASSERT("ECHO Huber-to-hard loss limit mismatch", fabs((R0 - Rt) - expectedGap) < 2e-7);
+
+	std::vector<float> zs = z;
+	for (size_t i = 0; i < zs.size(); ++i) zs[i] += 0.73f;
+	const double Rshift = echoRFromLogits(zs, tokens, targets, T, V, w,
+	    kappa, tau0, NULL, NULL, NULL, NULL, delta);
+	ASSERT("ECHO Huber loss not shift invariant", fabs(Rshift - Rh) < 1e-5);
+
+	const double lambda = 0.1;
+	const double rmsRatio = lambda * std::sqrt(echoSq / (double)(T * V)) /
+	                        std::sqrt(ceSq / (double)(T * V));
+	std::printf("  [ECHO E2 calibration] lambda=0.1 field_rms/ce_rms=%.4g\n", rmsRatio);
+	ASSERT("ECHO calibrated field RMS is zero/non-finite", rmsRatio > 0.0 && rmsRatio == rmsRatio);
+	ASSERT("ECHO calibrated field unexpectedly dominates CE", rmsRatio < 0.25);
+	ASSERT("ECHO field is not lambda-linear", fabs(2.0 * rmsRatio -
+	       (0.2 * std::sqrt(echoSq / (double)(T * V)) /
+	        std::sqrt(ceSq / (double)(T * V)))) < 1e-12);
+}
+
 void CHIRONEchoGpuParityTest()
 {
 #ifdef GLADES_HAVE_CUDA
@@ -20264,6 +20383,94 @@ void CHIRONEchoGpuParityTest()
 	std::printf("  [ECHO stats CPU/GPU parity] bit-exact over %d rows (%d active)  PASS\n",
 	            T, totalActive);
 
+	// (a2) Huberized stats + weighted-scatter parity.  This exercises the
+	// optional knee branch and its emitted h'(p-margin) weights.
+	const float huberDelta = 0.10f;
+	std::vector<float> paHC(T), rHC(T), wHC((size_t)T * w, -7.0f), pmaxHC(T);
+	std::vector<int> idsHC((size_t)T * w, -7), cntHC(T);
+	glades::chiron::chiron_echo_stats_cpu_huber(&probsF[0], &tokens[0], &targets[0],
+	    T, V, w, kappa, tau0, huberDelta, &paHC[0], &rHC[0], &idsHC[0],
+	    &wHC[0], &cntHC[0], &pmaxHC[0]);
+	bool huberKneeLive = false;
+	for (int t = 0; t < T; ++t)
+		for (int k = 0; k < cntHC[t]; ++k)
+		{
+			const float b = wHC[(size_t)t * w + k];
+			if (b > 0.0f && b < 1.0f) huberKneeLive = true;
+		}
+	ASSERT("ECHO GPU Huber fixture missed knee", huberKneeLive);
+
+	glades::gpu::GpuBuffer<float> dPAH, dRH, dWH, dPmaxH;
+	glades::gpu::GpuBuffer<int> dIdsH, dCntH;
+	dPAH.allocate(T); dRH.allocate(T); dWH.allocate((size_t)T * w); dPmaxH.allocate(T);
+	dIdsH.allocate((size_t)T * w); dIdsH.upload(&sent[0], (size_t)T * w); dCntH.allocate(T);
+	ASSERT("ECHO Huber stats dispatch failed",
+	       glades::gpu::echo_repeat_stats_huber(dProbs.data(), dTok.data(), dTgt.data(),
+	           T, V, w, kappa, tau0, huberDelta, dPAH.data(), dRH.data(),
+	           dIdsH.data(), dWH.data(), dCntH.data(), dPmaxH.data()));
+	std::vector<float> paHG(T), rHG(T), wHG((size_t)T * w), pmaxHG(T);
+	std::vector<int> idsHG((size_t)T * w), cntHG(T);
+	dPAH.download(&paHG[0], T); dRH.download(&rHG[0], T);
+	dWH.download(&wHG[0], (size_t)T * w); dPmaxH.download(&pmaxHG[0], T);
+	dIdsH.download(&idsHG[0], (size_t)T * w); dCntH.download(&cntHG[0], T);
+	for (int t = 0; t < T; ++t)
+	{
+		ASSERT("ECHO Huber activeCount CPU/GPU mismatch", cntHC[t] == cntHG[t]);
+		ASSERT("ECHO Huber PA CPU/GPU mismatch", fabsf(paHC[t] - paHG[t]) < 1e-7f);
+		ASSERT("ECHO Huber R CPU/GPU mismatch", fabsf(rHC[t] - rHG[t]) < 1e-7f);
+		ASSERT("ECHO Huber pmax CPU/GPU mismatch", pmaxHC[t] == pmaxHG[t]);
+		for (int k = 0; k < cntHC[t]; ++k)
+		{
+			const size_t slot = (size_t)t * w + k;
+			ASSERT("ECHO Huber ids CPU/GPU mismatch", idsHC[slot] == idsHG[slot]);
+			ASSERT("ECHO Huber weights CPU/GPU mismatch", fabsf(wHC[slot] - wHG[slot]) < 1e-7f);
+		}
+	}
+
+	std::vector<unsigned short> dlHuberC(n);
+	for (size_t i = 0; i < n; ++i)
+		dlHuberC[i] = glades::transformer_kernels::float_to_bf16_rn(2.0f * rng.next_unit() - 1.0f);
+	std::vector<unsigned short> dlHuberG = dlHuberC;
+	glades::chiron::chiron_echo_scatter_cpu_weighted(&probsBf[0], &idsHC[0],
+	    &wHC[0], &cntHC[0], echoCoef, T, V, w, &dlHuberC[0]);
+	glades::gpu::GpuBuffer<unsigned short> dDlHuber;
+	dDlHuber.allocate(n); dDlHuber.upload(&dlHuberG[0], n);
+	ASSERT("ECHO Huber scatter dispatch failed",
+	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dIdsH.data(),
+	           dWH.data(), dCntH.data(), echoCoef, T, V, w, dDlHuber.data()));
+	dDlHuber.download(&dlHuberG[0], n);
+	ASSERT("ECHO Huber weighted scatter CPU/GPU mismatch", dlHuberC == dlHuberG);
+
+	std::vector<float> huberLogZ(T);
+	for (int t = 0; t < T; ++t) huberLogZ[t] = 2.0f * rng.next_unit();
+	glades::gpu::GpuBuffer<float> dHuberLogZ;
+	dHuberLogZ.allocate(T); dHuberLogZ.upload(&huberLogZ[0], T);
+	std::vector<unsigned short> dlHuberComposeC(n), dlHuberComposeG(n);
+	glades::chiron::chiron_echo_zloss_bwd_cpu(&probsBf[0], &targets[0],
+	    &huberLogZ[0], zlossCoef, echoCoef, &paHC[0], T, V, &dlHuberComposeC[0]);
+	glades::chiron::chiron_echo_scatter_cpu_weighted(&probsBf[0], &idsHC[0],
+	    &wHC[0], &cntHC[0], echoCoef, T, V, w, &dlHuberComposeC[0]);
+	glades::gpu::GpuBuffer<unsigned short> dHuberCompose;
+	dHuberCompose.allocate(n);
+	ASSERT("ECHO Huber dense dispatch failed",
+	       glades::gpu::softmax_cross_entropy_bwd_bf16_zloss_echo(dProbs.data(),
+	           dTgt.data(), dHuberLogZ.data(), zlossCoef, echoCoef, dPAH.data(),
+	           T, V, dHuberCompose.data()));
+	ASSERT("ECHO Huber compose scatter failed",
+	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dIdsH.data(),
+	           dWH.data(), dCntH.data(), echoCoef, T, V, w, dHuberCompose.data()));
+	dHuberCompose.download(&dlHuberComposeG[0], n);
+	float huberWorst = 0.0f;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float a = glades::transformer_kernels::bf16_to_float(dlHuberComposeC[i]);
+		const float b = glades::transformer_kernels::bf16_to_float(dlHuberComposeG[i]);
+		const float bar = std::max(1e-3f, 0.0079f * std::max(fabsf(a), fabsf(b)));
+		huberWorst = std::max(huberWorst, fabsf(a - b) / bar);
+	}
+	ASSERT("ECHO Huber composed backward beyond 1 bf16 ulp", huberWorst <= 1.0f);
+	std::printf("  [ECHO Huber stats/scatter/compose CPU/GPU parity] PASS\n");
+
 	// (b) scatter-only parity — bit-exact (forced-rn ops both sides).
 	std::vector<unsigned short> dlBase(n);
 	for (size_t i = 0; i < n; ++i)
@@ -20317,6 +20524,42 @@ void CHIRONEchoGpuParityTest()
 	}
 	std::printf("  [ECHO dense+scatter compose parity] worst err/ulp-bar=%.2f (bar 1)\n", worst);
 	ASSERT("ECHO composed backward beyond 1 bf16 ulp", worst <= 1.0f);
+
+	// (d) Public maximum-window launch.  Exercises the 40 KiB shared hash at
+	// w=1024 and a duplicate-heavy window without the CPU reference's O(w^2)
+	// work.  The final row contains 17 ids; id 0 is truth-excluded.
+	const int Ts = 1024, Vs = 2048, ws = 1024;
+	const size_t ns = (size_t)Ts * Vs;
+	const unsigned short pTwo = glades::transformer_kernels::float_to_bf16_rn(0.2f);
+	std::vector<unsigned short> ps(ns, (unsigned short)0);
+	std::vector<int> toks(Ts), tgts(Ts, 0);
+	for (int t = 0; t < Ts; ++t)
+	{
+		toks[t] = t % 17;
+		for (int id = 0; id < 17; ++id) ps[(size_t)t * Vs + id] = pTwo;
+	}
+	glades::gpu::GpuBuffer<unsigned short> dPs;
+	glades::gpu::GpuBuffer<int> dToks, dTgts, dIdsS, dCntS;
+	glades::gpu::GpuBuffer<float> dPAS, dRS;
+	dPs.allocate(ns); dPs.upload(&ps[0], ns);
+	dToks.allocate(Ts); dToks.upload(&toks[0], Ts);
+	dTgts.allocate(Ts); dTgts.upload(&tgts[0], Ts);
+	dIdsS.allocate((size_t)Ts * ws); dCntS.allocate(Ts);
+	dPAS.allocate(Ts); dRS.allocate(Ts);
+	ASSERT("ECHO w=1024 stats dispatch failed",
+	       glades::gpu::echo_repeat_stats(dPs.data(), dToks.data(), dTgts.data(),
+	           Ts, Vs, ws, 1.0f, 0.05f, dPAS.data(), dRS.data(),
+	           dIdsS.data(), dCntS.data()));
+	std::vector<int> cntS(Ts);
+	std::vector<float> paS(Ts), rS(Ts);
+	dCntS.download(&cntS[0], Ts); dPAS.download(&paS[0], Ts); dRS.download(&rS[0], Ts);
+	ASSERT("ECHO w=1024 prefix truth exclusion failed", cntS[0] == 0);
+	ASSERT("ECHO w=1024 duplicate hash count failed", cntS[Ts - 1] == 16);
+	ASSERT("ECHO w=1024 produced non-finite mass/loss",
+	       paS[Ts - 1] == paS[Ts - 1] && rS[Ts - 1] == rS[Ts - 1] &&
+	       paS[Ts - 1] > 0.0f && rS[Ts - 1] > 0.0f);
+	std::printf("  [ECHO max-window shared-hash] w=1024 active=%d PA=%.4f PASS\n",
+	            cntS[Ts - 1], paS[Ts - 1]);
 #else
 	std::printf("  [ECHO GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
