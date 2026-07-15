@@ -1,6 +1,9 @@
 # CHIRON Loss-Regularizer Design Study — ECHO / BERM / LOFT (2026-07-09)
 
-**Status: DESIGN ONLY — no GPU experiments run (GPU occupied). Nothing built.**
+**Status (2026-07-15): ECHO IMPLEMENTED through engineering gates E0–E2; E3/E3.5/E4 training and generation gates remain unrun, so this is not a ship claim.**
+The original 2026-07-09 design study ran no GPU experiments. Implementation now spans
+`glades-ml` CPU/CUDA kernels and unit tests plus `glades-trainer` CLI/training wiring,
+telemetry, wrapper routing, and a one-step end-to-end smoke (implementation record §6).
 Owner brief: "design several regularization terms we can add to our loss."
 Method: research-framework-design 3-candidate protocol (the PIED/SIPHON precedent) — three
 independent theory agents developed materially different formulations from the identical
@@ -383,7 +386,12 @@ dz_t(u) += (λ/T)·π_t(u)·(a_t(u) − P_{A,t})
                     + π_t(u)·a_t(u) (sparse, ≤ w ids) ]
 ```
 
-Subgradient at the knee: closed-inactive (a=0); Huberized knee width δ=0.01 optional.
+Subgradient at the hard-hinge knee: closed-inactive (a=0).  The optional Huberized
+positive hinge (flag `--echo-huber δ`) is now specified exactly as
+`Hδ(x)=0` for `x≤0`, `x²/(2δ)` for `0<x<δ`, and `x−δ/2` for `x≥δ`.  Writing
+`b_v=Hδ'(π_v−m_v)` and `P_b=Σ_v π_v b_v`, its exact logit field is
+`π_u(b_u−P_b)`; `δ=0` recovers the hard field above bit-for-bit.  The implementation
+emits the sparse `b_v` values only in Huber mode, so the hard path pays no extra scratch.
 Properties (all verified): Σ_u dz-correction = 0 per row (shift-invariant);
 |dz(u)| ≤ λ/T; row-ℓ1 ≤ λ/(2T) vs CE's ≤ 2/T (≤ λ/4 relative); vocabulary-permutation
 equivariant; no dependence on any internal statistic (first purely-readout regularizer
@@ -485,12 +493,12 @@ coincide with CE stationary points wherever the constraint is slack.
 forward:  logits z (bf16) + LSE (fp32)  [existing]
 ECHO-A:   for each t (1 block/token):
             shared-mem histogram of W_t (w ids)  →  n_t(v) for distinct v
-            gather z_t(v) for v ∈ W_t; π = exp(z − LSE)  (fp32)
-            gate: v ≠ y_t, π > κ·n/w + τ₀  →  active list, P_A, partial ΣR
-            emit P_{A,t} (fp32[T]), active ids (int[T×(w+1)] scratch, 8.4 MB)
-loss:     L += (λ/T)·ΣR_t   [alongside z-loss term]
-backward: existing softmax_cross_entropy_bwd_bf16_zloss row scalar += −(λ/T)·P_{A,t}
-ECHO-C:   dz_t[u] += (λ/T)·π_t(u) for u in active list (row-disjoint scatter)
+            gather π_t(v) from materialized bf16 probs (fp32 registers)
+            gate: v ≠ y_t, π > κ·n/w + τ₀  →  active list, P_b, partial ΣHδ
+            emit P_b (fp32[T]), active ids; emit b_v only when δ>0
+loss:     L += (λ/T)·ΣHδ(π_t(v)−m_t(v))
+backward: combined CE/Z/ECHO row scalar += −(λ/T)·P_b
+ECHO-C:   dz_t[u] += (λ/T)·b_u·π_t(u) for u in active list (row-disjoint scatter)
 ```
 
 Val/inference: term absent (same contract as PIED). E0 bit-parity at
@@ -498,9 +506,11 @@ Val/inference: term absent (same contract as PIED). E0 bit-parity at
 
 ### 5.7 Computational tradeoffs
 
-~2M gathers+exps per µstep (T·w) + ~10 MB traffic beside the ~1-TFLOP readout GEMMs and
-the [T×V] CE sweep: **≤ 0.3% wall (hard ceiling well under the 2% budget)**; 8.4 MB
-scratch; zero new GEMMs; zero D2H in the step path; no global atomics.
+~2M gathers per µstep (T·w) + ~10 MB traffic beside the ~1-TFLOP readout GEMMs and
+the [T×V] CE sweep: **≤ 0.3% wall predicted (production wall gate remains E3)**;
+~8.6 MB hard-hinge scratch at T=16384,w=128, plus 8.0 MB only when Huber weights are
+enabled; zero new GEMMs and no global atomics.  The current trainer downloads O(T)
+ECHO vectors when it reads/logs step loss and telemetry; no [T×V] D2H occurs.
 
 ### 5.8 Comparison to existing methods (supporting the formulation)
 
@@ -527,18 +537,21 @@ the same observable (position-stratified val on repetitive regions + activation-
 trajectory). Mitigations: raise τ₀/κ (shrinks A), ECHO-lag reweighting (concentrates
 pressure where the diagnosis lives), λ down.
 
-### 5.10 Minimal prototype and gate plan (for when GPU frees; nothing run now)
+### 5.10 Minimal prototype and gate plan
 
-Minimal instantiation: flat ECHO (no lag weights), w=128, κ=2, τ₀=0.1, λ=0.1,
-hard hinge. Kernels: `echo_repeat_stats` (new, ~150 LoC), one-scalar extension of
-`softmax_cross_entropy_bwd_bf16_zloss`, `echo_sparse_scatter` (new, trivial) + CPU refs
-+ `test.sh chiron-echo`.
+Implemented instantiation: flat ECHO (no lag weights), w=128, κ=2, τ₀=0.1, λ opt-in,
+hard hinge by default. Kernels: `echo_repeat_stats[_huber]`, the combined
+`softmax_cross_entropy_bwd_bf16_zloss_echo`, `echo_scatter_bf16[_weighted]`, CPU refs,
+`test.sh chiron-echo`, and trainer smoke `scripts/echo_training_loss_smoke.sh`.
 
-- **E0** flag-off bit-parity.
-- **E1** units: FD logit-gradient incl. hinge; shift-invariance (z+c·1 ⇒ identical R,
-  dz); truth never in A; t<w edges; CPU≡GPU.
-- **E2** small-shape: per-row Σdz-correction = 0 (fp32 tol); init activation = 0;
-  Huber→hard consistency; λ calibration (field RMS vs CE-dz RMS).
+- **E0 engineering PASS (2026-07-15):** coefficient-zero trainer loss parity and shipped
+  z-loss-kernel bit parity; no ECHO allocation/dispatch at the default coefficient.
+- **E1 engineering PASS (2026-07-15):** FD hard-hinge logit gradient, shift invariance,
+  truth exclusion, prefix-window edges, dedup/margins, and CPU≡GPU hard stats/scatter.
+- **E2 engineering PASS (2026-07-15):** Huber FD and δ→0 hard consistency, per-row
+  zero-sum field, init inactivity, λ-linear RMS calibration, and CPU≡GPU Huber
+  stats/weighted-scatter/composed backward.  The end-to-end tiny trainer smoke verifies
+  warmup, all wrapper flags, Z-loss independence, loss ordering, and telemetry.
 - **E3** matched 2500-step pair (fresh baseline, same binary — era-drift discipline):
   kill if ΔNLL > +0.05, activation ≈ 0 by 2500 (inert), or any grad-skip delta; record
   E[P_A] + π(copy) histogram (margin-evasion tripwire).
@@ -589,5 +602,11 @@ regions.
 
 - Candidates developed 2026-07-09 by three parallel theory agents from the shared parsed
   problem (§2); orchestrator verification + correction §4.3; selection §4.2.
-- Nothing implemented; no flags exist yet; no GPU time spent.
+- ECHO hard kernels/CPU refs and initial E0/E1 suite landed in `glades-ml` commit
+  `cfd1a31ea`; initial trainer seams landed in sibling `glades-trainer` commit `e97a292`.
+- 2026-07-15 completion work adds the optional Huber field, warmup, independent-Z-loss
+  dispatch, all wrapper flags, active-rate/mean-mass/copy-probability telemetry, expanded
+  E2 tests, and an end-to-end trainer smoke.  Evidence is recorded in
+  `research/CHIRON_ECHO_IMPLEMENTATION_2026_07_15.md`.
+- E3/E3.5/E4 remain explicitly unrun; no NLL, generation, or ship claim is made.
 - Companion memory: `regularizer_design_echo_berm_loft.md` (auto-memory).
