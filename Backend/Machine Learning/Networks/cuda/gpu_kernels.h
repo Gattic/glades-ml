@@ -270,9 +270,40 @@ bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
 
 // ---------------------------------------------------------------------------
 // Paradigm shift #42 SCFA — Spectral Compressed Flow Attention primitives.
-// Compression/lift use existing sgemm_rowmajor (q_compr = B^T q  and
-// y_∥ = B y_compr).  These kernels supply the SCFA-specific operations.
+//
+// The original global DCT projection B B^T was not token-causal: an output at
+// position t changed when tokens after t changed.  The causal path partitions
+// T positions into k contiguous blocks.  `block_compress` summarizes each
+// block; `causal_lag_lift` exposes summary b only to block b+1.  The matching
+// transpose operators keep trainer backward exact while preserving O(T*m)
+// outer work and exact prefix invariance.
 // ---------------------------------------------------------------------------
+
+// out[b,c] = alpha * sum_{t in block(b)} x[t,c] / sqrt(|block(b)|)
+//          + beta * out[b,c].
+bool scfa_block_compress(const float* x, int T, int m, int k,
+                         float alpha, float beta, float* out,
+                         cudaStream_t stream = 0);
+
+// out[t,c] = alpha * x[block(t)-1,c] / sqrt(|block(t)-1|)
+//          + beta * out[t,c], or beta*out for the first block.
+bool scfa_causal_lag_lift(const float* x, int T, int m, int k,
+                          float alpha, float beta, float* out,
+                          cudaStream_t stream = 0);
+
+// Transpose of scfa_causal_lag_lift:
+// out[b,c] = alpha * sum_{t in block(b+1)} x[t,c] / sqrt(|block(b)|)
+//          + beta * out[b,c].
+bool scfa_causal_lag_reduce(const float* x, int T, int m, int k,
+                            float alpha, float beta, float* out,
+                            cudaStream_t stream = 0);
+
+// Transpose of scfa_block_compress:
+// out[t,c] = alpha * x[block(t),c] / sqrt(|block(t)|)
+//          + beta * out[t,c].
+bool scfa_block_expand(const float* x, int T, int m, int k,
+                       float alpha, float beta, float* out,
+                       cudaStream_t stream = 0);
 
 // y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]    (causal depthwise 1-D conv).
 // One filter per channel; m channels, T positions, half-width w (kernel size
@@ -377,8 +408,8 @@ bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
     float* dK,
     cudaStream_t stream = 0);
 
-// Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
-// to k columns.  Used as the sequence-spectral basis in SCFA.
+// Legacy research helper: fill B[T × k] with a truncated orthonormal DCT-II
+// basis. Causal CHIRON SCFA does not use this globally noncausal basis.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1292,10 @@ inline bool orion_lift_add_int8_bf16w_bf16anchor(void*, const void*, const void*
 inline bool orion_perturb_col_int8(float*, const float*, const void*, const float*, int, int, float) { return false; }
 inline bool orion_perturb_col_int8_bf16w(void*, const float*, const void*, const float*, int, int, float) { return false; }
 inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int, float) { return false; }
+inline bool scfa_block_compress(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_causal_lag_lift(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_causal_lag_reduce(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_block_expand(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }

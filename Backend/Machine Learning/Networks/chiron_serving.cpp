@@ -189,8 +189,16 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
 
     if (useScfa)
     {
+        if (w.scfa.dLoaded && !w.scfa.causalBlock)
+        {
+            err = "FATAL — checkpoint carries legacy global-DCT SCFA state without the "
+                  "causal-block marker (bit 4096). That operator leaks future tokens and is "
+                  "incompatible with autoregressive serving. Retrain with causal-block SCFA.";
+            return 7;
+        }
         // Resolve k and w.  Priority: CLI override > loaded blob > defaults.
-        const int defaultK = (dims.T >= 16) ? (dims.T / 16) : 4;
+        int defaultK = dims.T / 16;
+        if (defaultK < 4) defaultK = dims.T < 4 ? dims.T : 4;
         const int defaultW = 8;
         w.scfa.k = (o.scfaKOverride > 0) ? o.scfaKOverride
                    : (w.scfa.dLoaded ? w.scfa.k : defaultK);
@@ -201,15 +209,8 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
         if (w.scfa.w < 0) w.scfa.w = defaultW;
 
 #ifdef GLADES_HAVE_CUDA
-        // Build B (DCT-II basis).
-        const size_t B_sz = (size_t)dims.T * (size_t)w.scfa.k;
-        if (!w.scfa.B.allocate(B_sz)
-            || !glades::gpu::scfa_dct_basis_init(w.scfa.B.data(), dims.T, w.scfa.k))
-        {
-            std::fprintf(stderr, "[chiron-serving] SCFA B init failed (T=%d k=%d)\n",
-                         dims.T, w.scfa.k);
-            return 6;
-        }
+        // Causal SCFA uses implicit contiguous block compression and lagged
+        // lifts; the old dense DCT B[T,k] allocation is intentionally gone.
         // If D wasn't loaded, allocate and zero.
         if (!w.scfa.dLoaded)
         {
@@ -231,7 +232,8 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
         }
 #endif
         w.scfa.present = true;
-        std::printf("[chiron-serving] SCFA: ENABLED (k=%d w=%d, D %s)\n",
+        w.scfa.causalBlock = true;
+        std::printf("[chiron-serving] causal-block SCFA: ENABLED (k=%d w=%d, D %s)\n",
                     w.scfa.k, w.scfa.w, w.scfa.dLoaded ? "loaded" : "zero-fallback");
     }
     else
@@ -353,14 +355,19 @@ bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeig
     {
         if (!rot_a.allocate((size_t)m)) return false;
         if (!rot_c.allocate((size_t)m)) return false;
-        if (!whisc_Pbar.allocate((size_t)m)) return false;
-        if (!whisc_Qbar.allocate((size_t)m)) return false;
-        if (!whisc_a.allocate((size_t)m)) return false;
-        // Init Pbar/Qbar to a finite 1.0 (ema=1.0 zeroes their weight, but a
-        // finite value avoids any 0*NaN from uninitialized device memory).
-        std::vector<float> ones((size_t)m, 1.0f);
-        if (!whisc_Pbar.upload(&ones[0], (size_t)m)) return false;
-        if (!whisc_Qbar.upload(&ones[0], (size_t)m)) return false;
+        const size_t Lm = (size_t)L * (size_t)m;
+        if (!whisc_a.allocate(Lm)) return false;
+        if (w.whiscA.size() == Lm)
+        {
+            if (!whisc_a.upload(&w.whiscA[0], Lm)) return false;
+        }
+        else
+        {
+            // New causal checkpoints persist a. Identity is safe for freshly
+            // initialized/manual models; legacy SCFA checkpoints are refused.
+            std::vector<float> ones(Lm, 1.0f);
+            if (!whisc_a.upload(&ones[0], Lm)) return false;
+        }
     }
 
     // QK-Norm: upload the prefilled per-layer per-head gamma*sqrt(dH) scale
@@ -432,23 +439,18 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
     const size_t Tm = (size_t)T * (size_t)m;
     const size_t km = (size_t)k * (size_t)m;
 
-    // 1. q_compr[k, m] = B^T[k, T] . q[T, m]
-    if (!glades::gpu::sgemm_rowmajor_atb(
-            k, m, T, 1.0f,
-            scfa.B.data(), k,
-            s.q.data(),    m,
-            0.0f,
-            s.scfa_qcompr.data(), m)) return false;
+    // 1. Causal block compression. Summary b contains only its contiguous
+    // source block; lagged lifts expose it starting in the following block.
+    if (!glades::gpu::scfa_block_compress(
+            s.q.data(), T, m, k, 1.0f, 0.0f,
+            s.scfa_qcompr.data())) return false;
     dbg_mag(layer, "q_in", s.q, Tm);
     dbg_mag(layer, "q_compr", s.scfa_qcompr, km);
 
-    // 2. q_par[T, m] = B[T, k] . q_compr[k, m]
-    if (!glades::gpu::sgemm_rowmajor(
-            T, m, k, 1.0f,
-            scfa.B.data(),         k,
-            s.scfa_qcompr.data(),  m,
-            0.0f,
-            s.scfa_qpar.data(),    m)) return false;
+    // 2. Causal lag lift: q_par for block b uses only summary b-1.
+    if (!glades::gpu::scfa_causal_lag_lift(
+            s.scfa_qcompr.data(), T, m, k, 1.0f, 0.0f,
+            s.scfa_qpar.data())) return false;
 
     // 3. q_perp = q - q_par.
     glades::gpu::device_memcpy_d2d(s.scfa_qperp.data(), s.q.data(), sizeof(float) * Tm);
@@ -494,13 +496,10 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
     dbg_mag(layer, "y_perp", s.scfa_yperp, Tm);
     dbg_mag(layer, "y_compr", s.scfa_ycompr, km);
 
-    // 6. y_par[T, m] = B . y_compr[k, m].
-    if (!glades::gpu::sgemm_rowmajor(
-            T, m, k, 1.0f,
-            scfa.B.data(),          k,
-            s.scfa_ycompr.data(),   m,
-            0.0f,
-            s.scfa_ypar.data(),     m)) return false;
+    // 6. Causal lag lift: compressed output b is visible in block b+1.
+    if (!glades::gpu::scfa_causal_lag_lift(
+            s.scfa_ycompr.data(), T, m, k, 1.0f, 0.0f,
+            s.scfa_ypar.data())) return false;
 
     dbg_mag(layer, "y_par", s.scfa_ypar, Tm);
 
@@ -567,7 +566,7 @@ bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
 
     for (int l = 0; l < L; ++l)
     {
-        if (w.scfa.present)
+        if (cfg.useScfa)
         {
             if (!scfa_shear_eval(s, w.scfa,
                                  w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
@@ -606,15 +605,14 @@ bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
         //   4. rot_forward(+1): the folded 3-shear W^-1 R(theta) W in one pass, in place
         if (cfg.whiscCoupling)
         {
+            const float* aw = s.whisc_a.data() + (size_t)l * m;
             if (!glades::gpu::chiron_rot_coeffs(
                     s.rotPhiGpu[l]->data(), cfg.rotThetaMax, /*s_warm=*/1.0f, m,
                     s.rot_a.data(), s.rot_c.data())) return false;
-            if (!glades::gpu::chiron_whisc_update_stats(
-                    s.q.data(), s.p.data(), T, m,
-                    /*ema=*/1.0f, /*eps=*/1e-12f, cfg.whiscClamp,
-                    s.whisc_Pbar.data(), s.whisc_Qbar.data(), s.whisc_a.data())) return false;
+            // Fixed checkpoint state: current-window/future tokens never
+            // recalibrate coefficients used by this or a later decode step.
             if (!glades::gpu::chiron_whisc_fold_coeffs(
-                    s.rot_a.data(), s.rot_c.data(), s.whisc_a.data(), m)) return false;
+                    s.rot_a.data(), s.rot_c.data(), aw, m)) return false;
             if (!glades::gpu::chiron_rot_forward(
                     s.q.data(), s.p.data(), s.rot_a.data(), s.rot_c.data(),
                     /*sign=*/+1.0f, T, m)) return false;

@@ -469,6 +469,7 @@ static void CHIRONCkptRoundtripTest()
 		std::vector<float> dummyAdam(100, 3.14f);
 
 		const uint32_t flags = (uint32_t)glades::chiron::CKPT_BIT_SCFA
+		                     | (uint32_t)glades::chiron::CKPT_BIT_CAUSAL_SCFA
 		                     | (uint32_t)glades::chiron::CKPT_BIT_QKNORM_GAMMA
 		                     | (uint32_t)glades::chiron::CKPT_BIT_FP32_ADAM
 		                     | (uint32_t)glades::chiron::CKPT_BIT_ROT_PHI;
@@ -496,6 +497,7 @@ static void CHIRONCkptRoundtripTest()
 
 		// SCFA
 		ASSERT("rt4 scfa dLoaded", w.scfa.dLoaded);
+		ASSERT("rt4 scfa causal",  w.scfa.causalBlock);
 		ASSERT("rt4 scfa k",       w.scfa.k == scfa_k);
 		ASSERT("rt4 scfa w",       w.scfa.w == scfa_w);
 		ASSERT("rt4 scfa D size",  (int)w.scfa.D.size() == RT_L);
@@ -520,12 +522,12 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 5: Unknown bit 4096 → reject with errCode=4 ----
+	// ---- Case 5: Unknown bit 8192 → reject with errCode=4 ----
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
 
-		const uint32_t flags = 4096u;  // bit beyond CKPT_KNOWN_BITS_MASK
+		const uint32_t flags = 8192u;  // bit beyond CKPT_KNOWN_BITS_MASK
 
 		std::string path = rt_tmppath();
 		ASSERT("rt5 tmppath", !path.empty());
@@ -548,9 +550,9 @@ static void CHIRONCkptRoundtripTest()
 	}
 
 	// ---- Case 6: bit 2048 (trainer WhiSC) + bit 512 (a_drift) + bit 1024 (rot_phi) ----
-	// Serving ignores the trainer-owned WhiSC section.  a_drift remains the
-	// SECOND-to-last section and rot_phi remains last, so both EOF tails must
-	// still load element-exact.
+	// Serving loads fixed `a` from the trainer-owned WhiSC section. a_drift
+	// remains second-to-last and rot_phi remains last; all three EOF-relative
+	// reads must load element-exact.
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
@@ -590,6 +592,9 @@ static void CHIRONCkptRoundtripTest()
 		std::string err; int errCode = 0;
 		ASSERT("rt6 load",      glades::chiron::chiron_load_model(path, dims, w, err, errCode));
 		ASSERT("rt6 hasADrift", w.hasADrift);
+		ASSERT("rt6 whisc a size", w.whiscA.size() == aDrift_n);
+		for (size_t i = 0; i < aDrift_n; ++i)
+			ASSERT("rt6 whisc a val", w.whiscA[i] == whiscPayload[2u * aDrift_n + i]);
 		// a_drift loaded element-exact (2-section-tail arithmetic).
 		ASSERT("rt6 adrift size", w.aDrift.size() == aDrift_n);
 		for (size_t i = 0; i < aDrift_n; ++i)
@@ -843,7 +848,7 @@ void CHIRONResolveServingTest()
         glades::chiron::ChironModelWeights w;
         srv_fill_layer_weights(w, dims);
         // gamma_p empty, scfa.dLoaded=true
-        w.scfa.dLoaded = true;
+        w.scfa.dLoaded = true; w.scfa.causalBlock = true;
         w.scfa.k = 4;
         w.scfa.w = 1;
         // Allocate D for the loaded scfa
@@ -877,7 +882,7 @@ void CHIRONResolveServingTest()
             w.beta_p.push_back( srv_alloc_buf((size_t)dims.m, 0.0f));
         }
         // SCFA loaded
-        w.scfa.dLoaded = true;
+        w.scfa.dLoaded = true; w.scfa.causalBlock = true;
         w.scfa.k = 4;
         w.scfa.w = 1;
         const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
@@ -916,7 +921,7 @@ void CHIRONResolveServingTest()
         for (int l = 0; l < dims.L; ++l)
             w.beta_p.push_back(srv_alloc_buf((size_t)dims.m, 0.0f));
         // SCFA loaded
-        w.scfa.dLoaded = true;
+        w.scfa.dLoaded = true; w.scfa.causalBlock = true;
         w.scfa.k = 4;
         w.scfa.w = 1;
         const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
@@ -993,7 +998,7 @@ void CHIRONResolveServingTest()
         glades::chiron::ChironModelDims   dims = srv_dims();
         glades::chiron::ChironModelWeights w;
         srv_fill_layer_weights(w, dims);
-        w.scfa.dLoaded = true;
+        w.scfa.dLoaded = true; w.scfa.causalBlock = true;
         w.scfa.k = 4;
         w.scfa.w = 1;
         const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
@@ -1014,7 +1019,7 @@ void CHIRONResolveServingTest()
         glades::chiron::ChironModelDims   dims = srv_dims();
         glades::chiron::ChironModelWeights w;
         srv_fill_layer_weights(w, dims);
-        w.scfa.dLoaded = true;
+        w.scfa.dLoaded = true; w.scfa.causalBlock = true;
         w.scfa.k = 4;
         w.scfa.w = 1;
         const size_t D_sz = (size_t)dims.m * (w.scfa.w + 1);
@@ -1048,7 +1053,7 @@ void CHIRONResolveServingTest()
         ASSERT("case11 dims.T == 4", dims.T == 4);
     }
 
-    // ---- Case 12: SCFA on with no loaded D → D allocated+zeroed, B allocated,
+    // ---- Case 12: SCFA on with no loaded D → D allocated+zeroed,
     //              k/w defaulted to T/16 (min 4) and 8; returns 0 ----
     {
         glades::chiron::ChironModelDims   dims = srv_dims();  // T=64
@@ -1070,8 +1075,8 @@ void CHIRONResolveServingTest()
         ASSERT("case12 scfa.k == 4", w.scfa.k == 4);
         // w defaults to 8
         ASSERT("case12 scfa.w == 8", w.scfa.w == 8);
-        // B should be allocated
-        ASSERT("case12 B allocated", w.scfa.B.allocated());
+        // Causal block compression/lift is implicit; no dense B is allocated.
+        ASSERT("case12 B omitted", !w.scfa.B.allocated());
         // D should be allocated for each layer
         ASSERT("case12 D size", (int)w.scfa.D.size() == dims.L);
         for (int l = 0; l < dims.L; ++l)
@@ -1086,10 +1091,70 @@ void CHIRONResolveServingTest()
                 ASSERT("case12 D[l] zero", dbuf[i] == 0.0f);
         }
     }
+
+    // ---- Case 13: legacy global-DCT SCFA checkpoint is refused ----
+    {
+        glades::chiron::ChironModelDims dims = srv_dims();
+        glades::chiron::ChironModelWeights w;
+        srv_fill_layer_weights(w, dims);
+        w.scfa.dLoaded = true;
+        w.scfa.causalBlock = false;
+        w.scfa.k = 4;
+        w.scfa.w = 1;
+
+        glades::chiron::ChironServingOverrides o;
+        glades::chiron::ChironServingConfig cfg;
+        std::string err;
+        int rc = glades::chiron::chiron_resolve_serving(dims, w, o, cfg, err);
+        ASSERT("case13 legacy scfa rejected", rc == 7);
+        ASSERT("case13 error names causal marker", err.find("causal-block marker") != std::string::npos);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: chiron_eval_forward orchestration parity.
+// Test 5: causal SCFA block operators and transpose identities.
+// ---------------------------------------------------------------------------
+
+static void CHIRONScfaCausalBlockTest()
+{
+	const int T = 7, m = 3, k = 3;
+	const size_t Tm = (size_t)T * m, km = (size_t)k * m;
+	std::vector<float> x(Tm), z(km), y(Tm);
+	for (size_t i = 0; i < Tm; ++i)
+	{
+		x[i] = 0.03f * (float)((int)i - 9);
+		y[i] = 0.02f * (float)((int)i + 4);
+	}
+	for (size_t i = 0; i < km; ++i) z[i] = -0.04f * (float)((int)i - 3);
+
+	glades::gpu::GpuBuffer<float> dx, dz, dy, c, ctz, az, aty;
+	ASSERT("scfa causal alloc",
+	       dx.allocate(Tm) && dz.allocate(km) && dy.allocate(Tm)
+	       && c.allocate(km) && ctz.allocate(Tm) && az.allocate(Tm) && aty.allocate(km));
+	ASSERT("scfa causal upload", dx.upload(&x[0], Tm) && dz.upload(&z[0], km) && dy.upload(&y[0], Tm));
+	ASSERT("scfa block compress", glades::gpu::scfa_block_compress(dx.data(), T, m, k, 1.0f, 0.0f, c.data()));
+	ASSERT("scfa block expand", glades::gpu::scfa_block_expand(dz.data(), T, m, k, 1.0f, 0.0f, ctz.data()));
+	ASSERT("scfa lag lift", glades::gpu::scfa_causal_lag_lift(dz.data(), T, m, k, 1.0f, 0.0f, az.data()));
+	ASSERT("scfa lag reduce", glades::gpu::scfa_causal_lag_reduce(dy.data(), T, m, k, 1.0f, 0.0f, aty.data()));
+
+	std::vector<float> hc(km), hctz(Tm), haz(Tm), haty(km);
+	ASSERT("scfa causal download", c.download(&hc[0], km) && ctz.download(&hctz[0], Tm)
+	       && az.download(&haz[0], Tm) && aty.download(&haty[0], km));
+	double lhsC = 0.0, rhsC = 0.0, lhsA = 0.0, rhsA = 0.0;
+	for (size_t i = 0; i < km; ++i) { lhsC += (double)hc[i] * z[i]; rhsA += (double)z[i] * haty[i]; }
+	for (size_t i = 0; i < Tm; ++i) { rhsC += (double)x[i] * hctz[i]; lhsA += (double)haz[i] * y[i]; }
+	ASSERT("scfa block transpose", std::fabs(lhsC - rhsC) < 1e-5);
+	ASSERT("scfa lag transpose", std::fabs(lhsA - rhsA) < 1e-5);
+
+	// The first destination block has no completed source block and must be zero.
+	const int firstBlockEnd = T / k;
+	for (int t = 0; t < firstBlockEnd; ++t)
+		for (int cidx = 0; cidx < m; ++cidx)
+			ASSERT("scfa first block masked", haz[(size_t)t * m + cidx] == 0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: chiron_eval_forward orchestration parity.
 //
 // The reference below (EvalRefScratch / ref_scfa_shear / ref_forward) is an
 // INDEPENDENT transcription of chiron_infer.cpp's Scratch / scfa_shear_infer /
@@ -1121,7 +1186,7 @@ struct EvalRefScratch
 	glades::gpu::GpuBuffer<float> scfa_qcompr, scfa_qpar, scfa_qperp, scfa_yperp, scfa_ycompr, scfa_ypar;
 	glades::gpu::GpuBuffer<float> scfa_inner_p, scfa_inner_sQ, scfa_inner_sK, scfa_inner_sV, scfa_inner_sO, scfa_inner_sP;
 	glades::gpu::GpuBuffer<float> qknorm_invNorm, qknorm_gamma_scale;
-	glades::gpu::GpuBuffer<float> rot_a, rot_c, whisc_Pbar, whisc_Qbar, whisc_a;
+	glades::gpu::GpuBuffer<float> rot_a, rot_c, whisc_a;
 
 	bool allocate(const glades::chiron::ChironModelDims& d,
 	              const glades::chiron::ChironServingConfig& cfg, int scfaK)
@@ -1166,14 +1231,12 @@ struct EvalRefScratch
 		}
 		if (cfg.whiscCoupling)
 		{
+			const size_t Lm = (size_t)L * (size_t)m;
 			if (!rot_a.allocate((size_t)m)) return false;
 			if (!rot_c.allocate((size_t)m)) return false;
-			if (!whisc_Pbar.allocate((size_t)m)) return false;
-			if (!whisc_Qbar.allocate((size_t)m)) return false;
-			if (!whisc_a.allocate((size_t)m)) return false;
-			std::vector<float> ones((size_t)m, 1.0f);
-			if (!whisc_Pbar.upload(&ones[0], (size_t)m)) return false;
-			if (!whisc_Qbar.upload(&ones[0], (size_t)m)) return false;
+			if (!whisc_a.allocate(Lm)) return false;
+			std::vector<float> ones(Lm, 1.0f);
+			if (!whisc_a.upload(&ones[0], Lm)) return false;
 		}
 		if (!cfg.qknormGammaScale.empty())
 		{
@@ -1196,10 +1259,10 @@ static bool ref_scfa_shear(EvalRefScratch& s, const glades::chiron::ChironScfaSt
 	const size_t Tm = (size_t)T * (size_t)m;
 	const size_t km = (size_t)k * (size_t)m;
 
-	if (!glades::gpu::sgemm_rowmajor_atb(k, m, T, 1.0f,
-	        scfa.B.data(), k, s.q.data(), m, 0.0f, s.scfa_qcompr.data(), m)) return false;
-	if (!glades::gpu::sgemm_rowmajor(T, m, k, 1.0f,
-	        scfa.B.data(), k, s.scfa_qcompr.data(), m, 0.0f, s.scfa_qpar.data(), m)) return false;
+	if (!glades::gpu::scfa_block_compress(
+	        s.q.data(), T, m, k, 1.0f, 0.0f, s.scfa_qcompr.data())) return false;
+	if (!glades::gpu::scfa_causal_lag_lift(
+	        s.scfa_qcompr.data(), T, m, k, 1.0f, 0.0f, s.scfa_qpar.data())) return false;
 	glades::gpu::device_memcpy_d2d(s.scfa_qperp.data(), s.q.data(), sizeof(float) * Tm);
 	if (!glades::gpu::axpy(-1.0f, s.scfa_qpar.data(), s.scfa_qperp.data(), (int)Tm)) return false;
 	if (!glades::gpu::scfa_depthwise_causal_conv_fwd(
@@ -1228,8 +1291,8 @@ static bool ref_scfa_shear(EvalRefScratch& s, const glades::chiron::ChironScfaSt
 	        s.scfa_inner_sQ.data(), s.scfa_inner_sK.data(),
 	        s.scfa_inner_sV.data(), s.scfa_inner_sO.data(), s.scfa_inner_sP.data())) return false;
 	glades::gpu::device_memcpy_d2d(s.scfa_ycompr.data(), s.scfa_inner_p.data(), sizeof(float) * km);
-	if (!glades::gpu::sgemm_rowmajor(T, m, k, 1.0f,
-	        scfa.B.data(), k, s.scfa_ycompr.data(), m, 0.0f, s.scfa_ypar.data(), m)) return false;
+	if (!glades::gpu::scfa_causal_lag_lift(
+	        s.scfa_ycompr.data(), T, m, k, 1.0f, 0.0f, s.scfa_ypar.data())) return false;
 	const float sign = invert ? -1.0f : 1.0f;
 	if (!glades::gpu::axpy(1.0f, s.scfa_yperp.data(), s.scfa_ypar.data(), (int)Tm)) return false;
 	if (!glades::gpu::axpy(sign, s.scfa_ypar.data(), s.p.data(), (int)Tm)) return false;
@@ -1258,7 +1321,7 @@ static bool ref_forward(const glades::chiron::ChironModelDims& d, EvalRefScratch
 
 	for (int l = 0; l < L; ++l)
 	{
-		if (w.scfa.present)
+		if (cfg.useScfa)
 		{
 			if (!ref_scfa_shear(s, w.scfa,
 			                    w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
@@ -1285,14 +1348,12 @@ static bool ref_forward(const glades::chiron::ChironModelDims& d, EvalRefScratch
 
 		if (cfg.whiscCoupling)
 		{
+			const float* aw = s.whisc_a.data() + (size_t)l * m;
 			if (!glades::gpu::chiron_rot_coeffs(
 			        rotPhiRef[l]->data(), cfg.rotThetaMax, 1.0f, m,
 			        s.rot_a.data(), s.rot_c.data())) return false;
-			if (!glades::gpu::chiron_whisc_update_stats(
-			        s.q.data(), s.p.data(), T, m, 1.0f, 1e-12f, cfg.whiscClamp,
-			        s.whisc_Pbar.data(), s.whisc_Qbar.data(), s.whisc_a.data())) return false;
 			if (!glades::gpu::chiron_whisc_fold_coeffs(
-			        s.rot_a.data(), s.rot_c.data(), s.whisc_a.data(), m)) return false;
+			        s.rot_a.data(), s.rot_c.data(), aw, m)) return false;
 			if (!glades::gpu::chiron_rot_forward(
 			        s.q.data(), s.p.data(), s.rot_a.data(), s.rot_c.data(), 1.0f, T, m)) return false;
 		}
@@ -1435,15 +1496,12 @@ void CHIRONEvalForwardParityTest()
 		glades::chiron::ChironModelWeights w;
 		ev_fill_core_weights(w, d);
 
-		// SCFA state: k=4, w=1; real DCT basis; small nonzero D.
+		// SCFA state: k=4, w=1; implicit causal block basis; small nonzero D.
 		const int k = 4, sw = 1;
 		w.scfa.present = true;
-		w.scfa.dLoaded = true;
+		w.scfa.dLoaded = true; w.scfa.causalBlock = true;
 		w.scfa.k = k;
 		w.scfa.w = sw;
-		const size_t B_sz = (size_t)d.T * k;
-		ASSERT("case3 B alloc", w.scfa.B.allocate(B_sz));
-		ASSERT("case3 B init",  glades::gpu::scfa_dct_basis_init(w.scfa.B.data(), d.T, k));
 		const size_t D_sz = (size_t)d.m * (sw + 1);
 		for (int l = 0; l < d.L; ++l)
 		{
@@ -1469,6 +1527,76 @@ void CHIRONEvalForwardParityTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 7: full-window vs prefix-only logits at the same position.
+// Future tokens must not change any logit at or before the prefix boundary.
+// Exercises SCFA block compression/lag lift and lagged WhiSC together.
+// ---------------------------------------------------------------------------
+
+static void CHIRONPrefixCausalityTest()
+{
+	glades::chiron::ChironModelDims d = ev_dims();
+	glades::chiron::ChironModelWeights w;
+	ev_fill_core_weights(w, d);
+
+	const int k = 4, sw = 1;
+	w.scfa.present = true;
+	w.scfa.dLoaded = true; w.scfa.causalBlock = true;
+	w.scfa.k = k;
+	w.scfa.w = sw;
+	const size_t Dsz = (size_t)d.m * (sw + 1);
+	for (int l = 0; l < d.L; ++l)
+	{
+		glades::gpu::GpuBuffer<float>* Dl = new glades::gpu::GpuBuffer<float>();
+		std::vector<float> dh(Dsz);
+		for (size_t i = 0; i < Dsz; ++i) dh[i] = 0.015f * std::sin(0.17f * (float)i + 0.09f * l);
+		ASSERT("prefix D alloc", Dl->allocate(Dsz) && Dl->upload(&dh[0], Dsz));
+		w.scfa.D.push_back(Dl);
+	}
+	w.rotPhi.resize((size_t)d.L * d.m);
+	w.whiscA.resize((size_t)d.L * d.m);
+	for (size_t i = 0; i < w.rotPhi.size(); ++i)
+	{
+		w.rotPhi[i] = 0.08f + 0.013f * (float)i;
+		w.whiscA[i] = 0.8f + 0.02f * (float)i;
+	}
+
+	glades::chiron::ChironServingConfig cfg;
+	cfg.useScfa = true;
+	cfg.qkNorm = true;
+	cfg.fuseAttnReln = true;
+	cfg.whiscCoupling = true;
+	cfg.rotThetaMax = 0.07f;
+	cfg.whiscClamp = 8.0f;
+	cfg.epsReln = 1e-4f;
+	cfg.qknormGammaScale.resize((size_t)d.L * d.nH, 1.75f);
+
+	const int pos = 4;
+	std::vector<int> full((size_t)d.T), prefix((size_t)d.T);
+	for (int t = 0; t < d.T; ++t) full[t] = (3 * t + 1) % d.V;
+	prefix = full;
+	for (int t = pos + 1; t < d.T; ++t) prefix[t] = 0;
+
+	glades::chiron::ChironEvalScratch sf, sp;
+	ASSERT("prefix full scratch", sf.allocate(d, w, cfg));
+	ASSERT("prefix short scratch", sp.allocate(d, w, cfg));
+	ASSERT("prefix full upload", sf.d_tokens.upload(&full[0], (size_t)d.T));
+	ASSERT("prefix short upload", sp.d_tokens.upload(&prefix[0], (size_t)d.T));
+	ASSERT("prefix full forward", glades::chiron::chiron_eval_forward(d, w, cfg, sf));
+	ASSERT("prefix short forward", glades::chiron::chiron_eval_forward(d, w, cfg, sp));
+	std::vector<float> lf((size_t)d.T * d.V), lp((size_t)d.T * d.V);
+	ASSERT("prefix full download", sf.logits.download(&lf[0], lf.size()));
+	ASSERT("prefix short download", sp.logits.download(&lp[0], lp.size()));
+	for (int t = 0; t <= pos; ++t)
+		for (int v = 0; v < d.V; ++v)
+			ASSERT("full-vs-prefix causal logits", lf[(size_t)t * d.V + v] == lp[(size_t)t * d.V + v]);
+
+	bool futureDiffers = false;
+	for (int v = 0; v < d.V; ++v)
+		if (lf[(size_t)(pos + 1) * d.V + v] != lp[(size_t)(pos + 1) * d.V + v]) { futureDiffers = true; break; }
+	ASSERT("prefix regression changes future fixture", futureDiffers);
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
 
@@ -1478,5 +1606,7 @@ void CHIRONModelUnitTest()
 	CHIRONCkptBf16RneDiscriminatingTest();
 	CHIRONCkptRoundtripTest();
 	CHIRONResolveServingTest();
+	CHIRONScfaCausalBlockTest();
 	CHIRONEvalForwardParityTest();
+	CHIRONPrefixCausalityTest();
 }

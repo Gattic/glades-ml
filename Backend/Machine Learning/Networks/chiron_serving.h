@@ -89,12 +89,11 @@ struct ChironEvalScratch
     glades::gpu::GpuBuffer<float> scfa_inner_sP;  // [nH, k, k]
     glades::gpu::GpuBuffer<float> qknorm_invNorm;     // [k*nH] throwaway
     glades::gpu::GpuBuffer<float> qknorm_gamma_scale; // [L*nH] = gamma*sqrt(dH), prefilled
-    // WhiSC-D coupling scratch (CHRF bit 1024).  Each [m]; ema=1.0 so reused per layer/step.
+    // WhiSC-D coupling scratch. `a` is fixed checkpoint state, per layer,
+    // rather than being recalibrated from the current potentially padded window.
     glades::gpu::GpuBuffer<float> rot_a;       // [m] SORC coeff a (folded in place)
     glades::gpu::GpuBuffer<float> rot_c;       // [m] SORC coeff c (folded in place)
-    glades::gpu::GpuBuffer<float> whisc_Pbar;  // [m] E[p^2]
-    glades::gpu::GpuBuffer<float> whisc_Qbar;  // [m] E[q^2]
-    glades::gpu::GpuBuffer<float> whisc_a;     // [m] per-channel whitening scale
+    glades::gpu::GpuBuffer<float> whisc_a;     // [L*m] fixed whitening scale
     // Owned per-layer rot_phi angle buffers [m], uploaded from w.rotPhi when whisc.
     std::vector<glades::gpu::GpuBuffer<float>*> rotPhiGpu;
 

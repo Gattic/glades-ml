@@ -22,7 +22,7 @@ namespace chiron {
 // ---------------------------------------------------------------------------
 
 ChironScfaState::ChironScfaState()
-    : k(0), w(0), present(false), dLoaded(false)
+    : k(0), w(0), present(false), dLoaded(false), causalBlock(false)
 {
 }
 
@@ -435,6 +435,12 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
                 "  Rebuild chiron_infer against the matching trainer.\n", chrfFlags);
             err = eb; errCode = 4; std::fclose(fp); return false;
         }
+        if ((chrfFlags & (uint32_t)CKPT_BIT_CAUSAL_SCFA) != 0
+            && (chrfFlags & (uint32_t)CKPT_BIT_SCFA) == 0)
+        {
+            err = "chiron_infer: causal-block SCFA marker set without an SCFA section";
+            errCode = 4; std::fclose(fp); return false;
+        }
     }
     if (weightsBf16)
         std::printf("[chiron-ckpt] weights are bf16 on disk (2x smaller)\n");
@@ -579,7 +585,9 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
         }
         w.scfa.present = true;
         w.scfa.dLoaded = true;
-        std::printf("[chiron-ckpt] loaded SCFA state (k=%d w=%d, %.1f MB)\n",
+        w.scfa.causalBlock = (chrfFlags & (uint32_t)CKPT_BIT_CAUSAL_SCFA) != 0;
+        std::printf("[chiron-ckpt] loaded %s SCFA state (k=%d w=%d, %.1f MB)\n",
+                    w.scfa.causalBlock ? "causal-block" : "LEGACY NONCAUSAL",
                     scfaK, scfaW,
                     (double)((size_t)dims.L * D_sz * sizeof(float)) / (1024.0 * 1024.0));
     }
@@ -600,12 +608,37 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
                     dims.L, dims.nH);
     }
 
-    // bit 2048 is trainer-only WhiSC resume calibration state.  Serving always
-    // recalibrates Pbar/Qbar/a from the current window (ema=1), and the two
-    // model tails are found from EOF, so no sequential seek is needed here.
+    // bit 2048: load the cached WhiSC `a` from the trainer-owned Pbar/Qbar/a
+    // section. Serving treats it as fixed model state; recalibrating from the
+    // current full window would let future tokens change earlier logits.
     if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_WHISC_STATE) != 0)
-        std::printf("[chiron-ckpt] WhiSC calibration state present (trainer-resume section); "
-                    "serving will recalibrate from the current window\n");
+    {
+        const size_t nWhisc = (size_t)dims.L * dims.m;
+        const long secBytes = (long)(nWhisc * sizeof(float));
+        const int tailsAfterA = 1
+            + ((chrfFlags & (uint32_t)CKPT_BIT_A_DRIFT) != 0 ? 1 : 0)
+            + ((chrfFlags & (uint32_t)CKPT_BIT_ROT_PHI) != 0 ? 1 : 0);
+        if (std::fseek(fp, 0, SEEK_END) != 0)
+        {
+            err = "chiron_infer: seek(END) failed for WhiSC a";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        const long fileSize = std::ftell(fp);
+        const long need = (long)tailsAfterA * secBytes;
+        if (fileSize < need || std::fseek(fp, fileSize - need, SEEK_SET) != 0)
+        {
+            err = "chiron_infer: invalid WhiSC a tail offset";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        w.whiscA.assign(nWhisc, 1.0f);
+        if (std::fread(&w.whiscA[0], sizeof(float), nWhisc, fp) != nWhisc)
+        {
+            err = "chiron_infer: short read on WhiSC a (bit 2048)";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        std::printf("[chiron-ckpt] loaded fixed causal WhiSC a (L=%d m=%d, bit 2048)\n",
+                    dims.L, dims.m);
+    }
 
     // bit 512: OBSD per-layer drift gate a_drift (L*m FP32) — read from EOF tail.
     // a_drift is written immediately BEFORE rot_phi (bit 1024, which is always LAST).

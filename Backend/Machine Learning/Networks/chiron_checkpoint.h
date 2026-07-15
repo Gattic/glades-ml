@@ -13,7 +13,8 @@
 //   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
 //   | [bit 256] QK-Norm gamma: L*nH f32
 //   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
-//   | [bit 2048] WhiSC calibration: Pbar[L*m], Qbar[L*m], a[L*m] f32 (trainer-owned)
+//   | [bit 2048] WhiSC calibration: Pbar[L*m], Qbar[L*m], a[L*m] f32 (a used by serving)
+//   | [bit 4096] causal-block SCFA marker (no payload; changes SCFA operator semantics)
 //   | [bit 512] a_drift: L*m f32
 //   | [bit 1024] rot_phi: L*m f32       <-- MUST STAY LAST (EOF-tail read)
 // Version rules: v4 iff bit 64 (bf16-on-disk); else v3 iff bit 8 (gamma_p);
@@ -47,12 +48,13 @@ enum ChironCkptBits
 	CKPT_BIT_QKNORM_GAMMA = 256,
 	CKPT_BIT_A_DRIFT      = 512,
 	CKPT_BIT_ROT_PHI      = 1024,
-	CKPT_BIT_WHISC_STATE  = 2048
+	CKPT_BIT_WHISC_STATE  = 2048,
+	CKPT_BIT_CAUSAL_SCFA  = 4096
 };
 // All bits the current format defines.  The WhiSC section is trainer-owned and
 // sits before the two EOF tails, so serving may safely ignore it after checking
 // the bit.  Unknown future bits still hard-error to protect tail arithmetic.
-static const uint32_t CKPT_KNOWN_BITS_MASK = 0xFFFu;  // == 4095 == bits 1..2048
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0x1FFFu;  // == 8191 == bits 1..4096
 
 // CHRN v3 legacy flags word bits.
 enum ChironChrnBits
@@ -71,9 +73,10 @@ struct ChironScfaState
 {
 	int k;
 	int w;
-	bool present;   // SCFA forward active (resolve-time)
-	bool dLoaded;   // D came from the checkpoint
-	glades::gpu::GpuBuffer<float> B;                 // [T,k] DCT-II basis (recomputed, not stored)
+	bool present;      // SCFA forward active (resolve-time)
+	bool dLoaded;      // D came from the checkpoint
+	bool causalBlock;  // checkpoint declares exact-causal block SCFA semantics
+	glades::gpu::GpuBuffer<float> B;                 // legacy DCT basis; unused by causal-block SCFA
 	std::vector<glades::gpu::GpuBuffer<float>*> D;   // [L][m*(w+1)]
 	ChironScfaState();
 	~ChironScfaState();   // deletes D[i]
@@ -90,6 +93,7 @@ struct ChironModelWeights
 	std::vector<glades::gpu::GpuBuffer<float>*> gamma_p, beta_p; // [m]; empty if absent
 	ChironScfaState scfa;
 	std::vector<float> qknormGamma;  // L*nH iff bit 256, else empty
+	std::vector<float> whiscA;       // L*m iff bit 2048; fixed causal serving calibration
 	std::vector<float> rotPhi;       // L*m  iff bit 1024, else empty
 	std::vector<float> aDrift;       // L*m  iff bit 512 (OBSD per-layer drift gate); loaded from EOF tail; empty if absent
 	bool hasADrift;                  // bit 512 seen (aDrift is loaded; nonzero => refuse to serve)

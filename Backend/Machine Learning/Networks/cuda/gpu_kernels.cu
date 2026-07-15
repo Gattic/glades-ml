@@ -9119,26 +9119,109 @@ bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
 //  SCFA (paradigm shift #42) — Spectral Compressed Flow Attention primitives.
 // ===========================================================================
 //
-// SCFA replaces full T-token attention with attention in a k-dim sequence-
-// spectral basis B ∈ ℝ^{T×k} (k ≪ T) + a depthwise causal conv D covering
-// the out-of-spectrum residual.  Forward:
+// Causal SCFA replaces full T-token attention with attention over k contiguous
+// block summaries plus a depthwise causal residual mixer. C compresses each
+// block; A exposes summary b only to block b+1:
 //
-//   q_compr = B^T q                       (T → k compression)
-//   y_compr = SoftmaxAttn(q_compr ...)    (k-dim attention; existing kernel)
-//   y_∥     = B · y_compr                 (k → T lift)
-//   y_⊥     = D(q - B B^T q)              (depthwise causal conv on residual)
-//   y       = y_∥ + y_⊥
+//   q_compr = C q                         (T → k block compression)
+//   y_compr = CausalAttn(q_compr ...)     (k-summary attention)
+//   y_par   = A y_compr                   (one-block-delayed lift)
+//   y_perp  = D(q - A q_compr)            (causal residual convolution)
 //
-// This file ships the two SCFA-specific primitives:
-//   scfa_dct_basis_init    — fill B with normalized DCT-II basis (orthonormal)
-//   scfa_depthwise_causal_conv_fwd — y_⊥ = D(x) with causal kernel size 2w+1,
-//     one filter per channel; m channels, T positions, w half-width.
-//
-// The compression/lift steps reuse sgemm_rowmajor (in this same file).
-// Theorem 3 reversibility integration with CHIRON shears is handled at the
-// chiron_main.cpp level; these kernels are paradigm-agnostic linear algebra.
+// The legacy DCT initializer remains for compatibility with isolated research
+// tests, but causal CHIRON forward paths use the block/lag operators below.
 
 namespace {
+
+__device__ __forceinline__ int scfa_block_start(int b, int T, int k)
+{
+	return (int)(((long long)b * (long long)T) / (long long)k);
+}
+
+__device__ __forceinline__ int scfa_token_block(int t, int T, int k)
+{
+	// Inverse of start(b)=floor(b*T/k), valid for 0 < k <= T.
+	int b = (int)((((long long)(t + 1) * (long long)k) - 1ll) / (long long)T);
+	return b < k ? b : k - 1;
+}
+
+__global__ void scfa_block_compress_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	int b = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (b >= k || c >= m) return;
+	int begin = scfa_block_start(b, T, k);
+	int end = scfa_block_start(b + 1, T, k);
+	float sum = 0.0f;
+	for (int t = begin; t < end; ++t)
+		sum += x[(size_t)t * (size_t)m + (size_t)c];
+	float v = alpha * sum * rsqrtf((float)(end - begin));
+	size_t o = (size_t)b * (size_t)m + (size_t)c;
+	out[o] = beta == 0.0f ? v : v + beta * out[o];
+}
+
+__global__ void scfa_causal_lag_lift_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)T * (size_t)m;
+	if (idx >= n) return;
+	int t = (int)(idx / (size_t)m);
+	int c = (int)(idx % (size_t)m);
+	int dstBlock = scfa_token_block(t, T, k);
+	float v = 0.0f;
+	if (dstBlock > 0)
+	{
+		int srcBlock = dstBlock - 1;
+		int begin = scfa_block_start(srcBlock, T, k);
+		int end = scfa_block_start(srcBlock + 1, T, k);
+		v = alpha * x[(size_t)srcBlock * (size_t)m + (size_t)c]
+		    * rsqrtf((float)(end - begin));
+	}
+	out[idx] = beta == 0.0f ? v : v + beta * out[idx];
+}
+
+__global__ void scfa_causal_lag_reduce_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	int b = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (b >= k || c >= m) return;
+	float sum = 0.0f;
+	if (b + 1 < k)
+	{
+		int begin = scfa_block_start(b + 1, T, k);
+		int end = scfa_block_start(b + 2, T, k);
+		for (int t = begin; t < end; ++t)
+			sum += x[(size_t)t * (size_t)m + (size_t)c];
+	}
+	int srcBegin = scfa_block_start(b, T, k);
+	int srcEnd = scfa_block_start(b + 1, T, k);
+	float v = alpha * sum * rsqrtf((float)(srcEnd - srcBegin));
+	size_t o = (size_t)b * (size_t)m + (size_t)c;
+	out[o] = beta == 0.0f ? v : v + beta * out[o];
+}
+
+__global__ void scfa_block_expand_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)T * (size_t)m;
+	if (idx >= n) return;
+	int t = (int)(idx / (size_t)m);
+	int c = (int)(idx % (size_t)m);
+	int b = scfa_token_block(t, T, k);
+	int begin = scfa_block_start(b, T, k);
+	int end = scfa_block_start(b + 1, T, k);
+	float v = alpha * x[(size_t)b * (size_t)m + (size_t)c]
+	          * rsqrtf((float)(end - begin));
+	out[idx] = beta == 0.0f ? v : v + beta * out[idx];
+}
 
 // Apply 1-D depthwise causal conv: y[t, c] = Σ_{i=-w..0} K[c, w+i] · x[t+i, c]
 // for t ∈ [0, T), c ∈ [0, m).  Out-of-bounds left taps zero-padded.
@@ -9419,6 +9502,60 @@ __global__ void scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled_kernel(
 }
 
 } // anonymous namespace
+
+bool scfa_block_compress(const float* x, int T, int m, int k,
+                         float alpha, float beta, float* out,
+                         cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	dim3 grid((m + block - 1) / block, k);
+	scfa_block_compress_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_causal_lag_lift(const float* x, int T, int m, int k,
+                          float alpha, float beta, float* out,
+                          cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	size_t n = (size_t)T * (size_t)m;
+	int block = 256;
+	int grid = (int)((n + block - 1) / block);
+	scfa_causal_lag_lift_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_causal_lag_reduce(const float* x, int T, int m, int k,
+                            float alpha, float beta, float* out,
+                            cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	dim3 grid((m + block - 1) / block, k);
+	scfa_causal_lag_reduce_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_block_expand(const float* x, int T, int m, int k,
+                       float alpha, float beta, float* out,
+                       cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	size_t n = (size_t)T * (size_t)m;
+	int block = 256;
+	int grid = (int)((n + block - 1) / block);
+	scfa_block_expand_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
                                      int T, int m, int w, float* y,
