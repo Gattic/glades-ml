@@ -137,6 +137,14 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
                                 const int* targets,
                                 int T, int vocabSize, int padToken,
                                 int* correct_count, int* valid_count);
+// V10/V16 read-only output vectors, fused into the existing CE/argmax scans.
+bool chiron_vitals_output_vectors_bf16(const unsigned short* probs,
+                                        const int* targets,
+                                        int T, int vocabSize, int padToken,
+                                        float* loss_sum, int* loss_count,
+                                        int* correct_count, int* valid_count,
+                                        float* perTokenNll,
+                                        unsigned char* perTokenTop1);
 
 // 2026-05-14 live-eval suite — position-bucketed NLL + top-k accuracy.
 // Both operate on BF16 probs (the storage type used at runtime when
@@ -499,6 +507,10 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
                                 const float* dout,
                                 int T, int vocabSize, int dModel);
+// V15 read-only row-coverage tap: rowMass[token[t]] += sum_d |dout[t,d]|.
+bool embedding_coverage_accumulate(const int* tokenIds, const float* dout,
+                                   int T, int vocabSize, int dModel,
+                                   float* rowMass);
 
 // Per-row RMS clamp with non-finite sanitization, in place on x [rows×cols].
 //  - any non-finite element in a row → entire row zeroed, ++*d_nonfiniteCount
@@ -512,6 +524,13 @@ bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
 // mitigation, 2026-06-11 — see SIRA_TERMINAL_30K_RESULT_2026_05_27.md).
 bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
                    int* d_clampedCount, int* d_nonfiniteCount);
+// V1 fused form. d_preClampSumSq is ADDITIVE and records the raw sum of
+// squares before any sanitization/rescale; caller controls reset/cadence.
+bool row_rms_clamp_vitals(float* x, int rows, int cols, float tauRms,
+                          int* d_clampedCount, int* d_nonfiniteCount,
+                          float* d_preClampSumSq,
+                          int* d_boundaryClamped = NULL,
+                          int* d_boundaryNonfinite = NULL);
 
 // Per-vector L2-norm clamp, in place on x[n].  Non-finite vector → zeroed;
 // else ‖x‖₂ > maxNorm → scaled by maxNorm/‖x‖; else untouched (bit-identical).
@@ -638,7 +657,7 @@ bool adam_update_int8_state(float* param, const float* grad,
                              float* m_scale, float* v_scale,
                              float lr, float beta1, float beta2, float eps,
                              float weightDecay, float gradScale,
-                             int step, int n);
+                             int step, int n, float* vitalsStats = NULL);
 
 // BF16-grad variants of the above two: read gradient from a BF16 buffer
 // instead of FP32.  Used when MixedPrecisionConfig::gradStorageBf16 is
@@ -656,7 +675,7 @@ bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
                                       float* scratch_fp32,
                                       float lr, float beta1, float beta2, float eps,
                                       float weightDecay, float gradScale,
-                                      int step, int n);
+                                      int step, int n, float* vitalsStats = NULL);
 
 // BF16-WEIGHT variants: param is a bf16 buffer (Lowp mirror as canonical
 // weight store, no FP32 master).  Each step: cast bf16 weight → weight_scratch
@@ -692,7 +711,8 @@ bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
                                                float lr, float beta1, float beta2, float eps,
                                                float weightDecay, float gradScale,
                                                int step, int n,
-                                               uint32_t srBaseSeed, uint32_t srStepIdx);
+                                               uint32_t srBaseSeed, uint32_t srStepIdx,
+                                               float* vitalsStats = NULL);
 
 // Returns the number of FP32 scale entries required for int8 Adam state
 // given a parameter count n.
@@ -1032,6 +1052,12 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
 bool argmax_count_matches(const float* probs, const int* targets,
                           int T, int vocabSize, int padToken,
                           int* correct_count, int* valid_count);
+bool chiron_vitals_output_vectors(const float* probs, const int* targets,
+                                  int T, int vocabSize, int padToken,
+                                  float* loss_sum, int* loss_count,
+                                  int* correct_count, int* valid_count,
+                                  float* perTokenNll,
+                                  unsigned char* perTokenTop1);
 
 // ---------------------------------------------------------------------------
 // Chunked cross-entropy loss — never materializes the dense T × V logits
@@ -1146,12 +1172,17 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 // Caller must zero d_accumulator before the first call.
 // Multiple calls accumulate across different buffers.
 bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
+// Same read pass, atomically accumulates into global and a VITALS group scalar.
+bool sum_squared_accumulate_dual(const float* data, int n,
+                                 float* d_accumulator, float* d_secondary);
 
 // BF16-input variant of sum_squared_accumulate.  Decodes each element as bf16->f32
 // (zero-extend low 16 bits) and accumulates v*v into d_accumulator.  Used for the
 // global grad-norm pass under BF16-grad Phase-2 where the FP32 grad buffers have
 // been retired and only the BF16 mirrors are live.
 bool sum_squared_accumulate_bf16(const uint16_t* data, int n, float* d_accumulator);
+bool sum_squared_accumulate_bf16_dual(const uint16_t* data, int n,
+                                      float* d_accumulator, float* d_secondary);
 
 // BF16 ↔ FP32 element-wise casts. Operates element-wise on GPU buffers.
 // `n` is the number of elements (not bytes). Designed as primitives for
@@ -1267,6 +1298,7 @@ inline bool echo_scatter_bf16(const unsigned short*, const int*, const int*, flo
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
+inline bool chiron_vitals_output_vectors_bf16(const unsigned short*, const int*, int, int, int, float*, int*, int*, int*, float*, unsigned char*) { return false; }
 inline bool cross_entropy_nll_bucketed_bf16(const unsigned short*, const int*, int, int, int, int, float*, int*) { return false; }
 inline bool topk_accuracy_bf16(const unsigned short*, const int*, int, int, int, int, const int*, int*, int*) { return false; }
 inline bool distill_combined_bwd(const float*, const float*, const int*, int, int, float, float*) { return false; }
@@ -1332,7 +1364,10 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_gather_bf16(const uint16_t*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
+inline bool embedding_coverage_accumulate(const int*, const float*, int, int, int, float*) { return false; }
 inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
+inline bool row_rms_clamp_vitals(float*, int, int, float, int*, int*, float*,
+                                  int* = NULL, int* = NULL) { return false; }
 inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
 inline bool clamp_abs(float*, int, float) { return false; }
 inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { return false; }
@@ -1373,6 +1408,7 @@ inline bool softmax_backward_attn(const float*, const float*, int, int, float, f
 inline bool causal_softmax_with_bwd_attn(float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
+inline bool chiron_vitals_output_vectors(const float*, const int*, int, int, int, float*, int*, int*, int*, float*, unsigned char*) { return false; }
 inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,
                                        int, int, int, int, int,
                                        float*, int*, float*) { return false; }
@@ -1387,7 +1423,9 @@ inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, int*) { return false; }
 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
+inline bool sum_squared_accumulate_dual(const float*, int, float*, float*) { return false; }
 inline bool sum_squared_accumulate_bf16(const uint16_t*, int, float*) { return false; }
+inline bool sum_squared_accumulate_bf16_dual(const uint16_t*, int, float*, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
 inline bool cast_f32_to_bf16_stochastic(const float*, uint16_t*, size_t, uint32_t, uint32_t) { return false; }
@@ -1395,7 +1433,7 @@ inline bool cast_f32_to_bf16_batched(int, const float* const*, uint16_t* const*,
 inline bool bf16_accum_axpy(uint16_t*, const float*, float, float, size_t) { return false; }
 inline bool adam_update_int8_state(float*, const float*, int8_t*, uint8_t*,
                                     float*, float*, float, float, float, float,
-                                    float, float, int, int) { return false; }
+                                    float, float, int, int, float* = NULL) { return false; }
 inline int adam_int8_scale_count(int n) { return (n + 255) / 256; }
 inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
                                    float, float, float, float, float, float,
@@ -1409,7 +1447,7 @@ inline bool adam_update_bf16_state_bf16grad(float*, const uint16_t*, uint16_t*, 
 inline bool adam_update_int8_state_bf16grad(float*, const uint16_t*, int8_t*, uint8_t*,
                                              float*, float*, float*,
                                              float, float, float, float, float, float,
-                                             int, int) { return false; }
+                                             int, int, float* = NULL) { return false; }
 inline bool adam_update_bf16_state_bf16grad_bf16w(uint16_t*, float*, const uint16_t*,
                                                    uint16_t*, uint16_t*,
                                                    float, float, float, float, float, float,
@@ -1421,7 +1459,8 @@ inline bool adam_update_int8_state_bf16grad_bf16w(uint16_t*, float*, const uint1
 inline bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t*, const uint16_t*,
                                                       int8_t*, uint8_t*, float*, float*,
                                                       float, float, float, float, float, float,
-                                                      int, int, uint32_t, uint32_t) { return false; }
+                                                      int, int, uint32_t, uint32_t,
+                                                      float* = NULL) { return false; }
 inline bool astra_update(float*, const float*, float*,
                           float, float, float, float, float,
                           int, int) { return false; }

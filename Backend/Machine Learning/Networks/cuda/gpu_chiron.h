@@ -398,6 +398,33 @@ bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
                                      unsigned int srStepIdx,
                                      cudaStream_t stream = 0);
 
+// V3/V8 fused tap. By default performs the same p update as masked/unmasked
+// axpy2 and optional BF16-SR side-write (for kernel parity tests). With
+// readOnly=true it observes an already-committed p without writes. energy6 is additive:
+// {count, sum p_before^2, sum p_after^2, sum y^2,
+//  sum (alpha*eta*y)^2, sum p_before*(alpha*eta*y)}.
+// fisher is additive sum (y*dp)^2 (pass dp/fisher on the inverse walk).
+bool chiron_scfa_axpy2_vitals(float* p_fp32, unsigned short* p_bf16,
+                              float alpha,
+                              const float* a, const float* b, int n,
+                              bool useMask,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              unsigned int srBaseSeed,
+                              unsigned int srStepIdx,
+                              float* energy6,
+                              const float* dp, float* fisher,
+                              bool readOnly = false,
+                              cudaStream_t stream = 0);
+
+// V2 observer residual from saved forward {mu,sigma} and reanchor's split
+// {mu[T],invStd[T]}. sampleStride=1 writes every token; larger strides
+// deterministically write rows 0,stride,... into a compact output.
+bool chiron_vitals_reanchor_residual(const float* savedStats,
+                                      const float* recomputedSplit,
+                                      int T, float* residual,
+                                      int sampleStride = 1);
+
 // ---------------------------------------------------------------------------
 // PACT — Profile Anti-Cancellation Tax (2026-07-04).  Deterministic gated
 // anti-cancellation penalty on the p-bus increment assembly.  Design:
@@ -956,6 +983,13 @@ inline bool chiron_scfa_axpy2_masked_dual_p(float*, unsigned short*, float,
                                             const float*, const float*, int,
                                             unsigned int, unsigned int, float, float,
                                             unsigned int, unsigned int) { return false; }
+inline bool chiron_scfa_axpy2_vitals(float*, unsigned short*, float,
+                                     const float*, const float*, int, bool,
+                                     unsigned int, unsigned int, float, float,
+                                     unsigned int, unsigned int, float*,
+                                     const float*, float*, bool = false) { return false; }
+inline bool chiron_vitals_reanchor_residual(const float*, const float*, int,
+                                             float*, int = 1) { return false; }
 inline bool chiron_incdrop_scale_copy_dual(float*, unsigned short*, float,
                                            const float*, int,
                                            unsigned int, unsigned int, float, float) { return false; }

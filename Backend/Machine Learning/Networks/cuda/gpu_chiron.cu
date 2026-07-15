@@ -420,6 +420,108 @@ __global__ void chiron_scfa_axpy2_masked_dual_p_kernel(float* __restrict__ p_fp3
 	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
 }
 
+// V3/V8 telemetry commit. The existing kernels remain the default-off path.
+// The write-enabled mode mirrors the commit for kernel parity tests. Production
+// uses readOnly after the canonical commit so stochastic-rounding counters are
+// untouched; warp/block reductions emit six layer scalars or a Fisher sum.
+// energy6 = {count, sum p_before^2, sum p_after^2, sum y^2,
+//            sum committed_increment^2, sum p_before*committed_increment}.
+__global__ void chiron_scfa_axpy2_vitals_kernel(
+    float* __restrict__ p_fp32, unsigned short* __restrict__ p_bf16,
+    float alpha, const float* __restrict__ a, const float* __restrict__ b,
+    int n, int useMask, unsigned int key, unsigned int thr, float lo, float hi,
+    uint32_t srBaseSeed, uint32_t srStepIdx,
+    float* __restrict__ energy6, const float* __restrict__ dp,
+    float* __restrict__ fisher, int readOnly)
+{
+	float acc[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+	float fsum = 0.0f;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += blockDim.x * gridDim.x)
+	{
+		const float eta = useMask ? chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi) : 1.0f;
+		const float y = a[i] + b[i];
+		const float committed = alpha * (eta * y);
+		float before, after;
+		if (readOnly)
+		{
+			after = p_fp32[i];
+			before = after - committed; // telemetry reconstruction only; no model write
+		}
+		else
+		{
+			before = p_fp32[i];
+			after = before + committed;
+			p_fp32[i] = after;
+			if (p_bf16)
+				p_bf16[i] = fp32_to_bf16_sr_dev(after, (uint32_t)i, srStepIdx, srBaseSeed);
+		}
+		if (energy6)
+		{
+			acc[0] += 1.0f;
+			acc[1] += before * before;
+			acc[2] += after * after;
+			acc[3] += y * y;
+			acc[4] += committed * committed;
+			acc[5] += before * committed;
+		}
+		if (fisher && dp)
+		{
+			const float yd = y * dp[i];
+			fsum += yd * yd;
+		}
+	}
+	const int lane = threadIdx.x & 31;
+	const int warp = threadIdx.x >> 5;
+	for (int off = 16; off > 0; off >>= 1)
+	{
+		for (int j = 0; j < 6; ++j)
+			acc[j] += __shfl_down_sync(0xFFFFFFFFu, acc[j], off);
+		fsum += __shfl_down_sync(0xFFFFFFFFu, fsum, off);
+	}
+	__shared__ float warpAcc[7][32];
+	if (lane == 0)
+	{
+		for (int j = 0; j < 6; ++j) warpAcc[j][warp] = acc[j];
+		warpAcc[6][warp] = fsum;
+	}
+	__syncthreads();
+	if (warp == 0)
+	{
+		const int nWarp = blockDim.x / 32;
+		for (int j = 0; j < 6; ++j) acc[j] = lane < nWarp ? warpAcc[j][lane] : 0.0f;
+		fsum = lane < nWarp ? warpAcc[6][lane] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			for (int j = 0; j < 6; ++j)
+				acc[j] += __shfl_down_sync(0xFFFFFFFFu, acc[j], off);
+			fsum += __shfl_down_sync(0xFFFFFFFFu, fsum, off);
+		}
+		if (lane == 0)
+		{
+			if (energy6) for (int j = 0; j < 6; ++j) atomicAdd(energy6 + j, acc[j]);
+			if (fisher) atomicAdd(fisher, fsum);
+		}
+	}
+}
+
+__global__ void chiron_vitals_reanchor_residual_kernel(
+    const float* __restrict__ savedStats,
+    const float* __restrict__ recomputedSplit,
+    int T, int sampleStride, float* __restrict__ residual)
+{
+	const int sample = blockIdx.x * blockDim.x + threadIdx.x;
+	const int row = sample * sampleStride;
+	if (row >= T) return;
+	const float muSaved = savedStats[(size_t)row * 2u];
+	const float sigmaSaved = savedStats[(size_t)row * 2u + 1u];
+	const float muRecomputed = recomputedSplit[row];
+	const float invRecomputed = recomputedSplit[T + row];
+	const float scaleProduct = fmaxf(sigmaSaved * invRecomputed, 1e-30f);
+	residual[sample] = fabsf(logf(1.0f / scaleProduct))
+	                 + fabsf(muSaved - muRecomputed) * invRecomputed;
+}
+
 __global__ void chiron_axpy_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
                                              float alpha,
                                              const float* __restrict__ x,
@@ -741,6 +843,47 @@ bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_scfa_axpy2_masked_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
 	    p_fp32, p_bf16, alpha, a, b, n, key, thr, lo, hi, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2_vitals(float* p_fp32, unsigned short* p_bf16,
+                              float alpha,
+                              const float* a, const float* b, int n,
+                              bool useMask,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              unsigned int srBaseSeed,
+                              unsigned int srStepIdx,
+                              float* energy6,
+                              const float* dp, float* fisher,
+                              bool readOnly,
+                              cudaStream_t stream)
+{
+	if (!p_fp32 || !a || !b || n <= 0) return false;
+	if (!energy6 && !fisher) return false;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	if (grid > 256) grid = 256;
+	cudaStream_t s = stream != 0 ? stream : computeStream();
+	chiron_scfa_axpy2_vitals_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, useMask ? 1 : 0,
+	    key, thr, lo, hi, srBaseSeed, srStepIdx, energy6, dp, fisher,
+	    readOnly ? 1 : 0);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_vitals_reanchor_residual(const float* savedStats,
+                                      const float* recomputedSplit,
+                                      int T, float* residual,
+                                      int sampleStride)
+{
+	if (!savedStats || !recomputedSplit || !residual || T <= 0 || sampleStride <= 0) return false;
+	const int block = 256;
+	const int samples = (T + sampleStride - 1) / sampleStride;
+	const int grid = (samples + block - 1) / block;
+	chiron_vitals_reanchor_residual_kernel<<<grid, block, 0, computeStream()>>>(
+	    savedStats, recomputedSplit, T, sampleStride, residual);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

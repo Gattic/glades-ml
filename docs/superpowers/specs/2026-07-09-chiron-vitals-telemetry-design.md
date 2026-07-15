@@ -7,7 +7,10 @@ CHIRON 1B trainer covering four axes: **(1) gradient health, (2) generalization,
 quantities already resident during training, total budget **≤0.5% wall**, ≤50 MB VRAM,
 C++98/CUDA-native, default-off behind `--vitals`.
 
-Status: **DESIGN ONLY — nothing built, nothing committed to kernels or trainer.**
+Status: **IMPLEMENTED 2026-07-15** in glades-ml plus the sibling CHIRON trainer.
+The deterministic estimator/kernel/unit/smoke gates are implemented and passing; the
+long-horizon empirical gates G1–G10 remain run-level validation work (G9 necessarily
+rides the 20B run) and are not represented as passed by implementation tests.
 Produced by the 3-candidate research-framework-design protocol (candidates: LEDGER
 estimation-theoretic / STROBE dynamical-observability / TIDE measure-transport; STROBE
 selected as spine, LEDGER + TIDE absorbed as certificate terms — §2–3).
@@ -622,6 +625,32 @@ and stable; probe SEs measured (DEFF calibration); zero wall regression beyond 0
   is the first full-scale consumer (stopping rule V11, anneal trigger V14, memorization
   watch V13, attractor watch V17).
 
+### Implementation record (2026-07-15)
+
+- Host estimator/alarm engine: `Backend/Machine Learning/Networks/chiron_vitals.{h,cpp}`
+  implements V1–V18, bounded history, robust FAST alarms, absolute/self-test alarms,
+  quantiles/strata, dual-family saturation fits, GNS/GSNR, drift–diffusion, coverage,
+  Hill-tail, copy and contextual-gain estimators.
+- CUDA taps: `gpu_chiron.cu/.h` (V2/V3/V8) and `gpu_kernels.cu/.h`
+  (V1/V5/V7/V10/V15/V16), with warp-shuffle reductions and unchanged default-off
+  dispatch. The int8-Adam taps retain six parameter groups and use a deterministic
+  1/16 block sample at production scale with one atomic aggregate per sampled block.
+  V2 stores a deterministic stride-16 token sample and V15 accumulates only on the
+  cadence-gated capture step, reducing the VITALS device allocation by 82.9%.
+- Trainer integration: sibling `glades-trainer/trainer/chiron_main.cpp` provides
+  `--vitals`, `--vitals-cadence`, `--vitals-probe-every`, and
+  `--vitals-unigram`; fixed canary/fresh probes, two-spacing replay deltas, atomics-floor
+  calibration, K=4 PIED redraws, and the repetition template are cadence-gated.
+- Tests: `chiron-vitals-test.cpp` covers all catalog outputs and self-tests plus CUDA
+  parity for commit/BF16-SR, observer residual, Fisher, row RMS, coverage, output
+  vectors, and int8-Adam read-only behavior. A one-step small-shape trainer A/B produced
+  byte-identical CHRN checkpoints with VITALS off/on. The optimized M1 production-shape
+  hot-path n=2 measured median wall overhead +0.213% (elapsed +0.235%) and 0.29 MB
+  VITALS buffers, passing the ≤0.5% wall and ≤1% VRAM gates.
+- Validation boundary: deterministic implementation tests do not substitute for the
+  pre-registered production replays/correlations in G1–G10. Those gates remain open
+  until their specified training runs are executed.
+
 ## 13. Open conjectures (each gated)
 
 1. Λ crosses alarm ≥50 steps before loss divergence on SORC-class cascades (G1).
@@ -639,5 +668,5 @@ and stable; probe SEs measured (DEFF calibration); zero wall regression beyond 0
 
 *Design produced 2026-07-09 via the 3-candidate research-framework-design protocol.
 Candidates: LEDGER (estimation-theoretic), STROBE (dynamical-systems/observability;
-selected as spine), TIDE (measure-transport). Nothing in this document is built;
-implementation begins at M0 only on owner go-ahead.*
+selected as spine), TIDE (measure-transport). Implementation landed 2026-07-15;
+long-horizon empirical gates remain governed by the pre-registrations above.*

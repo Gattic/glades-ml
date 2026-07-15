@@ -13,6 +13,8 @@ set(Networks_src_files
 	chiron_checkpoint.cpp
 	chiron_serving.cpp
 	chiron_generate.cpp
+	chiron_vitals.cpp
+	chiron_vitals.h
 	sgd_dff.cpp
 	sgd_rnn.cpp
 	sgd_gru.cpp
