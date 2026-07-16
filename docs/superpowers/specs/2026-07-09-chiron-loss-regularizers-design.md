@@ -552,9 +552,18 @@ hard hinge by default. Kernels: `echo_repeat_stats[_huber]`, the combined
   zero-sum field, init inactivity, λ-linear RMS calibration, and CPU≡GPU Huber
   stats/weighted-scatter/composed backward.  The end-to-end tiny trainer smoke verifies
   warmup, all wrapper flags, Z-loss independence, loss ordering, and telemetry.
-- **E3** matched 2500-step pair (fresh baseline, same binary — era-drift discipline):
-  kill if ΔNLL > +0.05, activation ≈ 0 by 2500 (inert), or any grad-skip delta; record
-  E[P_A] + π(copy) histogram (margin-evasion tripwire).
+- **Memory/performance PASS (2026-07-15):** owner-slot bitmaps replaced the dense
+  `T*w` active-id buffer and an 11-scalar GPU reduction replaced four O(T) telemetry
+  downloads. At `T=16384,w=128`, hard scratch is `0.50 MiB` (`-93.9%`) and Huber
+  scratch is `8.50 MiB` (`-47.7%`, exact FP32 weights retained). Matched n=3
+  production elapsed overhead is `+0.33%` by independent medians / `+0.09%` by paired
+  medians; trainer-wall logs are unchanged at `70.4 s`.
+- **E3 quality FAIL / no-go (2026-07-15):** matched 2500-step treatment ended at
+  NLL `6.7239` versus baseline `6.7077` (`+0.0162`, bounded but not beneficial).
+  Stability, activation, and wall bars passed, but logged max-gradient ratio was `1.47×`
+  (bar `≤1.1×`) and the key-step NLL gaps were not non-increasing. Both final saves also
+  failed because their requested parent directories did not exist. E3.5/E4 are not
+  promoted for this λ=0.1 recipe; implementation remains default-off.
 - **E3.5** free-gen probe on both 2500-step checkpoints (--gen-metrics, prose seeds per
   the diagnosis protocol; repeated-token-fraction + type-token ratio, NOT distinct-4).
 - **E4** 30k matched pair. **Ship bar:** wide-32 within +0.02 of baseline AND ≥2×
