@@ -80,6 +80,19 @@ P0 contract/manifests/analysis
 No phase may consume artifacts from a later phase. Every generated artifact records source commit,
 checkpoint SHA-256, manifest hash, detector hash, decoder table, and command.
 
+### 2.1 Two parity-gated performance passes
+
+Correctness baselines land first. Optimizations are retained only when bit/tolerance parity holds and a
+measured resource bar improves; neither pass may weaken G1/G2.
+
+1. **PERF-A — compact sparse hazard layout (after P4 correctness).** Replace `[T,16]` hazard metadata
+   with active-row CSR plus one `rowSlot[T]` map. Target metadata falls from about 1.3 MiB to `<128 KiB`
+   at `T=16384,H=256`, while CPU/GPU loss and dlogits remain within G2 tolerances.
+2. **PERF-B — asynchronous CHAB prefetch (after P5 correctness).** Double-buffer the compact metadata,
+   read/decode the next record on CPU, and upload it on the transfer stream during clean accumulation.
+   The auxiliary pass waits on one event. Keep only if staging wall drops `>=50%`, total auxiliary wall
+   does not regress, clean RNG/checkpoint parity remains exact, and amortized overhead stays `<=1.5%`.
+
 ---
 
 ## 3. Phase P0 — freeze contracts, manifests, and analysis
@@ -104,6 +117,7 @@ checkpoint SHA-256, manifest hash, detector hash, decoder table, and command.
 ```text
 build_chiron_generation_manifests.py
   --corpus PATH --vocab PATH --seed N
+  --inventory-cache PATH [--train-shards CSV]
   --calibration-out PATH --calibration-payload PATH
   --train-out PATH --eval-out PATH [--self-test]
 ```
@@ -121,6 +135,12 @@ Calibration index contract:
 sample_id, domain, source_kind, blind_label, payload_sha256, token_offset, token_count
 ```
 
+The corpus input is the existing pretokenized layout (`train/*.tok.bin`, `val.tok.bin`, `vocab.bpe`).
+The generator samples EOS/BOS-delimited documents with bounded mmap searches, decodes only selected
+windows with the GLADES BPE merge table, and assigns deterministic auditable domain heuristics. It never
+loads a shard into RAM. A reusable inventory caches full shard SHA-256 by path/size/mtime/inode; a changed
+identity forces rehash, while unchanged multi-gigabyte shards are not re-read.
+
 `eval_manifest_v1.tsv` contains 128 contexts: 64 prose, 24 code, 16 math/markup, 24 mixed;
 96 reduced no-slide, 32 full no-slide, and 16 of the full rows tagged for sliding diagnostics.
 `train_manifest_v1.tsv` contains at least 512 training-split contexts (at least 384 reduced and 128
@@ -132,8 +152,9 @@ hashes only; token payloads/model outputs stay in the local gitignored artifact.
 
 - `python3 scripts/build_chiron_generation_manifests.py --self-test`
 - regenerate into a temporary directory and compare byte-for-byte;
-- fail on duplicate document IDs across splits, overlapping offsets, shard crossing, short contexts,
-  wrong corpus/vocab hash, non-divisible `T/k`, or unexpected row counts;
+- fail on duplicate document IDs across splits, overlapping offsets, shard/document crossing, missing
+  BOS/EOS bounds, short contexts, wrong corpus/vocab hash, stale inventory identity, non-divisible
+  `T/k`, or unexpected row counts;
 - validate reduced geometry `2048/128` and full geometry `16384/1024` without claiming parity.
 
 **Acceptance — M0**
@@ -141,7 +162,9 @@ hashes only; token payloads/model outputs stay in the local gitignored artifact.
 - deterministic bytes and stable hashes;
 - zero calibration/train/eval document overlap;
 - every train row names the training split and every eval row the held-out split;
-- README pins script/corpus/vocab/manifest hashes and privacy rules.
+- README pins script/corpus-inventory/vocab/manifest hashes, domain-heuristic version, and privacy rules;
+- peak Python RSS is `<128 MiB` on synthetic large sparse TOKB and generation performs no whole-shard
+  token materialization.
 
 ### P0.2 Analysis tool and frozen statistical contract
 
@@ -693,11 +716,33 @@ Add `CHIRONArrestGpuParityTest()` and `chiron-arrest`:
 - dense-plus-sparse result equals CPU reference;
 - active-kernel timing and allocation accounting.
 
+### P4.3 PERF-A — compact sparse hazard layout
+
+After the `[T,16]` correctness reference passes, change the production wrapper to active-row CSR:
+
+```text
+activeRows[A], rowOffsets[A+1], hazardIds[N], counts[A],
+weights[A], behaviorQ[A], currentQ[A], rowSlot[T]
+```
+
+`A<=H=256`, `N<=16A`, and `rowSlot[t]` is `-1` for inactive rows. Stats launches over `A`, scatter over
+`N`, and the unavoidable dense dlogits pass performs one `rowSlot[t]` lookup. Keep the original layout
+only inside tests as a reference.
+
+**PERF-A tests/gate**
+
+- compact versus reference summary/dlogits parity within the existing CPU/GPU tolerance;
+- duplicate, empty, max-`A`, max-`N`, and inactive-row fixtures;
+- measured metadata `<128 KiB` at `T=16384,H=256,K=16` and at least 75% below the reference layout;
+- no active-kernel wall regression over 1%; otherwise retain the correctness layout and record PERF-A
+  as NULL rather than weakening G2.
+
 **G2 math/kernel acceptance**
 
 - all CPU/GPU tests pass;
 - clamp frequency `<.1%` outside adversarial fixtures;
-- incremental device state `<=8 MiB` target, `<=50 MiB` hard kill;
+- incremental device state `<=8 MiB` target, `<=50 MiB` hard kill; PERF-A additionally targets
+  `<128 KiB` metadata;
 - active kernels `<=1%` of a normal micro-step;
 - no ECHO test or API changes except shared-pattern regression coverage.
 
@@ -756,15 +801,13 @@ branch, or altered counter sequence.
 - `Scratch` in `trainer/chiron_main.cpp`
 - `trainer/chiron_arrest_buffer.{h,cpp}`
 
-Allocate only when `arrestCoef>0`:
+Allocate only when `arrestCoef>0`. The correctness fallback uses `[T,16]` IDs/counts/weights/current-q.
+When PERF-A passes, production instead allocates compact `activeRows`, `rowOffsets`, `hazardIds`,
+`weights`, `behaviorQ`, `currentQ`, and `rowSlot[T]`, plus one
+`arrest_summary[ARREST_SUMMARY_SIZE]`. Host record/padded token storage and `Scratch::arrestReplay` are
+shared.
 
-- `arrest_ids[T*16]` int32;
-- `arrest_counts[T]` uint8;
-- `arrest_weights[T]`, `arrest_behavior_q[T]`, `arrest_current_q[T]` FP32;
-- `arrest_summary[ARREST_SUMMARY_SIZE]` FP32;
-- host record/padded token storage; reuse `Scratch::arrestReplay` from P2.4.
-
-Expected new device memory is about 1.3 MiB at `T=16384,K=16`; assert/log measured bytes. The loader
+Assert/log measured bytes: about 1.3 MiB for the fallback and `<128 KiB` target for PERF-A. The loader
 rejects training records with zero/nonfinite FP64 `weightSum`, converts the validated sum once to the
 kernel scale, and uses `auxOrdinal = count of cadence-eligible steps since sidecar.roundStart` and
 `recordIndex = auxOrdinal % recordCount`; no STL hash or mutable RNG is allowed. It validates age and
@@ -859,6 +902,22 @@ part of production cadence.
 - clean PIED/SR stream parity and byte-unchanged WhiSC Pbar/Qbar/a across replay;
 - memory and cadence accounting.
 
+### P5.7 PERF-B — asynchronous compact-record prefetch
+
+After synchronous P5 correctness passes, add two compact metadata slots. While ordinary accumulation
+runs, a CPU worker reads/validates the next CHAB record and the transfer stream uploads the inactive
+slot; an event makes the auxiliary pass wait only at consumption. Model tokens and the large `[T,V]`
+probability/dlogit buffers are never duplicated.
+
+**PERF-B tests/gate**
+
+- synchronous versus prefetched record bytes, record order, summary, dlogits, checkpoint, and RNG parity;
+- cancellation/error/refresh paths join the worker and never consume a partial slot;
+- peak incremental VRAM remains `<256 KiB` with two compact slots;
+- median staging wall falls `>=50%` over at least 100 synthetic records, total auxiliary wall does not
+  regress, and amortized training overhead remains `<=1.5%`;
+- if any bar misses, keep synchronous compact staging and record PERF-B as NULL.
+
 **G2 integration acceptance**
 
 - coefficient-zero loss/checkpoint bit parity;
@@ -866,7 +925,8 @@ part of production cadence.
 - replay p95 q tolerance from G1 retained;
 - clean PIED/SR sequence unchanged;
 - no nonfinite/clamp/stale contract violation;
-- active-kernel `<=1%`, amortized trainer overhead `<=1.5%`;
+- active-kernel `<=1%`, amortized trainer overhead `<=1.5%`; PERF-B is optional unless all its parity
+  and measured-benefit bars pass;
 - existing checkpoint, CHIRON, ECHO, and generation tests remain green.
 
 Verification:
