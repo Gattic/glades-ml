@@ -13,6 +13,7 @@
 //   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
 //   | [bit 256] QK-Norm gamma: L*nH f32
 //   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
+//   | [bit 8192] ORBIT optimizer state (trainer-owned; before all model tails)
 //   | [bit 2048] WhiSC calibration: Pbar[L*m], Qbar[L*m], a[L*m] f32 (a used by serving)
 //   | [bit 4096] causal-block SCFA marker (no payload; changes SCFA operator semantics)
 //   | [bit 512] a_drift: L*m f32
@@ -49,12 +50,13 @@ enum ChironCkptBits
 	CKPT_BIT_A_DRIFT      = 512,
 	CKPT_BIT_ROT_PHI      = 1024,
 	CKPT_BIT_WHISC_STATE  = 2048,
-	CKPT_BIT_CAUSAL_SCFA  = 4096
+	CKPT_BIT_CAUSAL_SCFA  = 4096,
+	CKPT_BIT_ORBIT_STATE  = 8192
 };
-// All bits the current format defines.  The WhiSC section is trainer-owned and
-// sits before the two EOF tails, so serving may safely ignore it after checking
-// the bit.  Unknown future bits still hard-error to protect tail arithmetic.
-static const uint32_t CKPT_KNOWN_BITS_MASK = 0x1FFFu;  // == 8191 == bits 1..4096
+// All bits the current format defines. WhiSC and ORBIT are trainer-owned and
+// sit before the two EOF tails, so serving may safely ignore them after checking
+// the bits. Unknown future bits still hard-error to protect tail arithmetic.
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0x3FFFu;  // == 16383 == bits 1..8192
 
 // CHRN v3 legacy flags word bits.
 enum ChironChrnBits

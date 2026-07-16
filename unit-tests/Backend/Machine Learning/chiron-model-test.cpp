@@ -522,29 +522,50 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 5: Unknown bit 8192 → reject with errCode=4 ----
+	// ---- Case 5: trainer-owned ORBIT bit is known and serving ignores payload ----
+	{
+		RTWeightData src;
+		rt_fill_weights(src, false);
+		const uint32_t flags = (uint32_t)glades::chiron::CKPT_BIT_ORBIT_STATE;
+		std::string path = rt_tmppath();
+		ASSERT("rt5 tmppath", !path.empty());
+		std::FILE* fp = std::fopen(path.c_str(), "wb");
+		ASSERT("rt5 fopen", fp != 0);
+		ASSERT("rt5 write_header", glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
+		ASSERT("rt5 write_weights", rt_write_weights(fp, src, false, false));
+		const uint32_t dummyOrbitPayload = 0x5442524fu;
+		ASSERT("rt5 orbit payload", std::fwrite(&dummyOrbitPayload, sizeof(dummyOrbitPayload), 1, fp) == 1);
+		std::fclose(fp);
+		glades::chiron::ChironModelDims dims;
+		glades::chiron::ChironModelWeights w;
+		std::string err; int errCode = 0;
+		ASSERT("rt5 accepted", glades::chiron::chiron_load_model(path, dims, w, err, errCode));
+		unlink(path.c_str());
+	}
+
+	// ---- Case 5b: Unknown bit 16384 → reject with errCode=4 ----
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
 
-		const uint32_t flags = 8192u;  // bit beyond CKPT_KNOWN_BITS_MASK
+		const uint32_t flags = 16384u;  // bit beyond CKPT_KNOWN_BITS_MASK
 
 		std::string path = rt_tmppath();
-		ASSERT("rt5 tmppath", !path.empty());
+		ASSERT("rt5b tmppath", !path.empty());
 
 		std::FILE* fp = std::fopen(path.c_str(), "wb");
-		ASSERT("rt5 fopen", fp != 0);
-		ASSERT("rt5 write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
-		ASSERT("rt5 write_weights", rt_write_weights(fp, src, false, false));
+		ASSERT("rt5b fopen", fp != 0);
+		ASSERT("rt5b write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
+		ASSERT("rt5b write_weights", rt_write_weights(fp, src, false, false));
 		std::fclose(fp);
 
 		glades::chiron::ChironModelDims     dims;
 		glades::chiron::ChironModelWeights  w;
 		std::string err; int errCode = 0;
 		bool ok = glades::chiron::chiron_load_model(path, dims, w, err, errCode);
-		ASSERT("rt5 rejected",   !ok);
-		ASSERT("rt5 errCode 4",  errCode == 4);
-		ASSERT("rt5 err unknown", err.find("unknown") != std::string::npos);
+		ASSERT("rt5b rejected",   !ok);
+		ASSERT("rt5b errCode 4",  errCode == 4);
+		ASSERT("rt5b err unknown", err.find("unknown") != std::string::npos);
 
 		unlink(path.c_str());
 	}
@@ -1574,7 +1595,7 @@ static void CHIRONPrefixCausalityTest()
 	std::vector<int> full((size_t)d.T), prefix((size_t)d.T);
 	for (int t = 0; t < d.T; ++t) full[t] = (3 * t + 1) % d.V;
 	prefix = full;
-	for (int t = pos + 1; t < d.T; ++t) prefix[t] = 0;
+	for (int t = pos + 1; t < d.T; ++t) prefix[t] = (full[t] + 1) % d.V;
 
 	glades::chiron::ChironEvalScratch sf, sp;
 	ASSERT("prefix full scratch", sf.allocate(d, w, cfg));
