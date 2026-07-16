@@ -22,6 +22,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdio>
 
@@ -2632,6 +2633,221 @@ bool chiron_sira_terminal_add_grad(const float* q, const float* p,
 }
 
 // ===========================================================================
+//  5e. Reversible SwiGLU FFN shear.
+// ===========================================================================
+
+namespace {
+
+__global__ void chiron_ffn_swiglu_f32_kernel(const float* gate, const float* up,
+                                              float* hidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=gate[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		hidden[i]=(g*sig)*up[i];
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_f32_kernel(float* gate, float* up,
+                                                  const float* dHidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=gate[i], u=up[i], dh=dHidden[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		const float silu=g*sig;
+		gate[i]=dh*u*(sig+g*sig*(1.0f-sig));
+		up[i]=dh*silu;
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bf16_kernel(const __nv_bfloat16* gate,
+                                               const __nv_bfloat16* up,
+                                               __nv_bfloat16* hidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]);
+		const float u=__bfloat162float(up[i]);
+		const float sig=1.0f/(1.0f+expf(-g));
+		hidden[i]=__float2bfloat16_rn((g*sig)*u);
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_bf16_kernel(__nv_bfloat16* gate,
+                                                   __nv_bfloat16* up,
+                                                   const float* dHidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]);
+		const float u=__bfloat162float(up[i]);
+		const float dh=dHidden[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		gate[i]=__float2bfloat16_rn(dh*u*(sig+g*sig*(1.0f-sig)));
+		up[i]=__float2bfloat16_rn(dh*(g*sig));
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_bf16_dh_kernel(__nv_bfloat16* gate,
+                                                      __nv_bfloat16* up,
+                                                      const __nv_bfloat16* dHidden,size_t n)
+{
+	for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]),u=__bfloat162float(up[i]);
+		const float dh=__bfloat162float(dHidden[i]);const float sig=1.0f/(1.0f+expf(-g));
+		gate[i]=__float2bfloat16_rn(dh*u*(sig+g*sig*(1.0f-sig)));
+		up[i]=__float2bfloat16_rn(dh*(g*sig));
+	}
+}
+
+__global__ void chiron_ffn_add_two_bf16_kernel(float* dq,const __nv_bfloat16* a,
+                                                const __nv_bfloat16* b,size_t n)
+{
+	for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)blockDim.x*gridDim.x)
+		dq[i]+=__bfloat162float(a[i])+__bfloat162float(b[i]);
+}
+
+inline int chiron_ffn_grid(size_t n)
+{
+	const size_t raw=(n+(size_t)kBlockElem-1)/(size_t)kBlockElem;
+	return (int)(raw>4096u?4096u:(raw?raw:1u));
+}
+
+} // anonymous namespace
+
+bool chiron_ffn_shear_forward(const float* q, float* p,
+                               const float* W_gate, const float* W_up,
+                               const float* W_down,
+                               int T, int m, int H, float sign,
+                               float* gate, float* up, float* hidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!q || !p || !W_gate || !W_up || !W_down || !gate || !up || !hidden) return false;
+	if (!sgemm_rowmajor(T,H,m,1.0f,q,m,W_gate,H,0.0f,gate,H)) return false;
+	if (!sgemm_rowmajor(T,H,m,1.0f,q,m,W_up,H,0.0f,up,H)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_f32_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(gate,up,hidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return sgemm_rowmajor(T,m,H,sign,hidden,H,W_down,m,1.0f,p,m);
+}
+
+bool chiron_ffn_shear_backward_invwalk(
+    const float* q, float* p, const float* dp,
+    const float* W_gate, const float* W_up, const float* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    float* gate, float* up, float* hidden, float* dHidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!chiron_ffn_shear_forward(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,gate,up,hidden)) return false;
+	if (!sgemm_rowmajor_abt(T,H,m,1.0f,dp,m,W_down,m,0.0f,dHidden,H)) return false;
+	if (!sgemm_rowmajor_atb(H,m,T,1.0f,hidden,H,dp,m,1.0f,dW_down,m)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bwd_f32_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(gate,up,dHidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (!sgemm_rowmajor_abt(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_atb(m,H,T,1.0f,q,m,gate,H,1.0f,dW_gate,H)) return false;
+	return sgemm_rowmajor_atb(m,H,T,1.0f,q,m,up,H,1.0f,dW_up,H);
+}
+
+bool chiron_ffn_shear_forward_bf16w(
+    const float* q, float* p,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H, float sign,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	if(!sgemm_pair_bf16_dst_bf16(false,T,H,m,1.0f,
+	        qbf,qbf,m,W_gate,W_up,H,0.0f,gate,up,H))return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+	    reinterpret_cast<const __nv_bfloat16*>(gate),
+	    reinterpret_cast<const __nv_bfloat16*>(up),
+	    reinterpret_cast<__nv_bfloat16*>(hidden),n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return sgemm_rowmajor_bf16(T,m,H,sign,hidden,H,W_down,m,1.0f,p,m);
+}
+
+bool chiron_ffn_shear_backward_invwalk_bf16w(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden)
+{
+	if (!chiron_ffn_shear_forward_bf16w(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,qbf,gate,up,hidden)) return false;
+	if (!cast_f32_to_bf16(dp,qbf,(size_t)T*m)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dHidden,H)) return false;
+	if (!sgemm_rowmajor_atb_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bwd_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),dHidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m)) return false;
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	if (!sgemm_rowmajor_atb_bf16(m,H,T,1.0f,qbf,m,gate,H,1.0f,dW_gate,H)) return false;
+	return sgemm_rowmajor_atb_bf16(m,H,T,1.0f,qbf,m,up,H,1.0f,dW_up,H);
+}
+
+bool chiron_ffn_shear_backward_invwalk_bf16w_bf16g(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, unsigned short* dW_gate, unsigned short* dW_up,
+    unsigned short* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden)
+{
+	if (!chiron_ffn_shear_forward_bf16w(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,qbf,gate,up,hidden)) return false;
+	if (!cast_f32_to_bf16(dp,qbf,(size_t)T*m)) return false;
+	const size_t n=(size_t)T*H;
+	if(H>=m)
+	{
+		unsigned short* dhbf=reinterpret_cast<unsigned short*>(dHidden);
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dhbf,H))return false;
+		if(!sgemm_rowmajor_atb_bf16_dst_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m))return false;
+		chiron_ffn_swiglu_bwd_bf16_dh_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+		    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),
+		    reinterpret_cast<const __nv_bfloat16*>(dhbf),n);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,m,H,1.0f,gate,H,W_gate,H,0.0f,hidden,m))return false;
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,m,H,1.0f,up,H,W_up,H,0.0f,dhbf,m))return false;
+		const size_t nq=(size_t)T*m;
+		chiron_ffn_add_two_bf16_kernel<<<chiron_ffn_grid(nq),kBlockElem,0,computeStream()>>>(
+		    dq,reinterpret_cast<const __nv_bfloat16*>(hidden),reinterpret_cast<const __nv_bfloat16*>(dhbf),nq);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	else
+	{
+		if(!sgemm_rowmajor_abt_bf16(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dHidden,H))return false;
+		if(!sgemm_rowmajor_atb_bf16_dst_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m))return false;
+		chiron_ffn_swiglu_bwd_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+		    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),dHidden,n);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		if(!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m))return false;
+		if(!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m))return false;
+	}
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	return sgemm_pair_bf16_dst_bf16(true,m,H,T,1.0f,
+	        qbf,qbf,m,gate,up,H,1.0f,dW_gate,dW_up,H);
+}
+
+// ===========================================================================
 //  6. Symplectic attention shear — composition wrapper.
 // ===========================================================================
 //
@@ -2695,6 +2911,32 @@ bool chiron_attention_shear(const float* q, float* p,
 bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
                                          const float* Wq, const float* Wk,
                                          const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+	if (!sgemm_rowmajor(T,dModel,m,1.0f,q,m,Wq,dModel,0.0f,scratch_Q,dModel)) return false;
+	if (!sgemm_rowmajor(T,dModelKV,m,1.0f,q,m,Wk,dModelKV,0.0f,scratch_K,dModelKV)) return false;
+	if (!sgemm_rowmajor(T,dModelKV,m,1.0f,q,m,Wv,dModelKV,0.0f,scratch_V,dModelKV)) return false;
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q,scratch_K,scratch_V,T,nHeads,nKVHeads,dHead,dModel,dModelKV,causal,
+	        scratch_O,scratch_S,scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16)) return false;
+	const float sign=invert?-1.0f:1.0f;
+	return sgemm_rowmajor(T,m,dModel,sign,scratch_O,dModel,Wo,m,1.0f,p,m);
+}
+
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
                                          int T, int m, int nHeads, int dHead,
                                          bool causal, bool invert,
                                          float* scratch_Q, float* scratch_K,
@@ -2705,27 +2947,9 @@ bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
                                          unsigned short* scratch_Vbf16,
                                          unsigned short* scratch_Pbf16)
 {
-	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
-	const int dModel = nHeads * dHead;
-
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
-		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, scratch_K, dModel))
-		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, scratch_V, dModel))
-		return false;
-
-	if (!flash_attention_cublas_tiled_bf16(
-	        scratch_Q, scratch_K, scratch_V,
-	        T, nHeads, dHead, dModel, causal,
-	        scratch_O, scratch_S,
-	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
-		return false;
-
-	const float sign = invert ? -1.0f : 1.0f;
-	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
-		return false;
-	return true;
+	return chiron_attention_shear_bf16_tiled(q,p,Wq,Wk,Wv,Wo,T,m,nHeads,nHeads,dHead,
+	    causal,invert,scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16);
 }
 
 // Cast-elim Port C fwd slice (2026-06-12): library toggle.  When ON, the
@@ -2741,7 +2965,7 @@ bool get_cast_elim_inner_fwd() { return g_cast_elim_inner_fwd; }
 static bool flash_attention_cublas_tiled_bf16_precast(
     const unsigned short* Qbf16, const unsigned short* Kbf16,
     const unsigned short* Vbf16,
-    int T, int nHeads, int dHead, int dModel,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
     bool causal,
     float* O,
     float* scratch_S,
@@ -2766,7 +2990,7 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           const unsigned short* Wk_bf,
                                           const unsigned short* Wv_bf,
                                           const unsigned short* Wo_bf,
-                                          int T, int m, int nHeads, int dHead,
+                                          int T, int m, int nHeads, int nKVHeads, int dHead,
                                           bool causal, bool invert,
                                           unsigned short* scratch_qbf,
                                           unsigned short* scratch_Obf,
@@ -2780,6 +3004,7 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 {
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
 
 	// Cast q FP32 -> BF16 once per layer.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
@@ -2796,13 +3021,13 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	{
 		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Qbf16, dModel))
 			return false;
-		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_Kbf16, dModel))
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_Kbf16, dModelKV))
 			return false;
-		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_Vbf16, dModel))
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_Vbf16, dModelKV))
 			return false;
 		if (!flash_attention_cublas_tiled_bf16_precast(
 		        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
-		        T, nHeads, dHead, dModel, causal,
+		        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 		        scratch_O, scratch_S, scratch_Pbf16))
 			return false;
 	}
@@ -2811,15 +3036,15 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	// BF16 x BF16 -> FP32 projections via BF16 tensor cores.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_K, dModelKV))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_V, dModelKV))
 		return false;
 
 	// Attention core (BF16 inputs, FP32 output).
 	if (!flash_attention_cublas_tiled_bf16(
 	        scratch_Q, scratch_K, scratch_V,
-	        T, nHeads, dHead, dModel, causal,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	        scratch_O, scratch_S,
 	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
 		return false;
@@ -2834,6 +3059,29 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	if (!sgemm_rowmajor_bf16(T, m, dModel, sign, scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m))
 		return false;
 	return true;
+}
+
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16)
+{
+	return chiron_attention_shear_bf16w_tiled(q,p,Wq_bf,Wk_bf,Wv_bf,Wo_bf,
+	    T,m,nHeads,nHeads,dHead,causal,invert,scratch_qbf,scratch_Obf,
+	    scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16);
 }
 
 // FP8 (E4M3) projection variant of chiron_attention_shear_bf16w_tiled.
@@ -2857,7 +3105,7 @@ bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
                                          const unsigned short* Wk_bf,
                                          const unsigned short* Wv_bf,
                                          const unsigned short* Wo_bf,
-                                         int T, int m, int nHeads, int dHead,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
                                          bool causal, bool invert,
                                          unsigned short* scratch_qbf,
                                          unsigned short* scratch_Obf,
@@ -2885,9 +3133,10 @@ bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
 	// (≤ 4 KB output per kernel) and pipeline on the same stream as the
 	// GEMMs, so they don't add measurable latency vs. the projections.
 	if (!fp8_calibrate_amax_e4m3_bf16(scratch_qbf, (size_t)T * m, d_scale_q)) return false;
+	const int dModelKV = nKVHeads * dHead;
 	if (!fp8_calibrate_amax_e4m3_bf16(Wq_bf, (size_t)m * dModel, d_scale_Wq)) return false;
-	if (!fp8_calibrate_amax_e4m3_bf16(Wk_bf, (size_t)m * dModel, d_scale_Wk)) return false;
-	if (!fp8_calibrate_amax_e4m3_bf16(Wv_bf, (size_t)m * dModel, d_scale_Wv)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wk_bf, (size_t)m * dModelKV, d_scale_Wk)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wv_bf, (size_t)m * dModelKV, d_scale_Wv)) return false;
 	if (!fp8_calibrate_amax_e4m3_bf16(Wo_bf, (size_t)dModel * m, d_scale_Wo)) return false;
 
 	// FP8 Q/K/V projections (BF16 inputs, FP8 GEMM core, FP32 output).
@@ -2895,19 +3144,19 @@ bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
 	        scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel,
 	        d_scale_q, d_scale_Wq))
 		return false;
-	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
-	        scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel,
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModelKV, m, 1.0f,
+	        scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_K, dModelKV,
 	        d_scale_q, d_scale_Wk))
 		return false;
-	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
-	        scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel,
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModelKV, m, 1.0f,
+	        scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_V, dModelKV,
 	        d_scale_q, d_scale_Wv))
 		return false;
 
 	// Attention core stays BF16 (cuBLAS sgemm_batched_strided_bf16 + custom softmax).
 	if (!flash_attention_cublas_tiled_bf16(
 	        scratch_Q, scratch_K, scratch_V,
-	        T, nHeads, dHead, dModel, causal,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	        scratch_O, scratch_S,
 	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
 		return false;
@@ -2926,6 +3175,34 @@ bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
 	        d_scale_O, d_scale_Wo))
 		return false;
 	return true;
+}
+
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O)
+{
+	return chiron_attention_shear_fp8w_tiled(q,p,Wq_bf,Wk_bf,Wv_bf,Wo_bf,
+	    T,m,nHeads,nHeads,dHead,causal,invert,scratch_qbf,scratch_Obf,
+	    scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16,
+	    d_scale_q,d_scale_Wq,d_scale_Wk,d_scale_Wv,d_scale_Wo,d_scale_O);
 }
 
 // BF16-weight backward counterpart to chiron_attention_shear_bf16w_tiled.
@@ -2947,7 +3224,7 @@ bool chiron_attention_shear_backward_bf16w_tiled(
     const float* q, const float* dp_new,
     const unsigned short* Wq_bf, const unsigned short* Wk_bf,
     const unsigned short* Wv_bf, const unsigned short* Wo_bf,
-    int T, int m, int nHeads, int dHead,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
     bool causal,
     float* dq,
     float* dWq, float* dWk, float* dWv, float* dWo,
@@ -2957,8 +3234,9 @@ bool chiron_attention_shear_backward_bf16w_tiled(
     float* sdO, float* sdQ, float* sdK, float* sdV,
     float* scratch_P, float* scratch_dP)
 {
-	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
 
 	// 1. Cast q -> BF16 for projections.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
@@ -2967,11 +3245,11 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, sK, dModelKV))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, sV, dModelKV))
 		return false;
-	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	                                    sO, scratch_P))
 		return false;
 
@@ -2996,12 +3274,9 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
-	// iter 107 (2026-05-21): flash_attention_backward_cublas_tiled now uses
-	// beta=0 (overwrite) for dV/dQ/dK — caller pre-zero is redundant.  Skipping
-	// the 3 cudaMemsetAsync calls saves ~3 × 16 MB / layer (production scale).
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
-	        T, nHeads, dHead, dModel, causal,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	        sdQ, sdK, sdV, scratch_P, scratch_dP))
 		return false;
 
@@ -3023,22 +3298,39 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWq, dModel))
 		return false;
 	// K:
-	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
 		return false;
-	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wk_bf, dModelKV, 1.0f, dq, m))
 		return false;
-	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWk, dModel))
+	if (!sgemm_rowmajor_atb_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, 1.0f, dWk, dModelKV))
 		return false;
 	// V:
-	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
 		return false;
-	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wv_bf, dModelKV, 1.0f, dq, m))
 		return false;
-	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWv, dModel))
+	if (!sgemm_rowmajor_atb_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, 1.0f, dWv, dModelKV))
 		return false;
 	return true;
+}
+
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq, float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf, unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	return chiron_attention_shear_backward_bf16w_tiled(
+	    q,dp_new,Wq_bf,Wk_bf,Wv_bf,Wo_bf,T,m,nHeads,nHeads,dHead,causal,
+	    dq,dWq,dWk,dWv,dWo,scratch_qbf,scratch_sdbf,sQ,sK,sV,sO,
+	    sdO,sdQ,sdK,sdV,scratch_P,scratch_dP);
 }
 
 // iter 61 (2026-05-16): BF16-grad variant.  Same math as the FP32-grad
@@ -3057,7 +3349,7 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     const float* q, const float* dp_new,
     const unsigned short* Wq_bf, const unsigned short* Wk_bf,
     const unsigned short* Wv_bf, const unsigned short* Wo_bf,
-    int T, int m, int nHeads, int dHead,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
     bool causal,
     float* dq,
     unsigned short* dWq_bf, unsigned short* dWk_bf,
@@ -3075,8 +3367,11 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 {
 	(void)dw_beta_zero;  // iter 108 FAIL — param ignored, beta stays at 1.0f.
 	const float dw_beta = 1.0f;
-	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+	const int groupSize = nHeads / nKVHeads;
+	if (nHeads % nKVHeads != 0) return false;
 
 	// 1. Cast q -> BF16 for projections.
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
@@ -3085,42 +3380,33 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
 	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, sK, dModelKV))
 		return false;
-	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, sV, dModelKV))
 		return false;
-	// BF16G backward is parity-sensitive here: keep the score GEMM/softmax
-	// path identical to flash_attention_cublas_tiled, but route only P·V
-	// through strict FP32 cuBLAS math (no TF32 tensor-core contraction).
+	// BF16G backward is parity-sensitive here: keep strict FP32 P·V.
 	{
 		const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
-		if (!sgemm_batched_strided_abt(
-		        T, T, dHead,
-		        invSqrtDH,
-		        sQ, dModel, (long long)dHead,
-		        sK, dModel, (long long)dHead,
-		        0.0f,
-		        scratch_P, T, (long long)T * T,
-		        nHeads))
-			return false;
-		if (causal)
+		if (nKVHeads == nHeads)
 		{
-			if (!causal_mask_softmax_inplace(scratch_P, nHeads, T))
-				return false;
+			if (!sgemm_batched_strided_abt(T,T,dHead,invSqrtDH,
+			        sQ,dModel,(long long)dHead,sK,dModelKV,(long long)dHead,
+			        0.0f,scratch_P,T,(long long)T*T,nHeads)) return false;
 		}
-		else if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P))
+		else if(!sgemm_batched_grouped_abt(T,T,dHead,invSqrtDH,
+		        sQ,dModel,(long long)dHead,sK,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_P,T,(long long)T*T,nHeads))return false;
+		if (causal) { if (!causal_mask_softmax_inplace(scratch_P,nHeads,T)) return false; }
+		else if (!softmax_forward(scratch_P,nHeads*T,T,scratch_P)) return false;
+		if (nKVHeads == nHeads)
 		{
-			return false;
+			if (!sgemm_batched_strided_exact(T,dHead,T,1.0f,
+			        scratch_P,T,(long long)T*T,sV,dModelKV,(long long)dHead,
+			        0.0f,sO,dModel,(long long)dHead,nHeads)) return false;
 		}
-		if (!sgemm_batched_strided_exact(
-		        T, dHead, T,
-		        1.0f,
-		        scratch_P, T, (long long)T * T,
-		        sV, dModel, (long long)dHead,
-		        0.0f,
-		        sO, dModel, (long long)dHead,
-		        nHeads))
-			return false;
+		else if(!sgemm_batched_grouped_exact(T,dHead,T,1.0f,
+		        scratch_P,T,(long long)T*T,sV,dModelKV,(long long)dHead,
+		        groupSize,0.0f,sO,dModel,(long long)dHead,nHeads))return false;
 	}
 
 	// 3. Output-projection backward.  dO = dp_new · Wo^T.
@@ -3141,11 +3427,9 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
-	// iter 107 (2026-05-21): caller-side memsets eliminated — beta=0 in
-	// flash_attention_backward_cublas_tiled makes them redundant.
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
-	        T, nHeads, dHead, dModel, causal,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	        sdQ, sdK, sdV, scratch_P, scratch_dP))
 		return false;
 
@@ -3165,22 +3449,41 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWq_bf, dModel))
 		return false;
 	// K:
-	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
 		return false;
-	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wk_bf, dModelKV, 1.0f, dq, m))
 		return false;
-	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWk_bf, dModel))
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWk_bf, dModelKV))
 		return false;
 	// V:
-	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
 		return false;
-	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wv_bf, dModelKV, 1.0f, dq, m))
 		return false;
-	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWv_bf, dModel))
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWv_bf, dModelKV))
 		return false;
 	return true;
+}
+
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf, unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP, bool dw_beta_zero)
+{
+	return chiron_attention_shear_backward_bf16w_bf16g_tiled(
+	    q,dp_new,Wq_bf,Wk_bf,Wv_bf,Wo_bf,T,m,nHeads,nHeads,dHead,causal,
+	    dq,dWq_bf,dWk_bf,dWv_bf,dWo_bf,scratch_qbf,scratch_sdbf,
+	    sQ,sK,sV,sO,sdO,sdQ,sdK,sdV,scratch_P,scratch_dP,dw_beta_zero);
 }
 
 // Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
@@ -3189,12 +3492,12 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 // improvement at T≥512 on Ampere/Ada hardware, at the cost of an [nH, T, T]
 // scratch buffer (caller-owned).
 //
-// Constraint: nHeads == nKVHeads (no GQA — the tiled kernel does not expand
-// the KV head dimension).
+// Compact K/V heads are broadcast over contiguous query-head groups without
+// materializing an expanded K/V tensor.
 bool chiron_attention_shear_tiled(const float* q, float* p,
                                     const float* Wq, const float* Wk,
                                     const float* Wv, const float* Wo,
-                                    int T, int m, int nHeads, int dHead,
+                                    int T, int m, int nHeads, int nKVHeads, int dHead,
                                     bool causal, bool invert,
                                     float* scratch_Q, float* scratch_K,
                                     float* scratch_V, float* scratch_O,
@@ -3203,15 +3506,16 @@ bool chiron_attention_shear_tiled(const float* q, float* p,
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
 
+	const int dModelKV = nKVHeads * dHead;
 	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
 		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, scratch_K, dModel))
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
 		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, scratch_V, dModel))
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
 		return false;
 
 	if (!flash_attention_cublas_tiled(scratch_Q, scratch_K, scratch_V,
-	                                    T, nHeads, dHead, dModel, causal,
+	                                    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	                                    scratch_O, scratch_S))
 		return false;
 
@@ -3221,6 +3525,19 @@ bool chiron_attention_shear_tiled(const float* q, float* p,
 	return true;
 }
 
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S)
+{
+	return chiron_attention_shear_tiled(q,p,Wq,Wk,Wv,Wo,T,m,nHeads,nHeads,dHead,
+	    causal,invert,scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S);
+}
+
 // Tiled variant of the shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled — TF32 tensor-core batched GEMMs for
 // P = softmax(QK^T), dV += P^T dO, dP = dO V^T, dS = softmax_bwd(P, dP),
@@ -3228,7 +3545,7 @@ bool chiron_attention_shear_tiled(const float* q, float* p,
 bool chiron_attention_shear_backward_tiled(
     const float* q, const float* dp_new,
     const float* Wq, const float* Wk, const float* Wv, const float* Wo,
-    int T, int m, int nHeads, int dHead,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
     bool causal,
     float* dq,
     float* dWq, float* dWk, float* dWv, float* dWo,
@@ -3239,14 +3556,15 @@ bool chiron_attention_shear_backward_tiled(
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
 
+	const int dModelKV = nKVHeads * dHead;
 	// Recompute Q, K, V, O from q.
 	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, sQ, dModel))
 		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, sK, dModel))
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
 		return false;
-	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, sV, dModel))
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
 		return false;
-	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	                                    sO, scratch_P))
 		return false;
 
@@ -3263,26 +3581,31 @@ bool chiron_attention_shear_backward_tiled(
 	// the caller pre-zero redundant.
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
-	        T, nHeads, dHead, dModel, causal,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
 	        sdQ, sdK, sdV, scratch_P, scratch_dP))
 		return false;
 
-	// dq += dQ · Wq^T + dK · Wk^T + dV · Wv^T
-	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
-		return false;
-	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdK, dModel, Wk, dModel, 1.0f, dq, m))
-		return false;
-	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdV, dModel, Wv, dModel, 1.0f, dq, m))
-		return false;
-
-	// dWq, dWk, dWv += q^T · dQ, dK, dV
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
-		return false;
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdK, dModel, 1.0f, dWk, dModel))
-		return false;
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdV, dModel, 1.0f, dWv, dModel))
-		return false;
+	if (!sgemm_rowmajor_abt(T,m,dModel,1.0f,sdQ,dModel,Wq,dModel,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,dModelKV,1.0f,sdK,dModelKV,Wk,dModelKV,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,dModelKV,1.0f,sdV,dModelKV,Wv,dModelKV,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_atb(m,dModel,T,1.0f,q,m,sdQ,dModel,1.0f,dWq,dModel)) return false;
+	if (!sgemm_rowmajor_atb(m,dModelKV,T,1.0f,q,m,sdK,dModelKV,1.0f,dWk,dModelKV)) return false;
+	if (!sgemm_rowmajor_atb(m,dModelKV,T,1.0f,q,m,sdV,dModelKV,1.0f,dWv,dModelKV)) return false;
 	return true;
+}
+
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq, float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	return chiron_attention_shear_backward_tiled(q,dp_new,Wq,Wk,Wv,Wo,
+	    T,m,nHeads,nHeads,dHead,causal,dq,dWq,dWk,dWv,dWo,
+	    sQ,sK,sV,sO,sdO,sdQ,sdK,sdV,scratch_P,scratch_dP);
 }
 
 // ===========================================================================
@@ -3290,57 +3613,63 @@ bool chiron_attention_shear_backward_tiled(
 // ===========================================================================
 
 bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
-                                    int T, int nHeads, int dHead, int dModel,
-                                    bool causal,
+                                    int T, int nHeads, int nKVHeads, int dHead,
+                                    int dModel, int dModelKV, bool causal,
                                     float* O, float* scratch_S)
 {
-	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0 || dModel < nHeads * dHead || dModelKV < nKVHeads * dHead)
+		return false;
 
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
 
-	// S[nH, T, T] = invSqrtDH · Q_h · K_h^T for each head h.
-	// Q and K are laid out as [T, dModel] with heads packed along dModel.
-	// For head h, the head slice is Q[:, h*dHead : (h+1)*dHead].
-	// Batched strided: stride_between_batches = dHead (the slice starts
-	// dHead elements later in the packed layout).
-	if (!sgemm_batched_strided_abt(
-	        T, T, dHead,
-	        invSqrtDH,
-	        Q, dModel, (long long)dHead,   // A = Q_h; lda=dModel, strideA=dHead
-	        K, dModel, (long long)dHead,   // B = K_h; ldb=dModel, strideB=dHead
-	        0.0f,
-	        scratch_S, T, (long long)T * T,  // C = S_h; ldc=T, strideC=T*T
-	        nHeads))
-		return false;
+	// Preserve the historical one-call path exactly when GQA is a no-op.
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt(
+		        T, T, dHead, invSqrtDH,
+		        Q, dModel, (long long)dHead,
+		        K, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_abt(
+	        T,T,dHead,invSqrtDH,Q,dModel,(long long)dHead,
+	        K,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
 
-	// Apply causal mask + row-softmax in place.
-	// `causal_mask_softmax_inplace` expects [batch, T, T] — we treat
-	// nHeads as batch.  (For non-causal we'd want a separate softmax
-	// but CHIRON always trains causal; assume causal here.)
 	if (causal)
 	{
-		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T))
-			return false;
+		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T)) return false;
 	}
-	else
+	else if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S))
 	{
-		// Fall back to plain rowwise softmax (still in-place).
-		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S))
-			return false;
+		return false;
 	}
 
-	// O[nH, T, dHead] = S · V  for each head.
-	if (!sgemm_batched_strided(
-	        T, dHead, T,
-	        1.0f,
-	        scratch_S, T, (long long)T * T,  // A = P_h; lda=T, strideA=T*T
-	        V, dModel, (long long)dHead,     // B = V_h; ldb=dModel, strideB=dHead
-	        0.0f,
-	        O, dModel, (long long)dHead,     // C = O_h; ldc=dModel, strideC=dHead
-	        nHeads))
-		return false;
-
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided(
+		        T, dHead, T, 1.0f,
+		        scratch_S, T, (long long)T * T,
+		        V, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped(
+	        T,dHead,T,1.0f,scratch_S,T,(long long)T*T,
+	        V,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
 	return true;
+}
+
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int dHead, int dModel,
+                                    bool causal, float* O, float* scratch_S)
+{
+	return flash_attention_cublas_tiled(Q, K, V, T, nHeads, nHeads, dHead,
+	                                     dModel, dModel, causal, O, scratch_S);
 }
 
 // ===========================================================================
@@ -3380,84 +3709,90 @@ void set_iter119_fa_inner_bf16(bool on)
 
 bool flash_attention_cublas_tiled_bf16(
     const float* Q, const float* K, const float* V,
-    int T, int nHeads, int dHead, int dModel,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
     bool causal,
     float* O,
     float* scratch_S,
     unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
     unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
 {
-	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
-	const size_t nPacked = static_cast<size_t>(T) * dModel;
-	// iter 118: drop-in FP32 FA kernel.  No BF16 casts; FP32 compute throughout.
+	const size_t nPackedQ = static_cast<size_t>(T) * dModel;
+	const size_t nPackedKV = static_cast<size_t>(T) * dModelKV;
+	const int groupSize = nHeads / nKVHeads;
 	if (g_iter118_fa_inner_fwd)
 	{
 		return flash_attention_multihead_forward(
-		    Q, K, V,
-		    T, nHeads, /*nKVHeads=*/nHeads,
-		    dHead, dModel, /*dModelKV=*/dModel,
-		    causal, O);
+		    Q, K, V, T, nHeads, nKVHeads,
+		    dHead, dModel, dModelKV, causal, O);
 	}
-	// iter 119: cast Q/K/V to BF16 (same as cuBLAS pipeline), then use the
-	// BF16-input FA kernel (still FP32 compute inside — no tensor cores yet).
-	// Compared to iter 118: halves input memory bandwidth via BF16 loads.
 	if (g_iter119_fa_inner_bf16)
 	{
-		if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
-		if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
-		if (!cast_f32_to_bf16(V, scratch_Vbf16, nPacked)) return false;
+		if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPackedQ)) return false;
+		if (!cast_f32_to_bf16(K, scratch_Kbf16, nPackedKV)) return false;
+		if (!cast_f32_to_bf16(V, scratch_Vbf16, nPackedKV)) return false;
 		return flash_attention_multihead_forward_bf16(
 		    scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
-		    T, nHeads, /*nKVHeads=*/nHeads,
-		    dHead, dModel, /*dModelKV=*/dModel,
-		    causal, O);
+		    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal, O);
 	}
 
-	// Cast Q/K/V once.
-	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
-	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
-	if (!cast_f32_to_bf16(V, scratch_Vbf16, nPacked)) return false;
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPackedQ)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPackedKV)) return false;
+	if (!cast_f32_to_bf16(V, scratch_Vbf16, nPackedKV)) return false;
 
-	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
-	if (!sgemm_batched_strided_abt_bf16(
-	        T, T, dHead, invSqrtDH,
-	        scratch_Qbf16, dModel, (long long)dHead,
-	        scratch_Kbf16, dModel, (long long)dHead,
-	        0.0f,
-	        scratch_S, T, (long long)T * T,
-	        nHeads))
-		return false;
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt_bf16(
+		        T, T, dHead, invSqrtDH,
+		        scratch_Qbf16, dModel, (long long)dHead,
+		        scratch_Kbf16, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_abt_bf16(
+	        T,T,dHead,invSqrtDH,scratch_Qbf16,dModel,(long long)dHead,
+	        scratch_Kbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
 
-	// iter 102 (2026-05-21): when causal, fuse softmax + FP32→BF16 cast into
-	// a single kernel that writes BF16 P directly to scratch_Pbf16.  Eliminates
-	// the separate cast_f32_to_bf16 launch + the FP32 S → BF16 P memory
-	// round-trip.  Math bit-identical to (softmax_inplace THEN cast).
-	// Non-causal path keeps the legacy (softmax_forward + cast) chain since
-	// the inner attention is always causal at CHIRON production (medalTrain=false).
 	if (causal)
 	{
-		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
-			return false;
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T)) return false;
 	}
 	else
 	{
 		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
-		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
-		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
+		const size_t nScores = static_cast<size_t>(nHeads) * T * T;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores)) return false;
 	}
 
-	// O = P · V via BF16 batched (plain NN).
-	if (!sgemm_batched_strided_bf16(
-	        T, dHead, T, 1.0f,
-	        scratch_Pbf16, T, (long long)T * T,
-	        scratch_Vbf16, dModel, (long long)dHead,
-	        0.0f,
-	        O, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16(
+		        T, dHead, T, 1.0f,
+		        scratch_Pbf16, T, (long long)T * T,
+		        scratch_Vbf16, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_bf16(
+	        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+	        scratch_Vbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
 	return true;
+}
+
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    float* O, float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
+{
+	return flash_attention_cublas_tiled_bf16(
+	    Q, K, V, T, nHeads, nHeads, dHead, dModel, dModel, causal,
+	    O, scratch_S, scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16);
 }
 
 // Cast-elim Port C fwd slice (2026-06-12): pre-cast variant — identical
@@ -3467,49 +3802,49 @@ bool flash_attention_cublas_tiled_bf16(
 static bool flash_attention_cublas_tiled_bf16_precast(
     const unsigned short* Qbf16, const unsigned short* Kbf16,
     const unsigned short* Vbf16,
-    int T, int nHeads, int dHead, int dModel,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
     bool causal,
     float* O,
     float* scratch_S,
     unsigned short* scratch_Pbf16)
 {
-	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
-
-	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
-	if (!sgemm_batched_strided_abt_bf16(
-	        T, T, dHead, invSqrtDH,
-	        Qbf16, dModel, (long long)dHead,
-	        Kbf16, dModel, (long long)dHead,
-	        0.0f,
-	        scratch_S, T, (long long)T * T,
-	        nHeads))
-		return false;
-
-	// Fused causal softmax + BF16 P write (iter 102 kernel); legacy split
-	// path for the non-causal case (not hit at CHIRON production).
+	const int groupSize = nHeads / nKVHeads;
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt_bf16(
+		        T, T, dHead, invSqrtDH,
+		        Qbf16, dModel, (long long)dHead,
+		        Kbf16, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads)) return false;
+	}
+	else if (!sgemm_batched_grouped_abt_bf16(
+	        T,T,dHead,invSqrtDH,Qbf16,dModel,(long long)dHead,
+	        Kbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
 	if (causal)
 	{
-		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
-			return false;
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T)) return false;
 	}
 	else
 	{
-		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
-		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
-		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
+		if (!softmax_forward(scratch_S, nHeads*T, T, scratch_S)) return false;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, (size_t)nHeads*T*T)) return false;
 	}
-
-	// O = P · V via BF16 batched (plain NN).
-	if (!sgemm_batched_strided_bf16(
-	        T, dHead, T, 1.0f,
-	        scratch_Pbf16, T, (long long)T * T,
-	        Vbf16, dModel, (long long)dHead,
-	        0.0f,
-	        O, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16(
+		        T, dHead, T, 1.0f,
+		        scratch_Pbf16, T, (long long)T*T,
+		        Vbf16, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads)) return false;
+	}
+	else if (!sgemm_batched_grouped_bf16(
+	        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+	        Vbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
 	return true;
 }
 
@@ -3522,54 +3857,80 @@ static bool flash_attention_cublas_tiled_bf16_precast(
 // Eliminates the V input cast and the O output cast per call.
 bool flash_attention_cublas_tiled_bf16_vpre_obf16(
     const float* Q, const float* K, const unsigned short* Vbf16,
-    int T, int nHeads, int dHead, int dModel,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
     bool causal,
     unsigned short* O_bf16,
     float* scratch_S,
     unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
     unsigned short* scratch_Pbf16)
 {
-	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
-	const size_t nPacked = static_cast<size_t>(T) * dModel;
-
-	// Cast post-QK-Norm Q/K (required precision boundary); V is pre-cast.
-	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
-	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
-
-	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
-	if (!sgemm_batched_strided_abt_bf16(
-	        T, T, dHead, invSqrtDH,
-	        scratch_Qbf16, dModel, (long long)dHead,
-	        scratch_Kbf16, dModel, (long long)dHead,
-	        0.0f,
-	        scratch_S, T, (long long)T * T,
-	        nHeads))
-		return false;
-
-	if (causal)
+	const int groupSize = nHeads / nKVHeads;
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, (size_t)T*dModel)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, (size_t)T*dModelKV)) return false;
+	if (nKVHeads == nHeads)
 	{
-		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T))
-			return false;
+		if (!sgemm_batched_strided_abt_bf16(
+		        T,T,dHead,invSqrtDH,
+		        scratch_Qbf16,dModel,(long long)dHead,
+		        scratch_Kbf16,dModelKV,(long long)dHead,
+		        0.0f,scratch_S,T,(long long)T*T,nHeads)) return false;
 	}
 	else
 	{
-		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
-		const size_t nScores_nc = static_cast<size_t>(nHeads) * T * T;
-		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores_nc)) return false;
+		for (int kv=0; kv<nKVHeads; ++kv)
+		{
+			const int h0=kv*groupSize;
+			if (!sgemm_batched_strided_abt_bf16(
+			        T,T,dHead,invSqrtDH,
+			        scratch_Qbf16+(size_t)h0*dHead,dModel,(long long)dHead,
+			        scratch_Kbf16+(size_t)kv*dHead,dModelKV,0,
+			        0.0f,scratch_S+(size_t)h0*T*T,T,(long long)T*T,groupSize)) return false;
+		}
 	}
-
-	// O = P · V, written directly as BF16 (FP32 accumulate, RNE store).
-	if (!sgemm_batched_strided_bf16_dst_bf16(
-	        T, dHead, T, 1.0f,
-	        scratch_Pbf16, T, (long long)T * T,
-	        Vbf16, dModel, (long long)dHead,
-	        0.0f,
-	        O_bf16, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S,scratch_Pbf16,nHeads,T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S,nHeads*T,T,scratch_S)) return false;
+		if (!cast_f32_to_bf16(scratch_S,scratch_Pbf16,(size_t)nHeads*T*T)) return false;
+	}
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16_dst_bf16(
+		        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+		        Vbf16,dModelKV,(long long)dHead,0.0f,
+		        O_bf16,dModel,(long long)dHead,nHeads)) return false;
+	}
+	else
+	{
+		for (int kv=0; kv<nKVHeads; ++kv)
+		{
+			const int h0=kv*groupSize;
+			if (!sgemm_batched_strided_bf16_dst_bf16(
+			        T,dHead,T,1.0f,
+			        scratch_Pbf16+(size_t)h0*T*T,T,(long long)T*T,
+			        Vbf16+(size_t)kv*dHead,dModelKV,0,0.0f,
+			        O_bf16+(size_t)h0*dHead,dModel,(long long)dHead,groupSize)) return false;
+		}
+	}
 	return true;
+}
+
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    unsigned short* O_bf16, float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16)
+{
+	return flash_attention_cublas_tiled_bf16_vpre_obf16(
+	    Q,K,Vbf16,T,nHeads,nHeads,dHead,dModel,dModel,causal,
+	    O_bf16,scratch_S,scratch_Qbf16,scratch_Kbf16,scratch_Pbf16);
 }
 
 // ===========================================================================
@@ -3584,98 +3945,119 @@ bool flash_attention_cublas_tiled_bf16_vpre_obf16(
 //   dQ  = (1/sqrt(dH)) · dS · K
 //   dK += (1/sqrt(dH)) · dS^T · Q
 
+__global__ void gqa_reduce_full_head_grads_kernel(const float* full,float* compact,
+                                                   int T,int nHeads,int nKVHeads,int dHead)
+{
+	const int i=blockIdx.x*blockDim.x+threadIdx.x;
+	const int n=T*nKVHeads*dHead;
+	if(i>=n)return;
+	const int j=i%dHead;
+	const int x=i/dHead;
+	const int kv=x%nKVHeads;
+	const int t=x/nKVHeads;
+	const int group=nHeads/nKVHeads;
+	float sum=0.0f;
+	for(int g=0;g<group;++g)sum+=full[(size_t)t*(nHeads*dHead)+(kv*group+g)*dHead+j];
+	compact[(size_t)t*(nKVHeads*dHead)+kv*dHead+j]=sum;
+}
+
+static bool gqa_reduce_full_head_grads(const float* full,float* compact,
+                                        int T,int nHeads,int nKVHeads,int dHead)
+{
+	const int n=T*nKVHeads*dHead;
+	gqa_reduce_full_head_grads_kernel<<<(n+255)/256,256,0,computeStream()>>>(full,compact,T,nHeads,nKVHeads,dHead);
+	return cudaGetLastError()==cudaSuccess;
+}
+
 bool flash_attention_backward_cublas_tiled(
     const float* Q, const float* K, const float* V,
     const float* /*O unused*/, const float* dO,
-    int T, int nHeads, int dHead, int dModel,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
     bool causal,
     float* dQ, float* dK, float* dV,
     float* scratch_P, float* scratch_dP)
 {
-	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
 
-	// Recompute S = (1/sqrt(dH)) · Q · K^T into scratch_P.
-	if (!sgemm_batched_strided_abt(
-	        T, T, dHead, invSqrtDH,
-	        Q, dModel, (long long)dHead,
-	        K, dModel, (long long)dHead,
-	        0.0f,
-	        scratch_P, T, (long long)T * T,
-	        nHeads))
-		return false;
-
-	// iter 115 (2026-05-21): reorder cuBLAS dP = dO · V^T to BEFORE the softmax
-	// pass, so both inputs (S in scratch_P, dP in scratch_dP) are available for
-	// the fused softmax+bwd_attn kernel.  cuBLAS is sequential on compute stream
-	// — this is just a code-order reorder.  Saves 1 kernel launch per call
-	// (24 calls/step at production) plus L2 cache benefit (P stays warm between
-	// fused kernel's pass 3 write and pass A read, vs cross-kernel eviction
-	// risk in the legacy split-kernel path).
-	if (!sgemm_batched_strided_abt(
-	        T, T, dHead, 1.0f,
-	        dO, dModel, (long long)dHead,
-	        V, dModel, (long long)dHead,
-	        0.0f,
-	        scratch_dP, T, (long long)T * T,
-	        nHeads))
-		return false;
-
-	if (causal)
+	if (nKVHeads == nHeads)
 	{
-		// iter 115: fused softmax (in-place S → P in scratch_P) + bwd_attn
-		// (dP → dS in-place in scratch_dP).  Literal concatenation of the
-		// two prior kernels' passes — math bit-identical at single-element
-		// FP32 precision (no merged-pass FMA reorder, unlike iter 83 NEGATIVE
-		// which merged the mask+max passes).
-		if (!causal_softmax_with_bwd_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
-			return false;
+		if (!sgemm_batched_strided_abt(
+		        T,T,dHead,invSqrtDH,Q,dModel,(long long)dHead,
+		        K,dModelKV,(long long)dHead,0.0f,
+		        scratch_P,T,(long long)T*T,nHeads)) return false;
+		if (!sgemm_batched_strided_abt(
+		        T,T,dHead,1.0f,dO,dModel,(long long)dHead,
+		        V,dModelKV,(long long)dHead,0.0f,
+		        scratch_dP,T,(long long)T*T,nHeads)) return false;
 	}
 	else
 	{
-		// Non-causal: keep legacy split kernels (fused kernel only implements
-		// the causal-mask path).
-		if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P)) return false;
-		if (!softmax_backward_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
-			return false;
+		if(!sgemm_batched_grouped_abt(T,T,dHead,invSqrtDH,
+		        Q,dModel,(long long)dHead,K,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_P,T,(long long)T*T,nHeads))return false;
+		if(!sgemm_batched_grouped_abt(T,T,dHead,1.0f,
+		        dO,dModel,(long long)dHead,V,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_dP,T,(long long)T*T,nHeads))return false;
 	}
 
-	// iter 107 (2026-05-21): dV = P^T · dO (overwrite, was += accumulate).
-	// All callers zero sdV before this call and don't depend on prior content.
-	// Math bit-identical when dV starts at zero.
-	if (!sgemm_batched_strided_atb(
-	        T, dHead, T, 1.0f,
-	        scratch_P, T, (long long)T * T,
-	        dO, dModel, (long long)dHead,
-	        0.0f,
-	        dV, dModel, (long long)dHead,
-	        nHeads))
-		return false;
+	if (causal)
+	{
+		if (!causal_softmax_with_bwd_attn(scratch_P,scratch_dP,nHeads,T,1.0f,scratch_dP)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_P,nHeads*T,T,scratch_P)) return false;
+		if (!softmax_backward_attn(scratch_P,scratch_dP,nHeads,T,1.0f,scratch_dP)) return false;
+	}
 
-	// dQ = (1/sqrt(dH)) · dS · K.  Use strict FP32 cuBLAS math
-	// for parity-sensitive replay (avoid TF32 tensor-core contraction).
-	if (!sgemm_batched_strided_exact(
-	        T, dHead, T, invSqrtDH,
-	        scratch_dP, T, (long long)T * T,
-	        K, dModel, (long long)dHead,
-	        0.0f,
-	        dQ, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
-	// iter 107 (2026-05-21): dK = (1/sqrt(dH)) · dS^T · Q (overwrite, was +=).
-	// Same rationale as dV above — all callers pre-zero sdK and don't depend
-	// on prior content.  Math bit-identical when dK starts at zero.
-	if (!sgemm_batched_strided_atb_exact(
-	        T, dHead, T, invSqrtDH,
-	        scratch_dP, T, (long long)T * T,
-	        Q, dModel, (long long)dHead,
-	        0.0f,
-	        dK, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_atb(
+		        T,dHead,T,1.0f,scratch_P,T,(long long)T*T,
+		        dO,dModel,(long long)dHead,0.0f,
+		        dV,dModelKV,(long long)dHead,nHeads)) return false;
+		if (!sgemm_batched_strided_exact(
+		        T,dHead,T,invSqrtDH,scratch_dP,T,(long long)T*T,
+		        K,dModelKV,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads)) return false;
+		if (!sgemm_batched_strided_atb_exact(
+		        T,dHead,T,invSqrtDH,scratch_dP,T,(long long)T*T,
+		        Q,dModel,(long long)dHead,0.0f,
+		        dK,dModelKV,(long long)dHead,nHeads)) return false;
+	}
+	else
+	{
+		// Materialize only full per-query-head gradients in dQ, which is free
+		// until the final dQ GEMM. This replaces 2*nHeads tiny GEMM launches
+		// with two batched GEMMs plus deterministic compact reductions.
+		if(!sgemm_batched_strided_atb(T,dHead,T,1.0f,
+		        scratch_P,T,(long long)T*T,dO,dModel,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads))return false;
+		if(!gqa_reduce_full_head_grads(dQ,dV,T,nHeads,nKVHeads,dHead))return false;
+		if(!sgemm_batched_strided_atb_exact(T,dHead,T,invSqrtDH,
+		        scratch_dP,T,(long long)T*T,Q,dModel,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads))return false;
+		if(!gqa_reduce_full_head_grads(dQ,dK,T,nHeads,nKVHeads,dHead))return false;
+		if(!sgemm_batched_grouped_exact(T,dHead,T,invSqrtDH,
+		        scratch_dP,T,(long long)T*T,K,dModelKV,(long long)dHead,
+		        groupSize,0.0f,dQ,dModel,(long long)dHead,nHeads))return false;
+	}
 	return true;
+}
+
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP)
+{
+	return flash_attention_backward_cublas_tiled(
+	    Q,K,V,O,dO,T,nHeads,nHeads,dHead,dModel,dModel,causal,
+	    dQ,dK,dV,scratch_P,scratch_dP);
 }
 
 // ===========================================================================

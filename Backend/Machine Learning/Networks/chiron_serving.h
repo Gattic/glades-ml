@@ -67,9 +67,12 @@ struct ChironEvalScratch
     glades::gpu::GpuBuffer<float> p;          // [T, m]
     glades::gpu::GpuBuffer<float> q_tmp;      // [T, m]
     glades::gpu::GpuBuffer<float> stats;      // [L, T, 2]
-    // Dense-attention scratch (allocated when SCFA is OFF).
-    glades::gpu::GpuBuffer<float> sQ, sK, sV, sO;  // [T, dModel]
+    // Dense-attention scratch (allocated when SCFA is OFF). Q/O use dModel;
+    // compact K/V use dModelKV.
+    glades::gpu::GpuBuffer<float> sQ, sK, sV, sO;
     glades::gpu::GpuBuffer<float> scratch_P;       // [nH, T, T]
+    // Reversible FFN scratch [T,ffnHidden].
+    glades::gpu::GpuBuffer<float> ffnGate, ffnUp, ffnHidden;
     glades::gpu::GpuBuffer<float> logits;          // [T, V] caller downloads
     // paradigm #32 fuse-attn-per-layer scratch.
     glades::gpu::GpuBuffer<float> p_norm;          // [T, m]
@@ -85,7 +88,7 @@ struct ChironEvalScratch
     glades::gpu::GpuBuffer<float> scfa_inner_sQ;
     glades::gpu::GpuBuffer<float> scfa_inner_sK;
     glades::gpu::GpuBuffer<float> scfa_inner_sV;
-    glades::gpu::GpuBuffer<float> scfa_inner_sO;  // each [k, dModel]
+    glades::gpu::GpuBuffer<float> scfa_inner_sO;  // Q/O [k,dModel], K/V [k,dModelKV]
     glades::gpu::GpuBuffer<float> scfa_inner_sP;  // [nH, k, k]
     glades::gpu::GpuBuffer<float> qknorm_invNorm;     // [k*nH] throwaway
     glades::gpu::GpuBuffer<float> qknorm_gamma_scale; // [L*nH] = gamma*sqrt(dH), prefilled

@@ -294,6 +294,11 @@ int main(int argc, char* argv[])
 		CHIRONPiedDualPParityTest();
 		CHIRONPiedDyDualParityTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-gqa-ffn") == 0 || strcmp(argv[1], "gqa-ffn") == 0)
+	    {
+		CHIRONGqaTiledTest();
+		CHIRONFfnShearTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-vitals") == 0 || strcmp(argv[1], "vitals") == 0)
 		CHIRONVitalsUnitTest();
 	    else if (strcmp(argv[1], "chiron-orbit") == 0 || strcmp(argv[1], "orbit") == 0)

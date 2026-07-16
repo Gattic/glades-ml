@@ -1,5 +1,9 @@
 # CHIRON Reversible FFN + GQA — Design & Implementation Plan (2026-07-07)
 
+**Status (2026-07-16): CLOSED NO-GO for the combined SCFA + full-token FFN proposal.**
+The compact GQA implementation and its launch optimizations are retained; reversible FFN support
+remains opt-in and disabled by default. See §8 for the measured gate record and disposition.
+
 **Goal:** Add the missing feed-forward capacity to the CHIRON flagship as a **reversible FFN
 shear**, and pay for it — parameters *and* VRAM — by shrinking the attention K/V projections with
 **Grouped-Query Attention (GQA)**, so the upgrade is **memory-neutral** under the 16 GB ceiling
@@ -189,3 +193,42 @@ are **validated independently** so a GQA regression vs an FFN regression is isol
 - H=2048 (1× SwiGLU) is narrow; is nKV=2/H≈2389 worth the extra attention-quality risk? (decide after A/E3 shows GQA's true cost).
 - Should the FFN read `q` pre- or post-WhiSC-rotation? (plan: pre-rotation, same incoming `q` as attention — simplest reversibility).
 - Multi-seed for the ship (lineage ships single-seed; owner call at Phase C).
+
+---
+
+## 8. Engineering gate record and disposition (2026-07-16)
+
+The pre-registered engineering experiment used a matched SCFA/int8-Adam shape
+`T=2048, m=128, L=2, nH=16, dH=16`; the treatment used `nKV=4, H=m=128`.
+All measurements compare steady-state medians from the same executable, GPU, seed, data, and
+configuration.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| E0 legacy compatibility | **PASS** | `nKV=nH` uses the historical tiled path and is byte-identical; zero-`W_down` CPU and CUDA FFN shears are byte-identical to FFN-off. |
+| E1 correctness | **PASS** | Compact GQA matched expanded-KV forward and backward references (`dK` max error `2.328e-10`, `dV` `1.490e-08`); FFN inverse, finite differences, and production BF16 parity passed. |
+| E2 persistent/live memory | **PASS** | Baseline and combined arms have equal changed-matrix parameter counts (`8m²` per layer). Post-allocation VRAM was `1.10 GiB` baseline versus `1.09 GiB` combined; a 10 ms process sampler observed `326 MiB` versus `320 MiB` live peaks. |
+| E2 SCFA wall time | **FAIL** | Baseline `2,081,114 tok/s`; GQA-only `2,075,935 tok/s` (`0.998×`); combined `1,694,511 tok/s` (`0.814×`). Combined wall was `1.228×` baseline, missing the `≤1.10×` bar. |
+| Baseline/compatibility | **PASS** | Finite loss and gradients, zero reported skips, CHRF v4 save/resume, serving inference, focused tests, and the full CHIRON suite passed. |
+
+The GQA performance defect was fixed: replacing serial per-head cuBLAS calls with grouped
+pointer-array GEMMs and a compact deterministic `dK/dV` reduction improved GQA-only throughput from
+about `0.60×` to `0.998×` baseline. The remaining miss belongs to the mechanism, not compact GQA:
+SCFA projects attention at compressed length `k=T/16`, while the proposed SwiGLU executes three
+matrix families over all `T` tokens during forward/inverse/backward. Compact K/V therefore funds the
+FFN's persistent memory but does not fund its full-token compute.
+
+A dense-attention control reached `110,972 tok/s` combined versus `108,872 tok/s` baseline
+(`1.019×` throughput), confirming that the failed bar is specific to pairing a full-token FFN with
+compressed SCFA. The experiment was not reclassified using that control because the registered
+hypothesis explicitly targeted SCFA.
+
+**Disposition:**
+
+- Retain compact GQA across CUDA, SCFA, checkpoints, trainer state, and serving.
+- Retain grouped GQA GEMM dispatch and compact gradient reduction.
+- Keep reversible FFN/checkpoint compatibility behind `--ffn-hidden`; default `0` remains FFN-off.
+- Do not enable the combined SCFA + `H=m` FFN in the flagship recipe and do not launch E3/E4.
+- Reopen only under a separately pre-registered hypothesis, such as compressed-domain or less-frequent
+  FFN placement, a separately quality-gated fused/lower-precision kernel, or an explicitly revised
+  wall-time bar.

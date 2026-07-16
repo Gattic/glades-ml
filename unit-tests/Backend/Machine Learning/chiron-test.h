@@ -37,6 +37,8 @@ void CHIRONBatchedSketchParityTest();
 void CHIRONGpuEndToEndTest();
 void CHIRONGpuAttentionShearParityTest();
 void CHIRONGpuFullBlockEndToEndTest();
+void CHIRONFfnShearTest();
+void CHIRONGqaTiledTest();
 void CHIRONGpuReLNBackwardTest();
 void CHIRONGpuAttentionShearBackwardTest();
 void CHIRONGpuFullBlockBackwardTest();

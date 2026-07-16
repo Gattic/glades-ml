@@ -69,6 +69,96 @@ inline void shear_sub_from_q(float* q, const float* u, unsigned int m)
 		q[i] -= u[i];
 }
 
+// Reversible SwiGLU FFN shear used by the CHIRON capacity upgrade:
+//   p += (SiLU(q W_gate) * (q W_up)) W_down.
+// q is never modified, so the inverse recomputes the same increment and
+// subtracts it.  Weight layouts are row-major W_gate/W_up [m,H], W_down [H,m].
+inline float chiron_silu_cpu(float x)
+{
+	return x / (1.0f + expf(-x));
+}
+
+inline void chiron_ffn_shear_cpu(const float* q, float* p,
+                                 const float* W_gate, const float* W_up,
+                                 const float* W_down,
+                                 unsigned int T, unsigned int m, unsigned int H,
+                                 float sign = 1.0f)
+{
+	std::vector<float> gate(H), up(H), hidden(H);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* qr = q + (size_t)t * m;
+		for (unsigned int h = 0; h < H; ++h)
+		{
+			double g = 0.0, u = 0.0;
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				g += (double)qr[i] * W_gate[(size_t)i * H + h];
+				u += (double)qr[i] * W_up[(size_t)i * H + h];
+			}
+			gate[h] = (float)g;
+			up[h] = (float)u;
+			hidden[h] = chiron_silu_cpu(gate[h]) * up[h];
+		}
+		float* pr = p + (size_t)t * m;
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			double y = 0.0;
+			for (unsigned int h = 0; h < H; ++h)
+				y += (double)hidden[h] * W_down[(size_t)h * m + i];
+			pr[i] += sign * (float)y;
+		}
+	}
+}
+
+// Analytic adjoint of the FFN shear.  dq and all dW buffers are accumulated;
+// dp passes through unchanged.  This helper does not alter p.
+inline void chiron_ffn_backward_cpu(const float* q, const float* dp,
+                                    const float* W_gate, const float* W_up,
+                                    const float* W_down,
+                                    unsigned int T, unsigned int m, unsigned int H,
+                                    float* dq, float* dW_gate, float* dW_up,
+                                    float* dW_down)
+{
+	std::vector<float> gate(H), up(H), hidden(H), dh(H), dg(H), du(H);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* qr = q + (size_t)t * m;
+		const float* dpr = dp + (size_t)t * m;
+		for (unsigned int h = 0; h < H; ++h)
+		{
+			double g = 0.0, u = 0.0, d = 0.0;
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				g += (double)qr[i] * W_gate[(size_t)i * H + h];
+				u += (double)qr[i] * W_up[(size_t)i * H + h];
+				d += (double)dpr[i] * W_down[(size_t)h * m + i];
+			}
+			gate[h] = (float)g; up[h] = (float)u; dh[h] = (float)d;
+			const float sig = 1.0f / (1.0f + expf(-gate[h]));
+			const float silu = gate[h] * sig;
+			hidden[h] = silu * up[h];
+			dg[h] = dh[h] * up[h] * (sig + gate[h] * sig * (1.0f - sig));
+			du[h] = dh[h] * silu;
+		}
+		for (unsigned int h = 0; h < H; ++h)
+		{
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				dW_down[(size_t)h * m + i] += hidden[h] * dpr[i];
+				dq[(size_t)t * m + i] += dg[h] * W_gate[(size_t)i * H + h]
+				                           + du[h] * W_up[(size_t)i * H + h];
+			}
+		}
+		for (unsigned int i = 0; i < m; ++i)
+			for (unsigned int h = 0; h < H; ++h)
+			{
+				dW_gate[(size_t)i * H + h] += qr[i] * dg[h];
+				dW_up[(size_t)i * H + h] += qr[i] * du[h];
+			}
+	}
+}
+
 // Zero reserved coordinates on a token-row vector. Used to enforce the
 // invariant that nonlinear maps do not write to reserved coords.
 inline void zero_reserved_coords_row(float* v, unsigned int r0, unsigned int r1)

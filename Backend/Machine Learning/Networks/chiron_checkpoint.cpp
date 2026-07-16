@@ -52,6 +52,9 @@ ChironModelWeights::~ChironModelWeights()
     for (size_t i = 0; i < beta.size();  ++i) delete beta[i];
     for (size_t i = 0; i < gamma_p.size(); ++i) delete gamma_p[i];
     for (size_t i = 0; i < beta_p.size(); ++i) delete beta_p[i];
+    for (size_t i = 0; i < ffnGate.size(); ++i) delete ffnGate[i];
+    for (size_t i = 0; i < ffnUp.size(); ++i) delete ffnUp[i];
+    for (size_t i = 0; i < ffnDown.size(); ++i) delete ffnDown[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +303,22 @@ bool chiron_write_header(std::FILE* fp, const ChironCkptHeader& h)
     return true;
 }
 
+bool chiron_write_architecture_section(std::FILE* fp, uint32_t flags,
+                                       int nKVHeads, int ffnHidden)
+{
+    if ((flags & (uint32_t)CKPT_BIT_GQA) != 0)
+    {
+        const int32_t v = (int32_t)nKVHeads;
+        if (std::fwrite(&v, sizeof(v), 1, fp) != 1) return false;
+    }
+    if ((flags & (uint32_t)CKPT_BIT_FFN) != 0)
+    {
+        const int32_t v = (int32_t)ffnHidden;
+        if (std::fwrite(&v, sizeof(v), 1, fp) != 1) return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Model-section writers
 // ---------------------------------------------------------------------------
@@ -411,6 +430,8 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
     // CHRF: 7×4-byte metadata block between dim-hdr and weights.
     // Skip 5 i32 (step, slcLast, runtimeT, runtimeL, runtimeAlpha), read flags u32, skip 1 i32.
     uint32_t chrfFlags = 0;
+    int32_t nKVHeadsMeta = hdr[3];
+    int32_t ffnHiddenMeta = 0;
     if (isFull)
     {
         std::fseek(fp, 5 * (int)sizeof(int32_t), SEEK_CUR);
@@ -439,6 +460,18 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
             && (chrfFlags & (uint32_t)CKPT_BIT_SCFA) == 0)
         {
             err = "chiron_infer: causal-block SCFA marker set without an SCFA section";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        if ((chrfFlags & (uint32_t)CKPT_BIT_GQA) != 0
+            && std::fread(&nKVHeadsMeta, sizeof(int32_t), 1, fp) != 1)
+        {
+            err = "chiron_infer: short GQA architecture metadata";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        if ((chrfFlags & (uint32_t)CKPT_BIT_FFN) != 0
+            && std::fread(&ffnHiddenMeta, sizeof(int32_t), 1, fp) != 1)
+        {
+            err = "chiron_infer: short FFN architecture metadata";
             errCode = 4; std::fclose(fp); return false;
         }
     }
@@ -476,10 +509,17 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
 
     dims.T      = hdr[0]; dims.m  = hdr[1]; dims.L  = hdr[2];
     dims.nH     = hdr[3]; dims.dH = hdr[4]; dims.V  = hdr[5];
+    dims.nKVH   = nKVHeadsMeta; dims.ffnHidden = ffnHiddenMeta;
     dims.dModel = dims.nH * dims.dH;
+    dims.dModelKV = dims.nKVH * dims.dH;
+    if (dims.nKVH <= 0 || dims.nH % dims.nKVH != 0 || dims.ffnHidden < 0)
+    {
+        err = "chiron_infer: invalid GQA/FFN architecture metadata";
+        errCode = 4; std::fclose(fp); return false;
+    }
 
-    std::printf("[chiron-ckpt] checkpoint dims: T=%d m=%d L=%d nH=%d dH=%d V=%d dModel=%d\n",
-                dims.T, dims.m, dims.L, dims.nH, dims.dH, dims.V, dims.dModel);
+    std::printf("[chiron-ckpt] dims: T=%d m=%d L=%d nH=%d nKVH=%d dH=%d V=%d dModel=%d ffnH=%d\n",
+                dims.T,dims.m,dims.L,dims.nH,dims.nKVH,dims.dH,dims.V,dims.dModel,dims.ffnHidden);
 
     // Load E [V, m].
     const size_t Esize = (size_t)dims.V * dims.m;
@@ -497,8 +537,11 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
     w.E.upload(&buf[0], Esize);
 
     // Load per-layer weights.
-    const size_t Wqkv_size = (size_t)dims.m * dims.dModel;
+    const size_t Wq_size   = (size_t)dims.m * dims.dModel;
+    const size_t Wkv_size  = (size_t)dims.m * dims.dModelKV;
     const size_t Wo_size   = (size_t)dims.dModel * dims.m;
+    const size_t WffnUp_size = (size_t)dims.m * dims.ffnHidden;
+    const size_t WffnDown_size = (size_t)dims.ffnHidden * dims.m;
     std::vector<float> gbuf;
     w.Wq.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
     w.Wk.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
@@ -512,25 +555,31 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
         w.beta_p.assign(dims.L,  (glades::gpu::GpuBuffer<float>*)0);
     }
     else { w.gamma_p.clear(); w.beta_p.clear(); }
+    if (dims.ffnHidden > 0)
+    {
+        w.ffnGate.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+        w.ffnUp.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+        w.ffnDown.assign(dims.L, (glades::gpu::GpuBuffer<float>*)0);
+    }
 
     for (int l = 0; l < dims.L; ++l)
     {
-        w.Wq[l]    = new glades::gpu::GpuBuffer<float>(); w.Wq[l]->allocate(Wqkv_size);
-        w.Wk[l]    = new glades::gpu::GpuBuffer<float>(); w.Wk[l]->allocate(Wqkv_size);
-        w.Wv[l]    = new glades::gpu::GpuBuffer<float>(); w.Wv[l]->allocate(Wqkv_size);
+        w.Wq[l]    = new glades::gpu::GpuBuffer<float>(); w.Wq[l]->allocate(Wq_size);
+        w.Wk[l]    = new glades::gpu::GpuBuffer<float>(); w.Wk[l]->allocate(Wkv_size);
+        w.Wv[l]    = new glades::gpu::GpuBuffer<float>(); w.Wv[l]->allocate(Wkv_size);
         w.Wo[l]    = new glades::gpu::GpuBuffer<float>(); w.Wo[l]->allocate(Wo_size);
         w.gamma[l] = new glades::gpu::GpuBuffer<float>(); w.gamma[l]->allocate(dims.m);
         w.beta[l]  = new glades::gpu::GpuBuffer<float>(); w.beta[l]->allocate(dims.m);
 
-        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        if (!chiron_read_block(fp, buf, Wq_size, weightsBf16))
         { err = "chiron_infer: short read (Wq)"; errCode = 4; std::fclose(fp); return false; }
-        w.Wq[l]->upload(&buf[0], Wqkv_size);
-        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        w.Wq[l]->upload(&buf[0], Wq_size);
+        if (!chiron_read_block(fp, buf, Wkv_size, weightsBf16))
         { err = "chiron_infer: short read (Wk)"; errCode = 4; std::fclose(fp); return false; }
-        w.Wk[l]->upload(&buf[0], Wqkv_size);
-        if (!chiron_read_block(fp, buf, Wqkv_size, weightsBf16))
+        w.Wk[l]->upload(&buf[0], Wkv_size);
+        if (!chiron_read_block(fp, buf, Wkv_size, weightsBf16))
         { err = "chiron_infer: short read (Wv)"; errCode = 4; std::fclose(fp); return false; }
-        w.Wv[l]->upload(&buf[0], Wqkv_size);
+        w.Wv[l]->upload(&buf[0], Wkv_size);
         if (!chiron_read_block(fp, buf, Wo_size, weightsBf16))
         { err = "chiron_infer: short read (Wo)"; errCode = 4; std::fclose(fp); return false; }
         w.Wo[l]->upload(&buf[0], Wo_size);
@@ -551,6 +600,21 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
             if (!chiron_read_block(fp, gbuf, (size_t)dims.m, weightsBf16))
             { err = "chiron_infer: short read (beta_p)"; errCode = 4; std::fclose(fp); return false; }
             w.beta_p[l]->upload(&gbuf[0], (size_t)dims.m);
+        }
+        if (dims.ffnHidden > 0)
+        {
+            w.ffnGate[l] = new glades::gpu::GpuBuffer<float>(); w.ffnGate[l]->allocate(WffnUp_size);
+            w.ffnUp[l]   = new glades::gpu::GpuBuffer<float>(); w.ffnUp[l]->allocate(WffnUp_size);
+            w.ffnDown[l] = new glades::gpu::GpuBuffer<float>(); w.ffnDown[l]->allocate(WffnDown_size);
+            if (!chiron_read_block(fp, buf, WffnUp_size, weightsBf16))
+            { err = "chiron_infer: short read (FFN gate)"; errCode = 4; std::fclose(fp); return false; }
+            w.ffnGate[l]->upload(&buf[0], WffnUp_size);
+            if (!chiron_read_block(fp, buf, WffnUp_size, weightsBf16))
+            { err = "chiron_infer: short read (FFN up)"; errCode = 4; std::fclose(fp); return false; }
+            w.ffnUp[l]->upload(&buf[0], WffnUp_size);
+            if (!chiron_read_block(fp, buf, WffnDown_size, weightsBf16))
+            { err = "chiron_infer: short read (FFN down)"; errCode = 4; std::fclose(fp); return false; }
+            w.ffnDown[l]->upload(&buf[0], WffnDown_size);
         }
     }
 
@@ -729,7 +793,8 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
     std::printf("[chiron-ckpt] loaded %d layers + embedding (%.1f MB)\n",
                 dims.L,
                 (double)((size_t)Esize + (size_t)dims.L
-                          * (3u * Wqkv_size + Wo_size + 2u * (size_t)dims.m))
+                          * (Wq_size + 2u*Wkv_size + Wo_size + 2u*(size_t)dims.m
+                             + 2u*WffnUp_size + WffnDown_size))
                 * 4.0 / (1024.0 * 1024.0));
     return true;
 #else

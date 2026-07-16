@@ -11338,9 +11338,126 @@ void CHIRONChunkedCrossEntropyParityTest()
 #endif
 }
 
+static double chiron_ffn_test_loss(const std::vector<float>& q,
+                                   const std::vector<float>& Wg,
+                                   const std::vector<float>& Wu,
+                                   const std::vector<float>& Wd,
+                                   const std::vector<float>& dp,
+                                   unsigned T, unsigned m, unsigned H)
+{
+	std::vector<float> p((size_t)T*m,0.0f);
+	glades::chiron::chiron_ffn_shear_cpu(&q[0],&p[0],&Wg[0],&Wu[0],&Wd[0],T,m,H);
+	double s=0.0;for(size_t i=0;i<p.size();++i)s+=(double)p[i]*dp[i];return s;
+}
+
+void CHIRONFfnShearTest()
+{
+	const unsigned T=2,m=3,H=4;
+	LCG rng(0xFF123u);
+	std::vector<float> q(T*m),p0(T*m),dp(T*m),Wg(m*H),Wu(m*H),Wd(H*m);
+	for(size_t i=0;i<q.size();++i){q[i]=0.25f*rng.next_unit();p0[i]=0.2f*rng.next_unit();dp[i]=0.3f*rng.next_unit();}
+	for(size_t i=0;i<Wg.size();++i){Wg[i]=0.2f*rng.next_unit();Wu[i]=0.2f*rng.next_unit();}
+	for(size_t i=0;i<Wd.size();++i) Wd[i]=0.2f*rng.next_unit();
+
+	// E0: zero W_down must be exact identity.
+	std::vector<float> zWd(H*m,0.0f),p=p0;
+	glades::chiron::chiron_ffn_shear_cpu(&q[0],&p[0],&Wg[0],&Wu[0],&zWd[0],T,m,H);
+	ASSERT("ffn zero-Wdown identity", p==p0);
+
+	// CPU forward/inverse and finite differences for q + all three matrices.
+	p=p0;
+	glades::chiron::chiron_ffn_shear_cpu(&q[0],&p[0],&Wg[0],&Wu[0],&Wd[0],T,m,H,+1.0f);
+	std::vector<float> pf=p;
+	glades::chiron::chiron_ffn_shear_cpu(&q[0],&p[0],&Wg[0],&Wu[0],&Wd[0],T,m,H,-1.0f);
+	ASSERT("ffn CPU inverse", max_abs_diff(p,p0)<1e-6f);
+	std::vector<float> dq(T*m,0.0f),dWg(m*H,0.0f),dWu(m*H,0.0f),dWd(H*m,0.0f);
+	glades::chiron::chiron_ffn_backward_cpu(&q[0],&dp[0],&Wg[0],&Wu[0],&Wd[0],T,m,H,
+	    &dq[0],&dWg[0],&dWu[0],&dWd[0]);
+	const float e=1e-3f; float fdMax=0.0f;
+	for(size_t family=0;family<4;++family){
+		std::vector<float>* v=family==0?&q:family==1?&Wg:family==2?&Wu:&Wd;
+		const std::vector<float>* a=family==0?&dq:family==1?&dWg:family==2?&dWu:&dWd;
+		for(size_t i=0;i<v->size();++i){float old=(*v)[i];(*v)[i]=old+e;double lp=chiron_ffn_test_loss(q,Wg,Wu,Wd,dp,T,m,H);(*v)[i]=old-e;double lm=chiron_ffn_test_loss(q,Wg,Wu,Wd,dp,T,m,H);(*v)[i]=old;float err=fabsf((float)((lp-lm)/(2.0*e))-(*a)[i]);if(err>fdMax)fdMax=err;}
+	}
+	ASSERT("ffn CPU finite difference", fdMax<2e-3f);
+
+#ifdef GLADES_HAVE_CUDA
+	if(glades::gpu::initDevice()){
+		glades::gpu::GpuBuffer<float> gq,gp,gdp,gWg,gWu,gWd,gdq,gdWg,gdWu,gdWd,gg,gu,gh,gdh;
+		gq.allocate(q.size());gp.allocate(p0.size());gdp.allocate(dp.size());gWg.allocate(Wg.size());gWu.allocate(Wu.size());gWd.allocate(Wd.size());
+		gdq.allocate(q.size());gdWg.allocate(Wg.size());gdWu.allocate(Wu.size());gdWd.allocate(Wd.size());
+		gg.allocate(T*H);gu.allocate(T*H);gh.allocate(T*H);gdh.allocate(T*H);
+		gq.upload(&q[0],q.size());gp.upload(&p0[0],p0.size());gdp.upload(&dp[0],dp.size());gWg.upload(&Wg[0],Wg.size());gWu.upload(&Wu[0],Wu.size());gWd.upload(&Wd[0],Wd.size());
+		glades::gpu::GpuBuffer<float> gzWd;gzWd.allocate(zWd.size());gzWd.upload(&zWd[0],zWd.size());
+		ASSERT("ffn GPU zero-Wdown forward",glades::gpu::chiron_ffn_shear_forward(gq.data(),gp.data(),gWg.data(),gWu.data(),gzWd.data(),T,m,H,1.0f,gg.data(),gu.data(),gh.data()));
+		std::vector<float> pz(p0.size());gp.download(&pz[0],pz.size());ASSERT("ffn GPU zero-Wdown bit exact",memcmp(&pz[0],&p0[0],p0.size()*sizeof(float))==0);
+		gp.upload(&p0[0],p0.size());
+		ASSERT("ffn GPU forward",glades::gpu::chiron_ffn_shear_forward(gq.data(),gp.data(),gWg.data(),gWu.data(),gWd.data(),T,m,H,1.0f,gg.data(),gu.data(),gh.data()));
+		std::vector<float> pg(p0.size());gp.download(&pg[0],pg.size());ASSERT("ffn GPU CPU parity",max_abs_diff(pg,pf)<2e-4f);
+		gdq.zero();gdWg.zero();gdWu.zero();gdWd.zero();
+		ASSERT("ffn GPU backward invwalk",glades::gpu::chiron_ffn_shear_backward_invwalk(gq.data(),gp.data(),gdp.data(),gWg.data(),gWu.data(),gWd.data(),T,m,H,gdq.data(),gdWg.data(),gdWu.data(),gdWd.data(),gg.data(),gu.data(),gh.data(),gdh.data()));
+		gp.download(&pg[0],pg.size());ASSERT("ffn GPU inverse",max_abs_diff(pg,p0)<2e-4f);
+		std::vector<float> h(q.size());gdq.download(&h[0],h.size());ASSERT("ffn GPU dq parity",max_abs_diff(h,dq)<5e-4f);
+		std::vector<float> hwg(Wg.size()),hwu(Wu.size()),hwd(Wd.size());gdWg.download(&hwg[0],hwg.size());gdWu.download(&hwu[0],hwu.size());gdWd.download(&hwd[0],hwd.size());
+		ASSERT("ffn GPU dWg parity",max_abs_diff(hwg,dWg)<5e-4f);ASSERT("ffn GPU dWu parity",max_abs_diff(hwu,dWu)<5e-4f);ASSERT("ffn GPU dWd parity",max_abs_diff(hwd,dWd)<5e-4f);
+
+		// Production BF16-weight/BF16-gradient path, including paired gate/up
+		// GEMMs and the H>=m BF16 backward fast path.
+		std::vector<uint16_t> bWg,bWu,bWd;fp32_to_bf16_rne(Wg,bWg);fp32_to_bf16_rne(Wu,bWu);fp32_to_bf16_rne(Wd,bWd);
+		glades::gpu::GpuBuffer<uint16_t> gbWg,gbWu,gbWd,bq,bg,bu,bh,bdWg,bdWu,bdWd;
+		gbWg.allocate(bWg.size());gbWu.allocate(bWu.size());gbWd.allocate(bWd.size());
+		gbWg.upload(&bWg[0],bWg.size());gbWu.upload(&bWu[0],bWu.size());gbWd.upload(&bWd[0],bWd.size());
+		bq.allocate(T*m);bg.allocate(T*H);bu.allocate(T*H);bh.allocate(T*H);bdWg.allocate(m*H);bdWu.allocate(m*H);bdWd.allocate(H*m);
+		bdWg.zero();bdWu.zero();bdWd.zero();gp.upload(&p0[0],p0.size());gdq.zero();
+		ASSERT("ffn BF16 forward",glades::gpu::chiron_ffn_shear_forward_bf16w(gq.data(),gp.data(),gbWg.data(),gbWu.data(),gbWd.data(),T,m,H,1.0f,bq.data(),bg.data(),bu.data(),bh.data()));
+		gp.download(&pg[0],pg.size());ASSERT("ffn BF16 forward parity",max_abs_diff(pg,pf)<5e-2f);
+		ASSERT("ffn BF16 backward invwalk",glades::gpu::chiron_ffn_shear_backward_invwalk_bf16w_bf16g(gq.data(),gp.data(),gdp.data(),gbWg.data(),gbWu.data(),gbWd.data(),T,m,H,gdq.data(),bdWg.data(),bdWu.data(),bdWd.data(),bq.data(),bg.data(),bu.data(),bh.data(),gdh.data()));
+		gp.download(&pg[0],pg.size());ASSERT("ffn BF16 inverse",max_abs_diff(pg,p0)<5e-3f);
+		gdq.download(&h[0],h.size());ASSERT("ffn BF16 dq parity",max_abs_diff(h,dq)<5e-2f);
+		std::vector<uint16_t> qwg(bWg.size()),qwu(bWu.size()),qwd(bWd.size());bdWg.download(&qwg[0],qwg.size());bdWu.download(&qwu[0],qwu.size());bdWd.download(&qwd[0],qwd.size());
+		for(size_t i=0;i<hwg.size();++i){union{uint32_t u;float f;}x;x.u=(uint32_t)qwg[i]<<16;hwg[i]=x.f;x.u=(uint32_t)qwu[i]<<16;hwu[i]=x.f;}
+		for(size_t i=0;i<hwd.size();++i){union{uint32_t u;float f;}x;x.u=(uint32_t)qwd[i]<<16;hwd[i]=x.f;}
+		ASSERT("ffn BF16 dWg parity",max_abs_diff(hwg,dWg)<5e-2f);ASSERT("ffn BF16 dWu parity",max_abs_diff(hwu,dWu)<5e-2f);ASSERT("ffn BF16 dWd parity",max_abs_diff(hwd,dWd)<5e-2f);
+	}
+#endif
+	std::printf("  CHIRON FFN shear: inverse + finite-diff PASS (fd max %.3e)\n",fdMax);
+}
+
+void CHIRONGqaTiledTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if(!glades::gpu::initDevice()){std::printf("  [GQA tiled] no CUDA -- skipped\n");return;}
+	const int T=8,nH=4,nKV=2,dH=4,dM=nH*dH,dKV=nKV*dH,group=nH/nKV;
+	LCG rng(0x6A41u);std::vector<float> Q(T*dM),K(T*dKV),V(T*dKV),Kx(T*dM),Vx(T*dM),dO(T*dM);
+	for(size_t i=0;i<Q.size();++i){Q[i]=.2f*rng.next_unit();dO[i]=.15f*rng.next_unit();}
+	for(size_t i=0;i<K.size();++i){K[i]=.2f*rng.next_unit();V[i]=.2f*rng.next_unit();}
+	for(int t=0;t<T;++t)for(int h=0;h<nH;++h)for(int j=0;j<dH;++j){int kv=h/group;Kx[t*dM+h*dH+j]=K[t*dKV+kv*dH+j];Vx[t*dM+h*dH+j]=V[t*dKV+kv*dH+j];}
+	glades::gpu::GpuBuffer<float> q,k,v,kx,vx,og,ob,s1,s2,do_,dqg,dkg,dvg,dqb,dkb,dvb,p1,p2,dp1,dp2;
+	q.allocate(Q.size());k.allocate(K.size());v.allocate(V.size());kx.allocate(Kx.size());vx.allocate(Vx.size());og.allocate(Q.size());ob.allocate(Q.size());s1.allocate((size_t)nH*T*T);s2.allocate((size_t)nH*T*T);
+	do_.allocate(dO.size());dqg.allocate(Q.size());dkg.allocate(K.size());dvg.allocate(V.size());dqb.allocate(Q.size());dkb.allocate(Kx.size());dvb.allocate(Vx.size());p1.allocate((size_t)nH*T*T);p2.allocate((size_t)nH*T*T);dp1.allocate((size_t)nH*T*T);dp2.allocate((size_t)nH*T*T);
+	q.upload(&Q[0],Q.size());k.upload(&K[0],K.size());v.upload(&V[0],V.size());kx.upload(&Kx[0],Kx.size());vx.upload(&Vx[0],Vx.size());do_.upload(&dO[0],dO.size());
+	ASSERT("GQA forward",glades::gpu::flash_attention_cublas_tiled(q.data(),k.data(),v.data(),T,nH,nKV,dH,dM,dKV,true,og.data(),s1.data()));
+	ASSERT("expanded baseline forward",glades::gpu::flash_attention_cublas_tiled(q.data(),kx.data(),vx.data(),T,nH,dH,dM,true,ob.data(),s2.data()));
+	std::vector<float> hg(Q.size()),hb(Q.size());og.download(&hg[0],hg.size());ob.download(&hb[0],hb.size());float ferr=max_abs_diff(hg,hb);ASSERT("GQA expanded forward parity",ferr<1e-5f);
+	// E0 no-op path is deliberately the historical implementation and must be bit-exact.
+	og.zero();ob.zero();ASSERT("GQA E0 new",glades::gpu::flash_attention_cublas_tiled(q.data(),kx.data(),vx.data(),T,nH,nH,dH,dM,dM,true,og.data(),s1.data()));ASSERT("GQA E0 old",glades::gpu::flash_attention_cublas_tiled(q.data(),kx.data(),vx.data(),T,nH,dH,dM,true,ob.data(),s2.data()));og.download(&hg[0],hg.size());ob.download(&hb[0],hb.size());ASSERT("GQA nKV=nH bit exact",memcmp(&hg[0],&hb[0],hg.size()*sizeof(float))==0);
+	dqg.zero();dkg.zero();dvg.zero();dqb.zero();dkb.zero();dvb.zero();
+	ASSERT("GQA backward",glades::gpu::flash_attention_backward_cublas_tiled(q.data(),k.data(),v.data(),og.data(),do_.data(),T,nH,nKV,dH,dM,dKV,true,dqg.data(),dkg.data(),dvg.data(),p1.data(),dp1.data()));
+	ASSERT("expanded baseline backward",glades::gpu::flash_attention_backward_cublas_tiled(q.data(),kx.data(),vx.data(),ob.data(),do_.data(),T,nH,dH,dM,true,dqb.data(),dkb.data(),dvb.data(),p2.data(),dp2.data()));
+	std::vector<float> dq1(Q.size()),dq2(Q.size()),dk1(K.size()),dv1(V.size()),dkx(Kx.size()),dvx(Vx.size());dqg.download(&dq1[0],dq1.size());dqb.download(&dq2[0],dq2.size());dkg.download(&dk1[0],dk1.size());dvg.download(&dv1[0],dv1.size());dkb.download(&dkx[0],dkx.size());dvb.download(&dvx[0],dvx.size());
+	float kerr=0,verr=0;for(int t=0;t<T;++t)for(int kvh=0;kvh<nKV;++kvh)for(int j=0;j<dH;++j){float ks=0,vs=0;for(int h=kvh*group;h<(kvh+1)*group;++h){ks+=dkx[t*dM+h*dH+j];vs+=dvx[t*dM+h*dH+j];}kerr=std::max(kerr,fabsf(ks-dk1[t*dKV+kvh*dH+j]));verr=std::max(verr,fabsf(vs-dv1[t*dKV+kvh*dH+j]));}
+	ASSERT("GQA dQ parity",max_abs_diff(dq1,dq2)<2e-5f);ASSERT("GQA dK reduction parity",kerr<2e-5f);ASSERT("GQA dV reduction parity",verr<2e-5f);
+	std::printf("  CHIRON GQA tiled: fwd %.3e dK %.3e dV %.3e; E0 bit-exact PASS\n",ferr,kerr,verr);
+#else
+	std::printf("  [GQA tiled] GLADES_HAVE_CUDA not defined -- skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
+	CHIRONFfnShearTest();
+	CHIRONGqaTiledTest();
 	CHIRONHRTCHaarRoundtripTest();
 	CHIRONHRTCHaarK4RecursiveTest();
 	CHIRONHRTCProcessPoolTest();

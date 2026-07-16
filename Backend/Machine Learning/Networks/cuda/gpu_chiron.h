@@ -176,6 +176,14 @@ bool get_cast_elim_inner_fwd();
 // FP32 Q/K (post-norm, cast internally), pre-cast BF16 V, BF16 O out.
 bool flash_attention_cublas_tiled_bf16_vpre_obf16(
     const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    unsigned short* O_bf16,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16);
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
     int T, int nHeads, int dHead, int dModel,
     bool causal,
     unsigned short* O_bf16,
@@ -548,6 +556,52 @@ bool chiron_sira_terminal_add_grad(const float* q, const float* p,
                                    float* dp);
 
 // ---------------------------------------------------------------------------
+// Reversible SwiGLU FFN shear.
+// Weight layouts: W_gate/W_up [m,H], W_down [H,m].  Forward/inverse leaves q
+// unchanged and adds sign*FFN(q) to p.  Backward-invwalk first subtracts FFN(q)
+// from p, then accumulates dq and parameter gradients; dp is read-only.
+// Caller owns four [T,H] FP32 work buffers for the reference path.
+bool chiron_ffn_shear_forward(const float* q, float* p,
+                               const float* W_gate, const float* W_up,
+                               const float* W_down,
+                               int T, int m, int H, float sign,
+                               float* gate, float* up, float* hidden);
+bool chiron_ffn_shear_backward_invwalk(
+    const float* q, float* p, const float* dp,
+    const float* W_gate, const float* W_up, const float* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    float* gate, float* up, float* hidden, float* dHidden);
+
+// BF16 tensor-core production path.  qbf is [T,m]; gate/up/hidden are [T,H]
+// BF16; dHidden is [T,H] FP32.  The backward variants differ only in gradient
+// destination precision.
+bool chiron_ffn_shear_forward_bf16w(
+    const float* q, float* p,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H, float sign,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden);
+bool chiron_ffn_shear_backward_invwalk_bf16w(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden);
+bool chiron_ffn_shear_backward_invwalk_bf16w_bf16g(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, unsigned short* dW_gate, unsigned short* dW_up,
+    unsigned short* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden);
+
+// ---------------------------------------------------------------------------
 // Symplectic attention shear (framework §3.2) — composition wrapper.
 //
 // Computes  p += Wo^T · Attention(Q=q·Wq, K=q·Wk, V=q·Wv)  on GPU, reusing
@@ -610,8 +664,16 @@ bool chiron_attention_shear_backward(
 // Tensor-core-backed shear forward.  Identical math to chiron_attention_shear
 // but routes the attention core through flash_attention_cublas_tiled (TF32
 // tensor cores).  Typical 5-10× wall-clock improvement at T≥512 on Ampere/Ada.
-// Extra scratch: scratch_S [nHeads, T, T], caller-owned.
-// Constraint: nHeads == nKVHeads (no GQA — tiled kernel doesn't broadcast).
+// Extra scratch: scratch_S [nHeads, T, T], caller-owned. Compact K/V heads
+// are broadcast over contiguous query-head groups without expansion.
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int nKVHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S);
 bool chiron_attention_shear_tiled(const float* q, float* p,
                                     const float* Wq, const float* Wk,
                                     const float* Wv, const float* Wo,
@@ -627,6 +689,18 @@ bool chiron_attention_shear_tiled(const float* q, float* p,
 // flash_attention_cublas_tiled_bf16.  ~2× over TF32-tiled on Ampere/Ada.
 // Extra scratch: BF16 staging for Q, K, V (each [T, dModel]) and P
 // ([nHeads, T, T]).
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16);
 bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
                                          const float* Wq, const float* Wk,
                                          const float* Wv, const float* Wo,
@@ -652,6 +726,22 @@ bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
 //   scratch_qbf   [T, m]          BF16 cast of q (one cast per layer)
 //   scratch_Obf   [T, dModel]     BF16 cast of attention output for Wo proj
 //   (plus the same scratch_Qbf16/Kbf16/Vbf16/Pbf16 as _bf16_tiled)
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int nKVHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16);
 bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           const unsigned short* Wq_bf,
                                           const unsigned short* Wk_bf,
@@ -688,6 +778,26 @@ bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
                                          const unsigned short* Wk_bf,
                                          const unsigned short* Wv_bf,
                                          const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O);
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
                                          int T, int m, int nHeads, int dHead,
                                          bool causal, bool invert,
                                          unsigned short* scratch_qbf,
@@ -715,6 +825,19 @@ bool chiron_attention_shear_backward_bf16w_tiled(
     const float* q, const float* dp_new,
     const unsigned short* Wq_bf, const unsigned short* Wk_bf,
     const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP);
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
     int T, int m, int nHeads, int dHead,
     bool causal,
     float* dq,
@@ -736,7 +859,7 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     const float* q, const float* dp_new,
     const unsigned short* Wq_bf, const unsigned short* Wk_bf,
     const unsigned short* Wv_bf, const unsigned short* Wo_bf,
-    int T, int m, int nHeads, int dHead,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
     bool causal,
     float* dq,
     unsigned short* dWq_bf, unsigned short* dWk_bf,
@@ -748,10 +871,35 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     float* scratch_P, float* scratch_dP,
     bool dw_beta_zero = false);  // iter 108: dW_bf cuBLAS beta (0=overwrite for
                                   // single micro-batch; 1=accumulate for grad accum).
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP,
+    bool dw_beta_zero = false);
 
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
 // scratch_dP, each [nHeads, T, T], caller-owned.
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP);
 bool chiron_attention_shear_backward_tiled(
     const float* q, const float* dp_new,
     const float* Wq, const float* Wk, const float* Wv, const float* Wo,
@@ -782,7 +930,11 @@ bool chiron_attention_shear_backward_tiled(
 //
 // Scratch: scratch_S [nH, T, T], FP32, caller-owned.
 //
-// Constraints: nHeads must equal nKVHeads (no GQA in this version).
+// nKVHeads must divide nHeads; K/V use compact [T, dModelKV] storage.
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int nKVHeads, int dHead,
+                                    int dModel, int dModelKV, bool causal,
+                                    float* O, float* scratch_S);
 bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
                                     int T, int nHeads, int dHead, int dModel,
                                     bool causal,
@@ -795,10 +947,18 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
 //
 // Scratch:
 //   scratch_S       [nH, T, T]   FP32 attention scores
-//   scratch_Qbf16   [T, dModel]  BF16 Q cast
-//   scratch_Kbf16   [T, dModel]  BF16 K cast
-//   scratch_Vbf16   [T, dModel]  BF16 V cast
+//   scratch_Qbf16   [T, dModel]    BF16 Q cast
+//   scratch_Kbf16   [T, dModelKV]  BF16 K cast
+//   scratch_Vbf16   [T, dModelKV]  BF16 V cast
 //   scratch_Pbf16   [nH, T, T]   BF16 P cast (for the PV GEMM)
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16);
 bool flash_attention_cublas_tiled_bf16(
     const float* Q, const float* K, const float* V,
     int T, int nHeads, int dHead, int dModel,
@@ -831,7 +991,8 @@ void set_iter119_fa_inner_bf16(bool on);
 //   dQ    = (1/sqrt(dH)) dS · K                             (batched)
 //   dK   += (1/sqrt(dH)) dS^T · Q                           (batched)
 //
-// Constraints: nHeads == nKVHeads (no GQA).
+// nKVHeads must divide nHeads; grouped dK/dV contributions are reduced into
+// compact [T, dModelKV] buffers.
 //
 // Scratch:
 //   scratch_P  [nH, T, T] — recomputed attention probs
@@ -841,6 +1002,13 @@ void set_iter119_fa_inner_bf16(bool on);
 // not needed by the cuBLAS-tiled path (we recompute P internally) but is
 // kept in the signature for drop-in compatibility with
 // flash_attention_multihead_backward.
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP);
 bool flash_attention_backward_cublas_tiled(
     const float* Q, const float* K, const float* V,
     const float* O, const float* dO,
@@ -1011,6 +1179,25 @@ inline bool chiron_sira_terminal_add_grad(const float*, const float*, int,
                                            float, float, float, float, float, float,
                                            const float*, float,
                                            float*, float*) { return false; }
+inline bool chiron_ffn_shear_forward(const float*, float*, const float*, const float*,
+                                      const float*, int, int, int, float,
+                                      float*, float*, float*) { return false; }
+inline bool chiron_ffn_shear_backward_invwalk(const float*, float*, const float*,
+                                               const float*, const float*, const float*,
+                                               int, int, int, float*, float*, float*, float*,
+                                               float*, float*, float*, float*) { return false; }
+inline bool chiron_ffn_shear_forward_bf16w(const float*, float*, const unsigned short*,
+                                            const unsigned short*, const unsigned short*,
+                                            int, int, int, float, unsigned short*,
+                                            unsigned short*, unsigned short*, unsigned short*) { return false; }
+inline bool chiron_ffn_shear_backward_invwalk_bf16w(
+    const float*, float*, const float*, const unsigned short*, const unsigned short*,
+    const unsigned short*, int, int, int, float*, float*, float*, float*,
+    unsigned short*, unsigned short*, unsigned short*, unsigned short*, float*) { return false; }
+inline bool chiron_ffn_shear_backward_invwalk_bf16w_bf16g(
+    const float*, float*, const float*, const unsigned short*, const unsigned short*,
+    const unsigned short*, int, int, int, float*, unsigned short*, unsigned short*,
+    unsigned short*, unsigned short*, unsigned short*, unsigned short*, unsigned short*, float*) { return false; }
 inline bool chiron_attention_shear(const float*, float*,
                                     const float*, const float*, const float*,
                                     const float*,

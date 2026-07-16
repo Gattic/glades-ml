@@ -543,12 +543,27 @@ static void CHIRONCkptRoundtripTest()
 		unlink(path.c_str());
 	}
 
-	// ---- Case 5b: Unknown bit 16384 → reject with errCode=4 ----
+	// ---- Case 5a: GQA + reversible FFN architecture/weights roundtrip ----
+	{
+		const int T=4,m=4,L=1,nH=2,nKV=1,dH=2,V=8,ffnH=6;
+		const uint32_t flags=(uint32_t)glades::chiron::CKPT_BIT_GQA|(uint32_t)glades::chiron::CKPT_BIT_FFN;
+		glades::chiron::ChironCkptHeader h;h.dims.T=T;h.dims.m=m;h.dims.L=L;h.dims.nH=nH;h.dims.dH=dH;h.dims.V=V;h.flags=flags;
+		std::vector<float> E(V*m),Wq(m*nH*dH),Wk(m*nKV*dH),Wv(m*nKV*dH),Wo(nH*dH*m),g(m),b(m),fg(m*ffnH),fu(m*ffnH),fd(ffnH*m);
+		rt_fill(&E[0],E.size(),1);rt_fill(&Wq[0],Wq.size(),2);rt_fill(&Wk[0],Wk.size(),3);rt_fill(&Wv[0],Wv.size(),4);rt_fill(&Wo[0],Wo.size(),5);rt_fill(&g[0],g.size(),6);rt_fill(&b[0],b.size(),7);rt_fill(&fg[0],fg.size(),8);rt_fill(&fu[0],fu.size(),9);rt_fill(&fd[0],fd.size(),10);
+		std::string path=rt_tmppath();std::FILE* fp=std::fopen(path.c_str(),"wb");ASSERT("rt5a fopen",fp!=0);
+		ASSERT("rt5a header",glades::chiron::chiron_write_header(fp,h));ASSERT("rt5a arch",glades::chiron::chiron_write_architecture_section(fp,flags,nKV,ffnH));
+		ASSERT("rt5a E",glades::chiron::chiron_write_block(fp,E,E.size(),false));ASSERT("rt5a Wq",glades::chiron::chiron_write_block(fp,Wq,Wq.size(),false));ASSERT("rt5a Wk",glades::chiron::chiron_write_block(fp,Wk,Wk.size(),false));ASSERT("rt5a Wv",glades::chiron::chiron_write_block(fp,Wv,Wv.size(),false));ASSERT("rt5a Wo",glades::chiron::chiron_write_block(fp,Wo,Wo.size(),false));ASSERT("rt5a g",glades::chiron::chiron_write_block(fp,g,g.size(),false));ASSERT("rt5a b",glades::chiron::chiron_write_block(fp,b,b.size(),false));ASSERT("rt5a fg",glades::chiron::chiron_write_block(fp,fg,fg.size(),false));ASSERT("rt5a fu",glades::chiron::chiron_write_block(fp,fu,fu.size(),false));ASSERT("rt5a fd",glades::chiron::chiron_write_block(fp,fd,fd.size(),false));std::fclose(fp);
+		glades::chiron::ChironModelDims d;glades::chiron::ChironModelWeights w;std::string err;int ec=0;ASSERT("rt5a load",glades::chiron::chiron_load_model(path,d,w,err,ec));
+		ASSERT("rt5a dims",d.nH==nH&&d.nKVH==nKV&&d.dModelKV==nKV*dH&&d.ffnHidden==ffnH);
+		rt_cmpbuf("rt5a Wk",*w.Wk[0],&Wk[0],Wk.size(),false);rt_cmpbuf("rt5a Wv",*w.Wv[0],&Wv[0],Wv.size(),false);rt_cmpbuf("rt5a fg",*w.ffnGate[0],&fg[0],fg.size(),false);rt_cmpbuf("rt5a fu",*w.ffnUp[0],&fu[0],fu.size(),false);rt_cmpbuf("rt5a fd",*w.ffnDown[0],&fd[0],fd.size(),false);unlink(path.c_str());
+	}
+
+	// ---- Case 5b: Unknown bit 65536 → reject with errCode=4 ----
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
 
-		const uint32_t flags = 16384u;  // bit beyond CKPT_KNOWN_BITS_MASK
+		const uint32_t flags = 65536u;  // bit beyond CKPT_KNOWN_BITS_MASK
 
 		std::string path = rt_tmppath();
 		ASSERT("rt5b tmppath", !path.empty());

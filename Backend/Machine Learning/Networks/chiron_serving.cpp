@@ -61,6 +61,10 @@ int chiron_resolve_serving(ChironModelDims& dims, ChironModelWeights& w,
                            const ChironServingOverrides& o,
                            ChironServingConfig& cfg, std::string& err)
 {
+    // In-memory callers predating GQA populate nH/dModel only. Preserve that
+    // legacy construction contract by resolving an omitted KV geometry to MHA.
+    if(dims.nKVH<=0)dims.nKVH=dims.nH;
+    if(dims.dModelKV<=0)dims.dModelKV=dims.dModel;
     // --- WhiSC interlocks (2026-07-01) ---
     // Both directions are hard errors: a mismatch silently produces wrong logits.
     const bool ckptHasWhisc = !w.rotPhi.empty();
@@ -309,7 +313,8 @@ ChironEvalScratch::~ChironEvalScratch()
 bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeights& w,
                                  const ChironServingConfig& cfg)
 {
-    const int T = d.T, m = d.m, L = d.L, dModel = d.dModel;
+    const int T=d.T, m=d.m, L=d.L, dModel=d.dModel;
+    const int dModelKV=d.dModelKV>0?d.dModelKV:dModel;
     const bool useScfa = cfg.useScfa;
     const int  scfaK   = w.scfa.k;
     const bool whisc   = cfg.whiscCoupling;
@@ -327,6 +332,7 @@ bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeig
         const size_t Tm  = (size_t)T * (size_t)m;
         const size_t km  = (size_t)scfaK * (size_t)m;
         const size_t kdM = (size_t)scfaK * (size_t)dModel;
+        const size_t kdMKV = (size_t)scfaK * (size_t)dModelKV;
         const size_t Skk = (size_t)d.nH * (size_t)scfaK * (size_t)scfaK;
         if (!scfa_qcompr.allocate(km)) return false;
         if (!scfa_qpar.allocate(Tm)) return false;
@@ -336,8 +342,8 @@ bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeig
         if (!scfa_ypar.allocate(Tm)) return false;
         if (!scfa_inner_p.allocate(km)) return false;
         if (!scfa_inner_sQ.allocate(kdM)) return false;
-        if (!scfa_inner_sK.allocate(kdM)) return false;
-        if (!scfa_inner_sV.allocate(kdM)) return false;
+        if (!scfa_inner_sK.allocate(kdMKV)) return false;
+        if (!scfa_inner_sV.allocate(kdMKV)) return false;
         if (!scfa_inner_sO.allocate(kdM)) return false;
         if (!scfa_inner_sP.allocate(Skk)) return false;
         if (!qknorm_invNorm.allocate((size_t)scfaK * d.nH)) return false;
@@ -346,10 +352,15 @@ bool ChironEvalScratch::allocate(const ChironModelDims& d, const ChironModelWeig
     else
     {
         if (!sQ.allocate((size_t)T * dModel)) return false;
-        if (!sK.allocate((size_t)T * dModel)) return false;
-        if (!sV.allocate((size_t)T * dModel)) return false;
+        if (!sK.allocate((size_t)T * dModelKV)) return false;
+        if (!sV.allocate((size_t)T * dModelKV)) return false;
         if (!sO.allocate((size_t)T * dModel)) return false;
         if (!scratch_P.allocate((size_t)d.nH * T * T)) return false;
+    }
+    if (d.ffnHidden > 0)
+    {
+        const size_t n=(size_t)T*d.ffnHidden;
+        if (!ffnGate.allocate(n) || !ffnUp.allocate(n) || !ffnHidden.allocate(n)) return false;
     }
     if (whisc)
     {
@@ -430,12 +441,13 @@ static void dbg_mag(int layer, const char* tag, const glades::gpu::GpuBuffer<flo
 static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
                             const float* Wq, const float* Wk,
                             const float* Wv, const float* Wo,
-                            int layer, int T, int m, int nH, int dH,
+                            int layer, int T, int m, int nH, int nKVH, int dH,
                             bool invert, bool qkNorm)
 {
     const int k = scfa.k;
     const int w = scfa.w;
     const int dModel = nH * dH;
+    const int dModelKV = nKVH * dH;
     const size_t Tm = (size_t)T * (size_t)m;
     const size_t km = (size_t)k * (size_t)m;
 
@@ -468,16 +480,16 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
         // QK-Norm decomposed path (replicates chiron_main.cpp:8734-8787 FP32 split).
         if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
                 s.scfa_qcompr.data(), m, Wq, dModel, 0.0f, s.scfa_inner_sQ.data(), dModel)) return false;
-        if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
-                s.scfa_qcompr.data(), m, Wk, dModel, 0.0f, s.scfa_inner_sK.data(), dModel)) return false;
-        if (!glades::gpu::sgemm_rowmajor(k, dModel, m, 1.0f,
-                s.scfa_qcompr.data(), m, Wv, dModel, 0.0f, s.scfa_inner_sV.data(), dModel)) return false;
+        if (!glades::gpu::sgemm_rowmajor(k, dModelKV, m, 1.0f,
+                s.scfa_qcompr.data(), m, Wk, dModelKV, 0.0f, s.scfa_inner_sK.data(), dModelKV)) return false;
+        if (!glades::gpu::sgemm_rowmajor(k, dModelKV, m, 1.0f,
+                s.scfa_qcompr.data(), m, Wv, dModelKV, 0.0f, s.scfa_inner_sV.data(), dModelKV)) return false;
         if (!glades::gpu::qknorm_forward_gpu(s.scfa_inner_sQ.data(), s.qknorm_invNorm.data(), k, nH, dH, 1e-6f)) return false;
-        if (!glades::gpu::qknorm_forward_gpu(s.scfa_inner_sK.data(), s.qknorm_invNorm.data(), k, nH, dH, 1e-6f)) return false;
+        if (!glades::gpu::qknorm_forward_gpu(s.scfa_inner_sK.data(), s.qknorm_invNorm.data(), k, nKVH, dH, 1e-6f)) return false;
         if (!glades::gpu::scale_q_per_head(s.scfa_inner_sQ.data(), s.qknorm_gamma_scale.data() + (size_t)layer * nH, k, nH, dH)) return false;
         if (!glades::gpu::flash_attention_cublas_tiled(
                 s.scfa_inner_sQ.data(), s.scfa_inner_sK.data(), s.scfa_inner_sV.data(),
-                k, nH, dH, dModel, /*causal=*/true,
+                k, nH, nKVH, dH, dModel, dModelKV, /*causal=*/true,
                 s.scfa_inner_sO.data(), s.scfa_inner_sP.data())) return false;
         if (!glades::gpu::sgemm_rowmajor(k, m, dModel, 1.0f,
                 s.scfa_inner_sO.data(), dModel, Wo, m, 0.0f, s.scfa_inner_p.data(), m)) return false;
@@ -485,7 +497,7 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
     else if (!glades::gpu::chiron_attention_shear_tiled(
             s.scfa_qcompr.data(), s.scfa_inner_p.data(),
             Wq, Wk, Wv, Wo,
-            k, m, nH, dH, /*causal=*/true, /*invert=*/false,
+            k, m, nH, nKVH, dH, /*causal=*/true, /*invert=*/false,
             s.scfa_inner_sQ.data(), s.scfa_inner_sK.data(),
             s.scfa_inner_sV.data(), s.scfa_inner_sO.data(),
             s.scfa_inner_sP.data())) return false;
@@ -520,7 +532,7 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
 bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
                          const ChironServingConfig& cfg, ChironEvalScratch& s)
 {
-    const int T = d.T, m = d.m, V = d.V, L = d.L, nH = d.nH, dH = d.dH;
+    const int T=d.T,m=d.m,V=d.V,L=d.L,nH=d.nH,nKVH=d.nKVH>0?d.nKVH:d.nH,dH=d.dH;
 
     // Fuse is only active if requested AND the checkpoint provided per-layer params.
     const bool applyFuse = cfg.fuseAttnPerLayer
@@ -570,14 +582,19 @@ bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
         {
             if (!scfa_shear_eval(s, w.scfa,
                                  w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
-                                 l, T, m, nH, dH, /*invert=*/false, cfg.qkNorm)) return false;
+                                 l,T,m,nH,nKVH,dH,/*invert=*/false,cfg.qkNorm)) return false;
         }
         else if (!glades::gpu::chiron_attention_shear_tiled(
                 s.q.data(), s.p.data(),
                 w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
-                T, m, nH, dH, /*causal=*/true, /*invert=*/false,
-                s.sQ.data(), s.sK.data(), s.sV.data(), s.sO.data(),
+                T,m,nH,nKVH,dH,/*causal=*/true,/*invert=*/false,
+                s.sQ.data(),s.sK.data(),s.sV.data(),s.sO.data(),
                 s.scratch_P.data())) return false;
+
+        if (d.ffnHidden > 0 && !glades::gpu::chiron_ffn_shear_forward(
+                s.q.data(),s.p.data(),w.ffnGate[l]->data(),w.ffnUp[l]->data(),
+                w.ffnDown[l]->data(),T,m,d.ffnHidden,1.0f,
+                s.ffnGate.data(),s.ffnUp.data(),s.ffnHidden.data())) return false;
 
         // Single-layer fuse: at layer L-1 only, q += p BEFORE the final q-reln.
         if (cfg.fuseAttnReln && l == L - 1)

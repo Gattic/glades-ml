@@ -9,7 +9,9 @@
 //   magic 'CHRF' | version u32 | hdr i32[6]={T,m,L,nH,dH,V}
 //   | step i32 | slcLastTransitionStep i32 | runtimeT i32 | runtimeL i32
 //   | runtimeSasAlpha f32 | flags u32 | faceStepCount i32
-//   | weights blob (E, then per layer Wq,Wk,Wv,Wo,gamma,beta[,gamma_p,beta_p])
+//   | [bit 16384] nKVHeads i32 | [bit 32768] ffnHidden i32
+//   | weights blob (E, then per layer Wq,Wk,Wv,Wo,gamma,beta[,gamma_p,beta_p]
+//                   [,FFN_gate,FFN_up,FFN_down])
 //   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
 //   | [bit 256] QK-Norm gamma: L*nH f32
 //   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
@@ -51,12 +53,14 @@ enum ChironCkptBits
 	CKPT_BIT_ROT_PHI      = 1024,
 	CKPT_BIT_WHISC_STATE  = 2048,
 	CKPT_BIT_CAUSAL_SCFA  = 4096,
-	CKPT_BIT_ORBIT_STATE  = 8192
+	CKPT_BIT_ORBIT_STATE  = 8192,
+	CKPT_BIT_GQA          = 16384,
+	CKPT_BIT_FFN          = 32768
 };
-// All bits the current format defines. WhiSC and ORBIT are trainer-owned and
-// sit before the two EOF tails, so serving may safely ignore them after checking
-// the bits. Unknown future bits still hard-error to protect tail arithmetic.
-static const uint32_t CKPT_KNOWN_BITS_MASK = 0x3FFFu;  // == 16383 == bits 1..8192
+// All bits the current format defines. Architecture metadata follows the fixed
+// header; WhiSC and ORBIT remain before the two EOF tails. Unknown future bits
+// still hard-error to protect section alignment and tail arithmetic.
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0xFFFFu;
 
 // CHRN v3 legacy flags word bits.
 enum ChironChrnBits
@@ -67,8 +71,9 @@ enum ChironChrnBits
 
 struct ChironModelDims
 {
-	int T, m, L, nH, dH, V, dModel;
-	ChironModelDims() : T(0), m(0), L(0), nH(0), dH(0), V(0), dModel(0) {}
+	int T, m, L, nH, nKVH, dH, V, dModel, dModelKV, ffnHidden;
+	ChironModelDims() : T(0), m(0), L(0), nH(0), nKVH(0), dH(0), V(0),
+	                    dModel(0), dModelKV(0), ffnHidden(0) {}
 };
 
 struct ChironScfaState
@@ -90,9 +95,11 @@ private:
 struct ChironModelWeights
 {
 	glades::gpu::GpuBuffer<float> E;                       // [V,m]
-	std::vector<glades::gpu::GpuBuffer<float>*> Wq, Wk, Wv, Wo;  // [m,dModel]/[dModel,m]
+	// Wq [m,dModel], compact Wk/Wv [m,dModelKV], Wo [dModel,m].
+	std::vector<glades::gpu::GpuBuffer<float>*> Wq, Wk, Wv, Wo;
 	std::vector<glades::gpu::GpuBuffer<float>*> gamma, beta;     // [m]
 	std::vector<glades::gpu::GpuBuffer<float>*> gamma_p, beta_p; // [m]; empty if absent
+	std::vector<glades::gpu::GpuBuffer<float>*> ffnGate, ffnUp, ffnDown;
 	ChironScfaState scfa;
 	std::vector<float> qknormGamma;  // L*nH iff bit 256, else empty
 	std::vector<float> whiscA;       // L*m iff bit 2048; fixed causal serving calibration
@@ -159,6 +166,10 @@ struct ChironCkptHeader
 };
 // Writes magic+version+hdr+meta+flags.  version derived from flags (see top).
 bool chiron_write_header(std::FILE* fp, const ChironCkptHeader& h);
+// Writes the flag-gated architecture metadata immediately after the fixed
+// header: nKVHeads for GQA, then ffnHidden for FFN.
+bool chiron_write_architecture_section(std::FILE* fp, uint32_t flags,
+                                       int nKVHeads, int ffnHidden);
 
 // ---- Model-section writers (byte layout owned here; data sourcing is caller's) ----
 bool chiron_write_scfa_section(std::FILE* fp, int k, int w,
