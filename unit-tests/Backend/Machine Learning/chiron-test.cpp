@@ -20353,32 +20353,42 @@ void CHIRONEchoGpuParityTest()
 	for (int t = 0; t < T; ++t) totalActive += cntC[t];
 	ASSERT("ECHO GPU parity fixture has no active hinges", totalActive > 0);
 
+	const int bitWords = (w + 31) / 32;
 	glades::gpu::GpuBuffer<unsigned short> dProbs;
-	glades::gpu::GpuBuffer<int> dTok, dTgt, dIds, dCnt;
+	glades::gpu::GpuBuffer<int> dTok, dTgt, dCnt;
+	glades::gpu::GpuBuffer<uint32_t> dBits;
 	glades::gpu::GpuBuffer<float> dPA, dR;
 	dProbs.allocate(n); dProbs.upload(&probsBf[0], n);
 	dTok.allocate(T); dTok.upload(&tokens[0], T);
 	dTgt.allocate(T); dTgt.upload(&targets[0], T);
 	dPA.allocate(T); dR.allocate(T); dCnt.allocate(T);
-	std::vector<int> sent((size_t)T * w, -7);
-	dIds.allocate((size_t)T * w); dIds.upload(&sent[0], (size_t)T * w);
+	dBits.allocate((size_t)T * bitWords);
 	ASSERT("ECHO echo_repeat_stats dispatch failed",
 	       glades::gpu::echo_repeat_stats(dProbs.data(), dTok.data(), dTgt.data(),
-	           T, V, w, kappa, tau0, dPA.data(), dR.data(), dIds.data(), dCnt.data()));
+	           T, V, w, kappa, tau0, dPA.data(), dR.data(), dBits.data(), dCnt.data()));
 	std::vector<float> paG(T), rG(T);
-	std::vector<int> idsG((size_t)T * w), cntG(T);
+	std::vector<uint32_t> bitsG((size_t)T * bitWords);
+	std::vector<int> cntG(T);
 	ASSERT("ECHO PA download failed", dPA.download(&paG[0], T));
 	ASSERT("ECHO Rrow download failed", dR.download(&rG[0], T));
-	ASSERT("ECHO ids download failed", dIds.download(&idsG[0], (size_t)T * w));
+	ASSERT("ECHO bits download failed", dBits.download(&bitsG[0], bitsG.size()));
 	ASSERT("ECHO cnt download failed", dCnt.download(&cntG[0], T));
 	for (int t = 0; t < T; ++t)
 	{
 		ASSERT("ECHO activeCount CPU/GPU mismatch", cntC[t] == cntG[t]);
 		ASSERT("ECHO PA CPU/GPU not bit-exact", paC[t] == paG[t]);
 		ASSERT("ECHO Rrow CPU/GPU not bit-exact", rC[t] == rG[t]);
-		for (int k = 0; k < w; ++k)
-			ASSERT("ECHO activeIds CPU/GPU mismatch",
-			       idsC[(size_t)t * w + k] == idsG[(size_t)t * w + k]);
+		const int wEff = std::min(w, t + 1);
+		const int base = t - wEff + 1;
+		int k = 0;
+		for (int s = 0; s < wEff; ++s)
+		{
+			if ((bitsG[(size_t)t * bitWords + (s >> 5)] & (1u << (s & 31))) == 0u) continue;
+			ASSERT("ECHO active owner/id CPU/GPU mismatch",
+			       k < cntC[t] && idsC[(size_t)t * w + k] == tokens[base + s]);
+			++k;
+		}
+		ASSERT("ECHO active bitmap population mismatch", k == cntC[t]);
 	}
 	std::printf("  [ECHO stats CPU/GPU parity] bit-exact over %d rows (%d active)  PASS\n",
 	            T, totalActive);
@@ -20401,31 +20411,70 @@ void CHIRONEchoGpuParityTest()
 	ASSERT("ECHO GPU Huber fixture missed knee", huberKneeLive);
 
 	glades::gpu::GpuBuffer<float> dPAH, dRH, dWH, dPmaxH;
-	glades::gpu::GpuBuffer<int> dIdsH, dCntH;
+	glades::gpu::GpuBuffer<int> dCntH;
+	glades::gpu::GpuBuffer<uint32_t> dBitsH;
 	dPAH.allocate(T); dRH.allocate(T); dWH.allocate((size_t)T * w); dPmaxH.allocate(T);
-	dIdsH.allocate((size_t)T * w); dIdsH.upload(&sent[0], (size_t)T * w); dCntH.allocate(T);
+	dBitsH.allocate((size_t)T * bitWords); dCntH.allocate(T);
 	ASSERT("ECHO Huber stats dispatch failed",
 	       glades::gpu::echo_repeat_stats_huber(dProbs.data(), dTok.data(), dTgt.data(),
 	           T, V, w, kappa, tau0, huberDelta, dPAH.data(), dRH.data(),
-	           dIdsH.data(), dWH.data(), dCntH.data(), dPmaxH.data()));
+	           dBitsH.data(), dWH.data(), dCntH.data(), dPmaxH.data()));
 	std::vector<float> paHG(T), rHG(T), wHG((size_t)T * w), pmaxHG(T);
-	std::vector<int> idsHG((size_t)T * w), cntHG(T);
+	std::vector<uint32_t> bitsHG((size_t)T * bitWords);
+	std::vector<int> cntHG(T);
 	dPAH.download(&paHG[0], T); dRH.download(&rHG[0], T);
 	dWH.download(&wHG[0], (size_t)T * w); dPmaxH.download(&pmaxHG[0], T);
-	dIdsH.download(&idsHG[0], (size_t)T * w); dCntH.download(&cntHG[0], T);
+	dBitsH.download(&bitsHG[0], bitsHG.size()); dCntH.download(&cntHG[0], T);
 	for (int t = 0; t < T; ++t)
 	{
 		ASSERT("ECHO Huber activeCount CPU/GPU mismatch", cntHC[t] == cntHG[t]);
 		ASSERT("ECHO Huber PA CPU/GPU mismatch", fabsf(paHC[t] - paHG[t]) < 1e-7f);
 		ASSERT("ECHO Huber R CPU/GPU mismatch", fabsf(rHC[t] - rHG[t]) < 1e-7f);
 		ASSERT("ECHO Huber pmax CPU/GPU mismatch", pmaxHC[t] == pmaxHG[t]);
-		for (int k = 0; k < cntHC[t]; ++k)
+		const int wEff = std::min(w, t + 1);
+		const int base = t - wEff + 1;
+		int k = 0;
+		for (int s = 0; s < wEff; ++s)
 		{
-			const size_t slot = (size_t)t * w + k;
-			ASSERT("ECHO Huber ids CPU/GPU mismatch", idsHC[slot] == idsHG[slot]);
-			ASSERT("ECHO Huber weights CPU/GPU mismatch", fabsf(wHC[slot] - wHG[slot]) < 1e-7f);
+			if ((bitsHG[(size_t)t * bitWords + (s >> 5)] & (1u << (s & 31))) == 0u) continue;
+			const size_t cpuSlot = (size_t)t * w + k;
+			const size_t gpuSlot = (size_t)t * w + s;
+			ASSERT("ECHO Huber owner/id CPU/GPU mismatch",
+			       k < cntHC[t] && idsHC[cpuSlot] == tokens[base + s]);
+			ASSERT("ECHO Huber weights CPU/GPU mismatch",
+			       fabsf(wHC[cpuSlot] - wHG[gpuSlot]) < 1e-7f);
+			++k;
 		}
+		ASSERT("ECHO Huber active bitmap population mismatch", k == cntHC[t]);
 	}
+
+	glades::gpu::GpuBuffer<float> dSummary;
+	dSummary.allocate(glades::gpu::ECHO_SUMMARY_SIZE);
+	ASSERT("ECHO summary dispatch failed",
+	       glades::gpu::echo_summarize_stats(dRH.data(), dPAH.data(), dPmaxH.data(),
+	           dCntH.data(), T, dSummary.data()));
+	std::vector<float> summary(glades::gpu::ECHO_SUMMARY_SIZE);
+	dSummary.download(&summary[0], summary.size());
+	double sumR = 0.0, sumPA = 0.0, sumPmax = 0.0;
+	float maxP = 0.0f;
+	int activeRows = 0, activeIds = 0, hist[5] = {0, 0, 0, 0, 0};
+	for (int t = 0; t < T; ++t)
+	{
+		sumR += rHG[t]; sumPA += paHG[t]; activeIds += cntHG[t];
+		if (cntHG[t] <= 0) continue;
+		++activeRows; sumPmax += pmaxHG[t]; maxP = std::max(maxP, pmaxHG[t]);
+		const int b = pmaxHG[t] < 0.10f ? 0 : (pmaxHG[t] < 0.25f ? 1 :
+		              (pmaxHG[t] < 0.50f ? 2 : (pmaxHG[t] < 0.75f ? 3 : 4)));
+		++hist[b];
+	}
+	ASSERT("ECHO summary R mismatch", fabs((double)summary[glades::gpu::ECHO_SUM_R] - sumR) < 1e-4);
+	ASSERT("ECHO summary PA mismatch", fabs((double)summary[glades::gpu::ECHO_SUM_PA] - sumPA) < 1e-4);
+	ASSERT("ECHO summary pmax sum mismatch", fabs((double)summary[glades::gpu::ECHO_SUM_PMAX] - sumPmax) < 1e-4);
+	ASSERT("ECHO summary max mismatch", summary[glades::gpu::ECHO_MAX_P] == maxP);
+	ASSERT("ECHO summary active rows mismatch", (int)summary[glades::gpu::ECHO_ACTIVE_ROWS] == activeRows);
+	ASSERT("ECHO summary active ids mismatch", (int)summary[glades::gpu::ECHO_ACTIVE_IDS] == activeIds);
+	for (int b = 0; b < 5; ++b)
+		ASSERT("ECHO summary histogram mismatch", (int)summary[glades::gpu::ECHO_HIST_0 + b] == hist[b]);
 
 	std::vector<unsigned short> dlHuberC(n);
 	for (size_t i = 0; i < n; ++i)
@@ -20436,8 +20485,8 @@ void CHIRONEchoGpuParityTest()
 	glades::gpu::GpuBuffer<unsigned short> dDlHuber;
 	dDlHuber.allocate(n); dDlHuber.upload(&dlHuberG[0], n);
 	ASSERT("ECHO Huber scatter dispatch failed",
-	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dIdsH.data(),
-	           dWH.data(), dCntH.data(), echoCoef, T, V, w, dDlHuber.data()));
+	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dTok.data(),
+	           dBitsH.data(), dWH.data(), echoCoef, T, V, w, dDlHuber.data()));
 	dDlHuber.download(&dlHuberG[0], n);
 	ASSERT("ECHO Huber weighted scatter CPU/GPU mismatch", dlHuberC == dlHuberG);
 
@@ -20457,8 +20506,8 @@ void CHIRONEchoGpuParityTest()
 	           dTgt.data(), dHuberLogZ.data(), zlossCoef, echoCoef, dPAH.data(),
 	           T, V, dHuberCompose.data()));
 	ASSERT("ECHO Huber compose scatter failed",
-	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dIdsH.data(),
-	           dWH.data(), dCntH.data(), echoCoef, T, V, w, dHuberCompose.data()));
+	       glades::gpu::echo_scatter_bf16_weighted(dProbs.data(), dTok.data(),
+	           dBitsH.data(), dWH.data(), echoCoef, T, V, w, dHuberCompose.data()));
 	dHuberCompose.download(&dlHuberComposeG[0], n);
 	float huberWorst = 0.0f;
 	for (size_t i = 0; i < n; ++i)
@@ -20481,7 +20530,7 @@ void CHIRONEchoGpuParityTest()
 	glades::gpu::GpuBuffer<unsigned short> dDl;
 	dDl.allocate(n); dDl.upload(&dlBase[0], n);
 	ASSERT("ECHO scatter dispatch failed",
-	       glades::gpu::echo_scatter_bf16(dProbs.data(), dIds.data(), dCnt.data(),
+	       glades::gpu::echo_scatter_bf16(dProbs.data(), dTok.data(), dBits.data(),
 	           echoCoef, T, V, w, dDl.data()));
 	std::vector<unsigned short> dlG(n);
 	ASSERT("ECHO scatter download failed", dDl.download(&dlG[0], n));
@@ -20490,6 +20539,37 @@ void CHIRONEchoGpuParityTest()
 	std::printf("  [ECHO scatter CPU/GPU parity] %lu/%lu diffs (bar 0)\n",
 	            (unsigned long)scatDiff, (unsigned long)n);
 	ASSERT("ECHO scatter CPU/GPU not bit-exact", scatDiff == 0);
+
+	// (b2) Standalone ECHO-only dense+scatter field used by detached trainer
+	// gradient probes.  Compare to the CPU decomposition within one BF16 ulp.
+	std::vector<unsigned short> dlEchoOnlyC(n), dlEchoOnlyG(n);
+	for (int t = 0; t < T; ++t)
+	{
+		const float eterm = -echoCoef * paC[t];
+		for (int v = 0; v < V; ++v)
+			dlEchoOnlyC[(size_t)t * V + v] =
+			    glades::transformer_kernels::float_to_bf16_rn(eterm * probsF[(size_t)t * V + v]);
+	}
+	glades::chiron::chiron_echo_scatter_cpu(&probsBf[0], &idsC[0], &cntC[0],
+	    echoCoef, T, V, w, &dlEchoOnlyC[0]);
+	glades::gpu::GpuBuffer<unsigned short> dEchoOnly;
+	dEchoOnly.allocate(n);
+	ASSERT("ECHO standalone dense dispatch failed",
+	       glades::gpu::echo_dense_bwd_bf16(dProbs.data(), echoCoef, dPA.data(),
+	           T, V, dEchoOnly.data()));
+	ASSERT("ECHO standalone scatter dispatch failed",
+	       glades::gpu::echo_scatter_bf16(dProbs.data(), dTok.data(), dBits.data(),
+	           echoCoef, T, V, w, dEchoOnly.data()));
+	dEchoOnly.download(&dlEchoOnlyG[0], n);
+	float standaloneWorst = 0.0f;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float a = glades::transformer_kernels::bf16_to_float(dlEchoOnlyC[i]);
+		const float b = glades::transformer_kernels::bf16_to_float(dlEchoOnlyG[i]);
+		const float bar = std::max(1e-5f, 0.0079f * std::max(fabsf(a), fabsf(b)));
+		standaloneWorst = std::max(standaloneWorst, fabsf(a - b) / bar);
+	}
+	ASSERT("ECHO standalone field beyond 1 bf16 ulp", standaloneWorst <= 1.0f);
 
 	// (c) dense+scatter compose parity — <=1 bf16-ulp bar (the dense kernel
 	// mirrors the shipped zloss kernel's plain-ops source, so FMA contraction
@@ -20510,7 +20590,7 @@ void CHIRONEchoGpuParityTest()
 	           dTgt.data(), dLogZ.data(), zlossCoef, echoCoef, dPA.data(),
 	           T, V, dDl2.data()));
 	ASSERT("ECHO scatter(2) dispatch failed",
-	       glades::gpu::echo_scatter_bf16(dProbs.data(), dIds.data(), dCnt.data(),
+	       glades::gpu::echo_scatter_bf16(dProbs.data(), dTok.data(), dBits.data(),
 	           echoCoef, T, V, w, dDl2.data()));
 	std::vector<unsigned short> dl2G(n);
 	ASSERT("ECHO compose download failed", dDl2.download(&dl2G[0], n));
@@ -20539,17 +20619,18 @@ void CHIRONEchoGpuParityTest()
 		for (int id = 0; id < 17; ++id) ps[(size_t)t * Vs + id] = pTwo;
 	}
 	glades::gpu::GpuBuffer<unsigned short> dPs;
-	glades::gpu::GpuBuffer<int> dToks, dTgts, dIdsS, dCntS;
+	glades::gpu::GpuBuffer<int> dToks, dTgts, dCntS;
+	glades::gpu::GpuBuffer<uint32_t> dBitsS;
 	glades::gpu::GpuBuffer<float> dPAS, dRS;
 	dPs.allocate(ns); dPs.upload(&ps[0], ns);
 	dToks.allocate(Ts); dToks.upload(&toks[0], Ts);
 	dTgts.allocate(Ts); dTgts.upload(&tgts[0], Ts);
-	dIdsS.allocate((size_t)Ts * ws); dCntS.allocate(Ts);
+	dBitsS.allocate((size_t)Ts * ((ws + 31) / 32)); dCntS.allocate(Ts);
 	dPAS.allocate(Ts); dRS.allocate(Ts);
 	ASSERT("ECHO w=1024 stats dispatch failed",
 	       glades::gpu::echo_repeat_stats(dPs.data(), dToks.data(), dTgts.data(),
 	           Ts, Vs, ws, 1.0f, 0.05f, dPAS.data(), dRS.data(),
-	           dIdsS.data(), dCntS.data()));
+	           dBitsS.data(), dCntS.data()));
 	std::vector<int> cntS(Ts);
 	std::vector<float> paS(Ts), rS(Ts);
 	dCntS.download(&cntS[0], Ts); dPAS.download(&paS[0], Ts); dRS.download(&rS[0], Ts);

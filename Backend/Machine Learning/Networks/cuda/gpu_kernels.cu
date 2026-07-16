@@ -4301,11 +4301,12 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss(
 
 // Per-row excess-copy statistics.  One block per row, blockDim.x == w.
 // A 2x-load-factor shared-memory hash builds counts + first-slot ownership in
-// expected O(w), avoiding the original O(w^2) duplicate/count scans.  Shared
-// atomics never escape the block; thread 0 still emits owner-slot order, so
-// outputs remain deterministic and CPU-reference comparable. huberDelta==0
-// is the exact hard hinge. For delta>0, sW=h'(p-margin), sP=p*sW is the
-// dense-gradient contribution, and sR is the Huberized loss.
+// expected O(w), avoiding the original O(w^2) duplicate/count scans.  Active
+// owner slots are emitted as a compact bitmap rather than T*w vocabulary ids;
+// scatter recovers each id from tokens.  Thread 0 retains owner-slot accumulation
+// order, so PA/R remain deterministic and CPU-reference comparable.
+// huberDelta==0 is the exact hard hinge. For delta>0, sW=h'(p-margin),
+// sP=p*sW is the dense-gradient contribution, and sR is the Huberized loss.
 __global__ void echo_repeat_stats_kernel(
     const unsigned short* __restrict__ probs,
     const int* __restrict__ tokens,
@@ -4314,19 +4315,20 @@ __global__ void echo_repeat_stats_kernel(
     float kappa, float tau0, float huberDelta,
     float* __restrict__ PA,
     float* __restrict__ Rrow,
-    int* __restrict__ activeIds,
+    uint32_t* __restrict__ activeBits,
     float* __restrict__ activeWeights,
     int* __restrict__ activeCount,
     float* __restrict__ maxActiveProb)
 {
 	extern __shared__ float smemEcho[];
-	float* sP = smemEcho;                    // [w] p*h'(p-m), else 0
-	float* sR = smemEcho + w;                // [w] Huberized hinge loss
-	float* sW = smemEcho + 2 * w;            // [w] h'(p-m)
-	int* sId = (int*)(smemEcho + 3 * w);     // [w] active id (else -1)
-	int* hashKeys = sId + w;                  // [hashSize], -1 = empty
-	int* hashCounts = hashKeys + hashSize;    // [hashSize]
-	int* hashOwners = hashCounts + hashSize;  // [hashSize], minimum slot
+	float* sP = smemEcho;                         // [w] p*h'(p-m), else 0
+	float* sR = smemEcho + w;                     // [w] Huberized hinge loss
+	float* sW = smemEcho + 2 * w;                 // [w] h'(p-m)
+	const int bitWords = (w + 31) / 32;
+	uint32_t* sBits = (uint32_t*)(smemEcho + 3 * w); // [ceil(w/32)]
+	int* hashKeys = (int*)(sBits + bitWords);      // [hashSize], -1 = empty
+	int* hashCounts = hashKeys + hashSize;         // [hashSize]
+	int* hashOwners = hashCounts + hashSize;       // [hashSize], minimum slot
 
 	const int t = blockIdx.x;
 	if (t >= T) return;
@@ -4339,7 +4341,7 @@ __global__ void echo_repeat_stats_kernel(
 	sP[s] = 0.0f;
 	sR[s] = 0.0f;
 	sW[s] = 0.0f;
-	sId[s] = -1;
+	if (s < bitWords) sBits[s] = 0u;
 	for (int i = s; i < hashSize; i += blockDim.x)
 	{
 		hashKeys[i] = -1;
@@ -4396,7 +4398,7 @@ __global__ void echo_repeat_stats_kernel(
 				sP[s] = __fmul_rn(p, weight);
 				sR[s] = contribution;
 				sW[s] = weight;
-				sId[s] = v;
+				atomicOr((unsigned int*)(sBits + (s >> 5)), 1u << (s & 31));
 			}
 		}
 	}
@@ -4408,13 +4410,12 @@ __global__ void echo_repeat_stats_kernel(
 		int cnt = 0;
 		for (int s2 = 0; s2 < wEff; ++s2)
 		{
-			if (sId[s2] < 0) continue;
+			if ((sBits[s2 >> 5] & (1u << (s2 & 31))) == 0u) continue;
 			pa = __fadd_rn(pa, sP[s2]);
 			r = __fadd_rn(r, sR[s2]);
-			const size_t slot = (size_t)t * w + cnt;
-			activeIds[slot] = sId[s2];
-			if (activeWeights) activeWeights[slot] = sW[s2];
-			const float p = bf16_load(probs[(size_t)t * V + sId[s2]]);
+			if (activeWeights) activeWeights[(size_t)t * w + s2] = sW[s2];
+			const int id = tokens[base + s2];
+			const float p = bf16_load(probs[(size_t)t * V + id]);
 			if (p > pmax) pmax = p;
 			++cnt;
 		}
@@ -4423,6 +4424,63 @@ __global__ void echo_repeat_stats_kernel(
 		activeCount[t] = cnt;
 		if (maxActiveProb) maxActiveProb[t] = pmax;
 	}
+	for (int i = s; i < bitWords; i += blockDim.x)
+		activeBits[(size_t)t * bitWords + i] = sBits[i];
+}
+
+// One deterministic block reduces ECHO's per-row diagnostics to 11 scalars.
+// The trainer already synchronizes to read its CE scalar each step; replacing
+// four O(T) downloads with this small vector removes avoidable PCIe traffic and
+// host reduction work without touching the regularizer gradient.
+__global__ void echo_summarize_stats_kernel(
+    const float* __restrict__ Rrow,
+    const float* __restrict__ PA,
+    const float* __restrict__ maxActiveProb,
+    const int* __restrict__ activeCount,
+    int T, float* __restrict__ summary)
+{
+	extern __shared__ float sSummary[];
+	float local[ECHO_SUMMARY_SIZE];
+	#pragma unroll
+	for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f) local[f] = 0.0f;
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	{
+		const int cnt = activeCount[t];
+		const float pmax = maxActiveProb[t];
+		local[ECHO_SUM_R] += Rrow[t];
+		local[ECHO_SUM_PA] += PA[t];
+		local[ECHO_ACTIVE_IDS] += (float)cnt;
+		if (cnt > 0)
+		{
+			local[ECHO_SUM_PMAX] += pmax;
+			if (pmax > local[ECHO_MAX_P]) local[ECHO_MAX_P] = pmax;
+			local[ECHO_ACTIVE_ROWS] += 1.0f;
+			const int hist = pmax < 0.10f ? 0 : (pmax < 0.25f ? 1 :
+			                 (pmax < 0.50f ? 2 : (pmax < 0.75f ? 3 : 4)));
+			local[ECHO_HIST_0 + hist] += 1.0f;
+		}
+	}
+	#pragma unroll
+	for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f)
+		sSummary[f * blockDim.x + threadIdx.x] = local[f];
+	__syncthreads();
+	for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			#pragma unroll
+			for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f)
+			{
+				const float b = sSummary[f * blockDim.x + threadIdx.x + stride];
+				float& a = sSummary[f * blockDim.x + threadIdx.x];
+				if (f == ECHO_MAX_P) { if (b > a) a = b; }
+				else a += b;
+			}
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+		for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f) summary[f] = sSummary[f * blockDim.x];
 }
 
 // Dense ECHO term folded into the zloss CE backward: source is the shipped
@@ -4460,25 +4518,46 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss_echo(
 	}
 }
 
+// Standalone dense ECHO field for detached gradient-attribution passes.  The
+// sparse positive term is added by echo_scatter_bf16[_weighted] immediately
+// afterward, matching the decomposition used by the combined training kernel.
+__global__ void echo_dense_backward_bf16(
+    const unsigned short* __restrict__ probs,
+    float echoCoef,
+    const float* __restrict__ PA,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	const int row = blockIdx.x;
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float eterm = __fmul_rn(-echoCoef, PA[row]);
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		dRow[i] = bf16_store(__fmul_rn(eterm, bf16_load(pRow[i])));
+}
+
 // Sparse ECHO scatter. activeWeights is null for the hard hinge and stores
-// h'(p-margin) for the optional Huberized knee.
+// h'(p-margin) at original owner slots for the optional Huberized knee.
 __global__ void echo_scatter_bf16_kernel(
     const unsigned short* __restrict__ probs,
-    const int* __restrict__ activeIds,
+    const int* __restrict__ tokens,
+    const uint32_t* __restrict__ activeBits,
     const float* __restrict__ activeWeights,
-    const int* __restrict__ activeCount,
     float echoCoef, int V, int w,
     unsigned short* __restrict__ dlogits)
 {
 	const int t = blockIdx.x;
-	const int cnt = activeCount[t];
-	for (int k = threadIdx.x; k < cnt; k += blockDim.x)
+	const int bitWords = (w + 31) / 32;
+	const int wEff = (t + 1 < w) ? (t + 1) : w;
+	const int base = t - wEff + 1;
+	for (int s = threadIdx.x; s < wEff; s += blockDim.x)
 	{
-		const size_t slot = (size_t)t * w + k;
-		const int id = activeIds[slot];
+		const uint32_t bits = activeBits[(size_t)t * bitWords + (s >> 5)];
+		if ((bits & (1u << (s & 31))) == 0u) continue;
+		const int id = tokens[base + s];
 		if (id < 0 || id >= V) continue;
 		const size_t off = (size_t)t * V + id;
-		const float weight = activeWeights ? activeWeights[slot] : 1.0f;
+		const float weight = activeWeights ? activeWeights[(size_t)t * w + s] : 1.0f;
 		const float weightedP = __fmul_rn(weight, bf16_load(probs[off]));
 		const float add = __fmul_rn(echoCoef, weightedP);
 		const float d = __fadd_rn(bf16_load(dlogits[off]), add);
@@ -4681,7 +4760,7 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
                              const int* targets, int T, int V, int w,
                              float kappa, float tau0, float huberDelta,
-                             float* PA, float* Rrow, int* activeIds,
+                             float* PA, float* Rrow, uint32_t* activeBits,
                              float* activeWeights, int* activeCount,
                              float* maxActiveProb)
 {
@@ -4689,11 +4768,12 @@ bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
 	if (w < 1 || w > 1024 || huberDelta < 0.0f) return false;
 	int hashSize = 2;
 	while (hashSize < 2 * w) hashSize <<= 1;
-	const int smem = w * 3 * (int)sizeof(float) + w * (int)sizeof(int)
+	const int bitWords = (w + 31) / 32;
+	const int smem = w * 3 * (int)sizeof(float) + bitWords * (int)sizeof(uint32_t)
 	               + hashSize * 3 * (int)sizeof(int);
 	echo_repeat_stats_kernel<<<T, w, smem, computeStream()>>>(
 	    probs, tokens, targets, T, V, w, hashSize, kappa, tau0, huberDelta,
-	    PA, Rrow, activeIds, activeWeights, activeCount, maxActiveProb);
+	    PA, Rrow, activeBits, activeWeights, activeCount, maxActiveProb);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -4701,10 +4781,24 @@ bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
 bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
                        const int* targets, int T, int V, int w,
                        float kappa, float tau0,
-                       float* PA, float* Rrow, int* activeIds, int* activeCount)
+                       float* PA, float* Rrow, uint32_t* activeBits,
+                       int* activeCount)
 {
 	return echo_repeat_stats_huber(probs, tokens, targets, T, V, w,
-	    kappa, tau0, 0.0f, PA, Rrow, activeIds, NULL, activeCount, NULL);
+	    kappa, tau0, 0.0f, PA, Rrow, activeBits, NULL, activeCount, NULL);
+}
+
+bool echo_summarize_stats(const float* Rrow, const float* PA,
+                          const float* maxActiveProb, const int* activeCount,
+                          int T, float* summary)
+{
+	if (T <= 0) return true;
+	const int block = 256;
+	const int smem = ECHO_SUMMARY_SIZE * block * (int)sizeof(float);
+	echo_summarize_stats_kernel<<<1, block, smem, computeStream()>>>(
+	    Rrow, PA, maxActiveProb, activeCount, T, summary);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
 }
 
 bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
@@ -4724,10 +4818,22 @@ bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
 	return true;
 }
 
+bool echo_dense_bwd_bf16(const unsigned short* probs, float echoCoef,
+                          const float* PA, int rows, int cols,
+                          unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	const int block = rowBlockSize(cols);
+	echo_dense_backward_bf16<<<rows, block, 0, computeStream()>>>(
+	    probs, echoCoef, PA, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool echo_scatter_bf16_weighted(const unsigned short* probs,
-                                const int* activeIds,
-                                const float* activeWeights,
-                                const int* activeCount, float echoCoef,
+                                const int* tokens,
+                                const uint32_t* activeBits,
+                                const float* activeWeights, float echoCoef,
                                 int rows, int cols, int w,
                                 unsigned short* dlogits)
 {
@@ -4735,17 +4841,17 @@ bool echo_scatter_bf16_weighted(const unsigned short* probs,
 	if (w < 1 || w > 1024) return false;
 	int block = (w < 32) ? 32 : ((w > 256) ? 256 : w);
 	echo_scatter_bf16_kernel<<<rows, block, 0, computeStream()>>>(
-	    probs, activeIds, activeWeights, activeCount,
+	    probs, tokens, activeBits, activeWeights,
 	    echoCoef, cols, w, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 
-bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
-                       const int* activeCount, float echoCoef,
+bool echo_scatter_bf16(const unsigned short* probs, const int* tokens,
+                       const uint32_t* activeBits, float echoCoef,
                        int rows, int cols, int w, unsigned short* dlogits)
 {
-	return echo_scatter_bf16_weighted(probs, activeIds, NULL, activeCount,
+	return echo_scatter_bf16_weighted(probs, tokens, activeBits, NULL,
 	    echoCoef, rows, cols, w, dlogits);
 }
 

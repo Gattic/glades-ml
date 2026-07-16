@@ -108,22 +108,47 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 // transformer_chiron_ops.h.  Training-only readout regularizer; the trainer
 // dispatches none of these at --echo-coef 0 (E0 discipline).
 // Per-row excess-copy stats over the trailing w-token window: PA[T] (dense
-// gradient mass), Rrow[T] (hinge loss terms), activeIds[T*w] (first cnt slots
-// per row), activeCount[T].  blockDim == w; w in [1, 1024].  The legacy entry
-// point is the exact hard hinge.  The Huber entry point implements
+// gradient mass), Rrow[T] (hinge loss terms), activeBits[T*ceil(w/32)] (owner
+// window-slot bitmap), activeCount[T].  Keeping owner slots rather than copied
+// vocabulary ids cuts hard-mode scratch from O(T*w) ints to O(T*w/32) words;
+// scatter recovers each id from tokens.  blockDim == w; w in [1, 1024].  The
+// legacy entry point is the exact hard hinge.  The Huber entry point implements
 // h_delta(x)=x^2/(2delta) for 0<x<delta and x-delta/2 for x>=delta;
-// activeWeights stores h'_delta(x), PA=sum(p*h'), and maxActiveProb is an
-// optional per-row diagnostic.  Nullable outputs avoid extra hard-hinge state.
+// activeWeights[T*w] stores h'_delta(x) at the original owner slot (only bits
+// marked active are valid), PA=sum(p*h'), and maxActiveProb is an optional
+// per-row diagnostic.
 bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
                        const int* targets, int T, int V, int w,
                        float kappa, float tau0,
-                       float* PA, float* Rrow, int* activeIds, int* activeCount);
+                       float* PA, float* Rrow, uint32_t* activeBits,
+                       int* activeCount);
 bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
                              const int* targets, int T, int V, int w,
                              float kappa, float tau0, float huberDelta,
-                             float* PA, float* Rrow, int* activeIds,
+                             float* PA, float* Rrow, uint32_t* activeBits,
                              float* activeWeights, int* activeCount,
                              float* maxActiveProb);
+// Compact GPU telemetry summary, avoiding four O(T) device-to-host copies per
+// training step.  All fields are floats; count fields are exact for supported
+// T/w.  maxActiveProb uses max reduction while all other fields use sum.
+enum EchoSummaryIndex
+{
+	ECHO_SUM_R = 0,
+	ECHO_SUM_PA,
+	ECHO_SUM_PMAX,
+	ECHO_MAX_P,
+	ECHO_ACTIVE_ROWS,
+	ECHO_ACTIVE_IDS,
+	ECHO_HIST_0,
+	ECHO_HIST_1,
+	ECHO_HIST_2,
+	ECHO_HIST_3,
+	ECHO_HIST_4,
+	ECHO_SUMMARY_SIZE
+};
+bool echo_summarize_stats(const float* Rrow, const float* PA,
+                          const float* maxActiveProb, const int* activeCount,
+                          int T, float* summary);
 // Shipped zloss CE backward + the dense ECHO term (-echoCoef*PA[t])*probs;
 // bit-identical to softmax_cross_entropy_bwd_bf16_zloss at echoCoef == 0.
 bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
@@ -134,15 +159,22 @@ bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
                                                 const float* PA,
                                                 int rows, int cols,
                                                 unsigned short* dlogits);
+// Dense term of the standalone ECHO-only backward used by detached gradient
+// attribution probes: dlogits[t,v] = -echoCoef*PA[t]*probs[t,v].  Follow with
+// echo_scatter_bf16[_weighted] to complete the exact ECHO field.
+bool echo_dense_bwd_bf16(const unsigned short* probs, float echoCoef,
+                          const float* PA, int rows, int cols,
+                          unsigned short* dlogits);
 // Sparse ECHO scatter.  Hard hinge adds echoCoef*probs[t,id]; the weighted
-// form additionally multiplies by activeWeights[t,k]=h'_delta(p-margin).
-bool echo_scatter_bf16(const unsigned short* probs, const int* activeIds,
-                       const int* activeCount, float echoCoef,
+// form additionally multiplies by activeWeights[t,ownerSlot]=h'_delta(p-margin).
+// tokens + the owner-slot bitmap recover ids without a dense active-id buffer.
+bool echo_scatter_bf16(const unsigned short* probs, const int* tokens,
+                       const uint32_t* activeBits, float echoCoef,
                        int rows, int cols, int w, unsigned short* dlogits);
 bool echo_scatter_bf16_weighted(const unsigned short* probs,
-                                const int* activeIds,
-                                const float* activeWeights,
-                                const int* activeCount, float echoCoef,
+                                const int* tokens,
+                                const uint32_t* activeBits,
+                                const float* activeWeights, float echoCoef,
                                 int rows, int cols, int w,
                                 unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
@@ -1309,11 +1341,14 @@ inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short
 inline bool softmax_forward_bf16_with_lse(const unsigned short*, int, int, unsigned short*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short*, const int*, const float*, float, int, int, unsigned short*) { return false; }
-inline bool echo_repeat_stats(const unsigned short*, const int*, const int*, int, int, int, float, float, float*, float*, int*, int*) { return false; }
-inline bool echo_repeat_stats_huber(const unsigned short*, const int*, const int*, int, int, int, float, float, float, float*, float*, int*, float*, int*, float*) { return false; }
+inline bool echo_repeat_stats(const unsigned short*, const int*, const int*, int, int, int, float, float, float*, float*, uint32_t*, int*) { return false; }
+inline bool echo_repeat_stats_huber(const unsigned short*, const int*, const int*, int, int, int, float, float, float, float*, float*, uint32_t*, float*, int*, float*) { return false; }
+enum EchoSummaryIndex { ECHO_SUM_R = 0, ECHO_SUM_PA, ECHO_SUM_PMAX, ECHO_MAX_P, ECHO_ACTIVE_ROWS, ECHO_ACTIVE_IDS, ECHO_HIST_0, ECHO_HIST_1, ECHO_HIST_2, ECHO_HIST_3, ECHO_HIST_4, ECHO_SUMMARY_SIZE };
+inline bool echo_summarize_stats(const float*, const float*, const float*, const int*, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short*, const int*, const float*, float, float, const float*, int, int, unsigned short*) { return false; }
-inline bool echo_scatter_bf16(const unsigned short*, const int*, const int*, float, int, int, int, unsigned short*) { return false; }
-inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const float*, const int*, float, int, int, int, unsigned short*) { return false; }
+inline bool echo_dense_bwd_bf16(const unsigned short*, float, const float*, int, int, unsigned short*) { return false; }
+inline bool echo_scatter_bf16(const unsigned short*, const int*, const uint32_t*, float, int, int, int, unsigned short*) { return false; }
+inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const uint32_t*, const float*, float, int, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
