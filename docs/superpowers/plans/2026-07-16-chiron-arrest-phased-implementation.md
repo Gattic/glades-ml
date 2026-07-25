@@ -177,6 +177,15 @@ measured resource bar improves; neither pass may weaken G1/G2.
 - **Dependencies:** reviewed docs at `1a1df09f8` or a documented successor.
 - **GPU:** forbidden.
 - **Exit:** M0 PASS.
+- **Execution status (2026-07-25):** **M0 PASS**. The real 384-row calibration index,
+  512-row training manifest, and 128-row evaluation manifest reproduced byte-for-byte. The logical
+  corpus digest is `62b69479629b6683bc62e05fa71053cf26f9f0eca09025ac782184b38c49e10c`;
+  local verification packet SHA-256 is
+  `0636f4391764af3bddee0bab016eee0c1d2ddf9baf7d02b9b143fb2bce1c5bcd`. Evidence and privacy
+  boundaries are recorded in the companion trainer's `research/generation-aware/README.md` at
+  `1e139e48cc419916b5d9c302faa0a20641370135`. P1/G0a
+  remains pending; M0 does not authorize model inference, training, P2 collection, or any E1b model
+  claim.
 
 ### P0.1 Manifest generator and schemas
 
