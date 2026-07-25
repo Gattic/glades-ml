@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-16
 
-**Status:** execution plan; no GPU run or objective implementation is authorized by this document
+**Status:** post-285k E1b diagnosis closed; ARREST execution plan; no ARREST GPU run or objective implementation is authorized by this document
 
 **Normative sources:**
 
@@ -14,8 +14,85 @@ This document converts the reviewed design into dependency-ordered engineering p
 with the normative sources, the stricter stop rule or acceptance bar wins.
 
 > **Operational boundary.** Phases 0 and 1 are CPU/documentation work. GPU-dependent tests and Phase 2
-> collection wait for owner scheduling and must not compete with the active causal FineWeb 275k run.
-> Phase 4 loss code does not begin until a fully trained causal checkpoint passes G0a, G0b, and G1.
+> collection wait for owner scheduling. The prior causal FineWeb run has ended, but E1b completion does
+> not authorize an ARREST run. Phase 4 loss code does not begin until a fully trained causal checkpoint
+> passes G0a, G0b, and G1.
+
+---
+
+## 0. Completed prerequisite — post-285k E1b diagnosis (2026-07-25)
+
+The preregistered held-out experiment `exp-chiron-e1b-held-out-factual` is closed. Its scope was limited
+to deciding whether the earlier small-suite signal was a synchronized checkpoint effect (**H-S**) or
+large enough legacy `chiron_generate` synchronization instability (**H-R**). It did not test ARREST and
+did not authorize training, checkpoint mutation, source changes, model attribution, or E2/E3 work.
+
+### E1b integrity and budget
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Frozen manifest E0 | **PASS** | 96 disjoint prompts: 32 factual, 32 multilingual, 32 nonoverlapping FineWeb windows; 24 frozen race sentinels; no EOS in selected FineWeb windows |
+| Synchronized packet integrity | **PASS** | 288/288 packets; zero downloaded-row argmax mismatches; zero nonfinite logits |
+| Legacy packet/command integrity | **PASS** | 360/360 packets; five identical command hashes per checkpoint; zero nonfinite logits |
+| Checkpoint immutability | **PASS** | all three post-run checkpoint SHA-256 values equal their frozen manifest values |
+| Frozen compute budget | **PASS** | exactly 24,192 generated token-forwards; 8,181 wall seconds; 2.2725 GPU-hours, below the 2.5 GPU-hour and 3 wall-hour caps |
+
+The pi harness was restarted during the final legacy arm. The original process tree remained healthy,
+was reattached rather than duplicated, and exited zero. No arm was rerun.
+
+### Preregistered conclusions
+
+For H-S, each confirmatory subgroup had to pass all four core bars after the fixed Bonferroni correction.
+Positive distinct-4 deltas and negative max-run deltas denote improvement, not regression.
+
+| 305k−285k subgroup | Distinct-4 delta (bar `<=−0.03`) | One-sided 97.5% bootstrap upper bound (bar `<0`) | Max-run delta (bar `>=+1.5`) | Worsened fraction (bar `>=60%`) | Verdict |
+|---|---:|---:|---:|---:|---|
+| Factual (`n=32`) | `+0.009221` | `+0.035348` | `−0.1875` | `37.5%` | **H-S FAIL** |
+| Multilingual (`n=32`) | `+0.005635` | `+0.016906` | `−2.09375` | `15.625%` | **H-S FAIL** |
+
+The three specificity controls all passed: in-domain distinct-4 delta `+0.037398 > −0.01`, in-domain
+max-run delta `−9.28125 < +0.5`, and reference NLL delta `−0.010846 < +0.05` nat. The required 300k
+report also opposed regression: factual distinct-4/max-run `+0.014344/−0.03125`, multilingual
+`+0.002561/−1.78125`, and reference NLL `−0.009628` nat. Keyword accuracy remained descriptively at
+floor (`0/32` for each subgroup at each checkpoint) and did not enter the decision.
+
+H-R **PASS**: all `24/24` sentinels showed cross-repeat disagreement or disagreement with synchronized
+raw argmax at each checkpoint, with 92 token-level legacy/posthoc-row argmax mismatches overall.
+Legacy subgroup-mean distinct-4 repeat ranges exceeded the preregistered `0.03` sufficiency bar
+(facts: `0.01282/0.03205/0.01923`; multilingual: `0.03846/0.03846/0.05128` at 285k/300k/305k).
+The multilingual matched-repeat 305k−285k deltas reproduced the adverse direction in all five repeats
+(distinct-4 `−0.03205` to `−0.09615`; max-run `+2.5` to `+3.0`). Max-run repeat range alone did not
+reach its alternative `1.0` bar.
+
+The frozen decision matrix therefore resolves **H-S FAIL / H-R sufficient PASS → evaluation artifact**.
+The held-out synchronized data do not support a post-285k factual or multilingual model regression;
+the legacy unsynchronized generation path is sufficiently unstable to explain the earlier small-suite
+direction. ARREST efficacy gates must not consume legacy unsynchronized generations. P2.1's explicit
+compute-to-transfer ordering, transfer-stream synchronization, and row-equality regression test are now
+preconditions for collector evidence. This diagnosis prioritizes that correctness work but does not
+advance any ARREST phase or authorize a follow-up run.
+
+### Evidence and immutable hashes
+
+Artifact root: `/home/robert/dev/glades-trainer/logs/chiron_e1b_20260725/`
+
+| Artifact | SHA-256 |
+|---|---|
+| `manifest.json` | `a8ca3d3f5dd117d3be898532e0151504bda4e05deaa22186415cf39f71622b6f` |
+| `analysis.json` | `31152eb4f35f1e57a226295e5400c8be6c02cf3613e239c3ef8a69e34e874d7d` |
+| `RESULTS.log` | `8dc65a5b09279959c8d60d013fde715aabb1b4009d1dcb72889a6ccd81d00696` |
+| `checkpoint-sha256-after.txt` | `0c7cb7afb4cfe1104eb293eeeba0372dd21145a97e865aec8f08a8d7e9633118` |
+| `SHA256SUMS` (864 evidence files; excludes itself) | `267ab372d9dd422111989583fa2614a7115726e0f584ec28594f9e9b2518d20d` |
+
+Frozen checkpoint SHA-256 values, reverified after E1b:
+
+- 285k: `921178c25bfabcd0b808bf3bec0a502e0031626293ca36b72b53dbaaea0e4bfc`
+- 300k: `2a70db1b64061f810274346eb6b72ce73d5e0a696ade6f1be07dff890ef42c66`
+- 305k: `01513097b09564aa476b27ea03dce558af4ebca732cf61a423aa61bd579d5c31`
+
+The complete `SHA256SUMS` index was reverified with `sha256sum -c` after terminal analysis; all 864
+entries passed. Raw packets, decoded generations, checkpoints, and logs remain local and are not
+committed.
 
 ---
 
