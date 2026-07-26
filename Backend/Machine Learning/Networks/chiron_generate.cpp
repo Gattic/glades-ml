@@ -440,6 +440,400 @@ bool chiron_tf_eval(const ChironModelDims& dims,
 }
 
 // ---------------------------------------------------------------------------
+// Pure CPU ARREST repetition detector (frozen detector contract v1).
+// ---------------------------------------------------------------------------
+
+ChironRepetitionConfig::ChironRepetitionConfig()
+    : maxPeriod(64)
+    , minCycleSupport(32)
+    , cycleThreshold(0.80f)
+    , repeatLookback(64)
+    , repeatedSpanWindow(128)
+    , minRepeatedSpan(8)
+    , diversityWindow(64)
+    , maxRunThreshold(8)
+    , repeatedSpanThreshold(0.60f)
+    , distinct1Threshold(0.15f)
+    , distinct4Threshold(0.35f)
+    , ngramWindow(128)
+    , maxHazards(16)
+    , minPeriodHazardSupport(8)
+    , hazardThreshold(0.70f)
+    , runConfidenceSpan(8)
+    , ngramConfidenceCount(4)
+    , postOnsetDecay(32.0f)
+{
+}
+
+ChironRepetitionMetrics::ChironRepetitionMetrics()
+    : distinct1(1.0)
+    , distinct2(1.0)
+    , distinct4(1.0)
+    , repeatFraction(0.0)
+    , cycleMax(0.0)
+    , repeatedSpanCoverage(0.0)
+    , cyclePeriod(0)
+    , longestSuffixCopy(0)
+    , maxRun(0)
+    , collapseOnset(-1)
+    , collapsed(false)
+{
+}
+
+ChironHazardRow::ChironHazardRow()
+    : count(0), overflow(false)
+{
+    for (int i = 0; i < 16; ++i)
+    {
+        tokenIds[i] = -1;
+        confidence[i] = 0.0f;
+    }
+}
+
+namespace {
+
+double repetition_distinct_range(const std::vector<int>& x,
+                                  int begin, int end, int ngram)
+{
+    const int length = end - begin;
+    if (ngram <= 0 || length < ngram) return 1.0;
+    std::set< std::vector<int> > unique;
+    for (int i = begin; i + ngram <= end; ++i)
+        unique.insert(std::vector<int>(x.begin() + i, x.begin() + i + ngram));
+    const int total = length - ngram + 1;
+    return total > 0 ? (double)unique.size() / (double)total : 1.0;
+}
+
+void repetition_lcp_table(const std::vector<int>& x,
+                          std::vector< std::vector<int> >& lcp)
+{
+    const int n = (int)x.size();
+    lcp.assign((size_t)n + 1, std::vector<int>((size_t)n + 1, 0));
+    for (int i = n - 1; i >= 0; --i)
+        for (int j = n - 1; j >= 0; --j)
+            if (x[i] == x[j]) lcp[i][j] = 1 + lcp[i + 1][j + 1];
+}
+
+double repetition_span_coverage(const std::vector< std::vector<int> >& lcp,
+                                int prefixLength,
+                                const ChironRepetitionConfig& config)
+{
+    if (prefixLength <= 0 || config.repeatedSpanWindow <= 0 ||
+        config.minRepeatedSpan <= 0)
+        return 0.0;
+
+    const int windowBegin = std::max(0, prefixLength - config.repeatedSpanWindow);
+    const int windowLength = prefixLength - windowBegin;
+    std::vector<int> difference((size_t)windowLength + 1, 0);
+
+    for (int current = windowBegin; current < prefixLength; ++current)
+    {
+        for (int earlier = 0; earlier < current; ++earlier)
+        {
+            int length = lcp[earlier][current];
+            const int available = prefixLength - current;
+            if (length > available) length = available;
+            if (length < config.minRepeatedSpan) continue;
+
+            int a0 = std::max(windowBegin, earlier);
+            int a1 = std::min(prefixLength, earlier + length);
+            if (a0 < a1)
+            {
+                ++difference[a0 - windowBegin];
+                --difference[a1 - windowBegin];
+            }
+            int b0 = current;
+            int b1 = std::min(prefixLength, current + length);
+            if (b0 < b1)
+            {
+                ++difference[b0 - windowBegin];
+                --difference[b1 - windowBegin];
+            }
+        }
+    }
+
+    int active = 0, covered = 0;
+    for (int i = 0; i < windowLength; ++i)
+    {
+        active += difference[i];
+        if (active > 0) ++covered;
+    }
+    return windowLength > 0 ? (double)covered / (double)windowLength : 0.0;
+}
+
+double repetition_cycle_score(const std::vector<int>& x,
+                              int prefixLength, int period, int support)
+{
+    if (period <= 0 || support <= 0 || prefixLength < period + support)
+        return -1.0;
+    const int start = prefixLength - support;
+    int matches = 0;
+    for (int i = start; i < prefixLength; ++i)
+        if (x[i] == x[i - period]) ++matches;
+    return (double)matches / (double)support;
+}
+
+int repetition_longest_suffix_copy(const std::vector< std::vector<int> >& lcp,
+                                   int length)
+{
+    int best = 0;
+    for (int suffix = 1; suffix < length; ++suffix)
+    {
+        const int suffixLength = length - suffix;
+        if (suffixLength <= best) continue;
+        for (int earlier = 0; earlier < suffix; ++earlier)
+        {
+            if (lcp[earlier][suffix] >= suffixLength)
+            {
+                best = suffixLength;
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+struct RepetitionCandidate
+{
+    int token;
+    float confidence;
+    RepetitionCandidate(int t, float c) : token(t), confidence(c) {}
+};
+
+void repetition_add_candidate(std::vector<RepetitionCandidate>& candidates,
+                              int token, float confidence)
+{
+    if (confidence < 0.0f) confidence = 0.0f;
+    if (confidence > 1.0f) confidence = 1.0f;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        if (candidates[i].token == token)
+        {
+            if (confidence > candidates[i].confidence)
+                candidates[i].confidence = confidence;
+            return;
+        }
+    }
+    candidates.push_back(RepetitionCandidate(token, confidence));
+}
+
+struct RepetitionCandidateOrder
+{
+    bool operator()(const RepetitionCandidate& a,
+                    const RepetitionCandidate& b) const
+    {
+        if (a.confidence != b.confidence) return a.confidence > b.confidence;
+        return a.token < b.token;
+    }
+};
+
+int repetition_suffix_run(const std::vector<int>& x, int prefixLength)
+{
+    if (prefixLength <= 0) return 0;
+    int run = 1;
+    for (int i = prefixLength - 1; i > 0 && x[i] == x[i - 1]; --i) ++run;
+    return run;
+}
+
+} // anonymous namespace
+
+void chiron_repetition_metrics(const std::vector<int>& generated,
+                               const ChironRepetitionConfig& config,
+                               ChironRepetitionMetrics& out)
+{
+    out = ChironRepetitionMetrics();
+    const int n = (int)generated.size();
+    out.distinct1 = repetition_distinct_range(generated, 0, n, 1);
+    out.distinct2 = repetition_distinct_range(generated, 0, n, 2);
+    out.distinct4 = repetition_distinct_range(generated, 0, n, 4);
+    if (n == 0) return;
+
+    out.maxRun = 1;
+    int run = 1, repeated = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (i > 0)
+        {
+            if (generated[i] == generated[i - 1]) ++run;
+            else run = 1;
+            if (run > out.maxRun) out.maxRun = run;
+        }
+        if (config.repeatLookback > 0)
+        {
+            const int begin = std::max(0, i - config.repeatLookback);
+            for (int j = begin; j < i; ++j)
+            {
+                if (generated[j] == generated[i]) { ++repeated; break; }
+            }
+        }
+    }
+    out.repeatFraction = (double)repeated / (double)n;
+
+    std::vector< std::vector<int> > lcp;
+    repetition_lcp_table(generated, lcp);
+    out.longestSuffixCopy = repetition_longest_suffix_copy(lcp, n);
+
+    int currentRun = 0;
+    const int maxPeriod = std::max(0, std::min(64, config.maxPeriod));
+    for (int prefix = 1; prefix <= n; ++prefix)
+    {
+        if (prefix == 1 || generated[prefix - 1] != generated[prefix - 2]) currentRun = 1;
+        else ++currentRun;
+
+        bool cycleCollapsed = false;
+        if (maxPeriod > 0 && config.minCycleSupport > 0)
+        {
+            for (int period = 1; period <= maxPeriod; ++period)
+            {
+                const int support = std::max(config.minCycleSupport, 2 * period);
+                const double score = repetition_cycle_score(generated, prefix, period, support);
+                if (score < 0.0) continue;
+                if (score > out.cycleMax ||
+                    (score == out.cycleMax &&
+                     (out.cyclePeriod == 0 || period < out.cyclePeriod)))
+                {
+                    out.cycleMax = score;
+                    out.cyclePeriod = period;
+                }
+                if (score >= (double)config.cycleThreshold) cycleCollapsed = true;
+            }
+        }
+
+        const double coverage = repetition_span_coverage(lcp, prefix, config);
+        if (coverage > out.repeatedSpanCoverage) out.repeatedSpanCoverage = coverage;
+
+        bool diversityCollapsed = false;
+        if (config.diversityWindow > 0 && prefix >= config.diversityWindow)
+        {
+            const int begin = prefix - config.diversityWindow;
+            const double d1 = repetition_distinct_range(generated, begin, prefix, 1);
+            const double d4 = repetition_distinct_range(generated, begin, prefix, 4);
+            diversityCollapsed = d1 <= (double)config.distinct1Threshold &&
+                                 d4 <= (double)config.distinct4Threshold;
+        }
+
+        const bool runCollapsed = config.maxRunThreshold > 0 &&
+                                  currentRun >= config.maxRunThreshold;
+        const bool spanCollapsed = config.repeatedSpanWindow > 0 &&
+                                   config.minRepeatedSpan > 0 &&
+                                   coverage >= (double)config.repeatedSpanThreshold;
+        if (out.collapseOnset < 0 &&
+            (runCollapsed || cycleCollapsed || spanCollapsed || diversityCollapsed))
+            out.collapseOnset = prefix - 1;
+    }
+    out.collapsed = out.collapseOnset >= 0;
+}
+
+void chiron_repetition_hazards(const std::vector<int>& generated,
+                               const ChironRepetitionConfig& config,
+                               std::vector<ChironHazardRow>& rows,
+                               std::vector<float>& rowWeights)
+{
+    const int n = (int)generated.size();
+    rows.assign((size_t)n, ChironHazardRow());
+    rowWeights.assign((size_t)n, 0.0f);
+
+    ChironRepetitionMetrics metrics;
+    chiron_repetition_metrics(generated, config, metrics);
+    const int maxPeriod = std::max(0, std::min(64, config.maxPeriod));
+    const int effectiveCap = std::max(0, std::min(16, config.maxHazards));
+
+    for (int t = 0; t < n; ++t)
+    {
+        std::vector<RepetitionCandidate> candidates;
+
+        const int suffixRun = repetition_suffix_run(generated, t);
+        if (suffixRun >= 2 && config.runConfidenceSpan > 0)
+        {
+            float confidence = (float)suffixRun / (float)config.runConfidenceSpan;
+            repetition_add_candidate(candidates, generated[t - 1], confidence);
+        }
+
+        if (maxPeriod > 0 && config.minCycleSupport > 0 &&
+            config.minPeriodHazardSupport > 0)
+        {
+            for (int period = 1; period <= maxPeriod && period < t; ++period)
+            {
+                const int target = std::max(config.minCycleSupport, 2 * period);
+                const int available = std::min(target, t - period);
+                if (available < config.minPeriodHazardSupport) continue;
+                const double score = repetition_cycle_score(generated, t, period, available);
+                if (score >= (double)config.hazardThreshold)
+                    repetition_add_candidate(candidates, generated[t - period], (float)score);
+            }
+        }
+
+        if (config.ngramWindow > 0 && config.ngramConfidenceCount > 0)
+        {
+            const int windowBegin = std::max(0, t - config.ngramWindow);
+            for (int ngram = 2; ngram <= 8; ++ngram)
+            {
+                const int suffixLength = ngram - 1;
+                const int suffixBegin = t - suffixLength;
+                if (suffixBegin < windowBegin) continue;
+                std::vector<RepetitionCandidate> counts;
+                for (int i = windowBegin; i + ngram <= t; ++i)
+                {
+                    bool match = true;
+                    for (int j = 0; j < suffixLength; ++j)
+                    {
+                        if (generated[i + j] != generated[suffixBegin + j])
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (!match) continue;
+                    const int token = generated[i + suffixLength];
+                    bool found = false;
+                    for (size_t c = 0; c < counts.size(); ++c)
+                    {
+                        if (counts[c].token == token)
+                        {
+                            counts[c].confidence += 1.0f;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) counts.push_back(RepetitionCandidate(token, 1.0f));
+                }
+                for (size_t c = 0; c < counts.size(); ++c)
+                {
+                    const int occurrences = (int)counts[c].confidence;
+                    if (occurrences < 2) continue;
+                    const float confidence = (float)occurrences /
+                                             (float)config.ngramConfidenceCount;
+                    repetition_add_candidate(candidates, counts[c].token, confidence);
+                }
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end(), RepetitionCandidateOrder());
+        ChironHazardRow& row = rows[t];
+        row.overflow = (int)candidates.size() > effectiveCap;
+        row.count = std::min((int)candidates.size(), effectiveCap);
+        for (int i = 0; i < row.count; ++i)
+        {
+            row.tokenIds[i] = candidates[i].token;
+            row.confidence[i] = candidates[i].confidence;
+        }
+
+        const float rowConfidence = candidates.empty() ? 0.0f : candidates[0].confidence;
+        if (metrics.collapseOnset >= 0 && t > metrics.collapseOnset)
+        {
+            if (config.postOnsetDecay > 0.0f)
+            {
+                const int age = t - (metrics.collapseOnset + 1);
+                rowWeights[t] = rowConfidence *
+                    (float)std::exp(-(double)age / (double)config.postOnsetDecay);
+            }
+        }
+        else if (rowConfidence >= config.hazardThreshold)
+            rowWeights[t] = rowConfidence;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // chiron_degeneration_metrics — verbatim port of chiron_infer.cpp:57-77.
 //   distinct4 = unique 4-grams / total 4-grams  (low => repetitive/collapsed)
 //   maxRun    = longest run of identical consecutive tokens (high => stuck)

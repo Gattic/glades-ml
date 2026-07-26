@@ -81,7 +81,70 @@ bool chiron_tf_eval(const ChironModelDims& dims, const ChironModelWeights& w,
                     ChironTfResult& out,
                     std::vector<float>* logitsAllOut);
 
-// distinct4 = unique 4-grams / total; maxRun = longest identical-token run.
+// Pure CPU ARREST detector configuration. Defaults are the frozen detector-v1
+// contract; G0a may version these fields before their hashes are frozen.
+struct ChironRepetitionConfig
+{
+	int maxPeriod;
+	int minCycleSupport;
+	float cycleThreshold;
+	int repeatLookback;
+	int repeatedSpanWindow;
+	int minRepeatedSpan;
+	int diversityWindow;
+	int maxRunThreshold;
+	float repeatedSpanThreshold;
+	float distinct1Threshold;
+	float distinct4Threshold;
+	int ngramWindow;
+	int maxHazards;
+	int minPeriodHazardSupport;
+	float hazardThreshold;
+	int runConfidenceSpan;
+	int ngramConfidenceCount;
+	float postOnsetDecay;
+	ChironRepetitionConfig();
+};
+
+struct ChironRepetitionMetrics
+{
+	double distinct1;
+	double distinct2;
+	double distinct4;
+	double repeatFraction;
+	double cycleMax;
+	double repeatedSpanCoverage;
+	int cyclePeriod;
+	int longestSuffixCopy;
+	int maxRun;
+	int collapseOnset;
+	bool collapsed;
+	ChironRepetitionMetrics();
+};
+
+struct ChironHazardRow
+{
+	int tokenIds[16];
+	float confidence[16];
+	int count;
+	bool overflow;
+	ChironHazardRow();
+};
+
+// Pure CPU trajectory metrics. No decoded text, logits, corpus labels, model
+// state, or GPU state enter this API.
+void chiron_repetition_metrics(const std::vector<int>& generated,
+                               const ChironRepetitionConfig& config,
+                               ChironRepetitionMetrics& out);
+
+// Emits generated.size() strict-prefix rows: row t uses generated[0:t].
+void chiron_repetition_hazards(const std::vector<int>& generated,
+                               const ChironRepetitionConfig& config,
+                               std::vector<ChironHazardRow>& rows,
+                               std::vector<float>& rowWeights);
+
+// Compatibility API: distinct4 = unique 4-grams / total; maxRun = longest
+// identical-token run. Outputs remain unchanged by the ARREST detector.
 void chiron_degeneration_metrics(const std::vector<int>& gen,
                                  double& distinct4, int& maxRun);
 

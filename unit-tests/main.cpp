@@ -329,6 +329,8 @@ int main(int argc, char* argv[])
 	    }
 	    else if (strcmp(argv[1], "chiron-model") == 0)
 		CHIRONModelUnitTest();
+	    else if (strcmp(argv[1], "chiron-generate-cpu") == 0)
+		CHIRONGenerateCpuUnitTest();
 	    else if (strcmp(argv[1], "chiron-generate") == 0)
 		CHIRONGenerateUnitTest();
 	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)

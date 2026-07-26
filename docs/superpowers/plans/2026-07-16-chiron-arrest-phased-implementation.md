@@ -308,6 +308,9 @@ Do not commit decoded corpus excerpts, model outputs, checkpoints, or raw logs.
 - **Dependencies:** P0/M0.
 - **GPU:** CPU implementation/tests may run while GPU is occupied.
 - **Exit:** G0a PASS and frozen detector hash.
+- **Execution status (2026-07-26):** P1.1–P1.2 detector engineering and the GPU-free
+  `chiron-generate-cpu` selector pass. P1.3 and calibration G0a remain pending; no detector/config hash
+  is frozen for G0b, and this engineering result does not authorize P2 or model evaluation.
 
 ### P1.1 Public detector API
 
@@ -320,11 +323,24 @@ Do not commit decoded corpus excerpts, model outputs, checkpoints, or raw logs.
 
 ```cpp
 struct ChironRepetitionConfig {
-    int maxPeriod;          // 64
-    int minCycleSupport;    // 32; effective support=max(32,2p)
-    float cycleThreshold;   // .80
-    int ngramWindow;        // 128
-    int maxHazards;         // 16
+    int maxPeriod;                    // 64
+    int minCycleSupport;              // 32; effective support=max(32,2p)
+    float cycleThreshold;             // .80
+    int repeatLookback;               // 64
+    int repeatedSpanWindow;           // 128
+    int minRepeatedSpan;              // 8
+    int diversityWindow;              // 64
+    int maxRunThreshold;              // 8
+    float repeatedSpanThreshold;      // .60
+    float distinct1Threshold;         // .15
+    float distinct4Threshold;         // .35
+    int ngramWindow;                  // 128
+    int maxHazards;                   // 16
+    int minPeriodHazardSupport;       // 8
+    float hazardThreshold;            // .70
+    int runConfidenceSpan;            // 8
+    int ngramConfidenceCount;         // 4
+    float postOnsetDecay;             // 32 tokens
     ChironRepetitionConfig();
 };
 
@@ -351,15 +367,53 @@ void chiron_repetition_hazards(const std::vector<int>& generated,
                                std::vector<float>& rowWeights);
 ```
 
-Keep `chiron_degeneration_metrics(...)` unchanged as a wrapper returning the legacy distinct-4/max-run
-values.
+Keep `chiron_degeneration_metrics(...)` unchanged as the lightweight compatibility API returning the
+legacy distinct-4/max-run values; it must not invoke the heavier detector path.
+
+**Frozen detector contract v1 (2026-07-26)**
+
+- Token indices are zero-based. `collapseOnset` is the first token index completing any collapse clause,
+  or `-1`. `collapsed` is first-hitting and therefore remains true after onset.
+- Public distinct-1/2/4, max-run, and repeat-fraction metrics cover the whole supplied trajectory.
+  Repeat fraction counts a position when the same token occurs in its preceding `repeatLookback`
+  positions. `cycleMax` is the maximum exact-match fraction over all full supports
+  `max(minCycleSupport,2p)`; ties retain the smaller period.
+- Repeated-span coverage is the maximum, over trajectory prefixes, fraction of the trailing
+  `repeatedSpanWindow` covered by either occurrence of an exact repeated span of at least
+  `minRepeatedSpan`. Earlier/current occurrences may overlap. `longestSuffixCopy` is the longest final
+  suffix equal to a substring beginning at a strictly earlier index, with overlap allowed.
+- The first-hitting collapse event is exactly: run length `>=maxRunThreshold`; full-support cycle score
+  `>=cycleThreshold`; repeated-span coverage `>=repeatedSpanThreshold`; or, once
+  `diversityWindow` tokens exist, trailing-window distinct-1 `<=distinct1Threshold` and distinct-4
+  `<=distinct4Threshold`.
+- `chiron_repetition_hazards` emits exactly `generated.size()` rows. Row `t` is the state before token
+  `t` and may inspect only `generated[0:t]`; row zero is empty. Appending arbitrary future tokens must
+  leave every pre-existing row and weight byte-identical.
+- Run continuation is the current suffix token after a run of at least two, with confidence
+  `min(1,runLength/runConfidenceSpan)`. Period continuation uses the token at offset `p` and the exact
+  trailing match fraction over up to `max(minCycleSupport,2p)` comparisons, requires at least
+  `minPeriodHazardSupport` comparisons, and enters only at `hazardThreshold`. N-gram closure searches
+  `n=2..8` in the trailing `ngramWindow`, requires the same suffix-plus-token n-gram at least twice,
+  and uses confidence `min(1,occurrences/ngramConfidenceCount)`.
+- Candidates deduplicate by token ID at maximum confidence. Ordering is descending confidence then
+  ascending token ID. `maxHazards` is clamped to the fixed row capacity 16; `overflow` reports any
+  unique candidate beyond the effective cap.
+- Row confidence is the maximum retained pre-cap candidate confidence. Because row `t` precedes token
+  `t`, the first post-onset state is `t=collapseOnset+1`; no hindsight label is applied to the row that
+  emits the onset token. Before that state, weight equals confidence only when it is at least
+  `hazardThreshold`. For `t>collapseOnset`, weight is
+  `confidence*exp(-(t-(collapseOnset+1))/postOnsetDecay)`. Otherwise weight is zero. A nonpositive
+  decay disables post-onset weighting rather than producing a nonfinite value.
+- No future tokens, decoded strings, post-decoder logits, corpus labels, model state, or GPU state enter
+  metrics or hazard construction. All invalid/nonpositive window/support settings produce bounded empty
+  evidence rather than out-of-range access.
 
 **Implementation rules**
 
-- metrics search periods 1–64 with support `max(32,2p)`;
+- metrics search periods 1–64 with support `max(32,2p)` under the configurable v1 defaults;
 - hazards use only `generated[0:t]`: run continuation, period continuation, n-gram closure 2–8;
-- deduplicate by token ID, retain maximum confidence, sort deterministically, expose overflow;
-- no future tokens, decoded strings, post-decoder logits, or corpus labels enter hazard construction.
+- deduplicate by token ID, retain maximum confidence, apply the frozen ordering, and expose overflow;
+- keep `chiron_degeneration_metrics(...)` outputs bit-exact for empty, short, and ordinary inputs.
 
 ### P1.2 Detector tests and selectors
 

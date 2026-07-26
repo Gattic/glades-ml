@@ -441,6 +441,310 @@ void CHIRONDegenMetricsTest()
 }
 
 // ---------------------------------------------------------------------------
+// Tests 4b-4d: ARREST detector-v1 pure CPU contract.
+// ---------------------------------------------------------------------------
+
+static int hazard_token_index(const glades::chiron::ChironHazardRow& row, int token)
+{
+	for (int i = 0; i < row.count; ++i) if (row.tokenIds[i] == token) return i;
+	return -1;
+}
+
+void CHIRONRepetitionMetricsTest()
+{
+	glades::chiron::ChironRepetitionConfig cfg;
+	ASSERT("detector max period default", cfg.maxPeriod == 64);
+	ASSERT("detector cycle support default", cfg.minCycleSupport == 32);
+	ASSERT("detector cycle threshold default", cfg.cycleThreshold == 0.80f);
+	ASSERT("detector repeat lookback default", cfg.repeatLookback == 64);
+	ASSERT("detector span window default", cfg.repeatedSpanWindow == 128);
+	ASSERT("detector min span default", cfg.minRepeatedSpan == 8);
+	ASSERT("detector diversity window default", cfg.diversityWindow == 64);
+	ASSERT("detector onset threshold default", cfg.maxRunThreshold == 8);
+	ASSERT("detector span threshold default", cfg.repeatedSpanThreshold == 0.60f);
+	ASSERT("detector distinct1 threshold default", cfg.distinct1Threshold == 0.15f);
+	ASSERT("detector distinct4 threshold default", cfg.distinct4Threshold == 0.35f);
+	ASSERT("detector ngram window default", cfg.ngramWindow == 128);
+	ASSERT("detector hazard cap default", cfg.maxHazards == 16);
+	ASSERT("detector period evidence default", cfg.minPeriodHazardSupport == 8);
+	ASSERT("detector hazard threshold default", cfg.hazardThreshold == 0.70f);
+	ASSERT("detector run confidence default", cfg.runConfidenceSpan == 8);
+	ASSERT("detector ngram confidence default", cfg.ngramConfidenceCount == 4);
+	ASSERT("detector post-onset decay default", cfg.postOnsetDecay == 32.0f);
+
+	// Empty and short input stay finite and non-collapsed.
+	{
+		std::vector<int> empty;
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(empty, cfg, m);
+		ASSERT("detector empty d1", m.distinct1 == 1.0);
+		ASSERT("detector empty d4", m.distinct4 == 1.0);
+		ASSERT("detector empty run", m.maxRun == 0);
+		ASSERT("detector empty onset", m.collapseOnset == -1 && !m.collapsed);
+		const int shortValues[] = {1, 2, 1};
+		std::vector<int> shortInput(shortValues, shortValues + 3);
+		glades::chiron::chiron_repetition_metrics(shortInput, cfg, m);
+		ASSERT("detector short d4", m.distinct4 == 1.0);
+		ASSERT("detector short no collapse", !m.collapsed);
+	}
+
+	// Constant collapse is first-hit by the eighth token (zero-based index 7).
+	{
+		std::vector<int> x(40, 5);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("detector constant max run", m.maxRun == 40);
+		ASSERT("detector constant onset", m.collapseOnset == 7 && m.collapsed);
+		ASSERT("detector constant repeat fraction", std::fabs(m.repeatFraction - 39.0 / 40.0) < 1e-12);
+	}
+
+	// Every supported fundamental period reaches a perfect full-support cycle.
+	const int periods[] = {2, 3, 8, 16, 32, 64};
+	for (int pi = 0; pi < 6; ++pi)
+	{
+		const int period = periods[pi];
+		std::vector<int> x;
+		for (int i = 0; i < 200; ++i) x.push_back(100 + (i % period));
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		char msg[96];
+		std::sprintf(msg, "detector period %d score", period);
+		ASSERT(msg, m.cycleMax == 1.0);
+		std::sprintf(msg, "detector period %d identity", period);
+		ASSERT(msg, m.cyclePeriod == period);
+		std::sprintf(msg, "detector period %d collapsed", period);
+		ASSERT(msg, m.collapsed);
+	}
+
+	// Two exact 64-token spans are fully covered, without requiring cycle-64
+	// support (which needs 192 tokens).
+	{
+		std::vector<int> x;
+		for (int i = 0; i < 64; ++i) x.push_back(1000 + i);
+		for (int i = 0; i < 64; ++i) x.push_back(1000 + i);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("detector repeated span coverage", m.repeatedSpanCoverage == 1.0);
+		ASSERT("detector repeated span collapse", m.collapsed);
+		ASSERT("detector suffix copy overlap", m.longestSuffixCopy == 64);
+	}
+
+	// A template may retain high distinct-4 while containing repeated local
+	// structure; it must not trip the diversity conjunction by itself.
+	{
+		std::vector<int> x;
+		for (int block = 0; block < 8; ++block)
+		{
+			for (int i = 0; i < 8; ++i) x.push_back(200 + i);
+			for (int i = 0; i < 24; ++i) x.push_back(10000 + block * 24 + i);
+		}
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("detector high-d4 template", m.distinct4 > 0.8);
+		ASSERT("detector high-d4 template not collapsed", !m.collapsed);
+	}
+
+	// Varied soup and a short code-like continuation remain clean.
+	{
+		std::vector<int> soup;
+		for (int i = 0; i < 256; ++i) soup.push_back(5000 + i);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(soup, cfg, m);
+		ASSERT("detector soup d1", m.distinct1 == 1.0);
+		ASSERT("detector soup d4", m.distinct4 == 1.0);
+		ASSERT("detector soup no collapse", !m.collapsed);
+		const int codeValues[] = {10, 20, 30, 123, 40, 41, 59, 11, 21, 31, 123, 42, 43, 59};
+		std::vector<int> code(codeValues, codeValues + 14);
+		glades::chiron::chiron_repetition_metrics(code, cfg, m);
+		ASSERT("detector code delimiters no collapse", !m.collapsed);
+		const int proseValues[] = {
+			301, 7, 302, 11, 303, 7, 304, 12, 305, 7, 306, 13,
+			307, 8, 308, 14, 309, 7, 310, 15, 311, 9, 312, 16,
+			313, 7, 314, 17, 315, 10, 316, 18, 317, 7, 318, 19
+		};
+		std::vector<int> prose(proseValues, proseValues + 36);
+		glades::chiron::chiron_repetition_metrics(prose, cfg, m);
+		ASSERT("detector real-like continuation no collapse", !m.collapsed);
+	}
+
+	// Repeat fraction uses only the preceding configured lookback.
+	{
+		const int values[] = {1, 2, 1, 3};
+		std::vector<int> x(values, values + 4);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("detector repeat fraction", m.repeatFraction == 0.25);
+	}
+
+	// The legacy API remains exactly equal to the new whole-trajectory fields.
+	{
+		std::vector<int> x;
+		for (int i = 0; i < 80; ++i) x.push_back((i * 7 + 3) % 23);
+		double legacyD4 = 0.0; int legacyRun = -1;
+		glades::chiron::chiron_degeneration_metrics(x, legacyD4, legacyRun);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("detector legacy distinct4 exact", legacyD4 == m.distinct4);
+		ASSERT("detector legacy max run exact", legacyRun == m.maxRun);
+	}
+}
+
+void CHIRONRepetitionHazardsTest()
+{
+	// Run confidence and strictly causal pre/post-onset row weights.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.maxPeriod = 0;
+		cfg.ngramWindow = 0;
+		std::vector<int> x(10, 5);
+		x.push_back(9); // supplies a row for the state after ten repeated tokens
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		ASSERT("hazard row count", rows.size() == x.size() && weights.size() == x.size());
+		ASSERT("hazard row zero empty", rows[0].count == 0 && weights[0] == 0.0f);
+		int at2 = hazard_token_index(rows[2], 5);
+		ASSERT("hazard run starts after two", at2 >= 0 && rows[2].confidence[at2] == 0.25f);
+		ASSERT("hazard weak run has zero weight", weights[2] == 0.0f);
+		int at6 = hazard_token_index(rows[6], 5);
+		ASSERT("hazard run candidate", at6 >= 0);
+		ASSERT("hazard run confidence", rows[6].confidence[at6] == 0.75f);
+		ASSERT("hazard run pre-onset weight", weights[6] == 0.75f);
+		ASSERT("hazard onset-emitting row no hindsight", std::fabs(weights[7] - 0.875f) < 1e-7f);
+		ASSERT("hazard first post-onset weight", weights[8] == 1.0f);
+		ASSERT("hazard decayed post-onset weight",
+		       std::fabs(weights[9] - (float)std::exp(-1.0 / 32.0)) < 1e-6f);
+	}
+
+	// A confident period predicts exactly the token p positions back.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.ngramWindow = 0;
+		cfg.repeatedSpanWindow = 0;
+		cfg.diversityWindow = 0;
+		cfg.maxRunThreshold = 0;
+		std::vector<int> x;
+		for (int i = 0; i < 14; ++i) x.push_back(10 + (i % 2));
+		x.push_back(99);
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		int index = hazard_token_index(rows[14], x[12]);
+		ASSERT("hazard period candidate", index >= 0);
+		ASSERT("hazard period confidence", rows[14].confidence[index] == 1.0f);
+		ASSERT("hazard period weight", weights[14] == 1.0f);
+	}
+
+	// N-gram closure requires two observed completions and deduplicates the
+	// same token across n=2 and n=3 at maximum confidence.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.maxPeriod = 0;
+		const int values[] = {1, 2, 3, 1, 2, 3, 1, 2, 99};
+		std::vector<int> x(values, values + 9);
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		ASSERT("hazard ngram dedup count", rows[8].count == 1);
+		ASSERT("hazard ngram token", rows[8].tokenIds[0] == 3);
+		ASSERT("hazard ngram confidence", rows[8].confidence[0] == 0.5f);
+		ASSERT("hazard ngram below weight threshold", weights[8] == 0.0f);
+	}
+
+	// Confidence sorts before token ID, while duplicate evidence retains the
+	// maximum confidence for one token.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.maxPeriod = 0;
+		cfg.ngramConfidenceCount = 8;
+		const int values[] = {5, 3, 5, 3, 5, 3, 5, 5, 5, 5, 5, 5, 99};
+		std::vector<int> x(values, values + 13);
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		ASSERT("hazard confidence order has candidates", rows[12].count >= 2);
+		ASSERT("hazard confidence order first token", rows[12].tokenIds[0] == 5);
+		ASSERT("hazard confidence order descending",
+		       rows[12].confidence[0] > rows[12].confidence[1]);
+		ASSERT("hazard confidence order keeps lower token",
+		       hazard_token_index(rows[12], 3) >= 0);
+	}
+
+	// More than sixteen unique bigram closures sets overflow and retains the
+	// deterministic lowest token IDs when all confidences tie.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.maxPeriod = 0;
+		std::vector<int> x;
+		for (int token = 100; token < 120; ++token)
+		{
+			x.push_back(7); x.push_back(token);
+			x.push_back(7); x.push_back(token);
+		}
+		x.push_back(7);
+		const int state = (int)x.size();
+		x.push_back(999);
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		ASSERT("hazard overflow flag", rows[state].overflow);
+		ASSERT("hazard overflow cap", rows[state].count == 16);
+		for (int i = 0; i < 16; ++i)
+		{
+			char msg[80]; std::sprintf(msg, "hazard overflow order %d", i);
+			ASSERT(msg, rows[state].tokenIds[i] == 100 + i);
+		}
+		cfg.maxHazards = 0;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		ASSERT("hazard zero cap empty", rows[state].count == 0);
+		ASSERT("hazard zero cap overflow", rows[state].overflow);
+	}
+
+	// Invalid/nonpositive evidence settings stay bounded and empty.
+	{
+		glades::chiron::ChironRepetitionConfig cfg;
+		cfg.maxPeriod = 0; cfg.minCycleSupport = 0; cfg.ngramWindow = 0;
+		cfg.runConfidenceSpan = 0; cfg.maxHazards = -1;
+		cfg.repeatedSpanWindow = 0; cfg.diversityWindow = 0; cfg.maxRunThreshold = 0;
+		std::vector<int> x(12, 4);
+		std::vector<glades::chiron::ChironHazardRow> rows;
+		std::vector<float> weights;
+		glades::chiron::chiron_repetition_hazards(x, cfg, rows, weights);
+		for (size_t i = 0; i < rows.size(); ++i)
+			ASSERT("hazard invalid config empty", rows[i].count == 0 && weights[i] == 0.0f);
+		glades::chiron::ChironRepetitionMetrics m;
+		glades::chiron::chiron_repetition_metrics(x, cfg, m);
+		ASSERT("metrics invalid config bounded", !m.collapsed && m.maxRun == 12);
+	}
+}
+
+void CHIRONRepetitionAppendInvariantTest()
+{
+	glades::chiron::ChironRepetitionConfig cfg;
+	std::vector<int> base;
+	for (int i = 0; i < 96; ++i) base.push_back((i % 11) < 8 ? (i % 4) : 1000 + i);
+	std::vector<int> extended(base);
+	for (int i = 0; i < 37; ++i) extended.push_back(7000 + i * 13);
+
+	std::vector<glades::chiron::ChironHazardRow> baseRows, extendedRows;
+	std::vector<float> baseWeights, extendedWeights;
+	glades::chiron::chiron_repetition_hazards(base, cfg, baseRows, baseWeights);
+	glades::chiron::chiron_repetition_hazards(extended, cfg, extendedRows, extendedWeights);
+	ASSERT("hazard append row prefix size", extendedRows.size() > baseRows.size());
+	for (size_t t = 0; t < baseRows.size(); ++t)
+	{
+		ASSERT("hazard append count", baseRows[t].count == extendedRows[t].count);
+		ASSERT("hazard append overflow", baseRows[t].overflow == extendedRows[t].overflow);
+		ASSERT("hazard append weight", baseWeights[t] == extendedWeights[t]);
+		for (int i = 0; i < 16; ++i)
+		{
+			ASSERT("hazard append token", baseRows[t].tokenIds[i] == extendedRows[t].tokenIds[i]);
+			ASSERT("hazard append confidence", baseRows[t].confidence[i] == extendedRows[t].confidence[i]);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Tiny-model fixture helpers for CHIRONTfEvalTest.
 // Replicated from chiron-model-test.cpp (ev_* helpers) — do NOT refactor that
 // file; these are an independent copy, as required by the task brief.
@@ -857,14 +1161,22 @@ void CHIRONGenerateStochasticDrawParityTest()
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate entry.
+// CPU-only and full aggregate entries.
 // ---------------------------------------------------------------------------
-void CHIRONGenerateUnitTest()
+void CHIRONGenerateCpuUnitTest()
 {
 	CHIRONMt19937RawTest();
 	CHIRONMt19937GoldenTest();
 	CHIRONSamplerGoldenTest();
 	CHIRONDegenMetricsTest();
+	CHIRONRepetitionMetricsTest();
+	CHIRONRepetitionHazardsTest();
+	CHIRONRepetitionAppendInvariantTest();
+}
+
+void CHIRONGenerateUnitTest()
+{
+	CHIRONGenerateCpuUnitTest();
 	CHIRONTfEvalTest();
 	CHIRONGenerateTopK1Test();
 	CHIRONGenerateWindowSlideTest();

@@ -670,7 +670,7 @@ cd unit-tests/build && sh .configure.sh cuda # compile with cuda
 cd unit-tests && bash test.sh nnall    # run all tests
 ```
 
-**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`, `chiron-pact`, `chiron-echo` (or `chiron-echo-cpu` for the GPU-free subset), `chiron-orbit`, `chiron-orbit-bench`, `chiron-generate`
+**Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`, `atlas`, `atlas-bench`, `chiron-model`, `chiron`, `chiron-rot`, `chiron-whisc`, `chiron-pied`, `chiron-pact`, `chiron-echo` (or `chiron-echo-cpu` for the GPU-free subset), `chiron-orbit`, `chiron-orbit-bench`, `chiron-generate-cpu`, `chiron-generate`
 
 **Install**: `cd build && make install` (installs to `~/.local`; also installs the ML header tree to `~/.local/include/glades/Backend/Machine Learning/` — required by the trainer since the vendored `include/` was removed)
 
@@ -727,8 +727,9 @@ Glades-ml owns CHIRON checkpoint I/O and serving since 2026-07-03:
   Per-call RNG seeding: the pre-2026-07-03 CLI used one process-level mt19937 shared
   across REPL prompts; one-shot/tokens-file paths are identical, multi-prompt REPL streams differ
   (acknowledged behavior change).
-- **Unit suite**: `bash test.sh chiron-generate` (615+ asserts: RNG/sampler goldens, stochastic
-  draw-parity, TF-eval correctness).
+- **Unit suites**: `bash test.sh chiron-generate-cpu` (GPU-free RNG/sampler goldens plus ARREST
+  detector metrics/hazards/append invariance) and `bash test.sh chiron-generate` (the CPU suite plus
+  stochastic draw-parity and TF-eval correctness).
 
 **Rebuild order** (static kernel link — `make install` alone does NOT update the trainer):
 ```
