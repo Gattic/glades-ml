@@ -46,6 +46,22 @@ struct ChironGenParams
 // Streaming sink: called once per generated token; return false to stop early.
 typedef bool (*ChironTokenSink)(void* ctx, int token);
 
+// Observer view immediately after sampling and before the token is appended or
+// sent to the sink. rawLogits and contextBeforeSample are valid only during the
+// callback. Returning false aborts generation with false and does not commit the
+// sampled token to outTokens/sink.
+struct ChironGenerationStep
+{
+	int step;
+	int logitsRow;
+	int sampledToken;
+	const float* rawLogits;
+	int vocabSize;
+	const std::vector<int>* contextBeforeSample;
+};
+typedef bool (*ChironGenerationStepObserver)(void* ctx,
+                                              const ChironGenerationStep& step);
+
 // Verbatim port of chiron_infer::sampleToken (penalties -> ngram ban ->
 // temperature/softmax -> top-k -> top-p -> single CDF draw).
 int chiron_sample_token(const std::vector<float>& logitsIn,
@@ -53,10 +69,24 @@ int chiron_sample_token(const std::vector<float>& logitsIn,
                         const std::vector<int>& context,
                         ChironMt19937& rng);
 
-// Generation loop (pad-to-T window, keep-last-T slide, one eval forward per
-// token, sample at position useLen-1, append, emit to sink).  promptTokens are
-// clamped to [0,V) as today.  Returns false on forward/scratch failure.
-// outTokens (optional) receives ONLY the generated tokens.
+// Observed generation loop (pad-to-T window, keep-last-T slide, one eval
+// forward per token, sample at position useLen-1, observe, append, emit). Prompt
+// tokens are clamped to [0,V) only in the model input; observer context retains
+// the original accumulated IDs. Returns false on forward/scratch/observer
+// failure. outTokens (optional) receives only successfully committed tokens.
+bool chiron_generate_observed(const ChironModelDims& dims,
+                              const ChironModelWeights& w,
+                              const ChironServingConfig& cfg,
+                              ChironEvalScratch& s,
+                              const std::vector<int>& promptTokens,
+                              const ChironGenParams& gp,
+                              ChironTokenSink sink, void* sinkCtx,
+                              ChironGenerationStepObserver observer,
+                              void* observerCtx,
+                              std::vector<int>* outTokens);
+
+// Source-compatible legacy entry point; exactly the observed path with a null
+// observer.
 bool chiron_generate(const ChironModelDims& dims, const ChironModelWeights& w,
                      const ChironServingConfig& cfg, ChironEvalScratch& s,
                      const std::vector<int>& promptTokens,

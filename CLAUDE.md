@@ -722,7 +722,9 @@ Glades-ml owns CHIRON checkpoint I/O and serving since 2026-07-03:
   **TOOLCHAIN-COUPLED**, pinned by golden-stream unit tests; do not change the RNG
   implementation without re-pinning goldens), `chiron_sample_token` (temperature/top-k/top-p
   + repetition penalty), `chiron_generate` (window-slide loop, sink streaming),
-  `chiron_tf_eval` (**single source of truth for TF-NLL** — used by both chiron_parity and
+  `chiron_generate_observed` (P2.1 causal pre-append callback; legacy generation is the null-observer
+  wrapper and still uses the full-logits download), `chiron_tf_eval` (**single source of truth for
+  TF-NLL** — used by both chiron_parity and
   chiron_infer; do not duplicate this logic), `chiron_degeneration_metrics`.
   Per-call RNG seeding: the pre-2026-07-03 CLI used one process-level mt19937 shared
   across REPL prompts; one-shot/tokens-file paths are identical, multi-prompt REPL streams differ

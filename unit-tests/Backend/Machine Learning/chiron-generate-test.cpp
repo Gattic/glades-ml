@@ -1080,6 +1080,49 @@ static bool sinkCountdown(void* ctx, int /*token*/)
 	return --(*pCount) > 0;
 }
 
+struct GenerationSinkCapture
+{
+	std::vector<int> tokens;
+};
+
+static bool sinkCapture(void* ctx, int token)
+{
+	GenerationSinkCapture* capture = static_cast<GenerationSinkCapture*>(ctx);
+	capture->tokens.push_back(token);
+	return true;
+}
+
+struct GenerationObserverCapture
+{
+	int failStep;
+	bool fieldsValid;
+	std::vector<int> steps;
+	std::vector<int> logitsRows;
+	std::vector<int> sampledTokens;
+	std::vector< std::vector<int> > contexts;
+	std::vector< std::vector<float> > rawRows;
+	GenerationObserverCapture() : failStep(-1), fieldsValid(true) {}
+};
+
+static bool generationObserver(void* ctx,
+                               const glades::chiron::ChironGenerationStep& step)
+{
+	GenerationObserverCapture* capture = static_cast<GenerationObserverCapture*>(ctx);
+	if (step.step != (int)capture->steps.size() || step.logitsRow < 0 ||
+	    step.vocabSize <= 0 || !step.rawLogits || !step.contextBeforeSample)
+		capture->fieldsValid = false;
+	capture->steps.push_back(step.step);
+	capture->logitsRows.push_back(step.logitsRow);
+	capture->sampledTokens.push_back(step.sampledToken);
+	if (step.contextBeforeSample) capture->contexts.push_back(*step.contextBeforeSample);
+	else capture->contexts.push_back(std::vector<int>());
+	std::vector<float> row;
+	if (step.rawLogits && step.vocabSize > 0)
+		row.assign(step.rawLogits, step.rawLogits + step.vocabSize);
+	capture->rawRows.push_back(row);
+	return step.step != capture->failStep;
+}
+
 // ---------------------------------------------------------------------------
 // Reference generation loop: same window/slide/clamp/sample logic as
 // chiron_generate, run on a SEPARATE scratch so the two paths are independent.
@@ -1093,9 +1136,11 @@ static void gen_reference_loop(
 	const std::vector<int>& promptTokens,
 	const glades::chiron::ChironGenParams& gp,
 	int maxSteps,
-	std::vector<int>& outRef)
+	std::vector<int>& outRef,
+	std::vector< std::vector<float> >* outRows = NULL)
 {
 	outRef.clear();
+	if (outRows) outRows->clear();
 	std::vector<int>   tokens(promptTokens);
 	glades::chiron::ChironMt19937 rng(gp.seed);
 	std::vector<int>   input((size_t)dims.T, 0);
@@ -1120,6 +1165,7 @@ static void gen_reference_loop(
 		const int lastPos = useLen - 1;
 		for (int v = 0; v < dims.V; ++v)
 			logitsRow[v] = logitsAll[(size_t)lastPos * (size_t)dims.V + v];
+		if (outRows) outRows->push_back(logitsRow);
 
 		int next = glades::chiron::chiron_sample_token(logitsRow, gp, tokens, rng);
 		tokens.push_back(next);
@@ -1355,6 +1401,141 @@ void CHIRONGenerateStochasticDrawParityTest()
 }
 
 // ---------------------------------------------------------------------------
+// Test 6f: observed generation is a causal, backward-compatible seam.
+// It preserves legacy tokens/sinks/RNG behavior, exposes the exact full-
+// download row used for sampling, and commits nothing when the observer fails.
+// ---------------------------------------------------------------------------
+void CHIRONGenerateObservedTest()
+{
+	glades::chiron::ChironModelDims d = tf_dims();
+	glades::chiron::ChironModelWeights w;
+	tf_fill_core_weights(w, d);
+	glades::chiron::ChironServingConfig cfg;
+	cfg.fuseAttnReln = true;
+	cfg.epsReln = 1e-4f;
+
+	glades::chiron::ChironGenParams gp;
+	gp.topK = 0;
+	gp.topP = 1.0f;
+	gp.temperature = 1.0f;
+	gp.maxTokens = 6;
+	gp.seed = 1337u;
+	const int promptArr[] = {1, 3, 5};
+	std::vector<int> prompt(promptArr, promptArr + 3);
+
+	glades::chiron::ChironEvalScratch legacyScratch, observedScratch, refScratch;
+	ASSERT("observed legacy scratch alloc", legacyScratch.allocate(d, w, cfg));
+	ASSERT("observed api scratch alloc", observedScratch.allocate(d, w, cfg));
+	ASSERT("observed ref scratch alloc", refScratch.allocate(d, w, cfg));
+
+	GenerationSinkCapture legacySink, observedSink;
+	std::vector<int> legacyTokens, observedTokens;
+	ASSERT("observed legacy generate",
+	       glades::chiron::chiron_generate(d, w, cfg, legacyScratch, prompt, gp,
+	                                      sinkCapture, &legacySink, &legacyTokens));
+	GenerationObserverCapture capture;
+	ASSERT("observed generate",
+	       glades::chiron::chiron_generate_observed(
+	           d, w, cfg, observedScratch, prompt, gp,
+	           sinkCapture, &observedSink, generationObserver, &capture,
+	           &observedTokens));
+
+	std::vector<int> refTokens;
+	std::vector< std::vector<float> > refRows;
+	gen_reference_loop(d, w, cfg, refScratch, prompt, gp, gp.maxTokens,
+	                   refTokens, &refRows);
+	ASSERT("observed fields valid", capture.fieldsValid);
+	ASSERT("observed callback count", (int)capture.steps.size() == gp.maxTokens);
+	ASSERT("observed legacy token parity", observedTokens == legacyTokens);
+	ASSERT("observed reference token parity", observedTokens == refTokens);
+	ASSERT("observed legacy sink parity", legacySink.tokens == legacyTokens);
+	ASSERT("observed sink parity", observedSink.tokens == observedTokens);
+	ASSERT("observed row count", capture.rawRows.size() == refRows.size());
+
+	std::vector<int> expectedContext(prompt);
+	for (int i = 0; i < gp.maxTokens; ++i)
+	{
+		ASSERT("observed step index", capture.steps[i] == i);
+		const int expectedRow = (int)expectedContext.size() < d.T ?
+		                        (int)expectedContext.size() - 1 : d.T - 1;
+		ASSERT("observed logits row", capture.logitsRows[i] == expectedRow);
+		ASSERT("observed sampled token", capture.sampledTokens[i] == observedTokens[i]);
+		ASSERT("observed causal context", capture.contexts[i] == expectedContext);
+		ASSERT("observed raw row size", (int)capture.rawRows[i].size() == d.V);
+		ASSERT("observed raw row equality", capture.rawRows[i] == refRows[i]);
+		expectedContext.push_back(observedTokens[i]);
+	}
+
+	// Failure occurs after one ordinary sample draw for step 2 but before that
+	// token is appended or sent to the sink.
+	glades::chiron::ChironEvalScratch failScratch;
+	ASSERT("observer failure scratch alloc", failScratch.allocate(d, w, cfg));
+	GenerationObserverCapture failing;
+	failing.failStep = 2;
+	GenerationSinkCapture failSink;
+	std::vector<int> failTokens;
+	ASSERT("observer failure propagates",
+	       !glades::chiron::chiron_generate_observed(
+	           d, w, cfg, failScratch, prompt, gp,
+	           sinkCapture, &failSink, generationObserver, &failing, &failTokens));
+	ASSERT("observer failure callback count", failing.sampledTokens.size() == 3);
+	ASSERT("observer failure committed count", failTokens.size() == 2);
+	ASSERT("observer failure sink count", failSink.tokens.size() == 2);
+	for (int i = 0; i < 3; ++i)
+		ASSERT("observer failure draw parity", failing.sampledTokens[i] == observedTokens[i]);
+	for (int i = 0; i < 2; ++i)
+	{
+		ASSERT("observer failure token prefix", failTokens[i] == observedTokens[i]);
+		ASSERT("observer failure sink prefix", failSink.tokens[i] == observedTokens[i]);
+	}
+
+	// A normal sink stop remains successful; the observer runs only for the two
+	// tokens that reach the append/sink stage.
+	glades::chiron::ChironEvalScratch stopScratch;
+	ASSERT("observed sink-stop scratch alloc", stopScratch.allocate(d, w, cfg));
+	GenerationObserverCapture stopCapture;
+	int countdown = 2;
+	std::vector<int> stopTokens;
+	ASSERT("observed sink-stop generate",
+	       glades::chiron::chiron_generate_observed(
+	           d, w, cfg, stopScratch, prompt, gp,
+	           sinkCountdown, &countdown, generationObserver, &stopCapture,
+	           &stopTokens));
+	ASSERT("observed sink-stop token count", stopTokens.size() == 2);
+	ASSERT("observed sink-stop callback count", stopCapture.steps.size() == 2);
+
+	// A one-token prompt exercises logits row zero and confirms that observer
+	// context retains the original ID while the model input clamps it. The
+	// longer fixture above reaches row T-1 after the context fills the window.
+	glades::chiron::ChironEvalScratch firstRowScratch;
+	ASSERT("observed first-row scratch alloc", firstRowScratch.allocate(d, w, cfg));
+	glades::chiron::ChironGenParams oneStep(gp);
+	oneStep.topK = 1;
+	oneStep.maxTokens = 1;
+	std::vector<int> firstPrompt(1, -5), firstTokens;
+	GenerationObserverCapture firstCapture;
+	ASSERT("observed first-row generate",
+	       glades::chiron::chiron_generate_observed(
+	           d, w, cfg, firstRowScratch, firstPrompt, oneStep,
+	           NULL, NULL, generationObserver, &firstCapture, &firstTokens));
+	ASSERT("observed first-row callback", firstCapture.steps.size() == 1);
+	ASSERT("observed first-row index", firstCapture.logitsRows[0] == 0);
+	ASSERT("observed first-row context", firstCapture.contexts[0] == firstPrompt);
+	ASSERT("observed last-row covered", capture.logitsRows.back() == d.T - 1);
+
+	// Invalid empty prompts fail before observer dispatch, preserving legacy
+	// behavior (including leaving a pre-existing output vector untouched).
+	GenerationObserverCapture emptyCapture;
+	std::vector<int> emptyPrompt, untouched(1, 77);
+	ASSERT("observed empty prompt fails",
+	       !glades::chiron::chiron_generate_observed(
+	           d, w, cfg, stopScratch, emptyPrompt, gp,
+	           NULL, NULL, generationObserver, &emptyCapture, &untouched));
+	ASSERT("observed empty callback count", emptyCapture.steps.empty());
+	ASSERT("observed empty output unchanged", untouched.size() == 1 && untouched[0] == 77);
+}
+
+// ---------------------------------------------------------------------------
 // CPU-only and full aggregate entries.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateCpuUnitTest()
@@ -1378,4 +1559,5 @@ void CHIRONGenerateUnitTest()
 	CHIRONGenerateSinkStopTest();
 	CHIRONGenerateClampTest();
 	CHIRONGenerateStochasticDrawParityTest();
+	CHIRONGenerateObservedTest();
 }

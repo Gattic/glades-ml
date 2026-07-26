@@ -266,8 +266,8 @@ int chiron_sample_token(const std::vector<float>& logitsIn,
 }
 
 // ---------------------------------------------------------------------------
-// chiron_generate — generation loop.
-// Ported from chiron_infer.cpp generate-lambda (lines 416-483), minus CLI
+// chiron_generate_observed — generation loop and backward-compatible observer
+// seam. Ported from chiron_infer.cpp generate-lambda (lines 416-483), minus CLI
 // concerns (BPE decode, printf, dumpTokens, genMetrics).
 // C++98: lambda comparators become functor structs.
 // ---------------------------------------------------------------------------
@@ -281,19 +281,22 @@ struct CmpByFloatDesc {
 };
 } // anonymous namespace
 
-bool chiron_generate(const ChironModelDims& dims,
-                     const ChironModelWeights& w,
-                     const ChironServingConfig& cfg,
-                     ChironEvalScratch& s,
-                     const std::vector<int>& promptTokens,
-                     const ChironGenParams& gp,
-                     ChironTokenSink sink,
-                     void* sinkCtx,
-                     std::vector<int>* outTokens)
+bool chiron_generate_observed(const ChironModelDims& dims,
+                              const ChironModelWeights& w,
+                              const ChironServingConfig& cfg,
+                              ChironEvalScratch& s,
+                              const std::vector<int>& promptTokens,
+                              const ChironGenParams& gp,
+                              ChironTokenSink sink,
+                              void* sinkCtx,
+                              ChironGenerationStepObserver observer,
+                              void* observerCtx,
+                              std::vector<int>* outTokens)
 {
 #ifndef GLADES_HAVE_CUDA
     (void)dims; (void)w; (void)cfg; (void)s;
-    (void)promptTokens; (void)gp; (void)sink; (void)sinkCtx; (void)outTokens;
+    (void)promptTokens; (void)gp; (void)sink; (void)sinkCtx;
+    (void)observer; (void)observerCtx; (void)outTokens;
     return false;
 #else
     // Empty prompt is unsupported — matches chiron_infer CLI behavior.
@@ -355,6 +358,21 @@ bool chiron_generate(const ChironModelDims& dims,
         // far) as context — exactly what chiron_infer passed as `context`.
         const int next = chiron_sample_token(logitsRow, gp, tokens, rng);
 
+        // The observer sees the causal pre-append context and the raw logits
+        // that produced sampledToken. A failed observer commits nothing and
+        // returns immediately, so no sink call or additional RNG draw occurs.
+        if (observer)
+        {
+            ChironGenerationStep step;
+            step.step = gen;
+            step.logitsRow = lastPos;
+            step.sampledToken = next;
+            step.rawLogits = &logitsRow[0];
+            step.vocabSize = dims.V;
+            step.contextBeforeSample = &tokens;
+            if (!observer(observerCtx, step)) return false;
+        }
+
         // Append to working buffer and record in output.
         tokens.push_back(next);
         if (outTokens) outTokens->push_back(next);
@@ -365,6 +383,20 @@ bool chiron_generate(const ChironModelDims& dims,
     }
     return true;
 #endif
+}
+
+bool chiron_generate(const ChironModelDims& dims,
+                     const ChironModelWeights& w,
+                     const ChironServingConfig& cfg,
+                     ChironEvalScratch& s,
+                     const std::vector<int>& promptTokens,
+                     const ChironGenParams& gp,
+                     ChironTokenSink sink,
+                     void* sinkCtx,
+                     std::vector<int>* outTokens)
+{
+    return chiron_generate_observed(dims, w, cfg, s, promptTokens, gp,
+                                    sink, sinkCtx, NULL, NULL, outTokens);
 }
 
 // ---------------------------------------------------------------------------

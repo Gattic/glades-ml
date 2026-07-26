@@ -541,6 +541,11 @@ bash build.sh
 - **Dependencies:** P1 detector API; M0 manifests.
 - **GPU:** implementation can proceed; parity/benchmark waits for scheduling.
 - **Exit:** collector engineering complete; final G1 closes in P3.
+- **Execution status (2026-07-26):** P2.1 compatibility seam implemented: the legacy API is a
+  null-observer wrapper, callbacks see causal pre-append context/raw logits/sampled token, observer
+  failure commits no token, and token/sink/RNG/full-download-row parity tests pass. The existing full
+  logits download is intentionally retained as the correctness baseline. Row-only transfer, P2.2–P2.5,
+  and every G1 claim remain pending; no CHAB, collector, replay, loss, or training-path code has started.
 
 ### P2.1 Backward-compatible observed generation
 

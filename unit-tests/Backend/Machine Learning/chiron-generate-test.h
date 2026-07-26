@@ -16,6 +16,7 @@ void CHIRONRepetitionHazardsTest(); // strict-prefix hazards, confidence, cap/ov
 void CHIRONRepetitionAppendInvariantTest(); // future append cannot alter prior rows
 void CHIRONTfEvalTest();            // chiron_tf_eval: NLL/acc bit-equal + logitsAllOut exact
 void CHIRONGenerateStochasticDrawParityTest(); // draw-count parity: full-softmax, draw-dependent picks
+void CHIRONGenerateObservedTest();  // observer causality/failure plus legacy token/sink parity
 
 // GPU-free aggregate plus the existing full aggregate.
 void CHIRONGenerateCpuUnitTest();
