@@ -308,9 +308,10 @@ Do not commit decoded corpus excerpts, model outputs, checkpoints, or raw logs.
 - **Dependencies:** P0/M0.
 - **GPU:** CPU implementation/tests may run while GPU is occupied.
 - **Exit:** G0a PASS and frozen detector hash.
-- **Execution status (2026-07-26):** P1.1–P1.2 detector engineering and the GPU-free
-  `chiron-generate-cpu` selector pass. P1.3 and calibration G0a remain pending; no detector/config hash
-  is frozen for G0b, and this engineering result does not authorize P2 or model evaluation.
+- **Execution status (2026-07-26):** P1.1–P1.2 detector engineering, canonical detector-config v1,
+  and the GPU-free `chiron-generate-cpu` selector pass. P1.3 and calibration G0a remain pending; no
+  detector/config hash is frozen for G0b, and this engineering result does not authorize P2 or model
+  evaluation.
 
 ### P1.1 Public detector API
 
@@ -369,6 +370,55 @@ void chiron_repetition_hazards(const std::vector<int>& generated,
 
 Keep `chiron_degeneration_metrics(...)` unchanged as the lightweight compatibility API returning the
 legacy distinct-4/max-run values; it must not invoke the heavier detector path.
+
+**Canonical detector-config v1**
+
+The config file is the exact byte representation emitted and accepted by
+`chiron_repetition_config_serialize(...)` / `chiron_repetition_config_parse(...)`. It consists of
+exactly 20 nonempty lines, uses ASCII with LF endings, requires a final LF, and has this fixed order:
+
+```text
+format=chiron-arrest-detector-config
+version=1
+maxPeriod=64
+minCycleSupport=32
+cycleThreshold=0.800000
+repeatLookback=64
+repeatedSpanWindow=128
+minRepeatedSpan=8
+diversityWindow=64
+maxRunThreshold=8
+repeatedSpanThreshold=0.600000
+distinct1Threshold=0.150000
+distinct4Threshold=0.350000
+ngramWindow=128
+maxHazards=16
+minPeriodHazardSupport=8
+hazardThreshold=0.700000
+runConfidenceSpan=8
+ngramConfidenceCount=4
+postOnsetDecay=32.000000
+```
+
+- Field names, order, case, decimal spelling, and the terminal LF are part of the identity. Integers
+  use unsigned canonical decimal with no leading zero. Floats use unsigned fixed-point decimal with
+  exactly six fractional digits and must round-trip exactly through the public `float` fields.
+- The parser accepts only canonical v1 bytes, bounded to 4096 bytes: no BOM, CR, comments, blank lines,
+  whitespace, unknown, duplicate, missing, or reordered fields, alternate numeric spellings, nonfinite
+  values, or trailing data. Parsing is transactional and leaves the caller's config unchanged on failure.
+- Strict scorer-valid ranges are: `maxPeriod` 1–64; `maxHazards` 1–16; `diversityWindow` 4–1048576;
+  `ngramWindow` 2–1048576; `ngramConfidenceCount` 2–1048576; every other integer 1–1048576; every
+  threshold in `(0,1]`; and `postOnsetDecay` in `(0,1048576]`. Additionally,
+  `minRepeatedSpan<=repeatedSpanWindow` and `minPeriodHazardSupport<=max(minCycleSupport,2*maxPeriod)`.
+  The detector's separately specified bounded behavior for invalid direct API configs remains intact;
+  invalid values simply cannot acquire a canonical calibration identity.
+- `chiron_repetition_config_sha256(...)` returns lowercase SHA-256 over all canonical bytes, including
+  the format/version lines and terminal LF. Because parsing rejects noncanonical bytes, this semantic
+  config identity is also the accepted file-byte identity. The default v1 golden is
+  `8a90e0790e0a5571374cb30dc8bae53aada84e2f3ed03277781ad035baeb9c04`.
+- Any schema, ordering, numeric encoding, validation, or hashing change requires a new version. Parameter
+  tuning within this schema changes the SHA-256 but not `version=1`. G0a must freeze the accepted config
+  bytes/hash together with the detector source hash; this contract alone does not freeze either for G0b.
 
 **Frozen detector contract v1 (2026-07-26)**
 

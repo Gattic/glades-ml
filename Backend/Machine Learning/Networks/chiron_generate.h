@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <cstddef>
+#include <string>
 #include <vector>
 #include "chiron_serving.h"
 
@@ -105,6 +106,22 @@ struct ChironRepetitionConfig
 	float postOnsetDecay;
 	ChironRepetitionConfig();
 };
+
+// Canonical detector-config schema. Parsing is intentionally strict: only the
+// exact LF-terminated v1 representation emitted by serialize is accepted.
+// The SHA-256 is over those canonical bytes, including format/version lines.
+enum { CHIRON_REPETITION_CONFIG_VERSION = 1 };
+bool chiron_repetition_config_validate(const ChironRepetitionConfig& config,
+                                       std::string* error = NULL);
+bool chiron_repetition_config_serialize(const ChironRepetitionConfig& config,
+                                        std::string& canonicalBytes,
+                                        std::string* error = NULL);
+bool chiron_repetition_config_parse(const std::string& canonicalBytes,
+                                    ChironRepetitionConfig& config,
+                                    std::string* error = NULL);
+bool chiron_repetition_config_sha256(const ChironRepetitionConfig& config,
+                                     std::string& lowercaseHex,
+                                     std::string* error = NULL);
 
 struct ChironRepetitionMetrics
 {

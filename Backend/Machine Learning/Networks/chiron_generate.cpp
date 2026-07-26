@@ -443,6 +443,339 @@ bool chiron_tf_eval(const ChironModelDims& dims,
 // Pure CPU ARREST repetition detector (frozen detector contract v1).
 // ---------------------------------------------------------------------------
 
+namespace {
+
+const char REPETITION_CONFIG_FORMAT[] = "chiron-arrest-detector-config";
+const uint64_t REPETITION_CONFIG_SCALE = UINT64_C(1000000);
+const int REPETITION_CONFIG_LIMIT = 1048576;
+
+void repetition_config_set_error(std::string* error, const std::string& message)
+{
+    if (error) *error = message;
+}
+
+bool repetition_config_int_range(const char* name, int value,
+                                 int minimum, int maximum,
+                                 std::string* error)
+{
+    if (value >= minimum && value <= maximum) return true;
+    repetition_config_set_error(error, std::string(name) + " is out of range");
+    return false;
+}
+
+bool repetition_config_float_units(const char* name, float value,
+                                   uint64_t& units, std::string* error)
+{
+    if (!(value == value) || value < 0.0f ||
+        value > (float)REPETITION_CONFIG_LIMIT)
+    {
+        repetition_config_set_error(error, std::string(name) + " is not finite and bounded");
+        return false;
+    }
+    const double scaled = (double)value * (double)REPETITION_CONFIG_SCALE;
+    const double rounded = std::floor(scaled + 0.5);
+    units = (uint64_t)rounded;
+    const float reconstructed = (float)((double)units /
+                                        (double)REPETITION_CONFIG_SCALE);
+    if (reconstructed != value)
+    {
+        repetition_config_set_error(error, std::string(name) +
+                                           " is not canonical to six decimal places");
+        return false;
+    }
+    return true;
+}
+
+bool repetition_config_float_range(const char* name, float value,
+                                   float minimumExclusive, float maximumInclusive,
+                                   std::string* error)
+{
+    uint64_t units = 0;
+    if (!repetition_config_float_units(name, value, units, error)) return false;
+    if (value > minimumExclusive && value <= maximumInclusive) return true;
+    repetition_config_set_error(error, std::string(name) + " is out of range");
+    return false;
+}
+
+void repetition_append_uint(std::string& out, uint64_t value)
+{
+    char digits[32];
+    int count = 0;
+    do
+    {
+        digits[count++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    while (value != 0);
+    while (count > 0) out.push_back(digits[--count]);
+}
+
+void repetition_append_int_line(std::string& out, const char* name, int value)
+{
+    out += name;
+    out.push_back('=');
+    repetition_append_uint(out, (uint64_t)value);
+    out.push_back('\n');
+}
+
+void repetition_append_float_line(std::string& out, const char* name, float value)
+{
+    uint64_t units = 0;
+    repetition_config_float_units(name, value, units, NULL);
+    out += name;
+    out.push_back('=');
+    repetition_append_uint(out, units / REPETITION_CONFIG_SCALE);
+    out.push_back('.');
+    uint64_t fraction = units % REPETITION_CONFIG_SCALE;
+    uint64_t divisor = UINT64_C(100000);
+    for (int i = 0; i < 6; ++i)
+    {
+        out.push_back((char)('0' + (fraction / divisor) % 10));
+        divisor /= 10;
+    }
+    out.push_back('\n');
+}
+
+void repetition_config_serialize_valid(const ChironRepetitionConfig& config,
+                                       std::string& out)
+{
+    out.clear();
+    out += "format=";
+    out += REPETITION_CONFIG_FORMAT;
+    out += "\nversion=";
+    repetition_append_uint(out, CHIRON_REPETITION_CONFIG_VERSION);
+    out.push_back('\n');
+    repetition_append_int_line(out, "maxPeriod", config.maxPeriod);
+    repetition_append_int_line(out, "minCycleSupport", config.minCycleSupport);
+    repetition_append_float_line(out, "cycleThreshold", config.cycleThreshold);
+    repetition_append_int_line(out, "repeatLookback", config.repeatLookback);
+    repetition_append_int_line(out, "repeatedSpanWindow", config.repeatedSpanWindow);
+    repetition_append_int_line(out, "minRepeatedSpan", config.minRepeatedSpan);
+    repetition_append_int_line(out, "diversityWindow", config.diversityWindow);
+    repetition_append_int_line(out, "maxRunThreshold", config.maxRunThreshold);
+    repetition_append_float_line(out, "repeatedSpanThreshold", config.repeatedSpanThreshold);
+    repetition_append_float_line(out, "distinct1Threshold", config.distinct1Threshold);
+    repetition_append_float_line(out, "distinct4Threshold", config.distinct4Threshold);
+    repetition_append_int_line(out, "ngramWindow", config.ngramWindow);
+    repetition_append_int_line(out, "maxHazards", config.maxHazards);
+    repetition_append_int_line(out, "minPeriodHazardSupport", config.minPeriodHazardSupport);
+    repetition_append_float_line(out, "hazardThreshold", config.hazardThreshold);
+    repetition_append_int_line(out, "runConfidenceSpan", config.runConfidenceSpan);
+    repetition_append_int_line(out, "ngramConfidenceCount", config.ngramConfidenceCount);
+    repetition_append_float_line(out, "postOnsetDecay", config.postOnsetDecay);
+}
+
+bool repetition_parse_uint(const std::string& text, int& value)
+{
+    if (text.empty() || (text.size() > 1 && text[0] == '0')) return false;
+    uint64_t parsed = 0;
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        if (text[i] < '0' || text[i] > '9') return false;
+        parsed = parsed * 10 + (uint64_t)(text[i] - '0');
+        if (parsed > UINT64_C(2147483647)) return false;
+    }
+    value = (int)parsed;
+    return true;
+}
+
+bool repetition_parse_float6(const std::string& text, float& value)
+{
+    const size_t dot = text.find('.');
+    if (dot == std::string::npos || dot == 0 || text.size() - dot - 1 != 6)
+        return false;
+    const std::string wholeText = text.substr(0, dot);
+    if (wholeText.size() > 1 && wholeText[0] == '0') return false;
+    uint64_t whole = 0;
+    for (size_t i = 0; i < wholeText.size(); ++i)
+    {
+        if (wholeText[i] < '0' || wholeText[i] > '9') return false;
+        whole = whole * 10 + (uint64_t)(wholeText[i] - '0');
+        if (whole > (uint64_t)REPETITION_CONFIG_LIMIT) return false;
+    }
+    uint64_t fraction = 0;
+    for (size_t i = dot + 1; i < text.size(); ++i)
+    {
+        if (text[i] < '0' || text[i] > '9') return false;
+        fraction = fraction * 10 + (uint64_t)(text[i] - '0');
+    }
+    const uint64_t units = whole * REPETITION_CONFIG_SCALE + fraction;
+    value = (float)((double)units / (double)REPETITION_CONFIG_SCALE);
+    return true;
+}
+
+bool repetition_parse_int_line(const std::string& line, const char* name,
+                               int& value, std::string* error)
+{
+    const std::string prefix = std::string(name) + "=";
+    if (line.compare(0, prefix.size(), prefix) != 0 ||
+        !repetition_parse_uint(line.substr(prefix.size()), value))
+    {
+        repetition_config_set_error(error, std::string("invalid canonical field: ") + name);
+        return false;
+    }
+    return true;
+}
+
+bool repetition_parse_float_line(const std::string& line, const char* name,
+                                 float& value, std::string* error)
+{
+    const std::string prefix = std::string(name) + "=";
+    if (line.compare(0, prefix.size(), prefix) != 0 ||
+        !repetition_parse_float6(line.substr(prefix.size()), value))
+    {
+        repetition_config_set_error(error, std::string("invalid canonical field: ") + name);
+        return false;
+    }
+    return true;
+}
+
+uint32_t repetition_sha_rotr(uint32_t value, int bits)
+{
+    return (value >> bits) | (value << (32 - bits));
+}
+
+struct RepetitionSha256
+{
+    uint32_t state[8];
+    uint64_t totalBytes;
+    unsigned char block[64];
+    size_t used;
+};
+
+void repetition_sha_transform(RepetitionSha256& sha, const unsigned char* block)
+{
+    static const uint32_t constants[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+        0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+        0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+        0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+        0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+        0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+    };
+    uint32_t words[64];
+    for (int i = 0; i < 16; ++i)
+    {
+        words[i] = ((uint32_t)block[4 * i] << 24) |
+                   ((uint32_t)block[4 * i + 1] << 16) |
+                   ((uint32_t)block[4 * i + 2] << 8) |
+                   (uint32_t)block[4 * i + 3];
+    }
+    for (int i = 16; i < 64; ++i)
+    {
+        const uint32_t s0 = repetition_sha_rotr(words[i - 15], 7) ^
+                            repetition_sha_rotr(words[i - 15], 18) ^
+                            (words[i - 15] >> 3);
+        const uint32_t s1 = repetition_sha_rotr(words[i - 2], 17) ^
+                            repetition_sha_rotr(words[i - 2], 19) ^
+                            (words[i - 2] >> 10);
+        words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+    }
+
+    uint32_t a = sha.state[0], b = sha.state[1], c = sha.state[2], d = sha.state[3];
+    uint32_t e = sha.state[4], f = sha.state[5], g = sha.state[6], h = sha.state[7];
+    for (int i = 0; i < 64; ++i)
+    {
+        const uint32_t sum1 = repetition_sha_rotr(e, 6) ^
+                              repetition_sha_rotr(e, 11) ^
+                              repetition_sha_rotr(e, 25);
+        const uint32_t choose = (e & f) ^ ((~e) & g);
+        const uint32_t t1 = h + sum1 + choose + constants[i] + words[i];
+        const uint32_t sum0 = repetition_sha_rotr(a, 2) ^
+                              repetition_sha_rotr(a, 13) ^
+                              repetition_sha_rotr(a, 22);
+        const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t t2 = sum0 + majority;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    sha.state[0] += a; sha.state[1] += b; sha.state[2] += c; sha.state[3] += d;
+    sha.state[4] += e; sha.state[5] += f; sha.state[6] += g; sha.state[7] += h;
+}
+
+void repetition_sha_init(RepetitionSha256& sha)
+{
+    const uint32_t initial[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    for (int i = 0; i < 8; ++i) sha.state[i] = initial[i];
+    sha.totalBytes = 0;
+    sha.used = 0;
+}
+
+void repetition_sha_update(RepetitionSha256& sha,
+                           const unsigned char* data, size_t length)
+{
+    sha.totalBytes += (uint64_t)length;
+    while (length > 0)
+    {
+        const size_t room = 64 - sha.used;
+        const size_t take = std::min(room, length);
+        std::memcpy(sha.block + sha.used, data, take);
+        sha.used += take;
+        data += take;
+        length -= take;
+        if (sha.used == 64)
+        {
+            repetition_sha_transform(sha, sha.block);
+            sha.used = 0;
+        }
+    }
+}
+
+void repetition_sha_finish(RepetitionSha256& sha, unsigned char digest[32])
+{
+    const uint64_t bitLength = sha.totalBytes * UINT64_C(8);
+    sha.block[sha.used++] = 0x80u;
+    if (sha.used > 56)
+    {
+        while (sha.used < 64) sha.block[sha.used++] = 0;
+        repetition_sha_transform(sha, sha.block);
+        sha.used = 0;
+    }
+    while (sha.used < 56) sha.block[sha.used++] = 0;
+    for (int i = 7; i >= 0; --i)
+        sha.block[sha.used++] = (unsigned char)(bitLength >> (8 * i));
+    repetition_sha_transform(sha, sha.block);
+    for (int i = 0; i < 8; ++i)
+    {
+        digest[4 * i] = (unsigned char)(sha.state[i] >> 24);
+        digest[4 * i + 1] = (unsigned char)(sha.state[i] >> 16);
+        digest[4 * i + 2] = (unsigned char)(sha.state[i] >> 8);
+        digest[4 * i + 3] = (unsigned char)sha.state[i];
+    }
+}
+
+void repetition_sha256_hex(const std::string& bytes, std::string& hex)
+{
+    RepetitionSha256 sha;
+    repetition_sha_init(sha);
+    repetition_sha_update(sha, (const unsigned char*)bytes.data(), bytes.size());
+    unsigned char digest[32];
+    repetition_sha_finish(sha, digest);
+    static const char digits[] = "0123456789abcdef";
+    hex.clear();
+    hex.reserve(64);
+    for (int i = 0; i < 32; ++i)
+    {
+        hex.push_back(digits[digest[i] >> 4]);
+        hex.push_back(digits[digest[i] & 15]);
+    }
+}
+
+} // anonymous namespace
+
 ChironRepetitionConfig::ChironRepetitionConfig()
     : maxPeriod(64)
     , minCycleSupport(32)
@@ -463,6 +796,183 @@ ChironRepetitionConfig::ChironRepetitionConfig()
     , ngramConfidenceCount(4)
     , postOnsetDecay(32.0f)
 {
+}
+
+bool chiron_repetition_config_validate(const ChironRepetitionConfig& config,
+                                       std::string* error)
+{
+    if (error) error->clear();
+    if (!repetition_config_int_range("maxPeriod", config.maxPeriod, 1, 64, error) ||
+        !repetition_config_int_range("minCycleSupport", config.minCycleSupport,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_float_range("cycleThreshold", config.cycleThreshold,
+                                       0.0f, 1.0f, error) ||
+        !repetition_config_int_range("repeatLookback", config.repeatLookback,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("repeatedSpanWindow", config.repeatedSpanWindow,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("minRepeatedSpan", config.minRepeatedSpan,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("diversityWindow", config.diversityWindow,
+                                     4, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("maxRunThreshold", config.maxRunThreshold,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_float_range("repeatedSpanThreshold",
+                                       config.repeatedSpanThreshold, 0.0f, 1.0f, error) ||
+        !repetition_config_float_range("distinct1Threshold", config.distinct1Threshold,
+                                       0.0f, 1.0f, error) ||
+        !repetition_config_float_range("distinct4Threshold", config.distinct4Threshold,
+                                       0.0f, 1.0f, error) ||
+        !repetition_config_int_range("ngramWindow", config.ngramWindow,
+                                     2, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("maxHazards", config.maxHazards, 1, 16, error) ||
+        !repetition_config_int_range("minPeriodHazardSupport",
+                                     config.minPeriodHazardSupport,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_float_range("hazardThreshold", config.hazardThreshold,
+                                       0.0f, 1.0f, error) ||
+        !repetition_config_int_range("runConfidenceSpan", config.runConfidenceSpan,
+                                     1, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_int_range("ngramConfidenceCount", config.ngramConfidenceCount,
+                                     2, REPETITION_CONFIG_LIMIT, error) ||
+        !repetition_config_float_range("postOnsetDecay", config.postOnsetDecay,
+                                       0.0f, (float)REPETITION_CONFIG_LIMIT, error))
+        return false;
+
+    if (config.minRepeatedSpan > config.repeatedSpanWindow)
+    {
+        repetition_config_set_error(error,
+            "minRepeatedSpan exceeds repeatedSpanWindow");
+        return false;
+    }
+    const int maximumPeriodEvidence =
+        std::max(config.minCycleSupport, 2 * config.maxPeriod);
+    if (config.minPeriodHazardSupport > maximumPeriodEvidence)
+    {
+        repetition_config_set_error(error,
+            "minPeriodHazardSupport exceeds available configured support");
+        return false;
+    }
+    return true;
+}
+
+bool chiron_repetition_config_serialize(const ChironRepetitionConfig& config,
+                                        std::string& canonicalBytes,
+                                        std::string* error)
+{
+    canonicalBytes.clear();
+    if (!chiron_repetition_config_validate(config, error)) return false;
+    repetition_config_serialize_valid(config, canonicalBytes);
+    return true;
+}
+
+bool chiron_repetition_config_parse(const std::string& canonicalBytes,
+                                    ChironRepetitionConfig& config,
+                                    std::string* error)
+{
+    if (canonicalBytes.empty() || canonicalBytes.size() > 4096 ||
+        canonicalBytes[canonicalBytes.size() - 1] != '\n' ||
+        canonicalBytes.find('\r') != std::string::npos)
+    {
+        repetition_config_set_error(error,
+            "config must be at most 4096 bytes, LF-only, and LF-terminated");
+        return false;
+    }
+    // Copy only after the size bound so canonicalBytes may safely alias error
+    // without allowing malformed oversized input to force a second allocation.
+    const std::string input(canonicalBytes);
+    if (error) error->clear();
+
+    std::vector<std::string> lines;
+    size_t begin = 0;
+    while (begin < input.size())
+    {
+        const size_t end = input.find('\n', begin);
+        if (end == std::string::npos)
+        {
+            repetition_config_set_error(error, "unterminated config line");
+            return false;
+        }
+        lines.push_back(input.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    if (lines.size() != 20)
+    {
+        repetition_config_set_error(error, "config must contain exactly 20 lines");
+        return false;
+    }
+    if (lines[0] != std::string("format=") + REPETITION_CONFIG_FORMAT)
+    {
+        repetition_config_set_error(error, "unsupported detector config format");
+        return false;
+    }
+    std::string expectedVersion("version=");
+    repetition_append_uint(expectedVersion, CHIRON_REPETITION_CONFIG_VERSION);
+    if (lines[1] != expectedVersion)
+    {
+        repetition_config_set_error(error, "unsupported detector config version");
+        return false;
+    }
+
+    ChironRepetitionConfig parsed;
+    if (!repetition_parse_int_line(lines[2], "maxPeriod", parsed.maxPeriod, error) ||
+        !repetition_parse_int_line(lines[3], "minCycleSupport",
+                                   parsed.minCycleSupport, error) ||
+        !repetition_parse_float_line(lines[4], "cycleThreshold",
+                                     parsed.cycleThreshold, error) ||
+        !repetition_parse_int_line(lines[5], "repeatLookback",
+                                   parsed.repeatLookback, error) ||
+        !repetition_parse_int_line(lines[6], "repeatedSpanWindow",
+                                   parsed.repeatedSpanWindow, error) ||
+        !repetition_parse_int_line(lines[7], "minRepeatedSpan",
+                                   parsed.minRepeatedSpan, error) ||
+        !repetition_parse_int_line(lines[8], "diversityWindow",
+                                   parsed.diversityWindow, error) ||
+        !repetition_parse_int_line(lines[9], "maxRunThreshold",
+                                   parsed.maxRunThreshold, error) ||
+        !repetition_parse_float_line(lines[10], "repeatedSpanThreshold",
+                                     parsed.repeatedSpanThreshold, error) ||
+        !repetition_parse_float_line(lines[11], "distinct1Threshold",
+                                     parsed.distinct1Threshold, error) ||
+        !repetition_parse_float_line(lines[12], "distinct4Threshold",
+                                     parsed.distinct4Threshold, error) ||
+        !repetition_parse_int_line(lines[13], "ngramWindow",
+                                   parsed.ngramWindow, error) ||
+        !repetition_parse_int_line(lines[14], "maxHazards",
+                                   parsed.maxHazards, error) ||
+        !repetition_parse_int_line(lines[15], "minPeriodHazardSupport",
+                                   parsed.minPeriodHazardSupport, error) ||
+        !repetition_parse_float_line(lines[16], "hazardThreshold",
+                                     parsed.hazardThreshold, error) ||
+        !repetition_parse_int_line(lines[17], "runConfidenceSpan",
+                                   parsed.runConfidenceSpan, error) ||
+        !repetition_parse_int_line(lines[18], "ngramConfidenceCount",
+                                   parsed.ngramConfidenceCount, error) ||
+        !repetition_parse_float_line(lines[19], "postOnsetDecay",
+                                     parsed.postOnsetDecay, error))
+        return false;
+
+    if (!chiron_repetition_config_validate(parsed, error)) return false;
+    std::string regenerated;
+    repetition_config_serialize_valid(parsed, regenerated);
+    if (regenerated != input)
+    {
+        repetition_config_set_error(error, "config bytes are not canonical");
+        return false;
+    }
+    config = parsed;
+    return true;
+}
+
+bool chiron_repetition_config_sha256(const ChironRepetitionConfig& config,
+                                     std::string& lowercaseHex,
+                                     std::string* error)
+{
+    lowercaseHex.clear();
+    std::string canonical;
+    if (!chiron_repetition_config_serialize(config, canonical, error)) return false;
+    repetition_sha256_hex(canonical, lowercaseHex);
+    return true;
 }
 
 ChironRepetitionMetrics::ChironRepetitionMetrics()

@@ -728,8 +728,8 @@ Glades-ml owns CHIRON checkpoint I/O and serving since 2026-07-03:
   across REPL prompts; one-shot/tokens-file paths are identical, multi-prompt REPL streams differ
   (acknowledged behavior change).
 - **Unit suites**: `bash test.sh chiron-generate-cpu` (GPU-free RNG/sampler goldens plus ARREST
-  detector metrics/hazards/append invariance) and `bash test.sh chiron-generate` (the CPU suite plus
-  stochastic draw-parity and TF-eval correctness).
+  canonical config validation/hash, detector metrics/hazards, and append invariance) and
+  `bash test.sh chiron-generate` (the CPU suite plus stochastic draw-parity and TF-eval correctness).
 
 **Rebuild order** (static kernel link — `make install` alone does NOT update the trainer):
 ```

@@ -35,6 +35,8 @@
 #include <cstdlib>   // strtod
 #include <stdint.h>
 #include <cmath>     // std::sin, std::exp, std::log, std::sqrt
+#include <limits>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -448,6 +450,198 @@ static int hazard_token_index(const glades::chiron::ChironHazardRow& row, int to
 {
 	for (int i = 0; i < row.count; ++i) if (row.tokenIds[i] == token) return i;
 	return -1;
+}
+
+static void assert_config_parse_rejected(const char* message, const std::string& bytes)
+{
+	glades::chiron::ChironRepetitionConfig out;
+	out.maxPeriod = 17;
+	std::string error;
+	const bool ok = glades::chiron::chiron_repetition_config_parse(bytes, out, &error);
+	ASSERT(message, !ok && !error.empty() && out.maxPeriod == 17);
+}
+
+static void assert_config_value_rejected(
+	const char* message, const glades::chiron::ChironRepetitionConfig& config)
+{
+	std::string error;
+	ASSERT(message, !glades::chiron::chiron_repetition_config_validate(config, &error) &&
+	       !error.empty());
+	std::string bytes("stale");
+	ASSERT(message, !glades::chiron::chiron_repetition_config_serialize(config, bytes, &error) &&
+	       bytes.empty());
+	std::string hash("stale");
+	ASSERT(message, !glades::chiron::chiron_repetition_config_sha256(config, hash, &error) &&
+	       hash.empty());
+}
+
+void CHIRONRepetitionConfigContractTest()
+{
+	const char* expected =
+		"format=chiron-arrest-detector-config\n"
+		"version=1\n"
+		"maxPeriod=64\n"
+		"minCycleSupport=32\n"
+		"cycleThreshold=0.800000\n"
+		"repeatLookback=64\n"
+		"repeatedSpanWindow=128\n"
+		"minRepeatedSpan=8\n"
+		"diversityWindow=64\n"
+		"maxRunThreshold=8\n"
+		"repeatedSpanThreshold=0.600000\n"
+		"distinct1Threshold=0.150000\n"
+		"distinct4Threshold=0.350000\n"
+		"ngramWindow=128\n"
+		"maxHazards=16\n"
+		"minPeriodHazardSupport=8\n"
+		"hazardThreshold=0.700000\n"
+		"runConfidenceSpan=8\n"
+		"ngramConfidenceCount=4\n"
+		"postOnsetDecay=32.000000\n";
+
+	glades::chiron::ChironRepetitionConfig config;
+	std::string error("stale"), bytes;
+	ASSERT("config schema version", glades::chiron::CHIRON_REPETITION_CONFIG_VERSION == 1);
+	ASSERT("config defaults validate",
+	       glades::chiron::chiron_repetition_config_validate(config, &error) && error.empty());
+	ASSERT("config optional error API",
+	       glades::chiron::chiron_repetition_config_validate(config));
+	ASSERT("config defaults serialize",
+	       glades::chiron::chiron_repetition_config_serialize(config, bytes, &error));
+	ASSERT("config canonical bytes", bytes == expected && bytes.size() == 434);
+
+	glades::chiron::ChironRepetitionConfig parsed;
+	parsed.maxPeriod = 1;
+	ASSERT("config canonical parse",
+	       glades::chiron::chiron_repetition_config_parse(bytes, parsed, &error));
+	std::string roundTrip;
+	ASSERT("config canonical round trip",
+	       glades::chiron::chiron_repetition_config_serialize(parsed, roundTrip, &error) &&
+	       roundTrip == bytes);
+	std::string aliasedInput(bytes);
+	glades::chiron::ChironRepetitionConfig aliasParsed;
+	ASSERT("config parse permits input/error alias",
+	       glades::chiron::chiron_repetition_config_parse(
+	           aliasedInput, aliasParsed, &aliasedInput) && aliasedInput.empty() &&
+	       aliasParsed.maxPeriod == config.maxPeriod);
+
+	std::string hash, hashAgain;
+	ASSERT("config sha256",
+	       glades::chiron::chiron_repetition_config_sha256(config, hash, &error));
+	ASSERT("config sha256 golden",
+	       hash == "8a90e0790e0a5571374cb30dc8bae53aada84e2f3ed03277781ad035baeb9c04");
+	ASSERT("config sha256 deterministic",
+	       glades::chiron::chiron_repetition_config_sha256(parsed, hashAgain, &error) &&
+	       hashAgain == hash);
+	glades::chiron::ChironRepetitionConfig changed(config);
+	changed.maxRunThreshold = 9;
+	ASSERT("config sha256 content identity",
+	       glades::chiron::chiron_repetition_config_sha256(changed, hashAgain, &error) &&
+	       hashAgain != hash);
+	glades::chiron::ChironRepetitionConfig paddingBoundary(config);
+	paddingBoundary.minCycleSupport = 1048576;
+	paddingBoundary.repeatLookback = 1048576;
+	ASSERT("config sha256 two-block padding golden",
+	       glades::chiron::chiron_repetition_config_serialize(
+	           paddingBoundary, roundTrip, &error) && roundTrip.size() == 444 &&
+	       roundTrip.size() % 64 == 60 &&
+	       glades::chiron::chiron_repetition_config_sha256(
+	           paddingBoundary, hashAgain, &error) &&
+	       hashAgain == "7e09525266becbdefdebb766237770954504975f54f78eccdd50ce9cf33f21ae");
+
+	glades::chiron::ChironRepetitionConfig minimum(config);
+	minimum.maxPeriod = 1; minimum.minCycleSupport = 1; minimum.cycleThreshold = 0.000001f;
+	minimum.repeatLookback = 1; minimum.repeatedSpanWindow = 1; minimum.minRepeatedSpan = 1;
+	minimum.diversityWindow = 4; minimum.maxRunThreshold = 1;
+	minimum.repeatedSpanThreshold = 0.000001f; minimum.distinct1Threshold = 0.000001f;
+	minimum.distinct4Threshold = 0.000001f; minimum.ngramWindow = 2; minimum.maxHazards = 1;
+	minimum.minPeriodHazardSupport = 1; minimum.hazardThreshold = 0.000001f;
+	minimum.runConfidenceSpan = 1; minimum.ngramConfidenceCount = 2;
+	minimum.postOnsetDecay = 0.000001f;
+	ASSERT("config accepts all lower boundaries",
+	       glades::chiron::chiron_repetition_config_serialize(minimum, roundTrip, &error) &&
+	       glades::chiron::chiron_repetition_config_parse(roundTrip, parsed, &error));
+
+	glades::chiron::ChironRepetitionConfig maximum(config);
+	maximum.minCycleSupport = 1048576; maximum.cycleThreshold = 1.0f;
+	maximum.repeatLookback = 1048576; maximum.repeatedSpanWindow = 1048576;
+	maximum.minRepeatedSpan = 1048576; maximum.diversityWindow = 1048576;
+	maximum.maxRunThreshold = 1048576; maximum.repeatedSpanThreshold = 1.0f;
+	maximum.distinct1Threshold = 1.0f; maximum.distinct4Threshold = 1.0f;
+	maximum.ngramWindow = 1048576; maximum.minPeriodHazardSupport = 1048576;
+	maximum.hazardThreshold = 1.0f; maximum.runConfidenceSpan = 1048576;
+	maximum.ngramConfidenceCount = 1048576; maximum.postOnsetDecay = 1048576.0f;
+	ASSERT("config accepts all upper boundaries",
+	       glades::chiron::chiron_repetition_config_serialize(maximum, roundTrip, &error) &&
+	       glades::chiron::chiron_repetition_config_parse(roundTrip, parsed, &error));
+
+	std::string malformed(bytes);
+	malformed.replace(malformed.find("version=1"), 9, "version=2");
+	assert_config_parse_rejected("config rejects future version", malformed);
+	malformed = bytes.substr(0, bytes.size() - 1);
+	assert_config_parse_rejected("config rejects missing final LF", malformed);
+	malformed = bytes + "trailing=true\n";
+	assert_config_parse_rejected("config rejects trailing data", malformed);
+	malformed = std::string("\xEF\xBB\xBF") + bytes;
+	assert_config_parse_rejected("config rejects UTF-8 BOM", malformed);
+	malformed = " " + bytes;
+	assert_config_parse_rejected("config rejects whitespace", malformed);
+	malformed = bytes;
+	malformed.erase(malformed.find("maxPeriod=64\n"), 13);
+	assert_config_parse_rejected("config rejects missing field", malformed);
+	malformed.assign(4097, 'x'); malformed[4096] = '\n';
+	assert_config_parse_rejected("config rejects oversized bytes", malformed);
+	malformed = bytes;
+	malformed.insert(malformed.find('\n'), 1, '\r');
+	assert_config_parse_rejected("config rejects CRLF", malformed);
+	malformed = bytes;
+	malformed.replace(malformed.find("maxPeriod"), 9, "unknownxx");
+	assert_config_parse_rejected("config rejects unknown key", malformed);
+	malformed = bytes;
+	malformed.insert(malformed.find("minCycleSupport="), "maxPeriod=64\n");
+	assert_config_parse_rejected("config rejects duplicate key", malformed);
+	malformed = bytes;
+	const std::string ordered = "maxPeriod=64\nminCycleSupport=32\n";
+	const std::string reversed = "minCycleSupport=32\nmaxPeriod=64\n";
+	malformed.replace(malformed.find(ordered), ordered.size(), reversed);
+	assert_config_parse_rejected("config rejects reordered fields", malformed);
+	malformed = bytes;
+	malformed.replace(malformed.find("maxPeriod=64"), 12, "maxPeriod=064");
+	assert_config_parse_rejected("config rejects leading zero", malformed);
+	malformed = bytes;
+	malformed.replace(malformed.find("0.800000"), 8, "0.80000");
+	assert_config_parse_rejected("config rejects noncanonical decimal", malformed);
+	malformed = bytes;
+	malformed.insert(malformed.find("cycleThreshold"), 1, '\0');
+	assert_config_parse_rejected("config rejects embedded NUL", malformed);
+
+	glades::chiron::ChironRepetitionConfig invalid(config);
+	invalid.maxPeriod = 65;
+	assert_config_value_rejected("config rejects period clamp alias", invalid);
+	invalid = config; invalid.maxPeriod = 0;
+	assert_config_value_rejected("config rejects zero period", invalid);
+	invalid = config; invalid.maxHazards = 17;
+	assert_config_value_rejected("config rejects hazard cap alias", invalid);
+	invalid = config; invalid.maxHazards = 0;
+	assert_config_value_rejected("config rejects zero hazard cap", invalid);
+	invalid = config; invalid.repeatLookback = 0;
+	assert_config_value_rejected("config rejects zero window", invalid);
+	invalid = config; invalid.hazardThreshold = 0.0f;
+	assert_config_value_rejected("config rejects zero threshold", invalid);
+	invalid = config; invalid.repeatedSpanThreshold = 1.000001f;
+	assert_config_value_rejected("config rejects threshold above one", invalid);
+	invalid = config; invalid.postOnsetDecay = 0.0f;
+	assert_config_value_rejected("config rejects zero decay", invalid);
+	invalid = config; invalid.minRepeatedSpan = invalid.repeatedSpanWindow + 1;
+	assert_config_value_rejected("config rejects impossible repeated span", invalid);
+	invalid = config; invalid.minPeriodHazardSupport = 129;
+	assert_config_value_rejected("config rejects impossible period support", invalid);
+	invalid = config; invalid.cycleThreshold = std::numeric_limits<float>::quiet_NaN();
+	assert_config_value_rejected("config rejects NaN", invalid);
+	invalid = config; invalid.hazardThreshold = std::numeric_limits<float>::infinity();
+	assert_config_value_rejected("config rejects infinity", invalid);
+	invalid = config; invalid.distinct1Threshold = 0.1234567f;
+	assert_config_value_rejected("config rejects sub-micro precision", invalid);
 }
 
 void CHIRONRepetitionMetricsTest()
@@ -1169,6 +1363,7 @@ void CHIRONGenerateCpuUnitTest()
 	CHIRONMt19937GoldenTest();
 	CHIRONSamplerGoldenTest();
 	CHIRONDegenMetricsTest();
+	CHIRONRepetitionConfigContractTest();
 	CHIRONRepetitionMetricsTest();
 	CHIRONRepetitionHazardsTest();
 	CHIRONRepetitionAppendInvariantTest();
