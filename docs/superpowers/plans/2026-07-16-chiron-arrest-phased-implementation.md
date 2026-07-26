@@ -308,10 +308,14 @@ Do not commit decoded corpus excerpts, model outputs, checkpoints, or raw logs.
 - **Dependencies:** P0/M0.
 - **GPU:** CPU implementation/tests may run while GPU is occupied.
 - **Exit:** G0a PASS and frozen detector hash.
-- **Execution status (2026-07-26):** P1.1–P1.2 detector engineering, canonical detector-config v1,
-  and the GPU-free `chiron-generate-cpu` selector pass. P1.3 and calibration G0a remain pending; no
-  detector/config hash is frozen for G0b, and this engineering result does not authorize P2 or model
-  evaluation.
+- **Execution status (2026-07-26):** **G0a PASS; P1 complete.** P1.1–P1.2 detector engineering,
+  canonical detector-config v1, GPU-free and GPU-bearing `chiron-generate` selectors, the CPU-only
+  P1.3 scorer, deterministic replay, and calibration bounds pass. Frozen glades-ml detector commit:
+  `421cb6eed1c2e065b73ba1303f146f77b7faed24`; config SHA-256:
+  `8a90e0790e0a5571374cb30dc8bae53aada84e2f3ed03277781ad035baeb9c04`. Evidence: glades-trainer
+  commit `a2d4a1057f8c4df180f71b5d2205238a282ca1e5`, `research/generation-aware/G0A_DETECTOR_REPORT.md`.
+  This closes P1 only; it does not authorize P2, model inference, collection, training, or any E1b
+  model-quality claim.
 
 ### P1.1 Public detector API
 
