@@ -47,6 +47,7 @@ struct ChironDecodeCache::Impl
     int T, m, V, L, nH, nKVH, dH, dModel, dModelKV, ffnHidden;
     int k, w, maxBlockWidth, historyCapacity;
     int position, completedBlocks, blockFill, historyCount, historyWrite;
+    int prefillCount;
     unsigned long stateEpoch;
     bool qkNorm, fuseAttnReln, fuseAttnPerLayer, whiscCoupling;
     float epsReln, rotThetaMax, whiscClamp;
@@ -56,7 +57,7 @@ struct ChironDecodeCache::Impl
         : modelIdentity(NULL), T(0), m(0), V(0), L(0), nH(0), nKVH(0), dH(0)
         , dModel(0), dModelKV(0), ffnHidden(0), k(0), w(0), maxBlockWidth(0)
         , historyCapacity(0), position(0), completedBlocks(0), blockFill(0)
-        , historyCount(0), historyWrite(0), stateEpoch(0), qkNorm(false), fuseAttnReln(false)
+        , historyCount(0), historyWrite(0), prefillCount(0), stateEpoch(0), qkNorm(false), fuseAttnReln(false)
         , fuseAttnPerLayer(false), whiscCoupling(false), epsReln(0.0f)
         , rotThetaMax(0.0f), whiscClamp(0.0f), isReady(false)
     {
@@ -160,6 +161,7 @@ struct ChironDecodeCache::Impl
         rotThetaMax = cfg.rotThetaMax;
         whiscClamp = cfg.whiscClamp;
         modelIdentity = &weights;
+        prefillCount = 0;
 
         for (int l = 0; l < L; ++l)
         {
@@ -192,7 +194,16 @@ struct ChironDecodeCache::Impl
     bool prepareCapture(int promptLength)
     {
         if (!isReady || promptLength <= 0 || promptLength >= T) return false;
+        // Production qualification found rare cross-context corruption when a
+        // ~1 GiB cache allocation was repeatedly zeroed and rebound to unrelated
+        // prompts. Reallocate owned layer storage on every later prefill; branch
+        // snapshots still share one prefill without reallocating.
+        if (prefillCount > 0)
+            for (int l = 0; l < L; ++l)
+                if (!layers[l]->allocate(k, m, dModelKV, maxBlockWidth, historyCapacity))
+                { clear(); return false; }
         if (!resetState()) return false;
+        ++prefillCount;
         position = promptLength;
         completedBlocks = 0;
         while (completedBlocks + 1 < k
@@ -257,7 +268,7 @@ struct ChironDecodeCache::Impl
         historyCapacity=source.historyCapacity; position=source.position;
         completedBlocks=source.completedBlocks; blockFill=source.blockFill;
         historyCount=source.historyCount; historyWrite=source.historyWrite;
-        stateEpoch=source.stateEpoch;
+        prefillCount=source.prefillCount; stateEpoch=source.stateEpoch;
         qkNorm=source.qkNorm; fuseAttnReln=source.fuseAttnReln;
         fuseAttnPerLayer=source.fuseAttnPerLayer;
         whiscCoupling=source.whiscCoupling; epsReln=source.epsReln;
