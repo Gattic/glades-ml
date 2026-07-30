@@ -1284,7 +1284,8 @@ __global__ void rope_apply_inplace(float* __restrict__ x,
                                    int T, int nHeads, int dHead,
                                    int halfDim, bool inverse)
 {
-	// Grid: one thread per (t, h, d) triple where d in [0, halfDim).
+	// Grid: one thread per (t, h, pair) triple. Pair adjacent dimensions
+	// (2*d, 2*d+1), matching the canonical CPU training/inference kernels.
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	int total = T * nHeads * halfDim;
 	if (idx >= total) return;
@@ -1300,11 +1301,13 @@ __global__ void rope_apply_inplace(float* __restrict__ x,
 
 	// x layout: [T, nHeads, dHead]
 	size_t base = ((size_t)t * nHeads + h) * dHead;
-	float x0 = x[base + d];
-	float x1 = x[base + d + halfDim];
+	const int i0 = 2 * d;
+	const int i1 = i0 + 1;
+	float x0 = x[base + i0];
+	float x1 = x[base + i1];
 
-	x[base + d]            = x0 * cosT - x1 * sinT;
-	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+	x[base + i0] = x0 * cosT - x1 * sinT;
+	x[base + i1] = x0 * sinT + x1 * cosT;
 }
 
 } // anonymous namespace
@@ -1356,11 +1359,13 @@ __global__ void rope_apply_qk_kernel(float* __restrict__ Q,
 	float sinT  = inverse ? -sinf(theta) : sinf(theta);
 
 	size_t base = ((size_t)t * nHeads + h) * dHead;
-	float x0 = x[base + d];
-	float x1 = x[base + d + halfDim];
+	const int i0 = 2 * d;
+	const int i1 = i0 + 1;
+	float x0 = x[base + i0];
+	float x1 = x[base + i1];
 
-	x[base + d]            = x0 * cosT - x1 * sinT;
-	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+	x[base + i0] = x0 * cosT - x1 * sinT;
+	x[base + i1] = x0 * sinT + x1 * cosT;
 }
 
 } // anonymous namespace

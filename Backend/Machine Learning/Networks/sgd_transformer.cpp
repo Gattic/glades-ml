@@ -10616,6 +10616,18 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+	if (useRope)
+	{
+		unsigned int ropeDim = dHead;
+		if (ropeDimOverride > 0)
+		{
+			const unsigned int requested = static_cast<unsigned int>(ropeDimOverride);
+			ropeDim = (requested < ropeDim) ? requested : ropeDim;
+		}
+		if ((ropeDim % 2u) != 0u)
+			ropeDim -= 1u;
+		transformerPosEncCache.ensureRope(ropeDim, cfg.ropeTheta);
+	}
 
 	// BF16 mixed precision. Enabled when the outer config sets
 	// mixedPrecision.enable and weightDType == BF16; per-site flags below
