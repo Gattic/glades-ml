@@ -4,6 +4,8 @@
 // C++98.
 
 #include "chiron_generate.h"
+#include "cuda/gpu_device.h"
+#include "cuda/gpu_kernels.h"
 
 #include <cstdio>     // snprintf, printf
 #include <cstdlib>    // getenv
@@ -279,6 +281,20 @@ struct CmpByFloatDesc {
     explicit CmpByFloatDesc(const std::vector<float>& vec) : v(vec) {}
     bool operator()(int a, int b) const { return v[a] > v[b]; }
 };
+
+#ifdef GLADES_HAVE_CUDA
+class ScopedGenerationEvent
+{
+public:
+    ScopedGenerationEvent() : eventHandle(gpu::createEvent(false)) {}
+    ~ScopedGenerationEvent() { gpu::destroyEvent(eventHandle); }
+    cudaEvent_t get() const { return eventHandle; }
+private:
+    cudaEvent_t eventHandle;
+    ScopedGenerationEvent(const ScopedGenerationEvent&);
+    ScopedGenerationEvent& operator=(const ScopedGenerationEvent&);
+};
+#endif
 } // anonymous namespace
 
 bool chiron_generate_observed(const ChironModelDims& dims,
@@ -302,6 +318,11 @@ bool chiron_generate_observed(const ChironModelDims& dims,
     // Empty prompt is unsupported — matches chiron_infer CLI behavior.
     if (promptTokens.empty()) return false;
 
+    // Most serving binaries initialize the shared streams at startup. Keep the
+    // public generation API usable for direct callers (including unit fixtures)
+    // that previously relied on CUDA's implicit device initialization.
+    if (!gpu::isAvailable() && !gpu::initDevice()) return false;
+
     if (outTokens) outTokens->clear();
 
     // Working buffer: starts as prompt, grows one token per generation step.
@@ -313,8 +334,9 @@ bool chiron_generate_observed(const ChironModelDims& dims,
     ChironMt19937 rng(gp.seed);
 
     std::vector<int>   input((size_t)dims.T, 0);
-    std::vector<float> logitsAll((size_t)dims.T * (size_t)dims.V);
     std::vector<float> logitsRow((size_t)dims.V);
+    ScopedGenerationEvent computeReady;
+    if (!computeReady.get()) return false;
 
     for (int gen = 0; gen < gp.maxTokens; ++gen)
     {
@@ -333,11 +355,19 @@ bool chiron_generate_observed(const ChironModelDims& dims,
         if (!s.d_tokens.upload(&input[0], (size_t)dims.T)) return false;
         if (!chiron_eval_forward(dims, w, cfg, s)) return false;
 
-        // Extract logits row for the last valid position (useLen-1).
-        if (!s.logits.download(&logitsAll[0], logitsAll.size())) return false;
+        // Extract only the logits row for the last valid position. The event
+        // makes the transfer stream wait for every forward kernel queued on
+        // the compute stream; the transfer synchronization makes the host row
+        // safe to sample before the next iteration can begin.
         const int lastPos = useLen - 1;
-        for (int v = 0; v < dims.V; ++v)
-            logitsRow[v] = logitsAll[(size_t)lastPos * (size_t)dims.V + v];
+        if (!gpu::synchronizeCheck("chiron_generate forward")) return false;
+        if (!gpu::recordEvent(computeReady.get(), gpu::computeStream())) return false;
+        if (!gpu::streamWaitEvent(gpu::transferStream(), computeReady.get())) return false;
+        gpu::device_memcpy_d2h(
+            &logitsRow[0],
+            s.logits.data() + (size_t)lastPos * (size_t)dims.V,
+            (size_t)dims.V * sizeof(float));
+        if (!gpu::synchronizeTransferStream()) return false;
 
         // CHIRON_DBG: env-gated top-5 logit dump (harmless in lib; matches
         // chiron_infer.cpp lines 462-471 with lambda → functor).

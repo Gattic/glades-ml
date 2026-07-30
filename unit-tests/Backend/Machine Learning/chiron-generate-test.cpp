@@ -1402,8 +1402,8 @@ void CHIRONGenerateStochasticDrawParityTest()
 
 // ---------------------------------------------------------------------------
 // Test 6f: observed generation is a causal, backward-compatible seam.
-// It preserves legacy tokens/sinks/RNG behavior, exposes the exact full-
-// download row used for sampling, and commits nothing when the observer fails.
+// It preserves legacy tokens/sinks/RNG behavior, proves the row-only transfer
+// equals an independent full download, and commits nothing on observer failure.
 // ---------------------------------------------------------------------------
 void CHIRONGenerateObservedTest()
 {
@@ -1466,6 +1466,22 @@ void CHIRONGenerateObservedTest()
 		expectedContext.push_back(observedTokens[i]);
 	}
 
+	// Repeat the same observed call on one reusable scratch. Every selected
+	// token and every transferred row must be byte-identical across runs.
+	glades::chiron::ChironEvalScratch repeatScratch;
+	ASSERT("observed repeat scratch alloc", repeatScratch.allocate(d, w, cfg));
+	for (int rep = 0; rep < 5; ++rep)
+	{
+		GenerationObserverCapture repeated;
+		std::vector<int> repeatedTokens;
+		ASSERT("observed repeat generate",
+		       glades::chiron::chiron_generate_observed(
+		           d, w, cfg, repeatScratch, prompt, gp,
+		           NULL, NULL, generationObserver, &repeated, &repeatedTokens));
+		ASSERT("observed repeat token identity", repeatedTokens == observedTokens);
+		ASSERT("observed repeat row identity", repeated.rawRows == capture.rawRows);
+	}
+
 	// Failure occurs after one ordinary sample draw for step 2 but before that
 	// token is appended or sent to the sink.
 	glades::chiron::ChironEvalScratch failScratch;
@@ -1507,8 +1523,9 @@ void CHIRONGenerateObservedTest()
 	// A one-token prompt exercises logits row zero and confirms that observer
 	// context retains the original ID while the model input clamps it. The
 	// longer fixture above reaches row T-1 after the context fills the window.
-	glades::chiron::ChironEvalScratch firstRowScratch;
+	glades::chiron::ChironEvalScratch firstRowScratch, firstRowRefScratch;
 	ASSERT("observed first-row scratch alloc", firstRowScratch.allocate(d, w, cfg));
+	ASSERT("observed first-row ref scratch alloc", firstRowRefScratch.allocate(d, w, cfg));
 	glades::chiron::ChironGenParams oneStep(gp);
 	oneStep.topK = 1;
 	oneStep.maxTokens = 1;
@@ -1518,9 +1535,16 @@ void CHIRONGenerateObservedTest()
 	       glades::chiron::chiron_generate_observed(
 	           d, w, cfg, firstRowScratch, firstPrompt, oneStep,
 	           NULL, NULL, generationObserver, &firstCapture, &firstTokens));
+	std::vector<int> firstRefTokens;
+	std::vector< std::vector<float> > firstRefRows;
+	gen_reference_loop(d, w, cfg, firstRowRefScratch, firstPrompt, oneStep, 1,
+	                   firstRefTokens, &firstRefRows);
 	ASSERT("observed first-row callback", firstCapture.steps.size() == 1);
 	ASSERT("observed first-row index", firstCapture.logitsRows[0] == 0);
 	ASSERT("observed first-row context", firstCapture.contexts[0] == firstPrompt);
+	ASSERT("observed first-row full-download parity",
+	       firstCapture.rawRows[0] == firstRefRows[0]);
+	ASSERT("observed first-row token parity", firstTokens == firstRefTokens);
 	ASSERT("observed last-row covered", capture.logitsRows.back() == d.T - 1);
 
 	// Invalid empty prompts fail before observer dispatch, preserving legacy
