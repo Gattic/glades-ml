@@ -529,8 +529,12 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
 // on it.  CHIRON_DBG env-gated debug blocks are kept.
 // ---------------------------------------------------------------------------
 
-bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
-                         const ChironServingConfig& cfg, ChironEvalScratch& s)
+bool chiron_eval_forward_observed(const ChironModelDims& d,
+                                  const ChironModelWeights& w,
+                                  const ChironServingConfig& cfg,
+                                  ChironEvalScratch& s,
+                                  ChironEvalScfaLayerObserver observer,
+                                  void* observerContext)
 {
     const int T=d.T,m=d.m,V=d.V,L=d.L,nH=d.nH,nKVH=d.nKVH>0?d.nKVH:d.nH,dH=d.dH;
 
@@ -583,6 +587,7 @@ bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
             if (!scfa_shear_eval(s, w.scfa,
                                  w.Wq[l]->data(), w.Wk[l]->data(), w.Wv[l]->data(), w.Wo[l]->data(),
                                  l,T,m,nH,nKVH,dH,/*invert=*/false,cfg.qkNorm)) return false;
+            if (observer && !observer(observerContext, l, s)) return false;
         }
         else if (!glades::gpu::chiron_attention_shear_tiled(
                 s.q.data(), s.p.data(),
@@ -667,6 +672,12 @@ bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
         std::printf("[dbg] logits[pos0]: max=%.4g argmax=%d mean=%.4g\n", mx, am, mean/d.V);
     }
     return true;
+}
+
+bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
+                         const ChironServingConfig& cfg, ChironEvalScratch& s)
+{
+    return chiron_eval_forward_observed(d, w, cfg, s, NULL, NULL);
 }
 
 } // namespace chiron

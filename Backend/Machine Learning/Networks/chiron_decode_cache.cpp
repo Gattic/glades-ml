@@ -187,6 +187,62 @@ struct ChironDecodeCache::Impl
         return true;
     }
 
+    bool prepareCapture(int promptLength)
+    {
+        if (!isReady || promptLength <= 0 || promptLength >= T) return false;
+        if (!resetState()) return false;
+        position = promptLength;
+        completedBlocks = 0;
+        while (completedBlocks + 1 < k
+               && promptLength >= blockBegin(completedBlocks + 1))
+            ++completedBlocks;
+        blockFill = promptLength - blockBegin(completedBlocks);
+        historyCount = std::min(promptLength, historyCapacity);
+        historyWrite = historyCount % historyCapacity;
+        return blockFill >= 0 && blockFill < blockWidth(completedBlocks);
+    }
+
+    bool captureLayer(int layerIndex, const ChironEvalScratch& s)
+    {
+        if (layerIndex < 0 || layerIndex >= L || position <= 0 || position >= T)
+            return false;
+        Layer& layer = *layers[layerIndex];
+        if (completedBlocks > 0)
+        {
+            glades::gpu::device_memcpy_d2d(
+                layer.qCompr.data(), s.scfa_qcompr.data(),
+                (size_t)completedBlocks * m * sizeof(float));
+            glades::gpu::device_memcpy_d2d(
+                layer.kCache.data(), s.scfa_inner_sK.data(),
+                (size_t)completedBlocks * dModelKV * sizeof(float));
+            glades::gpu::device_memcpy_d2d(
+                layer.vCache.data(), s.scfa_inner_sV.data(),
+                (size_t)completedBlocks * dModelKV * sizeof(float));
+            glades::gpu::device_memcpy_d2d(
+                layer.yLast.data(),
+                s.scfa_ycompr.data() + (size_t)(completedBlocks - 1) * m,
+                (size_t)m * sizeof(float));
+        }
+        if (blockFill > 0)
+            glades::gpu::device_memcpy_d2d(
+                layer.qBlock.data(),
+                s.q.data() + (size_t)blockBegin(completedBlocks) * m,
+                (size_t)blockFill * m * sizeof(float));
+        if (historyCount > 0)
+            glades::gpu::device_memcpy_d2d(
+                layer.qPerpRing.data(),
+                s.scfa_qperp.data() + (size_t)(position - historyCount) * m,
+                (size_t)historyCount * m * sizeof(float));
+        return true;
+    }
+
+    static bool captureLayerCallback(void* context, int layerIndex,
+                                     const ChironEvalScratch& s)
+    {
+        Impl* self = static_cast<Impl*>(context);
+        return self && self->captureLayer(layerIndex, s);
+    }
+
     bool cloneState(const Impl& source)
     {
         clear();
@@ -462,12 +518,24 @@ bool chiron_decode_prefill(const ChironModelDims& d,
     (void)d; (void)w; (void)cfg; (void)s; (void)promptTokens; (void)cache;
     return false;
 #else
-    if (promptTokens.empty() || (int)promptTokens.size() >= d.T
+    const int promptLength = (int)promptTokens.size();
+    if (promptLength <= 0 || promptLength >= d.T
         || !cache.impl_->matches(d, w, cfg, s)) return false;
-    if (!cache.impl_->resetState()) return false;
-    for (size_t i = 0; i < promptTokens.size(); ++i)
-        if (!cache.impl_->consume(d, w, cfg, s, promptTokens[i],
-                                  i + 1 == promptTokens.size())) return false;
+    std::vector<int> input((size_t)d.T, 0);
+    for (int i = 0; i < promptLength; ++i)
+    {
+        int token = promptTokens[(size_t)i];
+        input[(size_t)i] = (token >= 0 && token < d.V) ? token : 0;
+    }
+    if (!cache.impl_->prepareCapture(promptLength)) return false;
+    if (!s.d_tokens.upload(&input[0], input.size())) return false;
+    if (!chiron_eval_forward_observed(d, w, cfg, s,
+            ChironDecodeCache::Impl::captureLayerCallback, cache.impl_)) return false;
+    if (promptLength > 1)
+        glades::gpu::device_memcpy_d2d(
+            s.logits.data(),
+            s.logits.data() + (size_t)(promptLength - 1) * d.V,
+            (size_t)d.V * sizeof(float));
     return true;
 #endif
 }

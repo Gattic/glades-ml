@@ -117,6 +117,19 @@ private:
 bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
                          const ChironServingConfig& cfg, ChironEvalScratch& s);
 
+// Internal serving seam used by exact cache prefill. The observer runs once per
+// SCFA layer after attention has produced q_compr/q_perp/y_compr and before any
+// row-local FFN/fuse/WhiSC/ReLN mutation of q. A null observer is equivalent to
+// chiron_eval_forward. Returning false aborts the forward.
+typedef bool (*ChironEvalScfaLayerObserver)(void* context, int layer,
+                                            const ChironEvalScratch& scratch);
+bool chiron_eval_forward_observed(const ChironModelDims& d,
+                                  const ChironModelWeights& w,
+                                  const ChironServingConfig& cfg,
+                                  ChironEvalScratch& s,
+                                  ChironEvalScfaLayerObserver observer,
+                                  void* observerContext);
+
 } // namespace chiron
 } // namespace glades
 
