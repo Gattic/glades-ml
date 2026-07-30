@@ -1830,6 +1830,28 @@ static void CHIRONDecodeCacheTest()
 	ASSERT("decode snapshot invalidation reset", cache.reset());
 	ASSERT("decode stale snapshot rejected", !snapshot.restore(cache, cachedScratch));
 
+	std::vector<int> reusePrompt(prompt);
+	for (size_t i = 0; i < reusePrompt.size(); ++i)
+		reusePrompt[i] = (reusePrompt[i] + 5) % d.V;
+	ASSERT("decode reused-cache prefill", glades::chiron::chiron_decode_prefill(
+		d, w, cfg, cachedScratch, reusePrompt, cache));
+	glades::chiron::ChironDecodeCache freshCache;
+	glades::chiron::ChironEvalScratch freshScratch;
+	ASSERT("decode fresh-cache alloc", freshCache.allocate(d, w, cfg));
+	ASSERT("decode fresh-cache scratch", freshScratch.allocate(d, w, cfg));
+	ASSERT("decode fresh-cache prefill", glades::chiron::chiron_decode_prefill(
+		d, w, cfg, freshScratch, reusePrompt, freshCache));
+	ASSERT("decode reused-cache logits", cachedScratch.logits.download(&cached[0], cached.size()));
+	ASSERT("decode fresh-cache logits", freshScratch.logits.download(&full[0], full.size()));
+	ASSERT("decode cross-prompt cache reuse prefill parity", cached == full);
+	ASSERT("decode reused-cache branch", glades::chiron::chiron_decode_step(
+		d, w, cfg, cachedScratch, 11, cache));
+	ASSERT("decode fresh-cache branch", glades::chiron::chiron_decode_step(
+		d, w, cfg, freshScratch, 11, freshCache));
+	ASSERT("decode reused-cache branch logits", cachedScratch.logits.download(&cached[0], cached.size()));
+	ASSERT("decode fresh-cache branch logits", freshScratch.logits.download(&full[0], full.size()));
+	ASSERT("decode cross-prompt cache reuse branch parity", cached == full);
+
 	glades::chiron::ChironServingConfig denseCfg = cfg;
 	denseCfg.useScfa = false;
 	glades::chiron::ChironDecodeCache denseCache;
