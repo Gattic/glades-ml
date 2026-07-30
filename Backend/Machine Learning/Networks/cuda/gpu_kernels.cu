@@ -9641,6 +9641,15 @@ __global__ void scfa_causal_lag_lift_kernel(
 	out[idx] = beta == 0.0f ? v : v + beta * out[idx];
 }
 
+__global__ void scfa_lag_row_kernel(
+    const float* __restrict__ summary, int m, int blockWidth,
+    float* __restrict__ out)
+{
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	out[c] = summary[c] * rsqrtf((float)blockWidth);
+}
+
 __global__ void scfa_causal_lag_reduce_kernel(
     const float* __restrict__ x, int T, int m, int k,
     float alpha, float beta, float* __restrict__ out)
@@ -10010,6 +10019,18 @@ bool scfa_block_expand(const float* x, int T, int m, int k,
 	int block = 256;
 	int grid = (int)((n + block - 1) / block);
 	scfa_block_expand_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_lag_row(const float* summary, int m, int blockWidth, float* out,
+                  cudaStream_t stream)
+{
+	if (!summary || !out || m <= 0 || blockWidth <= 0) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	int grid = (m + block - 1) / block;
+	scfa_lag_row_kernel<<<grid, block, 0, s>>>(summary, m, blockWidth, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

@@ -12,6 +12,7 @@ set(Networks_src_files
 	checkpoint_persistence.cpp
 	chiron_checkpoint.cpp
 	chiron_serving.cpp
+	chiron_decode_cache.cpp
 	chiron_generate.cpp
 	chiron_orbit.cpp
 	chiron_orbit.h

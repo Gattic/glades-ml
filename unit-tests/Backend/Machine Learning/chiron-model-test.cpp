@@ -14,6 +14,7 @@
 #include "../../unit-test.h"
 #include "../../../Backend/Machine Learning/Networks/chiron_checkpoint.h"
 #include "../../../Backend/Machine Learning/Networks/chiron_serving.h"
+#include "../../../Backend/Machine Learning/Networks/chiron_generate.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_chiron.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
@@ -1163,19 +1164,22 @@ static void CHIRONScfaCausalBlockTest()
 	}
 	for (size_t i = 0; i < km; ++i) z[i] = -0.04f * (float)((int)i - 3);
 
-	glades::gpu::GpuBuffer<float> dx, dz, dy, c, ctz, az, aty;
+	glades::gpu::GpuBuffer<float> dx, dz, dy, c, ctz, az, aty, lagRow;
 	ASSERT("scfa causal alloc",
 	       dx.allocate(Tm) && dz.allocate(km) && dy.allocate(Tm)
-	       && c.allocate(km) && ctz.allocate(Tm) && az.allocate(Tm) && aty.allocate(km));
+	       && c.allocate(km) && ctz.allocate(Tm) && az.allocate(Tm) && aty.allocate(km)
+	       && lagRow.allocate((size_t)m));
 	ASSERT("scfa causal upload", dx.upload(&x[0], Tm) && dz.upload(&z[0], km) && dy.upload(&y[0], Tm));
 	ASSERT("scfa block compress", glades::gpu::scfa_block_compress(dx.data(), T, m, k, 1.0f, 0.0f, c.data()));
 	ASSERT("scfa block expand", glades::gpu::scfa_block_expand(dz.data(), T, m, k, 1.0f, 0.0f, ctz.data()));
 	ASSERT("scfa lag lift", glades::gpu::scfa_causal_lag_lift(dz.data(), T, m, k, 1.0f, 0.0f, az.data()));
 	ASSERT("scfa lag reduce", glades::gpu::scfa_causal_lag_reduce(dy.data(), T, m, k, 1.0f, 0.0f, aty.data()));
+	ASSERT("scfa decode lag row", glades::gpu::scfa_lag_row(dz.data(), m, T / k, lagRow.data()));
 
-	std::vector<float> hc(km), hctz(Tm), haz(Tm), haty(km);
+	std::vector<float> hc(km), hctz(Tm), haz(Tm), haty(km), hLag((size_t)m);
 	ASSERT("scfa causal download", c.download(&hc[0], km) && ctz.download(&hctz[0], Tm)
-	       && az.download(&haz[0], Tm) && aty.download(&haty[0], km));
+	       && az.download(&haz[0], Tm) && aty.download(&haty[0], km)
+	       && lagRow.download(&hLag[0], hLag.size()));
 	double lhsC = 0.0, rhsC = 0.0, lhsA = 0.0, rhsA = 0.0;
 	for (size_t i = 0; i < km; ++i) { lhsC += (double)hc[i] * z[i]; rhsA += (double)z[i] * haty[i]; }
 	for (size_t i = 0; i < Tm; ++i) { rhsC += (double)x[i] * hctz[i]; lhsA += (double)haz[i] * y[i]; }
@@ -1187,6 +1191,9 @@ static void CHIRONScfaCausalBlockTest()
 	for (int t = 0; t < firstBlockEnd; ++t)
 		for (int cidx = 0; cidx < m; ++cidx)
 			ASSERT("scfa first block masked", haz[(size_t)t * m + cidx] == 0.0f);
+	for (int cidx = 0; cidx < m; ++cidx)
+		ASSERT("scfa decode lag matches full lift",
+		       hLag[cidx] == haz[(size_t)firstBlockEnd * m + cidx]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,6 +1639,217 @@ static void CHIRONPrefixCausalityTest()
 	ASSERT("prefix regression changes future fixture", futureDiffers);
 }
 
+struct DecodeGenerationTrace
+{
+	std::vector<int> sampled;
+	std::vector<int> rows;
+	std::vector<float> logits;
+};
+
+static bool capture_decode_generation(void* opaque,
+                                      const glades::chiron::ChironGenerationStep& step)
+{
+	DecodeGenerationTrace* trace = static_cast<DecodeGenerationTrace*>(opaque);
+	trace->sampled.push_back(step.sampledToken);
+	trace->rows.push_back(step.logitsRow);
+	trace->logits.insert(trace->logits.end(), step.rawLogits,
+	                     step.rawLogits + step.vocabSize);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: bounded-state SCFA decode cache vs fresh full-prefix forwards.
+// Covers partial blocks, a block boundary, QK-Norm, WhiSC-D, reset/clone, and
+// explicit no-slide rejection. Incremental attention uses a single-query FP32
+// reduction while full forward uses tiled TF32, so this is a semantic/numeric
+// tolerance gate rather than a bit-identity gate.
+// ---------------------------------------------------------------------------
+
+static void CHIRONDecodeCacheTest()
+{
+	glades::chiron::ChironModelDims d = ev_dims();
+	glades::chiron::ChironModelWeights w;
+	ev_fill_core_weights(w, d);
+
+	const int k = 4, sw = 1;
+	w.scfa.present = true;
+	w.scfa.dLoaded = true;
+	w.scfa.causalBlock = true;
+	w.scfa.k = k;
+	w.scfa.w = sw;
+	const size_t Dsz = (size_t)d.m * (sw + 1);
+	for (int l = 0; l < d.L; ++l)
+	{
+		glades::gpu::GpuBuffer<float>* Dl = new glades::gpu::GpuBuffer<float>();
+		std::vector<float> dh(Dsz);
+		for (size_t i = 0; i < Dsz; ++i)
+			dh[i] = 0.015f * std::sin(0.17f * (float)i + 0.09f * l);
+		ASSERT("decode D alloc", Dl->allocate(Dsz) && Dl->upload(&dh[0], Dsz));
+		w.scfa.D.push_back(Dl);
+	}
+	w.rotPhi.resize((size_t)d.L * d.m);
+	w.whiscA.resize((size_t)d.L * d.m);
+	for (size_t i = 0; i < w.rotPhi.size(); ++i)
+	{
+		w.rotPhi[i] = 0.08f + 0.013f * (float)i;
+		w.whiscA[i] = 0.8f + 0.02f * (float)i;
+	}
+
+	glades::chiron::ChironServingConfig cfg;
+	cfg.useScfa = true;
+	cfg.qkNorm = true;
+	cfg.fuseAttnReln = true;
+	cfg.whiscCoupling = true;
+	cfg.rotThetaMax = 0.07f;
+	cfg.whiscClamp = 8.0f;
+	cfg.epsReln = 1e-4f;
+	cfg.qknormGammaScale.resize((size_t)d.L * d.nH, 1.75f);
+
+	std::vector<int> tokens((size_t)d.T);
+	for (int t = 0; t < d.T; ++t) tokens[t] = (3 * t + 1) % d.V;
+
+	std::vector<float> embeddingBefore((size_t)d.V * d.m), filterBefore(Dsz);
+	ASSERT("decode model embedding before", w.E.download(&embeddingBefore[0], embeddingBefore.size()));
+	ASSERT("decode model filter before", w.scfa.D[0]->download(&filterBefore[0], filterBefore.size()));
+
+	glades::chiron::ChironEvalScratch cachedScratch, fullScratch;
+	ASSERT("decode cached scratch", cachedScratch.allocate(d, w, cfg));
+	ASSERT("decode full scratch", fullScratch.allocate(d, w, cfg));
+	glades::chiron::ChironDecodeCache cache;
+	ASSERT("decode cache alloc", cache.allocate(d, w, cfg));
+	ASSERT("decode cache no sliding", !cache.slidingSupported());
+
+	std::vector<int> prefix((size_t)d.T, 0);
+	std::vector<float> cached((size_t)d.V), full((size_t)d.V);
+	for (int pos = 0; pos < d.T - 1; ++pos)
+	{
+		prefix[pos] = tokens[pos];
+		ASSERT("decode step", glades::chiron::chiron_decode_step(
+			d, w, cfg, cachedScratch, tokens[pos], cache));
+		ASSERT("decode cached logits", cachedScratch.logits.download(&cached[0], cached.size()));
+		ASSERT("decode full upload", fullScratch.d_tokens.upload(&prefix[0], prefix.size()));
+		ASSERT("decode full forward", glades::chiron::chiron_eval_forward(d, w, cfg, fullScratch));
+		ASSERT("decode full row", glades::gpu::synchronizeCheck("decode full row"));
+		glades::gpu::device_memcpy_d2h(&full[0],
+			fullScratch.logits.data() + (size_t)pos * d.V,
+			(size_t)d.V * sizeof(float));
+		ASSERT("decode full row sync", glades::gpu::synchronizeTransferStream());
+		for (int v = 0; v < d.V; ++v)
+			ASSERT("decode stepwise logits", std::fabs(cached[v] - full[v]) < 2e-3f);
+		ASSERT("decode position", cache.position() == pos + 1);
+	}
+	ASSERT("decode crossed blocks", cache.completedBlocks() == 3);
+
+	glades::chiron::ChironDecodeCache clone;
+	ASSERT("decode clone", clone.cloneFrom(cache));
+	ASSERT("decode clone position", clone.position() == cache.position());
+	glades::chiron::ChironEvalScratch cloneScratch;
+	ASSERT("decode clone scratch", cloneScratch.allocate(d, w, cfg));
+	ASSERT("decode source final", glades::chiron::chiron_decode_step(
+		d, w, cfg, cachedScratch, tokens[d.T - 1], cache));
+	ASSERT("decode clone final", glades::chiron::chiron_decode_step(
+		d, w, cfg, cloneScratch, tokens[d.T - 1], clone));
+	std::vector<float> cloned((size_t)d.V);
+	ASSERT("decode source download", cachedScratch.logits.download(&cached[0], cached.size()));
+	ASSERT("decode clone download", cloneScratch.logits.download(&cloned[0], cloned.size()));
+	for (int v = 0; v < d.V; ++v)
+		ASSERT("decode clone logits", cached[v] == cloned[v]);
+	const int fullPosition = cache.position();
+	ASSERT("decode full context position", fullPosition == d.T);
+	ASSERT("decode rejects sliding", !glades::chiron::chiron_decode_step(
+		d, w, cfg, cachedScratch, 1, cache));
+	ASSERT("decode reject no mutation", cache.position() == fullPosition);
+
+	ASSERT("decode reset", cache.reset());
+	ASSERT("decode reset position", cache.position() == 0 && cache.completedBlocks() == 0);
+	std::vector<int> prompt(tokens.begin(), tokens.begin() + 5);
+	ASSERT("decode prefill", glades::chiron::chiron_decode_prefill(
+		d, w, cfg, cachedScratch, prompt, cache));
+	ASSERT("decode prefill position", cache.position() == 5 && cache.completedBlocks() == 2);
+	ASSERT("decode prefill logits", cachedScratch.logits.download(&cached[0], cached.size()));
+	std::fill(prefix.begin(), prefix.end(), 0);
+	for (size_t i = 0; i < prompt.size(); ++i) prefix[i] = prompt[i];
+	ASSERT("decode prefill full upload", fullScratch.d_tokens.upload(&prefix[0], prefix.size()));
+	ASSERT("decode prefill full forward", glades::chiron::chiron_eval_forward(d, w, cfg, fullScratch));
+	ASSERT("decode prefill full sync", glades::gpu::synchronizeCheck("decode prefill full"));
+	glades::gpu::device_memcpy_d2h(&full[0],
+		fullScratch.logits.data() + (prompt.size() - 1u) * d.V,
+		(size_t)d.V * sizeof(float));
+	ASSERT("decode prefill row sync", glades::gpu::synchronizeTransferStream());
+	for (int v = 0; v < d.V; ++v)
+		ASSERT("decode prefill-vs-full logits", std::fabs(cached[v] - full[v]) < 2e-3f);
+	std::vector<float> firstPrefill(cached);
+	ASSERT("decode repeated reset", cache.reset());
+	ASSERT("decode repeated prefill", glades::chiron::chiron_decode_prefill(
+		d, w, cfg, cachedScratch, prompt, cache));
+	ASSERT("decode repeated logits", cachedScratch.logits.download(&cached[0], cached.size()));
+	for (int v = 0; v < d.V; ++v)
+		ASSERT("decode reset reproducible", cached[v] == firstPrefill[v]);
+	const int beforeOversize = cache.position();
+	ASSERT("decode rejects full-length prefill", !glades::chiron::chiron_decode_prefill(
+		d, w, cfg, cachedScratch, tokens, cache));
+	ASSERT("decode oversized prefill no mutation", cache.position() == beforeOversize);
+
+	glades::chiron::ChironServingConfig denseCfg = cfg;
+	denseCfg.useScfa = false;
+	glades::chiron::ChironDecodeCache denseCache;
+	ASSERT("decode rejects dense attention", !denseCache.allocate(d, w, denseCfg));
+
+	std::vector<int> generationPrompt(tokens.begin(), tokens.begin() + 3);
+	glades::chiron::ChironGenParams gp;
+	gp.maxTokens = 4;
+	gp.topK = 1;
+	gp.topP = 1.0f;
+	gp.temperature = 1.0f;
+	gp.repPenalty = 1.0f;
+	gp.freqPenalty = 0.0f;
+	gp.presPenalty = 0.0f;
+	gp.noRepeatN = 0;
+	std::vector<int> fullGenerated, cachedGenerated;
+	DecodeGenerationTrace fullTrace, cachedTrace;
+	glades::chiron::ChironEvalScratch fullGenScratch, cachedGenScratch;
+	ASSERT("decode full generation scratch", fullGenScratch.allocate(d, w, cfg));
+	ASSERT("decode cached generation scratch", cachedGenScratch.allocate(d, w, cfg));
+	ASSERT("decode full generation", glades::chiron::chiron_generate_observed(
+		d, w, cfg, fullGenScratch, generationPrompt, gp, NULL, NULL,
+		capture_decode_generation, &fullTrace, &fullGenerated));
+	ASSERT("decode cached generation", glades::chiron::chiron_generate_cached_observed(
+		d, w, cfg, cachedGenScratch, generationPrompt, gp, NULL, NULL,
+		capture_decode_generation, &cachedTrace, &cachedGenerated));
+	ASSERT("decode greedy generated tokens", cachedGenerated == fullGenerated);
+	ASSERT("decode greedy observer tokens", cachedTrace.sampled == fullTrace.sampled);
+	ASSERT("decode greedy logical rows", cachedTrace.rows == fullTrace.rows);
+	ASSERT("decode greedy trace size", cachedTrace.logits.size() == fullTrace.logits.size());
+	for (size_t i = 0; i < cachedTrace.logits.size(); ++i)
+		ASSERT("decode greedy raw logits", std::fabs(cachedTrace.logits[i] - fullTrace.logits[i]) < 2e-3f);
+
+	gp.topK = d.V;
+	gp.seed = 424242u;
+	std::vector<int> stochasticA, stochasticB;
+	glades::chiron::ChironEvalScratch stochasticScratchA, stochasticScratchB;
+	ASSERT("decode stochastic scratch A", stochasticScratchA.allocate(d, w, cfg));
+	ASSERT("decode stochastic scratch B", stochasticScratchB.allocate(d, w, cfg));
+	ASSERT("decode stochastic generation A", glades::chiron::chiron_generate_cached(
+		d, w, cfg, stochasticScratchA, generationPrompt, gp, NULL, NULL, &stochasticA));
+	ASSERT("decode stochastic generation B", glades::chiron::chiron_generate_cached(
+		d, w, cfg, stochasticScratchB, generationPrompt, gp, NULL, NULL, &stochasticB));
+	ASSERT("decode stochastic RNG reproducible", stochasticA == stochasticB);
+
+	glades::chiron::ChironGenParams tooLong = gp;
+	tooLong.maxTokens = d.T;
+	std::vector<int> rejectedOutput(1, 99);
+	ASSERT("decode generation rejects slide", !glades::chiron::chiron_generate_cached(
+		d, w, cfg, cachedGenScratch, generationPrompt, tooLong,
+		NULL, NULL, &rejectedOutput));
+	ASSERT("decode generation rejection is preflight", rejectedOutput.size() == 1 && rejectedOutput[0] == 99);
+
+	std::vector<float> embeddingAfter(embeddingBefore.size()), filterAfter(filterBefore.size());
+	ASSERT("decode model embedding after", w.E.download(&embeddingAfter[0], embeddingAfter.size()));
+	ASSERT("decode model filter after", w.scfa.D[0]->download(&filterAfter[0], filterAfter.size()));
+	ASSERT("decode checkpoint embedding immutable", embeddingAfter == embeddingBefore);
+	ASSERT("decode checkpoint filter immutable", filterAfter == filterBefore);
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate entry.
 // ---------------------------------------------------------------------------
@@ -1645,4 +1863,5 @@ void CHIRONModelUnitTest()
 	CHIRONScfaCausalBlockTest();
 	CHIRONEvalForwardParityTest();
 	CHIRONPrefixCausalityTest();
+	CHIRONDecodeCacheTest();
 }

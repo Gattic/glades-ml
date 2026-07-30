@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
-#include "chiron_serving.h"
+#include "chiron_decode_cache.h"
 
 namespace glades {
 namespace chiron {
@@ -93,6 +93,28 @@ bool chiron_generate(const ChironModelDims& dims, const ChironModelWeights& w,
                      const ChironGenParams& gp,
                      ChironTokenSink sink, void* sinkCtx,
                      std::vector<int>* outTokens);
+
+// Exact-geometry causal-SCFA generation using one bounded-state prefill and
+// incremental token steps. This v1 path never slides: it rejects prompts at or
+// beyond T and requests that would need more than T consumed input positions.
+bool chiron_generate_cached_observed(const ChironModelDims& dims,
+                                     const ChironModelWeights& w,
+                                     const ChironServingConfig& cfg,
+                                     ChironEvalScratch& s,
+                                     const std::vector<int>& promptTokens,
+                                     const ChironGenParams& gp,
+                                     ChironTokenSink sink, void* sinkCtx,
+                                     ChironGenerationStepObserver observer,
+                                     void* observerCtx,
+                                     std::vector<int>* outTokens);
+bool chiron_generate_cached(const ChironModelDims& dims,
+                            const ChironModelWeights& w,
+                            const ChironServingConfig& cfg,
+                            ChironEvalScratch& s,
+                            const std::vector<int>& promptTokens,
+                            const ChironGenParams& gp,
+                            ChironTokenSink sink, void* sinkCtx,
+                            std::vector<int>* outTokens);
 
 struct ChironTfResult
 {

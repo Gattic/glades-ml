@@ -429,6 +429,100 @@ bool chiron_generate(const ChironModelDims& dims,
                                     sink, sinkCtx, NULL, NULL, outTokens);
 }
 
+bool chiron_generate_cached_observed(const ChironModelDims& dims,
+                                     const ChironModelWeights& w,
+                                     const ChironServingConfig& cfg,
+                                     ChironEvalScratch& s,
+                                     const std::vector<int>& promptTokens,
+                                     const ChironGenParams& gp,
+                                     ChironTokenSink sink,
+                                     void* sinkCtx,
+                                     ChironGenerationStepObserver observer,
+                                     void* observerCtx,
+                                     std::vector<int>* outTokens)
+{
+#ifndef GLADES_HAVE_CUDA
+    (void)dims; (void)w; (void)cfg; (void)s; (void)promptTokens; (void)gp;
+    (void)sink; (void)sinkCtx; (void)observer; (void)observerCtx; (void)outTokens;
+    return false;
+#else
+    if (promptTokens.empty() || (int)promptTokens.size() >= dims.T) return false;
+    if (gp.maxTokens > 0
+        && (long long)promptTokens.size() + (long long)gp.maxTokens - 1ll > dims.T)
+        return false;
+    if (!gpu::isAvailable() && !gpu::initDevice()) return false;
+    if (outTokens) outTokens->clear();
+    if (gp.maxTokens <= 0) return true;
+
+    ChironDecodeCache cache;
+    if (!cache.allocate(dims, w, cfg)) return false;
+    if (!chiron_decode_prefill(dims, w, cfg, s, promptTokens, cache)) return false;
+
+    std::vector<int> tokens(promptTokens);
+    std::vector<float> logitsRow((size_t)dims.V);
+    ChironMt19937 rng(gp.seed);
+    ScopedGenerationEvent computeReady;
+    if (!computeReady.get()) return false;
+
+    for (int gen = 0; gen < gp.maxTokens; ++gen)
+    {
+        if (!gpu::synchronizeCheck("chiron cached generation forward")) return false;
+        if (!gpu::recordEvent(computeReady.get(), gpu::computeStream())) return false;
+        if (!gpu::streamWaitEvent(gpu::transferStream(), computeReady.get())) return false;
+        gpu::device_memcpy_d2h(&logitsRow[0], s.logits.data(),
+                              (size_t)dims.V * sizeof(float));
+        if (!gpu::synchronizeTransferStream()) return false;
+
+        if (std::getenv("CHIRON_DBG") && gen < 4)
+        {
+            std::vector<int> idx(dims.V);
+            for (int v = 0; v < dims.V; ++v) idx[v] = v;
+            const int top5 = dims.V < 5 ? dims.V : 5;
+            CmpByFloatDesc cmp(logitsRow);
+            std::partial_sort(idx.begin(), idx.begin() + top5, idx.end(), cmp);
+            std::printf("[dbg-cached-gen %d] pos=%d top5: ", gen, cache.position() - 1);
+            for (int j = 0; j < top5; ++j)
+                std::printf("tok%d=%.3g  ", idx[j], logitsRow[idx[j]]);
+            std::printf("\n");
+        }
+
+        const int next = chiron_sample_token(logitsRow, gp, tokens, rng);
+        if (observer)
+        {
+            ChironGenerationStep step;
+            step.step = gen;
+            step.logitsRow = cache.position() - 1;
+            step.sampledToken = next;
+            step.rawLogits = &logitsRow[0];
+            step.vocabSize = dims.V;
+            step.contextBeforeSample = &tokens;
+            if (!observer(observerCtx, step)) return false;
+        }
+
+        tokens.push_back(next);
+        if (outTokens) outTokens->push_back(next);
+        if (sink && !sink(sinkCtx, next)) break;
+        if (gen + 1 < gp.maxTokens
+            && !chiron_decode_step(dims, w, cfg, s, next, cache)) return false;
+    }
+    return true;
+#endif
+}
+
+bool chiron_generate_cached(const ChironModelDims& dims,
+                            const ChironModelWeights& w,
+                            const ChironServingConfig& cfg,
+                            ChironEvalScratch& s,
+                            const std::vector<int>& promptTokens,
+                            const ChironGenParams& gp,
+                            ChironTokenSink sink,
+                            void* sinkCtx,
+                            std::vector<int>* outTokens)
+{
+    return chiron_generate_cached_observed(dims, w, cfg, s, promptTokens, gp,
+                                           sink, sinkCtx, NULL, NULL, outTokens);
+}
+
 // ---------------------------------------------------------------------------
 // chiron_tf_eval — verbatim port of chiron_infer.cpp tf-check block (536-581).
 // One forward over the padded window; per-position argmax + double-precision

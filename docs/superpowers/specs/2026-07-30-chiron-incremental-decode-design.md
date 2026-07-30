@@ -98,10 +98,10 @@ state.
 
 After consuming `position` tokens, each layer cache contains:
 
-1. exact committed `q_compr[0..completedBlocks-1]`;
-2. exact committed `y_compr[0..completedBlocks-1]`;
+1. exact committed `q_compr[0..completedBlocks-1]` and their projected K/V rows;
+2. the most recently committed `y_compr` row (older rows are never read again);
 3. layer-input `q` rows for the uncommitted current block, in order;
-4. the most recent `min(position,w)` `q_perp` rows, in order;
+4. the most recent `min(position,w+1)` `q_perp` rows, in order;
 5. no value derived from a token at index `>= position`.
 
 Global cache metadata stores model geometry, `position`, and readiness. Model

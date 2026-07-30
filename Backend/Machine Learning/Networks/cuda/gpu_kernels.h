@@ -362,6 +362,12 @@ bool scfa_block_expand(const float* x, int T, int m, int k,
                        float alpha, float beta, float* out,
                        cudaStream_t stream = 0);
 
+// Decode helper for the lag lift of one completed block. Uses device rsqrtf,
+// matching scfa_causal_lag_lift rather than a host-rounded scale constant:
+// out[c] = summary[c] / sqrt(blockWidth).
+bool scfa_lag_row(const float* summary, int m, int blockWidth, float* out,
+                  cudaStream_t stream = 0);
+
 // y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]    (causal depthwise 1-D conv).
 // One filter per channel; m channels, T positions, half-width w (kernel size
 // w+1 since we only use the causal half + center tap).  Out-of-bounds is 0.
@@ -1382,6 +1388,7 @@ inline bool scfa_block_compress(const float*, int, int, int, float, float, float
 inline bool scfa_causal_lag_lift(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_causal_lag_reduce(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_block_expand(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_lag_row(const float*, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
