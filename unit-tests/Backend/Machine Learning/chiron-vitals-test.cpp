@@ -271,6 +271,47 @@ void CHIRONVitalsGpuTapTest()
 	int hlc=0,hc=0,hv=0;dLossCount.download(&hlc,1);dCorrect.download(&hc,1);dValid.download(&hv,1);
 	ASSERT("VITALS output counts",hlc==TV&&hc==TV&&hv==TV);
 
+	// Multi-block validation reduction: every row must contribute once, not
+	// once per launched CUDA block. Cover boundaries around one warp/block and
+	// the production T=16384 geometry with deterministic BF16 probabilities.
+	const int countCases[] = {1, 63, 64, 65, 128, 257, 16384};
+	for (size_t ci = 0; ci < sizeof(countCases) / sizeof(countCases[0]); ++ci)
+	{
+		const int rows = countCases[ci], cols = 8, pad = 7;
+		std::vector<float> hp((size_t)rows * cols, 0.0f);
+		std::vector<int> ht(rows, 0);
+		int expectedCount = 0;
+		for (int t = 0; t < rows; ++t)
+		{
+			ht[t] = (t % 7 == 0) ? pad : (t % 6);
+			hp[(size_t)t * cols + ht[t]] = 0.25f;
+			if (ht[t] != pad) ++expectedCount;
+		}
+		glades::gpu::GpuBuffer<float> fp, loss;
+		glades::gpu::GpuBuffer<unsigned short> bp;
+		glades::gpu::GpuBuffer<int> tgt, count;
+		ASSERT("VITALS count fp alloc", fp.allocate(hp.size()));
+		ASSERT("VITALS count bf alloc", bp.allocate(hp.size()));
+		ASSERT("VITALS count target alloc", tgt.allocate(ht.size()));
+		ASSERT("VITALS count scalar alloc", loss.allocate(1) && count.allocate(1));
+		ASSERT("VITALS count fp upload", fp.upload(&hp[0], hp.size()));
+		ASSERT("VITALS count target upload", tgt.upload(&ht[0], ht.size()));
+		ASSERT("VITALS count bf cast",
+		       glades::gpu::cast_f32_to_bf16(fp.data(), bp.data(), hp.size()));
+		ASSERT("VITALS count NLL launch",
+		       glades::gpu::cross_entropy_nll_loss_bf16(
+		           bp.data(), tgt.data(), rows, cols, pad, loss.data(), count.data()));
+		float gotLoss = 0.0f;
+		int gotCount = 0;
+		ASSERT("VITALS count loss download", loss.download(&gotLoss, 1));
+		ASSERT("VITALS count value download", count.download(&gotCount, 1));
+		ASSERT("VITALS distinct validation count", gotCount == expectedCount);
+		const double expectedLoss = expectedCount * -std::log(0.25);
+		ASSERT("VITALS validation NLL sum",
+		       std::fabs((double)gotLoss - expectedLoss) <=
+		           2e-5 * std::max(1.0, expectedLoss));
+	}
+
 	// V5/V7 int8 Adam telemetry is mathematically side-effect free.
 	const int na=512, ns=glades::gpu::adam_int8_scale_count(na);
 	std::vector<float> par(na,0.5f),grad(na);for(int i=0;i<na;++i)grad[i]=0.01f*(float)(i%9-4);
