@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-16
 
-**Status:** post-285k E1b diagnosis closed; ARREST execution plan; no ARREST GPU run or objective implementation is authorized by this document
+**Status:** P2 engineering complete; P3 terminal G1 NO-GO (2026-07-26); population G0b and ARREST objective/training were not run or authorized
 
 **Normative sources:**
 
@@ -13,10 +13,11 @@
 This document converts the reviewed design into dependency-ordered engineering phases. If it conflicts
 with the normative sources, the stricter stop rule or acceptance bar wins.
 
-> **Operational boundary.** Phases 0 and 1 are CPU/documentation work. GPU-dependent tests and Phase 2
-> collection wait for owner scheduling. The prior causal FineWeb run has ended, but E1b completion does
-> not authorize an ARREST run. Phase 4 loss code does not begin until a fully trained causal checkpoint
-> passes G0a, G0b, and G1.
+> **Operational boundary.** P2 engineering and the scheduled P3 feasibility sentinels completed. Reduced
+> geometry failed full-geometry token/raw-q parity, and full-geometry collection exceeded the frozen 25%
+> cost hard kill. Population G0b, trainer-replay p95, P4 loss code, and every ARREST training phase remain
+> closed. The terminal result is recorded in the companion trainer's
+> `research/generation-aware/ARREST_P2_P3_G1_NO_GO_2026_07_26.md`.
 
 ---
 
@@ -541,11 +542,12 @@ bash build.sh
 - **Dependencies:** P1 detector API; M0 manifests.
 - **GPU:** implementation can proceed; parity/benchmark waits for scheduling.
 - **Exit:** collector engineering complete; final G1 closes in P3.
-- **Execution status (2026-07-26):** P2.1 compatibility seam implemented: the legacy API is a
-  null-observer wrapper, callbacks see causal pre-append context/raw logits/sampled token, observer
-  failure commits no token, and token/sink/RNG/full-download-row parity tests pass. The existing full
-  logits download is intentionally retained as the correctness baseline. Row-only transfer, P2.2–P2.5,
-  and every G1 claim remain pending; no CHAB, collector, replay, loss, or training-path code has started.
+- **Execution status (2026-07-26):** **P2 engineering complete; P3 G1 terminal NO-GO.** P2.1 uses
+  explicit compute→transfer ordering and row-only downloads with token/sink/RNG/full-row parity. The
+  companion trainer completed CHAB v1, atomic run state, observed rollout collection, and diagnostic-only
+  replay with explicit compute→host synchronization. Reduced/full token identity and raw-q parity failed,
+  while full collection exceeded the preregistered cost hard kill. Population G0b and trainer-replay p95
+  were not run; no ARREST loss, backward path, optimizer step, or pilot is authorized.
 
 ### P2.1 Backward-compatible observed generation
 
@@ -758,6 +760,10 @@ If reduced parity fails, mark reduced geometry unavailable; P3 benchmarks full g
 - **Exit:** G0b and G1 PASS, or a terminal no-go/redirect.
 - **Hard rule:** no ARREST loss/reference/kernel or active training-path code before this phase passes;
   P2's exit-before-training replay diagnostic is the only trainer-side prerequisite.
+- **Execution status (2026-07-26):** **terminal G1 NO-GO.** The reduced sentinel failed token identity and
+  raw-q tolerance (`|delta q|=0.0107924 > 0.002`). Full geometry measured 2.1583 forwards/s; even one
+  context across the three required decoders projected to 0.0989 GPU-hours, above the 0.078 hard kill.
+  No eligible geometry remained, so population G0b and trainer replay were not run.
 
 ### P3.1 Preregister the run
 
