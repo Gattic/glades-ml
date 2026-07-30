@@ -2,7 +2,21 @@
 
 **Date:** 2026-07-30
 
-**Status:** active engineering plan; no new long training run is authorized until the phase gates below pass
+**Status:** terminal P4 NO-GO (2026-07-30); P0-P3 passed, P4 failed, and P5-P7 were not authorized
+
+## Final outcome
+
+Correctness and exact no-slide decode engineering passed. The frozen native-geometry
+24,576-token cache gate reached 221.086851 tokens/s at a sampled 7,744 MiB peak on the
+RTX 4080 SUPER, with an aggregate trajectory identical to the independent-cache baseline.
+
+The small-scale trainability gate then stopped the plan. CHIRON passed all one-document
+runs, but its eight-document free-greedy accuracy was 0.932692 for seed 1337 and 0.911538
+for seed 2024, below the required 0.95 per-seed bar. The repaired conventional Transformer
+passed all three seeds with 1.0 free-greedy accuracy and 8/8 exact documents. Therefore no
+P5 recipe arms, P6 pilot, P7 scale-up, or ARREST reopening was run. Durable evidence is in
+`glades-trainer/research/generation-aware/CHIRON_PRACTICAL_P3_CACHE_GATE_2026_07_30.md`
+and `CHIRON_PRACTICAL_P4_MEMORIZATION_GATE_2026_07_30.md`.
 
 ## 1. Practical-v1 contract
 
