@@ -429,10 +429,12 @@ bool chiron_generate(const ChironModelDims& dims,
                                     sink, sinkCtx, NULL, NULL, outTokens);
 }
 
-bool chiron_generate_cached_observed(const ChironModelDims& dims,
+bool chiron_generate_cached_from_prefill_observed(
+                                     const ChironModelDims& dims,
                                      const ChironModelWeights& w,
                                      const ChironServingConfig& cfg,
                                      ChironEvalScratch& s,
+                                     ChironDecodeCache& cache,
                                      const std::vector<int>& promptTokens,
                                      const ChironGenParams& gp,
                                      ChironTokenSink sink,
@@ -442,7 +444,7 @@ bool chiron_generate_cached_observed(const ChironModelDims& dims,
                                      std::vector<int>* outTokens)
 {
 #ifndef GLADES_HAVE_CUDA
-    (void)dims; (void)w; (void)cfg; (void)s; (void)promptTokens; (void)gp;
+    (void)dims; (void)w; (void)cfg; (void)s; (void)cache; (void)promptTokens; (void)gp;
     (void)sink; (void)sinkCtx; (void)observer; (void)observerCtx; (void)outTokens;
     return false;
 #else
@@ -451,12 +453,10 @@ bool chiron_generate_cached_observed(const ChironModelDims& dims,
         && (long long)promptTokens.size() + (long long)gp.maxTokens - 1ll > dims.T)
         return false;
     if (!gpu::isAvailable() && !gpu::initDevice()) return false;
+    if (!cache.ready() || cache.contextLimit() != dims.T
+        || cache.position() != (int)promptTokens.size()) return false;
     if (outTokens) outTokens->clear();
     if (gp.maxTokens <= 0) return true;
-
-    ChironDecodeCache cache;
-    if (!cache.allocate(dims, w, cfg)) return false;
-    if (!chiron_decode_prefill(dims, w, cfg, s, promptTokens, cache)) return false;
 
     std::vector<int> tokens(promptTokens);
     std::vector<float> logitsRow((size_t)dims.V);
@@ -507,6 +507,30 @@ bool chiron_generate_cached_observed(const ChironModelDims& dims,
     }
     return true;
 #endif
+}
+
+bool chiron_generate_cached_observed(const ChironModelDims& dims,
+                                     const ChironModelWeights& w,
+                                     const ChironServingConfig& cfg,
+                                     ChironEvalScratch& s,
+                                     const std::vector<int>& promptTokens,
+                                     const ChironGenParams& gp,
+                                     ChironTokenSink sink,
+                                     void* sinkCtx,
+                                     ChironGenerationStepObserver observer,
+                                     void* observerCtx,
+                                     std::vector<int>* outTokens)
+{
+    if (promptTokens.empty() || (int)promptTokens.size() >= dims.T) return false;
+    if (gp.maxTokens > 0
+        && (long long)promptTokens.size() + (long long)gp.maxTokens - 1ll > dims.T)
+        return false;
+    ChironDecodeCache cache;
+    if (!cache.allocate(dims, w, cfg)) return false;
+    if (!chiron_decode_prefill(dims, w, cfg, s, promptTokens, cache)) return false;
+    return chiron_generate_cached_from_prefill_observed(
+        dims, w, cfg, s, cache, promptTokens, gp, sink, sinkCtx,
+        observer, observerCtx, outTokens);
 }
 
 bool chiron_generate_cached(const ChironModelDims& dims,

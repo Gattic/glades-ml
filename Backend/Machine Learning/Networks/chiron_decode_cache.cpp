@@ -47,6 +47,7 @@ struct ChironDecodeCache::Impl
     int T, m, V, L, nH, nKVH, dH, dModel, dModelKV, ffnHidden;
     int k, w, maxBlockWidth, historyCapacity;
     int position, completedBlocks, blockFill, historyCount, historyWrite;
+    unsigned long stateEpoch;
     bool qkNorm, fuseAttnReln, fuseAttnPerLayer, whiscCoupling;
     float epsReln, rotThetaMax, whiscClamp;
     bool isReady;
@@ -55,7 +56,7 @@ struct ChironDecodeCache::Impl
         : modelIdentity(NULL), T(0), m(0), V(0), L(0), nH(0), nKVH(0), dH(0)
         , dModel(0), dModelKV(0), ffnHidden(0), k(0), w(0), maxBlockWidth(0)
         , historyCapacity(0), position(0), completedBlocks(0), blockFill(0)
-        , historyCount(0), historyWrite(0), qkNorm(false), fuseAttnReln(false)
+        , historyCount(0), historyWrite(0), stateEpoch(0), qkNorm(false), fuseAttnReln(false)
         , fuseAttnPerLayer(false), whiscCoupling(false), epsReln(0.0f)
         , rotThetaMax(0.0f), whiscClamp(0.0f), isReady(false)
     {
@@ -184,6 +185,7 @@ struct ChironDecodeCache::Impl
         blockFill = 0;
         historyCount = 0;
         historyWrite = 0;
+        ++stateEpoch;
         return true;
     }
 
@@ -255,6 +257,7 @@ struct ChironDecodeCache::Impl
         historyCapacity=source.historyCapacity; position=source.position;
         completedBlocks=source.completedBlocks; blockFill=source.blockFill;
         historyCount=source.historyCount; historyWrite=source.historyWrite;
+        stateEpoch=source.stateEpoch;
         qkNorm=source.qkNorm; fuseAttnReln=source.fuseAttnReln;
         fuseAttnPerLayer=source.fuseAttnPerLayer;
         whiscCoupling=source.whiscCoupling; epsReln=source.epsReln;
@@ -491,6 +494,129 @@ bool ChironDecodeCache::ready() const { return impl_->isReady; }
 int ChironDecodeCache::position() const { return impl_->position; }
 int ChironDecodeCache::completedBlocks() const { return impl_->completedBlocks; }
 int ChironDecodeCache::contextLimit() const { return impl_->T; }
+
+struct ChironDecodeSnapshot::Impl
+{
+    struct Layer
+    {
+        glades::gpu::GpuBuffer<float> yLast;
+        glades::gpu::GpuBuffer<float> qBlock;
+        glades::gpu::GpuBuffer<float> qPerpRing;
+    };
+    std::vector<Layer*> layers;
+    glades::gpu::GpuBuffer<float> logits;
+    const void* owner;
+    int m, V, L, maxBlockWidth, historyCapacity;
+    int position, completedBlocks, blockFill, historyCount, historyWrite;
+    unsigned long stateEpoch;
+    bool isReady;
+
+    Impl()
+        : owner(NULL), m(0), V(0), L(0), maxBlockWidth(0), historyCapacity(0)
+        , position(0), completedBlocks(0), blockFill(0), historyCount(0)
+        , historyWrite(0), stateEpoch(0), isReady(false)
+    {
+    }
+    ~Impl() { clear(); }
+    void clear()
+    {
+        for (size_t i = 0; i < layers.size(); ++i) delete layers[i];
+        layers.clear();
+        logits.free();
+        owner = NULL;
+        isReady = false;
+    }
+    bool configure(const void* cacheOwner, int modelWidth, int vocab, int layerCount,
+                   int blockWidth, int ringCapacity)
+    {
+        if (isReady && owner == cacheOwner && m == modelWidth && V == vocab
+            && L == layerCount && maxBlockWidth == blockWidth
+            && historyCapacity == ringCapacity)
+            return true;
+        clear();
+        owner=cacheOwner; m=modelWidth; V=vocab; L=layerCount;
+        maxBlockWidth=blockWidth; historyCapacity=ringCapacity;
+        if (!logits.allocate((size_t)V)) { clear(); return false; }
+        for (int l = 0; l < L; ++l)
+        {
+            Layer* layer = new Layer();
+            layers.push_back(layer);
+            if (!layer->yLast.allocate((size_t)m)
+                || !layer->qBlock.allocate((size_t)maxBlockWidth * m)
+                || !layer->qPerpRing.allocate((size_t)historyCapacity * m))
+            { clear(); return false; }
+        }
+        isReady = true;
+        return true;
+    }
+};
+
+ChironDecodeSnapshot::ChironDecodeSnapshot() : impl_(new Impl()) {}
+ChironDecodeSnapshot::~ChironDecodeSnapshot() { delete impl_; }
+bool ChironDecodeSnapshot::ready() const { return impl_->isReady; }
+
+bool ChironDecodeSnapshot::capture(ChironDecodeCache& cache,
+                                   ChironEvalScratch& scratch)
+{
+#ifndef GLADES_HAVE_CUDA
+    (void)cache; (void)scratch;
+    return false;
+#else
+    ChironDecodeCache::Impl& source = *cache.impl_;
+    if (!source.isReady || source.position <= 0
+        || scratch.logits.size() < (size_t)source.V) return false;
+    if (!impl_->configure(cache.impl_, source.m, source.V, source.L,
+                          source.maxBlockWidth, source.historyCapacity)) return false;
+    impl_->position=source.position;
+    impl_->completedBlocks=source.completedBlocks;
+    impl_->blockFill=source.blockFill;
+    impl_->historyCount=source.historyCount;
+    impl_->historyWrite=source.historyWrite;
+    impl_->stateEpoch=source.stateEpoch;
+    for (int l = 0; l < source.L; ++l)
+    {
+        ChironDecodeCache::Impl::Layer& src = *source.layers[l];
+        Impl::Layer& dst = *impl_->layers[l];
+        glades::gpu::device_memcpy_d2d(dst.yLast.data(), src.yLast.data(), src.yLast.bytes());
+        glades::gpu::device_memcpy_d2d(dst.qBlock.data(), src.qBlock.data(), src.qBlock.bytes());
+        glades::gpu::device_memcpy_d2d(dst.qPerpRing.data(), src.qPerpRing.data(), src.qPerpRing.bytes());
+    }
+    glades::gpu::device_memcpy_d2d(impl_->logits.data(), scratch.logits.data(),
+                                    (size_t)source.V * sizeof(float));
+    return true;
+#endif
+}
+
+bool ChironDecodeSnapshot::restore(ChironDecodeCache& cache,
+                                   ChironEvalScratch& scratch) const
+{
+#ifndef GLADES_HAVE_CUDA
+    (void)cache; (void)scratch;
+    return false;
+#else
+    ChironDecodeCache::Impl& target = *cache.impl_;
+    if (!impl_->isReady || impl_->owner != cache.impl_
+        || !target.isReady || target.stateEpoch != impl_->stateEpoch
+        || target.m != impl_->m || target.V != impl_->V || target.L != impl_->L
+        || scratch.logits.size() < (size_t)target.V) return false;
+    for (int l = 0; l < target.L; ++l)
+    {
+        ChironDecodeCache::Impl::Layer& dst = *target.layers[l];
+        const Impl::Layer& src = *impl_->layers[l];
+        glades::gpu::device_memcpy_d2d(dst.yLast.data(), src.yLast.data(), src.yLast.bytes());
+        glades::gpu::device_memcpy_d2d(dst.qBlock.data(), src.qBlock.data(), src.qBlock.bytes());
+        glades::gpu::device_memcpy_d2d(dst.qPerpRing.data(), src.qPerpRing.data(), src.qPerpRing.bytes());
+    }
+    glades::gpu::device_memcpy_d2d(scratch.logits.data(), impl_->logits.data(),
+                                    (size_t)target.V * sizeof(float));
+    target.position=impl_->position;
+    target.completedBlocks=impl_->completedBlocks;
+    target.blockFill=impl_->blockFill;
+    target.historyCount=impl_->historyCount;
+    target.historyWrite=impl_->historyWrite;
+    return true;
+#endif
+}
 
 bool chiron_decode_step(const ChironModelDims& d,
                         const ChironModelWeights& w,

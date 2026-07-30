@@ -15,6 +15,8 @@
 namespace glades {
 namespace chiron {
 
+class ChironDecodeSnapshot;
+
 class ChironDecodeCache
 {
 public:
@@ -50,6 +52,26 @@ private:
                                    const ChironServingConfig&,
                                    ChironEvalScratch&, int,
                                    ChironDecodeCache&);
+    friend class ChironDecodeSnapshot;
+};
+
+// Lightweight branch point for one prefilled cache. Completed q/K/V prefix
+// rows remain immutable in the owning cache; only the mutable partial block,
+// convolution rings, delayed y row, metadata, and prompt logits are copied.
+// A snapshot restores only its original cache instance.
+class ChironDecodeSnapshot
+{
+public:
+    ChironDecodeSnapshot();
+    ~ChironDecodeSnapshot();
+    bool capture(ChironDecodeCache& cache, ChironEvalScratch& scratch);
+    bool restore(ChironDecodeCache& cache, ChironEvalScratch& scratch) const;
+    bool ready() const;
+private:
+    struct Impl;
+    Impl* impl_;
+    ChironDecodeSnapshot(const ChironDecodeSnapshot&);
+    ChironDecodeSnapshot& operator=(const ChironDecodeSnapshot&);
 };
 
 // Resets cache, consumes a non-empty prompt shorter than d.T, and leaves logits

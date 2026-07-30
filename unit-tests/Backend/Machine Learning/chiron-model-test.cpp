@@ -1785,10 +1785,50 @@ static void CHIRONDecodeCacheTest()
 	ASSERT("decode repeated logits", cachedScratch.logits.download(&cached[0], cached.size()));
 	for (int v = 0; v < d.V; ++v)
 		ASSERT("decode reset reproducible", cached[v] == firstPrefill[v]);
+
+	glades::chiron::ChironDecodeSnapshot snapshot;
+	ASSERT("decode snapshot capture", snapshot.capture(cache, cachedScratch));
+	ASSERT("decode snapshot ready", snapshot.ready());
+	ASSERT("decode snapshot branch step", glades::chiron::chiron_decode_step(
+		d, w, cfg, cachedScratch, 7, cache));
+	std::vector<float> branchLogits((size_t)d.V), repeatedBranch((size_t)d.V);
+	ASSERT("decode snapshot branch download", cachedScratch.logits.download(
+		&branchLogits[0], branchLogits.size()));
+	ASSERT("decode snapshot restore", snapshot.restore(cache, cachedScratch));
+	ASSERT("decode snapshot restored position", cache.position() == (int)prompt.size());
+	ASSERT("decode snapshot repeated step", glades::chiron::chiron_decode_step(
+		d, w, cfg, cachedScratch, 7, cache));
+	ASSERT("decode snapshot repeated download", cachedScratch.logits.download(
+		&repeatedBranch[0], repeatedBranch.size()));
+	ASSERT("decode snapshot branch deterministic", branchLogits == repeatedBranch);
+	ASSERT("decode snapshot final restore", snapshot.restore(cache, cachedScratch));
+
+	glades::chiron::ChironGenParams branchGp;
+	branchGp.maxTokens = 3;
+	branchGp.topK = 1;
+	branchGp.topP = 1.0f;
+	branchGp.temperature = 1.0f;
+	branchGp.repPenalty = 1.0f;
+	branchGp.freqPenalty = 0.0f;
+	branchGp.presPenalty = 0.0f;
+	branchGp.noRepeatN = 0;
+	std::vector<int> branchA, branchB;
+	ASSERT("decode snapshot generation A", glades::chiron::chiron_generate_cached_from_prefill_observed(
+		d, w, cfg, cachedScratch, cache, prompt, branchGp,
+		NULL, NULL, NULL, NULL, &branchA));
+	ASSERT("decode snapshot generation restore", snapshot.restore(cache, cachedScratch));
+	ASSERT("decode snapshot generation B", glades::chiron::chiron_generate_cached_from_prefill_observed(
+		d, w, cfg, cachedScratch, cache, prompt, branchGp,
+		NULL, NULL, NULL, NULL, &branchB));
+	ASSERT("decode snapshot generation deterministic", branchA == branchB);
+	ASSERT("decode snapshot post-generation restore", snapshot.restore(cache, cachedScratch));
+
 	const int beforeOversize = cache.position();
 	ASSERT("decode rejects full-length prefill", !glades::chiron::chiron_decode_prefill(
 		d, w, cfg, cachedScratch, tokens, cache));
 	ASSERT("decode oversized prefill no mutation", cache.position() == beforeOversize);
+	ASSERT("decode snapshot invalidation reset", cache.reset());
+	ASSERT("decode stale snapshot rejected", !snapshot.restore(cache, cachedScratch));
 
 	glades::chiron::ChironServingConfig denseCfg = cfg;
 	denseCfg.useScfa = false;

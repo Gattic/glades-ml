@@ -94,6 +94,22 @@ bool chiron_generate(const ChironModelDims& dims, const ChironModelWeights& w,
                      ChironTokenSink sink, void* sinkCtx,
                      std::vector<int>* outTokens);
 
+// Generate one branch from an already-prefilled cache. s.logits[0..V) must
+// still hold the prompt's final logits (or have been restored by a
+// ChironDecodeSnapshot). The branch mutates cache and s.
+bool chiron_generate_cached_from_prefill_observed(
+                                     const ChironModelDims& dims,
+                                     const ChironModelWeights& w,
+                                     const ChironServingConfig& cfg,
+                                     ChironEvalScratch& s,
+                                     ChironDecodeCache& cache,
+                                     const std::vector<int>& promptTokens,
+                                     const ChironGenParams& gp,
+                                     ChironTokenSink sink, void* sinkCtx,
+                                     ChironGenerationStepObserver observer,
+                                     void* observerCtx,
+                                     std::vector<int>* outTokens);
+
 // Exact-geometry causal-SCFA generation using one bounded-state prefill and
 // incremental token steps. This v1 path never slides: it rejects prompts at or
 // beyond T and requests that would need more than T consumed input positions.
