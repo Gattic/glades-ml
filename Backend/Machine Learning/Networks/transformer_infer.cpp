@@ -2266,6 +2266,22 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
                                                                         std::vector<float>& outLogits) const
 {
+	return transformerLmForwardLastTraceImpl(tokenIds, outLogits, NULL);
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastTrace(const std::vector<unsigned int>& tokenIds,
+                                                                       std::vector<float>& outLogits,
+                                                                       glades::TransformerForwardTrace& outTrace) const
+{
+	return transformerLmForwardLastTraceImpl(tokenIds, outLogits, &outTrace);
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,
+                                                                           std::vector<float>& outLogits,
+                                                                           glades::TransformerForwardTrace* outTrace) const
+{
+	if (outTrace)
+		outTrace->clear();
 	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
@@ -2362,6 +2378,15 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const st
 	else
 	{
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmForwardLastLogits: unknown positionalEncoding");
+	}
+
+	if (outTrace)
+	{
+		outTrace->hiddenSize = dModel;
+		outTrace->layers = tt.nLayers;
+		outTrace->lastHidden.reserve((static_cast<size_t>(tt.nLayers) + 1u) * dModel);
+		const float* lastInput = &h[(T - 1u) * static_cast<size_t>(dModel)];
+		outTrace->lastHidden.insert(outTrace->lastHidden.end(), lastInput, lastInput + dModel);
 	}
 
 	// Per-layer buffers reused across layers
@@ -2508,6 +2533,12 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const st
 					return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
 				}
 			}
+		}
+
+		if (outTrace)
+		{
+			const float* lastLayer = &h[(T - 1u) * static_cast<size_t>(dModel)];
+			outTrace->lastHidden.insert(outTrace->lastHidden.end(), lastLayer, lastLayer + dModel);
 		}
 	}
 

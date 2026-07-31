@@ -112,10 +112,41 @@ private:
     ChironEvalScratch& operator=(const ChironEvalScratch&);
 };
 
+// Bounded diagnostic trace for one selected row. `lastQ` and `lastP` are
+// stage-major: embedded input first, then one row after each CHIRON layer.
+// Normal serving does not populate or retain this state.
+struct ChironEvalTrace
+{
+    int hiddenSize;
+    int layers;
+    int row;
+    std::vector<float> lastQ;
+    std::vector<float> lastP;
+
+    ChironEvalTrace() : hiddenSize(0), layers(0), row(-1), lastQ(), lastP() {}
+    void clear()
+    {
+        hiddenSize = 0;
+        layers = 0;
+        row = -1;
+        lastQ.clear();
+        lastP.clear();
+    }
+};
+
 // Forward pass: q_0 = embed(tokens) -> logits [T, V] in s.logits.  Preserves the
 // exact glades::gpu call sequence of chiron_infer.cpp::forwardInfer.
 bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
                          const ChironServingConfig& cfg, ChironEvalScratch& s);
+
+// Diagnostic variant sharing the exact forward above while capturing q/p for
+// one row at input and after each layer. `traceRow` must be in [0,T).
+bool chiron_eval_forward_trace(const ChironModelDims& d,
+                               const ChironModelWeights& w,
+                               const ChironServingConfig& cfg,
+                               ChironEvalScratch& s,
+                               int traceRow,
+                               ChironEvalTrace& trace);
 
 // Internal serving seam used by exact cache prefill. The observer runs once per
 // SCFA layer after attention has produced q_compr/q_perp/y_compr and before any

@@ -40,6 +40,12 @@ struct TransformerPublicAPI
 		NNetworkStatus forwardLastLogits(const std::vector<TokenId>& tokenIds,
 		                                 std::vector<float>& outLogits) const;
 
+		// Diagnostic full-forward helper. Returns the same logits as
+		// forwardLastLogits plus the last-position input/post-block hidden rows.
+		NNetworkStatus forwardLastTrace(const std::vector<TokenId>& tokenIds,
+		                                std::vector<float>& outLogits,
+		                                TransformerForwardTrace& outTrace) const;
+
 	private:
 		const NNetwork& net;
 	};
@@ -80,6 +86,12 @@ struct TransformerPublicAPI
 
 	// Full forward last-logits (debug/test parity helper).
 	static NNetworkStatus forwardLastLogits(const NNetwork& net, const std::vector<TokenId>& tokenIds, std::vector<float>& outLogits);
+
+	// Diagnostic full-forward last-logits plus bounded last-position hidden trace.
+	static NNetworkStatus forwardLastTrace(const NNetwork& net,
+	                                       const std::vector<TokenId>& tokenIds,
+	                                       std::vector<float>& outLogits,
+	                                       TransformerForwardTrace& outTrace);
 };
 
 } // namespace glades

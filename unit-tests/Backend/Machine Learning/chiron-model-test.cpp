@@ -1490,9 +1490,27 @@ static void ev_compare(const char* tag,
 	std::vector<float> gotLogits(Ln);
 	ASSERT("ev got download", es.logits.download(&gotLogits[0], Ln));
 
+	// --- Diagnostic trace must share the exact forward/logits path. ---
+	glades::chiron::ChironEvalScratch traceScratch;
+	ASSERT("ev trace scratch alloc", traceScratch.allocate(d, w, cfg));
+	ASSERT("ev trace tokens", traceScratch.d_tokens.upload(&tokens[0], (size_t)d.T));
+	glades::chiron::ChironEvalTrace trace;
+	ASSERT("ev trace forward", glades::chiron::chiron_eval_forward_trace(
+			d, w, cfg, traceScratch, d.T - 1, trace));
+	std::vector<float> traceLogits(Ln);
+	ASSERT("ev trace logits download", traceScratch.logits.download(&traceLogits[0], Ln));
+	ASSERT("ev trace hidden size", trace.hiddenSize == d.m);
+	ASSERT("ev trace layers", trace.layers == d.L);
+	ASSERT("ev trace row", trace.row == d.T - 1);
+	ASSERT("ev trace q shape", trace.lastQ.size() == (size_t)(d.L + 1) * d.m);
+	ASSERT("ev trace p shape", trace.lastP.size() == (size_t)(d.L + 1) * d.m);
+
 	// --- Bit-identical assertion ---
 	for (size_t i = 0; i < Ln; ++i)
+	{
 		ASSERT(tag, gotLogits[i] == refLogits[i]);
+		ASSERT("ev trace logits bit-identical", traceLogits[i] == gotLogits[i]);
+	}
 }
 
 void CHIRONEvalForwardParityTest()

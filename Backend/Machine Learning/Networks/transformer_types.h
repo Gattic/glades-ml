@@ -125,6 +125,30 @@ struct TransformerGenerateResult
 	}
 };
 
+// Diagnostic-only last-position hidden trace from a full causal forward.
+// `lastHidden` is stage-major: embedded/positioned input first, then one row
+// after each Transformer block. It deliberately excludes attention matrices
+// and full-sequence activations so callers cannot accidentally turn this into
+// a high-memory serving path.
+struct TransformerForwardTrace
+{
+	unsigned int hiddenSize;
+	unsigned int layers;
+	std::vector<float> lastHidden;
+
+	TransformerForwardTrace()
+	    : hiddenSize(0u), layers(0u), lastHidden()
+	{
+	}
+
+	void clear()
+	{
+		hiddenSize = 0u;
+		layers = 0u;
+		lastHidden.clear();
+	}
+};
+
 struct TransformerServeRequest
 {
 	std::vector<unsigned int> promptTokens;

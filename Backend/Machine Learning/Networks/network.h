@@ -3282,6 +3282,19 @@ public:
 	// - outLogits is resized to vocabSize and filled with unnormalized logits.
 	NNetworkStatus transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
 	                                             std::vector<float>& outLogits) const;
+
+	// Diagnostic variant that also captures the last-position hidden row at
+	// input and after every block. The implementation shares the exact full
+	// forward above; normal inference remains uninstrumented.
+	NNetworkStatus transformerLmForwardLastTrace(const std::vector<unsigned int>& tokenIds,
+	                                            std::vector<float>& outLogits,
+	                                            TransformerForwardTrace& outTrace) const;
+
+private:
+	// Shared implementation for the public logits-only and diagnostic variants.
+	NNetworkStatus transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits,
+	                                                TransformerForwardTrace* outTrace) const;
 };
 };
 

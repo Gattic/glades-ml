@@ -529,14 +529,39 @@ static bool scfa_shear_eval(ChironEvalScratch& s, const ChironScfaState& scfa,
 // on it.  CHIRON_DBG env-gated debug blocks are kept.
 // ---------------------------------------------------------------------------
 
-bool chiron_eval_forward_observed(const ChironModelDims& d,
-                                  const ChironModelWeights& w,
-                                  const ChironServingConfig& cfg,
-                                  ChironEvalScratch& s,
-                                  ChironEvalScfaLayerObserver observer,
-                                  void* observerContext)
+static bool append_trace_row(const ChironEvalScratch& s, int T, int m,
+                             int traceRow, ChironEvalTrace& trace)
+{
+    const size_t count = (size_t)T * (size_t)m;
+    std::vector<float> q(count), p(count);
+    if (!s.q.download(&q[0], count) || !s.p.download(&p[0], count)) return false;
+    const float* qr = &q[(size_t)traceRow * (size_t)m];
+    const float* pr = &p[(size_t)traceRow * (size_t)m];
+    trace.lastQ.insert(trace.lastQ.end(), qr, qr + m);
+    trace.lastP.insert(trace.lastP.end(), pr, pr + m);
+    return true;
+}
+
+static bool chiron_eval_forward_impl(const ChironModelDims& d,
+                                     const ChironModelWeights& w,
+                                     const ChironServingConfig& cfg,
+                                     ChironEvalScratch& s,
+                                     ChironEvalScfaLayerObserver observer,
+                                     void* observerContext,
+                                     int traceRow,
+                                     ChironEvalTrace* trace)
 {
     const int T=d.T,m=d.m,V=d.V,L=d.L,nH=d.nH,nKVH=d.nKVH>0?d.nKVH:d.nH,dH=d.dH;
+    if (trace)
+    {
+        trace->clear();
+        if (traceRow < 0 || traceRow >= T) return false;
+        trace->hiddenSize = m;
+        trace->layers = L;
+        trace->row = traceRow;
+        trace->lastQ.reserve((size_t)(L + 1) * (size_t)m);
+        trace->lastP.reserve((size_t)(L + 1) * (size_t)m);
+    }
 
     // Fuse is only active if requested AND the checkpoint provided per-layer params.
     const bool applyFuse = cfg.fuseAttnPerLayer
@@ -563,6 +588,7 @@ bool chiron_eval_forward_observed(const ChironModelDims& d,
     // q_0 = embed(tokens); p_0 = 0.
     if (!glades::gpu::embedding_gather(w.E.data(), s.d_tokens.data(), T, V, m, s.q.data())) return false;
     if (!s.p.zero()) return false;
+    if (trace && !append_trace_row(s, T, m, traceRow, *trace)) return false;
 
     if (std::getenv("CHIRON_DBG"))
     {
@@ -646,6 +672,7 @@ bool chiron_eval_forward_observed(const ChironModelDims& d,
                 w.gamma[l]->data(), w.beta[l]->data(),
                 T, m, cfg.epsReln)) return false;
         glades::gpu::device_memcpy_d2d(s.q.data(), s.q_tmp.data(), sizeof(float) * T * m);
+        if (trace && !append_trace_row(s, T, m, traceRow, *trace)) return false;
 
         if (std::getenv("CHIRON_DBG"))
         {
@@ -674,10 +701,32 @@ bool chiron_eval_forward_observed(const ChironModelDims& d,
     return true;
 }
 
+bool chiron_eval_forward_observed(const ChironModelDims& d,
+                                  const ChironModelWeights& w,
+                                  const ChironServingConfig& cfg,
+                                  ChironEvalScratch& s,
+                                  ChironEvalScfaLayerObserver observer,
+                                  void* observerContext)
+{
+    return chiron_eval_forward_impl(d, w, cfg, s, observer, observerContext,
+                                    -1, NULL);
+}
+
 bool chiron_eval_forward(const ChironModelDims& d, const ChironModelWeights& w,
                          const ChironServingConfig& cfg, ChironEvalScratch& s)
 {
-    return chiron_eval_forward_observed(d, w, cfg, s, NULL, NULL);
+    return chiron_eval_forward_impl(d, w, cfg, s, NULL, NULL, -1, NULL);
+}
+
+bool chiron_eval_forward_trace(const ChironModelDims& d,
+                               const ChironModelWeights& w,
+                               const ChironServingConfig& cfg,
+                               ChironEvalScratch& s,
+                               int traceRow,
+                               ChironEvalTrace& trace)
+{
+    return chiron_eval_forward_impl(d, w, cfg, s, NULL, NULL,
+                                    traceRow, &trace);
 }
 
 } // namespace chiron
