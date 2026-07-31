@@ -18,6 +18,15 @@ P5 recipe arms, P6 pilot, P7 scale-up, or ARREST reopening was run. Durable evid
 `glades-trainer/research/generation-aware/CHIRON_PRACTICAL_P3_CACHE_GATE_2026_07_30.md`
 and `CHIRON_PRACTICAL_P4_MEMORIZATION_GATE_2026_07_30.md`.
 
+A preregistered 2026-07-31 trace diagnostic subsequently localized both failures to
+sparse negative target margins on exact truth prefixes, with exactly zero pre-onset
+hidden/logit drift. The repaired Transformer had margins above +11 at both matched
+positions. Matched forced-token controls did not establish CHIRON-specific propagation:
+both architectures failed the remaining exact continuation after corruption. The direct
+blocker is therefore truth-prefix conditional separation hidden by aggregate accuracy,
+not a serving-path mismatch; the P4 NO-GO is unchanged. See
+`glades-trainer/research/generation-aware/CHIRON_PRACTICAL_P4_DIVERGENCE_DIAGNOSTIC_2026_07_31.md`.
+
 ## 1. Practical-v1 contract
 
 The next CHIRON qualification lineage targets a native `T=2048` context. A model trained at
