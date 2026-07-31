@@ -1194,6 +1194,133 @@ static void CHIRONScfaCausalBlockTest()
 	for (int cidx = 0; cidx < m; ++cidx)
 		ASSERT("scfa decode lag matches full lift",
 		       hLag[cidx] == haz[(size_t)firstBlockEnd * m + cidx]);
+
+	// Backward causality support. A loss at row 2 (the first row of block 1)
+	// may reach its own row and earlier inputs, but never row 3 — a future row
+	// in the same block — or any later row. Check all three SCFA adjoints:
+	// lag-reduce, block-expand, and the causal depthwise-convolution backward.
+	const int cut = 2, w = 2;
+	std::vector<float> causalDy(Tm, 0.0f), filter((size_t)m * (w + 1));
+	for (int cidx = 0; cidx < m; ++cidx)
+	{
+		causalDy[(size_t)cut * m + cidx] = 0.25f + 0.1f * cidx;
+		for (int tap = 0; tap <= w; ++tap)
+			filter[(size_t)cidx * (w + 1) + tap] = 0.2f + 0.03f * (cidx + tap);
+	}
+	glades::gpu::GpuBuffer<float> dCausalDy, dSummaryGrad, dExpanded, dFilter, dDx, dDk;
+	ASSERT("scfa backward causal alloc",
+	       dCausalDy.allocate(Tm) && dSummaryGrad.allocate(km) && dExpanded.allocate(Tm)
+	       && dFilter.allocate(filter.size()) && dDx.allocate(Tm) && dDk.allocate(filter.size()));
+	ASSERT("scfa backward causal upload",
+	       dCausalDy.upload(&causalDy[0], Tm) && dFilter.upload(&filter[0], filter.size()));
+	ASSERT("scfa backward causal zero", dDx.zero() && dDk.zero());
+	ASSERT("scfa backward lag reduce",
+	       glades::gpu::scfa_causal_lag_reduce(
+	           dCausalDy.data(), T, m, k, 1.0f, 0.0f, dSummaryGrad.data()));
+	ASSERT("scfa backward block expand",
+	       glades::gpu::scfa_block_expand(
+	           dSummaryGrad.data(), T, m, k, 1.0f, 0.0f, dExpanded.data()));
+	ASSERT("scfa backward causal conv",
+	       glades::gpu::scfa_depthwise_causal_conv_bwd(
+	           dx.data(), dFilter.data(), dCausalDy.data(), T, m, w,
+	           dDx.data(), dDk.data()));
+	std::vector<float> summaryGrad(km), expanded(Tm), convDx(Tm);
+	ASSERT("scfa backward causal download",
+	       dSummaryGrad.download(&summaryGrad[0], km)
+	       && dExpanded.download(&expanded[0], Tm)
+	       && dDx.download(&convDx[0], Tm));
+	bool sawPastSummaryGrad = false, sawConvGrad = false;
+	for (int cidx = 0; cidx < m; ++cidx)
+	{
+		if (summaryGrad[cidx] != 0.0f) sawPastSummaryGrad = true;
+		for (int b = 1; b < k; ++b)
+			ASSERT("scfa backward excludes current/future summaries",
+			       summaryGrad[(size_t)b * m + cidx] == 0.0f);
+	}
+	for (int t = 0; t < T; ++t)
+		for (int cidx = 0; cidx < m; ++cidx)
+		{
+			if (t <= cut && convDx[(size_t)t * m + cidx] != 0.0f) sawConvGrad = true;
+			if (t > cut)
+			{
+				ASSERT("scfa block adjoint excludes future rows",
+				       expanded[(size_t)t * m + cidx] == 0.0f);
+				ASSERT("scfa conv adjoint excludes future rows",
+				       convDx[(size_t)t * m + cidx] == 0.0f);
+			}
+		}
+	ASSERT("scfa backward fixture reaches past summary", sawPastSummaryGrad);
+	ASSERT("scfa backward fixture reaches causal conv inputs", sawConvGrad);
+
+	// The compressed inner attention is the only nonlinear path between the
+	// block operators. A loss on compressed row 0 must not produce K/V input
+	// gradients on rows 1 or 2 when its causal flag is wired correctly. The
+	// noncausal control proves this fixture detects the exact mask regression.
+	const int aT = 3, aM = 4;
+	const size_t aN = (size_t)aT * aM, aP = (size_t)aT * aT;
+	std::vector<float> aq(aN), ak(aN), av(aN), ado(aN, 0.0f);
+	for (size_t i = 0; i < aN; ++i)
+	{
+		aq[i] = 0.05f * (float)(i + 1);
+		ak[i] = -0.04f * (float)(i + 2);
+		av[i] = 0.03f * (float)(i + 3);
+	}
+	for (int cidx = 0; cidx < aM; ++cidx) ado[cidx] = 0.2f + 0.05f * cidx;
+	glades::gpu::GpuBuffer<float> dAq, dAk, dAv, dAo, dAdo;
+	glades::gpu::GpuBuffer<float> dAdq, dAdk, dAdv, dAp, dAdp;
+	ASSERT("scfa inner causal alloc",
+	       dAq.allocate(aN) && dAk.allocate(aN) && dAv.allocate(aN)
+	       && dAo.allocate(aN) && dAdo.allocate(aN)
+	       && dAdq.allocate(aN) && dAdk.allocate(aN) && dAdv.allocate(aN)
+	       && dAp.allocate(aP) && dAdp.allocate(aP));
+	ASSERT("scfa inner causal upload",
+	       dAq.upload(&aq[0], aN) && dAk.upload(&ak[0], aN)
+	       && dAv.upload(&av[0], aN) && dAdo.upload(&ado[0], aN));
+	ASSERT("scfa inner causal forward",
+	       glades::gpu::flash_attention_cublas_tiled(
+	           dAq.data(), dAk.data(), dAv.data(), aT, 1, aM, aM,
+	           true, dAo.data(), dAp.data()));
+	ASSERT("scfa inner causal grad zero", dAdq.zero() && dAdk.zero() && dAdv.zero());
+	ASSERT("scfa inner causal backward",
+	       glades::gpu::flash_attention_backward_cublas_tiled(
+	           dAq.data(), dAk.data(), dAv.data(), dAo.data(), dAdo.data(),
+	           aT, 1, aM, aM, true,
+	           dAdq.data(), dAdk.data(), dAdv.data(), dAp.data(), dAdp.data()));
+	std::vector<float> adq(aN), adk(aN), adv(aN);
+	ASSERT("scfa inner causal grad download",
+	       dAdq.download(&adq[0], aN) && dAdk.download(&adk[0], aN)
+	       && dAdv.download(&adv[0], aN));
+	bool sawInnerPastGrad = false;
+	for (int cidx = 0; cidx < aM; ++cidx)
+	{
+		if (adk[cidx] != 0.0f || adv[cidx] != 0.0f) sawInnerPastGrad = true;
+		for (int t = 1; t < aT; ++t)
+		{
+			ASSERT("scfa inner causal dQ excludes future rows",
+			       adq[(size_t)t * aM + cidx] == 0.0f);
+			ASSERT("scfa inner causal dK excludes future rows",
+			       adk[(size_t)t * aM + cidx] == 0.0f);
+			ASSERT("scfa inner causal dV excludes future rows",
+			       adv[(size_t)t * aM + cidx] == 0.0f);
+		}
+	}
+	ASSERT("scfa inner causal fixture reaches row zero", sawInnerPastGrad);
+
+	ASSERT("scfa inner noncausal grad zero", dAdq.zero() && dAdk.zero() && dAdv.zero());
+	ASSERT("scfa inner noncausal backward control",
+	       glades::gpu::flash_attention_backward_cublas_tiled(
+	           dAq.data(), dAk.data(), dAv.data(), dAo.data(), dAdo.data(),
+	           aT, 1, aM, aM, false,
+	           dAdq.data(), dAdk.data(), dAdv.data(), dAp.data(), dAdp.data()));
+	ASSERT("scfa inner noncausal grad download",
+	       dAdk.download(&adk[0], aN) && dAdv.download(&adv[0], aN));
+	bool noncausalLeaksFuture = false;
+	for (int t = 1; t < aT; ++t)
+		for (int cidx = 0; cidx < aM; ++cidx)
+			if (adk[(size_t)t * aM + cidx] != 0.0f
+			    || adv[(size_t)t * aM + cidx] != 0.0f)
+				noncausalLeaksFuture = true;
+	ASSERT("scfa inner noncausal control exposes future rows", noncausalLeaksFuture);
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,10 +1723,14 @@ void CHIRONEvalForwardParityTest()
 static void CHIRONPrefixCausalityTest()
 {
 	glades::chiron::ChironModelDims d = ev_dims();
+	// Match the production P4 geometry that motivated this regression: two
+	// contiguous 16-token blocks. The cut and perturbation below are eight
+	// positions apart but remain inside the same destination block.
+	d.T = 32;
 	glades::chiron::ChironModelWeights w;
 	ev_fill_core_weights(w, d);
 
-	const int k = 4, sw = 1;
+	const int k = 2, sw = 4;
 	w.scfa.present = true;
 	w.scfa.dLoaded = true; w.scfa.causalBlock = true;
 	w.scfa.k = k;
@@ -1631,11 +1762,14 @@ static void CHIRONPrefixCausalityTest()
 	cfg.epsReln = 1e-4f;
 	cfg.qknormGammaScale.resize((size_t)d.L * d.nH, 1.75f);
 
-	const int pos = 4;
+	const int pos = 18;
+	const int sameBlockFuture = 26;
 	std::vector<int> full((size_t)d.T), prefix((size_t)d.T);
 	for (int t = 0; t < d.T; ++t) full[t] = (3 * t + 1) % d.V;
 	prefix = full;
-	for (int t = pos + 1; t < d.T; ++t) prefix[t] = (full[t] + 1) % d.V;
+	prefix[sameBlockFuture] = (full[sameBlockFuture] + 5) % d.V;
+	ASSERT("prefix fixture stays in one SCFA block",
+	       pos / (d.T / k) == sameBlockFuture / (d.T / k));
 
 	glades::chiron::ChironEvalScratch sf, sp;
 	ASSERT("prefix full scratch", sf.allocate(d, w, cfg));
@@ -1653,8 +1787,27 @@ static void CHIRONPrefixCausalityTest()
 
 	bool futureDiffers = false;
 	for (int v = 0; v < d.V; ++v)
-		if (lf[(size_t)(pos + 1) * d.V + v] != lp[(size_t)(pos + 1) * d.V + v]) { futureDiffers = true; break; }
-	ASSERT("prefix regression changes future fixture", futureDiffers);
+		if (lf[(size_t)sameBlockFuture * d.V + v]
+		    != lp[(size_t)sameBlockFuture * d.V + v])
+		{
+			futureDiffers = true;
+			break;
+		}
+	ASSERT("prefix regression changes same-block future fixture", futureDiffers);
+
+	// Hidden-state causality must hold as strongly as readout causality.
+	glades::chiron::ChironEvalScratch tf, tp;
+	ASSERT("prefix trace full scratch", tf.allocate(d, w, cfg));
+	ASSERT("prefix trace changed scratch", tp.allocate(d, w, cfg));
+	ASSERT("prefix trace full upload", tf.d_tokens.upload(&full[0], (size_t)d.T));
+	ASSERT("prefix trace changed upload", tp.d_tokens.upload(&prefix[0], (size_t)d.T));
+	glades::chiron::ChironEvalTrace fullTrace, changedTrace;
+	ASSERT("prefix trace full forward",
+	       glades::chiron::chiron_eval_forward_trace(d, w, cfg, tf, pos, fullTrace));
+	ASSERT("prefix trace changed forward",
+	       glades::chiron::chiron_eval_forward_trace(d, w, cfg, tp, pos, changedTrace));
+	ASSERT("same-block future leaves q trace unchanged", fullTrace.lastQ == changedTrace.lastQ);
+	ASSERT("same-block future leaves p trace unchanged", fullTrace.lastP == changedTrace.lastP);
 }
 
 struct DecodeGenerationTrace
