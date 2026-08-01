@@ -554,6 +554,13 @@ glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const gla
 	return TransformerPublicAPI::runtime(net).forwardLastLogits(tokenIds, outLogits);
 }
 
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogitsGpu(const glades::NNetwork& net,
+                                                                          const std::vector<glades::TokenId>& tokenIds,
+                                                                          std::vector<float>& outLogits)
+{
+	return TransformerPublicAPI::runtime(net).forwardLastLogitsGpu(tokenIds, outLogits);
+}
+
 glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastTrace(const glades::NNetwork& net,
                                                                       const std::vector<glades::TokenId>& tokenIds,
                                                                       std::vector<float>& outLogits,
@@ -591,6 +598,12 @@ glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(
                                                                                 std::vector<float>& outLogits) const
 {
 	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogitsGpu(const std::vector<glades::TokenId>& tokenIds,
+                                                                                   std::vector<float>& outLogits) const
+{
+	return net.transformerLmForwardLastLogitsGpu(tokenIds, outLogits);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastTrace(const std::vector<glades::TokenId>& tokenIds,

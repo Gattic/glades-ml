@@ -272,14 +272,16 @@ bool chiron_load_fp32_adam_group(std::FILE* fp,
 // ---------------------------------------------------------------------------
 
 // Writes CHRF magic + version (derived from flags) + hdr[6] + metadata + flags.
-// Version rule (mirrors trainer save_full_checkpoint chiron_main.cpp:6059):
-//   bit 64 (BF16_DISK) → v4; else bit 8 (GAMMA_P) → v3; else v2.
+// Version rule (mirrors trainer save_full_checkpoint):
+//   bit 65536 (FP32 E override) → v5; bit 64 (BF16_DISK) → v4;
+//   else bit 8 (GAMMA_P) → v3; else v2.
 bool chiron_write_header(std::FILE* fp, const ChironCkptHeader& h)
 {
     const char magic[4] = {'C','H','R','F'};
-    const uint32_t version = (h.flags & (uint32_t)CKPT_BIT_BF16_DISK) ? 4u
-                           : (h.flags & (uint32_t)CKPT_BIT_GAMMA_P)   ? 3u
-                           :                                              2u;
+    const uint32_t version = (h.flags & (uint32_t)CKPT_BIT_FP32_EMBEDDING) ? 5u
+                           : (h.flags & (uint32_t)CKPT_BIT_BF16_DISK)      ? 4u
+                           : (h.flags & (uint32_t)CKPT_BIT_GAMMA_P)        ? 3u
+                           :                                                   2u;
     const int32_t hdr[6]      = { h.dims.T, h.dims.m, h.dims.L,
                                    h.dims.nH, h.dims.dH, h.dims.V };
     const int32_t step        = h.step;
@@ -394,7 +396,7 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
             path.c_str(), magic[0], magic[1], magic[2], magic[3]);
         err = eb; errCode = 4; std::fclose(fp); return false;
     }
-    const int maxVer = isFull ? 4 : 3;
+    const int maxVer = isFull ? 5 : 3;
     const int minVer = isFull ? 2 : 1;
     if (std::fread(&version, sizeof(int), 1, fp) != 1
         || version < minVer || version > maxVer)
@@ -670,6 +672,21 @@ bool chiron_load_model(const std::string& path, ChironModelDims& dims,
         std::printf("[chiron-ckpt] loaded per-head QK-Norm gamma (L=%d nH=%d)"
                     " -- exact (not gamma~14 approx)\n",
                     dims.L, dims.nH);
+    }
+
+    // v5 bit 65536: E is canonical FP32 during training even when layer
+    // weights are BF16. Override the compatibility BF16 E blob so serving and
+    // resumed training see the exact pre-checkpoint embedding values.
+    if (isFull && (chrfFlags & (uint32_t)CKPT_BIT_FP32_EMBEDDING) != 0)
+    {
+        std::vector<float> exactE(Esize);
+        if (std::fread(&exactE[0], sizeof(float), Esize, fp) != Esize)
+        {
+            err = "chiron_infer: short FP32 embedding override";
+            errCode = 4; std::fclose(fp); return false;
+        }
+        w.E.upload(&exactE[0], Esize);
+        std::printf("[chiron-ckpt] loaded exact FP32 embedding override (v5)\n");
     }
 
     // bit 2048: load the cached WhiSC `a` from the trainer-owned Pbar/Qbar/a

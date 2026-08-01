@@ -9537,7 +9537,183 @@ bool glades::NNetwork::syncTransformerGpuTrainingWeightsToCpu()
 	hostView.blocks = blockViews.empty() ? NULL : &blockViews[0];
 	hostView.blockCount = static_cast<unsigned int>(blockViews.size());
 
-	return glades::gpu::downloadTransformerWeightsToHost(*gpuTransformerWeights, hostView);
+	if (!glades::gpu::downloadTransformerWeightsToHost(*gpuTransformerWeights, hostView))
+		return false;
+
+	// Checkpoints are written from the CPU-owned TensorTransformerState. The GPU
+	// Adam path must therefore synchronize its persistent moment tensors at each
+	// train/eval boundary; syncing only model weights produced apparently valid
+	// checkpoints whose resumed optimizer silently restarted from zero moments.
+#define GLADES_DOWNLOAD_ADAM(device_, host_) do { \
+	if ((device_).allocated() && !(host_).empty() && \
+	    !(device_).download(&(host_)[0], (host_).size())) return false; \
+} while (0)
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->vTokE, tensorTransformer.vTokE);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2TokE, tensorTransformer.v2TokE);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->mLmBias, tensorTransformer.mLmBias);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2LmBias, tensorTransformer.v2LmBias);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->vWIn, tensorTransformer.vWIn);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2WIn, tensorTransformer.v2WIn);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->mBIn, tensorTransformer.mBIn);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2BIn, tensorTransformer.v2BIn);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->vWOut, tensorTransformer.vWOut);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2WOut, tensorTransformer.v2WOut);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->mBOut, tensorTransformer.mBOut);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2BOut, tensorTransformer.v2BOut);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->mLnFinalGamma, tensorTransformer.mLnFinalGamma);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2LnFinalGamma, tensorTransformer.v2LnFinalGamma);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->mLnFinalBeta, tensorTransformer.mLnFinalBeta);
+	GLADES_DOWNLOAD_ADAM(gpuTransformerWeights->v2LnFinalBeta, tensorTransformer.v2LnFinalBeta);
+	for (size_t l = 0; l < tensorTransformer.blocks.size(); ++l)
+	{
+		gpu::GpuTransformerWeights::Block& d = gpuTransformerWeights->blocks[l];
+		TensorTransformerState::Block& h = tensorTransformer.blocks[l];
+		GLADES_DOWNLOAD_ADAM(d.mLn1Gamma, h.mLn1Gamma);
+		GLADES_DOWNLOAD_ADAM(d.v2Ln1Gamma, h.v2Ln1Gamma);
+		GLADES_DOWNLOAD_ADAM(d.mLn1Beta, h.mLn1Beta);
+		GLADES_DOWNLOAD_ADAM(d.v2Ln1Beta, h.v2Ln1Beta);
+		GLADES_DOWNLOAD_ADAM(d.vWq, h.vWq); GLADES_DOWNLOAD_ADAM(d.v2Wq, h.v2Wq);
+		GLADES_DOWNLOAD_ADAM(d.vWk, h.vWk); GLADES_DOWNLOAD_ADAM(d.v2Wk, h.v2Wk);
+		GLADES_DOWNLOAD_ADAM(d.vWv, h.vWv); GLADES_DOWNLOAD_ADAM(d.v2Wv, h.v2Wv);
+		GLADES_DOWNLOAD_ADAM(d.vWo, h.vWo); GLADES_DOWNLOAD_ADAM(d.v2Wo, h.v2Wo);
+		GLADES_DOWNLOAD_ADAM(d.mBq, h.mBq); GLADES_DOWNLOAD_ADAM(d.v2Bq, h.v2Bq);
+		GLADES_DOWNLOAD_ADAM(d.mBk, h.mBk); GLADES_DOWNLOAD_ADAM(d.v2Bk, h.v2Bk);
+		GLADES_DOWNLOAD_ADAM(d.mBv, h.mBv); GLADES_DOWNLOAD_ADAM(d.v2Bv, h.v2Bv);
+		GLADES_DOWNLOAD_ADAM(d.mBo, h.mBo); GLADES_DOWNLOAD_ADAM(d.v2Bo, h.v2Bo);
+		GLADES_DOWNLOAD_ADAM(d.mLn2Gamma, h.mLn2Gamma);
+		GLADES_DOWNLOAD_ADAM(d.v2Ln2Gamma, h.v2Ln2Gamma);
+		GLADES_DOWNLOAD_ADAM(d.mLn2Beta, h.mLn2Beta);
+		GLADES_DOWNLOAD_ADAM(d.v2Ln2Beta, h.v2Ln2Beta);
+		GLADES_DOWNLOAD_ADAM(d.vW1, h.vW1); GLADES_DOWNLOAD_ADAM(d.v2W1, h.v2W1);
+		GLADES_DOWNLOAD_ADAM(d.vW2, h.vW2); GLADES_DOWNLOAD_ADAM(d.v2W2, h.v2W2);
+		GLADES_DOWNLOAD_ADAM(d.mB1, h.mB1); GLADES_DOWNLOAD_ADAM(d.v2B1, h.v2B1);
+		GLADES_DOWNLOAD_ADAM(d.mB2, h.mB2); GLADES_DOWNLOAD_ADAM(d.v2B2, h.v2B2);
+	}
+#undef GLADES_DOWNLOAD_ADAM
+	return true;
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
+    const std::vector<unsigned int>& tokenIds,
+    std::vector<float>& outLogits) const
+{
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmForwardLastLogitsGpu: NNetwork is already running");
+	if (netType != TYPE_TRANSFORMER_DECODER || !tensorTransformer.tokenModel ||
+	    !tensorTransformer.initialized)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmForwardLastLogitsGpu: initialized token decoder required");
+	if (tokenIds.empty())
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		    "transformerLmForwardLastLogitsGpu: tokenIds empty");
+
+	NNetwork* self = const_cast<NNetwork*>(this);
+	TensorTransformerState& tt = self->tensorTransformer;
+	for (size_t i = 0; i < tokenIds.size(); ++i)
+		if (tokenIds[i] >= tt.vocabSize)
+			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+			    "transformerLmForwardLastLogitsGpu: tokenId out of range");
+
+	TransformerRuntimeConfigSnapshot runtimeCfg;
+	NNetworkStatus cfgStatus = buildTransformerRuntimeConfigSnapshot(
+	    "transformerLmForwardLastLogitsGpu", trainingConfig.transformer, runtimeCfg);
+	if (!cfgStatus.ok()) return cfgStatus;
+	if (!self->ensureGpuState() || !self->gpuTransformerWeights ||
+	    !self->gpuTransformerWeights->initialized)
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+		    "transformerLmForwardLastLogitsGpu: GPU weight initialization failed");
+
+	TransformerEpochCfg cfg;
+	cfg.inputSize = tt.inputSize;
+	cfg.outSize = tt.outSize;
+	cfg.dModel = tt.dModel;
+	cfg.dFF = tt.dFF;
+	cfg.nHeads = tt.nHeads;
+	cfg.nKVHeads = tt.nKVHeads > 0u ? tt.nKVHeads : tt.nHeads;
+	cfg.nLayers = tt.nLayers;
+	cfg.vocabSize = tt.vocabSize;
+	if (cfg.nHeads == 0u || cfg.dModel % cfg.nHeads != 0u ||
+	    cfg.nKVHeads == 0u || cfg.nHeads % cfg.nKVHeads != 0u)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmForwardLastLogitsGpu: invalid attention geometry");
+	cfg.dHead = cfg.dModel / cfg.nHeads;
+	cfg.dModelKV = cfg.nKVHeads * cfg.dHead;
+	cfg.ff1Width = (static_cast<int>(runtimeCfg.ffnKind) ==
+	                    static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
+	    ? 2u * cfg.dFF : cfg.dFF;
+	cfg.padTokenId = tt.padTokenId;
+	cfg.causal = tt.causal;
+	cfg.tokenLM = true;
+	cfg.tieEmb = tt.tieEmbeddings;
+	cfg.isTrain = false;
+	cfg.gradClip = trainingConfig.perElementGradClip;
+	cfg.lnEps = runtimeCfg.layerNormEps;
+	cfg.ropeTheta = runtimeCfg.ropeTheta;
+	cfg.costFx = skeleton ? skeleton->getOutputType() : 0;
+	cfg.posEnc = static_cast<int>(runtimeCfg.positionalEncoding);
+	cfg.normType = static_cast<int>(runtimeCfg.normType);
+	cfg.ffnKind = static_cast<int>(runtimeCfg.ffnKind);
+	cfg.ffnAct = static_cast<int>(runtimeCfg.ffnActivation);
+	cfg.ropeDimOverride = runtimeCfg.ropeDimOverride;
+	cfg.tokenLmNegK = trainingConfig.transformer.tokenLmSampledNegatives;
+	cfg.ddpEnabled = false;
+	cfg.useLowpWeights = false;
+	cfg.lowpDType = glades::MixedPrecisionConfig::WEIGHT_F32;
+	cfg.mpEnable = false;
+	cfg.mpUseLossScaling = false;
+	cfg.mpDynamicLossScaling = false;
+	cfg.seqBatchMax = 1u;
+	cfg.tokenLmLossKind = trainingConfig.transformer.tokenLmLossKind;
+	cfg.tokenLmAllowHuge = true;
+	cfg.lrScheduleMultiplier = 1.0f;
+
+	const unsigned int T = static_cast<unsigned int>(tokenIds.size());
+	if (!self->ensureTransformerGpuTrainingScratch(cfg, T))
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+		    "transformerLmForwardLastLogitsGpu: scratch allocation failed");
+	std::vector<int> ids(T);
+	for (unsigned int i = 0u; i < T; ++i) ids[i] = static_cast<int>(tokenIds[i]);
+	if (!self->gpuTransformerScratch->tokenIds.upload(&ids[0], T))
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+		    "transformerLmForwardLastLogitsGpu: token upload failed");
+
+	const bool useRope = cfg.posEnc ==
+	    static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE);
+	if (useRope)
+	{
+		unsigned int ropeDim = cfg.dHead;
+		if (cfg.ropeDimOverride > 0 &&
+		    static_cast<unsigned int>(cfg.ropeDimOverride) < ropeDim)
+			ropeDim = static_cast<unsigned int>(cfg.ropeDimOverride);
+		if (ropeDim % 2u != 0u) --ropeDim;
+		self->transformerPosEncCache.ensureRope(ropeDim, cfg.ropeTheta);
+		std::vector<float> invFreq(self->transformerPosEncCache.ropeInvFreq.size());
+		for (size_t i = 0; i < invFreq.size(); ++i)
+			invFreq[i] = static_cast<float>(self->transformerPosEncCache.ropeInvFreq[i]);
+		if (!invFreq.empty() &&
+		    !self->gpuTransformerScratch->gpuInvFreq.upload(&invFreq[0], invFreq.size()))
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    "transformerLmForwardLastLogitsGpu: RoPE upload failed");
+	}
+
+	if (!self->transformerGpuRunForwardOnly(cfg, T,
+	        false, useRope, false, false, false, false, false, false, false,
+	        false, cfg.ropeDimOverride, NULL) ||
+	    !glades::gpu::synchronizeCheck("transformerLmForwardLastLogitsGpu"))
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+		    "transformerLmForwardLastLogitsGpu: forward failed");
+
+	outLogits.assign(cfg.vocabSize, 0.0f);
+	glades::gpu::device_memcpy_d2h(&outLogits[0],
+	    self->gpuTransformerScratch->logits.data() +
+	        static_cast<size_t>(T - 1u) * cfg.vocabSize,
+	    static_cast<size_t>(cfg.vocabSize) * sizeof(float));
+	if (!glades::gpu::synchronizeTransferStream())
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+		    "transformerLmForwardLastLogitsGpu: logits download failed");
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
 namespace {
@@ -10599,6 +10775,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		progressEverySeq = 1u;
 	int64_t lastProgressMs = epochStartMs;
 	static const int64_t kProgressIntervalMs = 5000;
+	const char* stepTelemetryEnv = std::getenv("GLADES_TRANSFORMER_STEP_TELEMETRY");
+	const bool emitStepTelemetry = stepTelemetryEnv && std::strcmp(stepTelemetryEnv, "1") == 0;
+	double telemetryBatchLossSum = 0.0;
+	unsigned long long telemetryBatchTargets = 0ULL;
+	int64_t telemetryBatchStartMs = epochStartMs;
 
 	if (nHeads == 0u || (dModel % nHeads) != 0u)
 	{
@@ -10720,6 +10901,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		const unsigned int T = di->getTrainSequenceLength(s);
 		if (T == 0u)
 			continue;
+		if (seqInBatch == 0u)
+			telemetryBatchStartMs = getCurrentTimeMilliseconds();
 		echoObserveEntries.clear();
 		int echoObserveTotalFeatures = 0;
 		const bool gpuBatchEchoObserve =
@@ -11339,6 +11522,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			heliosProbeLastSeqValid = true;
 
 			gpuValidTargets = static_cast<unsigned int>(lossCountVal);
+			if (cfg.isTrain)
+			{
+				telemetryBatchLossSum += static_cast<double>(lossVal);
+				telemetryBatchTargets += static_cast<unsigned long long>(lossCountVal);
+			}
 			tokenLmNllSum += static_cast<double>(lossVal);
 			tokenLmTokenCount += static_cast<unsigned long long>(lossCountVal);
 			clsCorrect += static_cast<unsigned long long>(correctVal);
@@ -15230,6 +15418,30 @@ if (ad_.valid) { \
 				}
 			}
 
+			if (emitStepTelemetry && logger && tokenLM)
+			{
+				const int64_t telemetryEndMs = getCurrentTimeMilliseconds();
+				const double stepMs = static_cast<double>(telemetryEndMs - telemetryBatchStartMs);
+				const double stepNll = telemetryBatchTargets > 0ULL
+				    ? telemetryBatchLossSum / static_cast<double>(telemetryBatchTargets) : 0.0;
+				const double predictedTokensPerSec = stepMs > 0.0
+				    ? static_cast<double>(telemetryBatchTargets) * 1000.0 / stepMs : 0.0;
+				std::ostringstream telemetry;
+				telemetry << "event=transformer_step_telemetry";
+				append_logfmt_kv(telemetry, "optimizer_step", tensorTransformer.optimizerStep);
+				append_logfmt_kv(telemetry, "train_nll", stepNll);
+				append_logfmt_kv(telemetry, "raw_grad_norm", lastGradNorm);
+				append_logfmt_kv(telemetry, "grad_scale", lastGradNormScale);
+				append_logfmt_kv(telemetry, "clipped", lastGradNormScale < 1.0f);
+				append_logfmt_kv(telemetry, "true_skip", false);
+				append_logfmt_kv(telemetry, "optimizer_applied", true);
+				append_logfmt_kv(telemetry, "predicted_tokens", telemetryBatchTargets);
+				append_logfmt_kv(telemetry, "step_ms", stepMs);
+				append_logfmt_kv(telemetry, "predicted_tokens_per_sec", predictedTokensPerSec);
+				logger->info("NNetwork", shmea::GString(telemetry.str().c_str()));
+			}
+			telemetryBatchLossSum = 0.0;
+			telemetryBatchTargets = 0ULL;
 			seqInBatch = 0u;
 			timeStepsInBatch = 0u;
 		}
@@ -15278,3 +15490,13 @@ if (ad_.valid) { \
 
 }
 #endif // GLADES_HAVE_CUDA
+
+#ifndef GLADES_HAVE_CUDA
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
+    const std::vector<unsigned int>&,
+    std::vector<float>&) const
+{
+	return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+	    "transformerLmForwardLastLogitsGpu: CUDA support is unavailable");
+}
+#endif

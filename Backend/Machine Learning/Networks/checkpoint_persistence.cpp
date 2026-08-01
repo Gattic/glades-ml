@@ -1078,6 +1078,7 @@ static bool write_manifest(const std::string& manifestPath,
                            int netType,
                            int epochs,
                            uint64_t rngSeed,
+                           uint64_t rngState,
                            const glades::TrainingConfig& trainingConfig,
                            bool includeOptimizerState,
                            unsigned long long transformerOptimizerStep,
@@ -1100,6 +1101,7 @@ static bool write_manifest(const std::string& manifestPath,
 	write_kv(out, "netType", u64_to_string(static_cast<uint64_t>(netType)));
 	write_kv(out, "epochs", u64_to_string(static_cast<uint64_t>(epochs)));
 	write_kv(out, "rngSeed", u64_to_string(rngSeed));
+	write_kv(out, "rngState", u64_to_string(rngState));
 	write_kv(out, "includeOptimizerState", includeOptimizerState ? "1" : "0");
 	write_kv(out, "maxShardBytes", u64_to_string(static_cast<uint64_t>(maxShardBytes)));
 	write_kv(out, "shardCount", u64_to_string(static_cast<uint64_t>(shards.size())));
@@ -1845,6 +1847,8 @@ static void restore_checkpoint_runtime_metadata(const std::map<std::string, std:
                                                 bool& includeOptimizerStateOut,
                                                 uint64_t& seedOut,
                                                 bool& hasSeedOut,
+                                                uint64_t& rngStateOut,
+                                                bool& hasRngStateOut,
                                                 glades::TrainingConfig& cfg)
 {
 	int savedEpochs = 0;
@@ -1852,6 +1856,7 @@ static void restore_checkpoint_runtime_metadata(const std::map<std::string, std:
 		epochsOut = savedEpochs;
 
 	hasSeedOut = parse_u64(kv, "rngSeed", seedOut);
+	hasRngStateOut = parse_u64(kv, "rngState", rngStateOut);
 	includeOptimizerStateOut = true;
 	(void)parse_bool01(kv, "includeOptimizerState", includeOptimizerStateOut);
 
@@ -5926,6 +5931,7 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	                    netType,
 	                    epochs,
 	                    rngSeed,
+	                    rngEngine.s,
 	                    trainingConfig,
 	                    cfg.includeOptimizerState,
 	                    trStep,
@@ -6038,11 +6044,20 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 
 	// Restore metadata/config before allocating tensors.
 	uint64_t savedSeed = 0u;
+	uint64_t savedRngState = 0u;
 	bool hasSavedSeed = false;
+	bool hasSavedRngState = false;
 	bool includeOpt = true;
-	restore_checkpoint_runtime_metadata(kv, epochs, includeOpt, savedSeed, hasSavedSeed, trainingConfig);
+	restore_checkpoint_runtime_metadata(kv, epochs, includeOpt, savedSeed, hasSavedSeed,
+	                                    savedRngState, hasSavedRngState, trainingConfig);
 	if (hasSavedSeed)
 		setSeed(savedSeed);
+	if (hasSavedRngState)
+	{
+		if (savedRngState == 0ULL)
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: rngState must be nonzero");
+		rngEngine.s = savedRngState;
+	}
 
 	// Optimizer-state completeness guard:
 	// If the run is configured for AdamW, the checkpoint must include optimizer state.
@@ -7278,6 +7293,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			}
 		}
 	}
+
+	// A loaded checkpoint is authoritative initialized state. When GPU training
+	// is enabled, tensor allocation may defer random initialization to the
+	// device; leaving that flag set here would overwrite the tensors just read
+	// on the first ensureGpuState() call and silently restart model weights.
+	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
+		tensorTransformer.gpuInitDeferred = false;
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }

@@ -559,30 +559,46 @@ static void CHIRONCkptRoundtripTest()
 		rt_cmpbuf("rt5a Wk",*w.Wk[0],&Wk[0],Wk.size(),false);rt_cmpbuf("rt5a Wv",*w.Wv[0],&Wv[0],Wv.size(),false);rt_cmpbuf("rt5a fg",*w.ffnGate[0],&fg[0],fg.size(),false);rt_cmpbuf("rt5a fu",*w.ffnUp[0],&fu[0],fu.size(),false);rt_cmpbuf("rt5a fd",*w.ffnDown[0],&fd[0],fd.size(),false);unlink(path.c_str());
 	}
 
-	// ---- Case 5b: Unknown bit 65536 → reject with errCode=4 ----
+	// ---- Case 5b: CHRF v5 BF16 weights + exact FP32 embedding override ----
 	{
 		RTWeightData src;
 		rt_fill_weights(src, false);
-
-		const uint32_t flags = 65536u;  // bit beyond CKPT_KNOWN_BITS_MASK
-
+		const uint32_t flags = (uint32_t)glades::chiron::CKPT_BIT_BF16_DISK
+		                     | (uint32_t)glades::chiron::CKPT_BIT_FP32_EMBEDDING;
 		std::string path = rt_tmppath();
-		ASSERT("rt5b tmppath", !path.empty());
-
 		std::FILE* fp = std::fopen(path.c_str(), "wb");
 		ASSERT("rt5b fopen", fp != 0);
-		ASSERT("rt5b write_header",  glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
-		ASSERT("rt5b write_weights", rt_write_weights(fp, src, false, false));
+		ASSERT("rt5b header", glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
+		ASSERT("rt5b weights", rt_write_weights(fp, src, true, false));
+		ASSERT("rt5b exact E", glades::chiron::chiron_write_block(fp, src.E, src.E.size(), false));
 		std::fclose(fp);
+		glades::chiron::ChironModelDims dims;
+		glades::chiron::ChironModelWeights w;
+		std::string err; int errCode = 0;
+		ASSERT("rt5b load", glades::chiron::chiron_load_model(path, dims, w, err, errCode));
+		rt_cmpbuf("rt5b exact E", w.E, &src.E[0], src.E.size(), false);
+		rt_cmpbuf("rt5b bf16 Wq", *w.Wq[0], &src.layers[0].Wq[0], src.layers[0].Wq.size(), true);
+		unlink(path.c_str());
+	}
 
-		glades::chiron::ChironModelDims     dims;
-		glades::chiron::ChironModelWeights  w;
+	// ---- Case 5c: Unknown bit 131072 → reject with errCode=4 ----
+	{
+		RTWeightData src;
+		rt_fill_weights(src, false);
+		const uint32_t flags = 131072u;  // bit beyond CKPT_KNOWN_BITS_MASK
+		std::string path = rt_tmppath();
+		std::FILE* fp = std::fopen(path.c_str(), "wb");
+		ASSERT("rt5c fopen", fp != 0);
+		ASSERT("rt5c write_header", glades::chiron::chiron_write_header(fp, rt_make_hdr(flags)));
+		ASSERT("rt5c write_weights", rt_write_weights(fp, src, false, false));
+		std::fclose(fp);
+		glades::chiron::ChironModelDims dims;
+		glades::chiron::ChironModelWeights w;
 		std::string err; int errCode = 0;
 		bool ok = glades::chiron::chiron_load_model(path, dims, w, err, errCode);
-		ASSERT("rt5b rejected",   !ok);
-		ASSERT("rt5b errCode 4",  errCode == 4);
-		ASSERT("rt5b err unknown", err.find("unknown") != std::string::npos);
-
+		ASSERT("rt5c rejected", !ok);
+		ASSERT("rt5c errCode 4", errCode == 4);
+		ASSERT("rt5c err unknown", err.find("unknown") != std::string::npos);
 		unlink(path.c_str());
 	}
 

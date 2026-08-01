@@ -3283,6 +3283,11 @@ public:
 	NNetworkStatus transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
 	                                             std::vector<float>& outLogits) const;
 
+	// GPU counterpart used by checkpoint evaluators. Runs the same full
+	// sequence GPU forward as training and returns only the last logits row.
+	NNetworkStatus transformerLmForwardLastLogitsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits) const;
+
 	// Diagnostic variant that also captures the last-position hidden row at
 	// input and after every block. The implementation shares the exact full
 	// forward above; normal inference remains uninstrumented.

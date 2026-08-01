@@ -209,6 +209,8 @@ int main(int argc, char* argv[])
 		VESTAUnitTest();
 	    else if (strcmp(argv[1], "helios") == 0)
 		HELIOSUnitTest();
+	    else if (strcmp(argv[1], "chiron-token-count") == 0)
+		CHIRONTokenLmMetricCountTest();
 	    else if (strcmp(argv[1], "chiron") == 0)
 		CHIRONUnitTest();
 	    else if (strcmp(argv[1], "chiron-sira") == 0 || strcmp(argv[1], "sira") == 0)

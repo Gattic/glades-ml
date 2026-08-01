@@ -151,6 +151,9 @@ void CHIRONEchoE2CpuTest();
 void CHIRONEchoGpuParityTest();
 void CHIRONEchoZlossZeroCoefBitParityTest();
 
+// Focused multi-block token-LM accounting regression.
+void CHIRONTokenLmMetricCountTest();
+
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
 

@@ -14,14 +14,16 @@
 //                   [,FFN_gate,FFN_up,FFN_down])
 //   | [bit 128] SCFA: k i32, w i32, per-layer D[m*(w+1)] f32
 //   | [bit 256] QK-Norm gamma: L*nH f32
+//   | [bit 65536] FP32 embedding override: V*m f32 (resume-exact E)
 //   | [bits 2|16|32] Adam state | [bit 4] Kahan | [bit 1] FACE   (trainer-owned)
 //   | [bit 8192] ORBIT optimizer state (trainer-owned; before all model tails)
 //   | [bit 2048] WhiSC calibration: Pbar[L*m], Qbar[L*m], a[L*m] f32 (a used by serving)
 //   | [bit 4096] causal-block SCFA marker (no payload; changes SCFA operator semantics)
 //   | [bit 512] a_drift: L*m f32
 //   | [bit 1024] rot_phi: L*m f32       <-- MUST STAY LAST (EOF-tail read)
-// Version rules: v4 iff bit 64 (bf16-on-disk); else v3 iff bit 8 (gamma_p);
-// else v2.  CHRN (legacy) v1..3; v3 prepends a u32 flags word (bits below).
+// Version rules: v5 iff bit 65536 (FP32 embedding override); else v4 iff bit
+// 64 (bf16-on-disk); else v3 iff bit 8 (gamma_p); else v2. CHRN (legacy)
+// v1..3; v3 prepends a u32 flags word (bits below).
 //
 // C++98.
 
@@ -55,12 +57,13 @@ enum ChironCkptBits
 	CKPT_BIT_CAUSAL_SCFA  = 4096,
 	CKPT_BIT_ORBIT_STATE  = 8192,
 	CKPT_BIT_GQA          = 16384,
-	CKPT_BIT_FFN          = 32768
+	CKPT_BIT_FFN          = 32768,
+	CKPT_BIT_FP32_EMBEDDING = 65536
 };
 // All bits the current format defines. Architecture metadata follows the fixed
 // header; WhiSC and ORBIT remain before the two EOF tails. Unknown future bits
 // still hard-error to protect section alignment and tail arithmetic.
-static const uint32_t CKPT_KNOWN_BITS_MASK = 0xFFFFu;
+static const uint32_t CKPT_KNOWN_BITS_MASK = 0x1FFFFu;
 
 // CHRN v3 legacy flags word bits.
 enum ChironChrnBits

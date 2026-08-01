@@ -3997,7 +3997,8 @@ __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
 
     float localLoss = 0.0f;
     int localCount = 0;
-    for (int t = threadIdx.x; t < T; t += blockDim.x)
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
+         t += blockDim.x * gridDim.x)
     {
         int tgt = targets[t];
         if (padToken >= 0 && tgt == padToken) continue;

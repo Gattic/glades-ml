@@ -11244,6 +11244,48 @@ void CHIRONDfaL16Test()
 #endif
 }
 
+// CHIRONTokenLmMetricCountTest ----------------------------------------------
+// Regression for multi-block CE reduction: every target row must contribute
+// exactly once. The prior kernel omitted blockIdx from its row loop, so at
+// T=2048 all eight blocks counted and summed every target eight times.
+void CHIRONTokenLmMetricCountTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [token-lm-metrics] no CUDA device — skipped\n");
+		return;
+	}
+	const int T = 2048;
+	const int V = 7;
+	const int pad = -1;
+	std::vector<float> probs((size_t)T * V, 1.0f / (float)V);
+	std::vector<int> targets(T, 0);
+	for (int t = 0; t < T; ++t) targets[t] = t % V;
+	glades::gpu::GpuBuffer<float> d_probs;
+	glades::gpu::GpuBuffer<int> d_targets, d_out;
+	ASSERT("token-lm metric probs alloc", d_probs.allocate(probs.size()));
+	ASSERT("token-lm metric targets alloc", d_targets.allocate(targets.size()));
+	ASSERT("token-lm metric output alloc", d_out.allocate(4));
+	ASSERT("token-lm metric probs upload", d_probs.upload(&probs[0], probs.size()));
+	ASSERT("token-lm metric targets upload", d_targets.upload(&targets[0], targets.size()));
+	ASSERT("collect_token_lm_metrics multi-block",
+	       glades::gpu::collect_token_lm_metrics(
+	           d_probs.data(), d_targets.data(), T, V, pad, d_out.data()));
+	int packed[4] = {0, 0, 0, 0};
+	ASSERT("token-lm metric output download", d_out.download(packed, 4));
+	float loss = 0.0f;
+	std::memcpy(&loss, &packed[0], sizeof(loss));
+	const float expectedLoss = (float)T * std::log((float)V);
+	ASSERT("multi-block CE target count is not multiplied by grid size", packed[1] == T);
+	ASSERT("multi-block argmax valid count matches CE count", packed[3] == T);
+	ASSERT("multi-block CE loss counts every row once",
+	       std::fabs(loss - expectedLoss) <= 1e-3f * expectedLoss);
+#else
+	std::printf("  [token-lm-metrics] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -11499,6 +11541,7 @@ void CHIRONUnitTest()
 	CHIRONPtocDisabledParityTest();
 	CHIRONPtocDiagnosticsMathTest();
 	CHIRONOvfgStiefelAdamDescentTest();
+	CHIRONTokenLmMetricCountTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
 	CHIRONChunkedCrossEntropyBenchmark();
