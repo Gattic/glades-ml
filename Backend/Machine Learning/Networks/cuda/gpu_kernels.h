@@ -192,6 +192,17 @@ bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
                                       float coefficient, float margin,
                                       float temperature, int rows, int cols,
                                       unsigned short* dlogits, float* rowStats);
+// Frozen-step diagnostic variant. probs supplies the exact stored CE field;
+// hardNegativeMass, when non-null and pre-zeroed, receives unit mass per row
+// shared uniformly over the exact maximum set. No second optimizer pass runs.
+bool chiron_crm_forward_backward_bf16_observed(const unsigned short* logits,
+                                               const unsigned short* probs,
+                                               const int* targets,
+                                               float coefficient, float margin,
+                                               float temperature, int rows, int cols,
+                                               unsigned short* dlogits,
+                                               float* rowStats,
+                                               float* hardNegativeMass);
 
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
@@ -1369,6 +1380,7 @@ inline bool echo_summarize_stats(const float*, const float*, const float*, const
 inline bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short*, const int*, const float*, float, float, const float*, int, int, unsigned short*) { return false; }
 inline bool chiron_crm_forward_backward(const float*, const int*, float coefficient, float, float, int, int, float*, float*) { return coefficient == 0.0f; }
 inline bool chiron_crm_forward_backward_bf16(const unsigned short*, const int*, float coefficient, float, float, int, int, unsigned short*, float*) { return coefficient == 0.0f; }
+inline bool chiron_crm_forward_backward_bf16_observed(const unsigned short*, const unsigned short*, const int*, float coefficient, float, float, int, int, unsigned short*, float*, float*) { return coefficient == 0.0f; }
 inline bool echo_dense_bwd_bf16(const unsigned short*, float, const float*, int, int, unsigned short*) { return false; }
 inline bool echo_scatter_bf16(const unsigned short*, const int*, const uint32_t*, float, int, int, int, unsigned short*) { return false; }
 inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const uint32_t*, const float*, float, int, int, int, unsigned short*) { return false; }

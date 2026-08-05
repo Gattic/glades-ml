@@ -94,6 +94,24 @@ __device__ float blockReduceSum(float val, float* smem)
 	return val;
 }
 
+// Three reductions with one block synchronization. CRM uses this for decoded
+// sum/norm/certificate and observed component triples; it avoids five extra
+// block barriers in the production-sized row kernel.
+__device__ void blockReduceSum3(float& a, float& b, float& c,
+                                float* smemA, float* smemB, float* smemC)
+{
+	const int lane = threadIdx.x & 31;
+	const int wid = threadIdx.x >> 5;
+	a = warpReduceSum(a); b = warpReduceSum(b); c = warpReduceSum(c);
+	if (lane == 0) { smemA[wid] = a; smemB[wid] = b; smemC[wid] = c; }
+	__syncthreads();
+	const int numWarps = (blockDim.x + 31) / 32;
+	a = (threadIdx.x < (unsigned)numWarps) ? smemA[threadIdx.x] : 0.0f;
+	b = (threadIdx.x < (unsigned)numWarps) ? smemB[threadIdx.x] : 0.0f;
+	c = (threadIdx.x < (unsigned)numWarps) ? smemC[threadIdx.x] : 0.0f;
+	if (wid == 0) { a = warpReduceSum(a); b = warpReduceSum(b); c = warpReduceSum(c); }
+}
+
 // Block-wide max reduction using shared memory.
 __device__ float blockReduceMax(float val, float* smem)
 {
@@ -4318,22 +4336,37 @@ __device__ __forceinline__ float crm_sigmoid(float a)
 	return e / (1.0f + e);
 }
 
+__device__ __forceinline__ float crm_bf16_half_ulp(float value)
+{
+	const float magnitude = fabsf(value);
+	if (magnitude == 0.0f) return ldexpf(1.0f, -134);
+	int exponent = 0;
+	frexpf(magnitude, &exponent);
+	return ldexpf(1.0f, exponent - 9);
+}
+
 template <bool BF16>
 __global__ void chiron_crm_forward_backward_kernel(
     const void* __restrict__ logitsRaw,
+    const void* __restrict__ probsRaw,
     const int* __restrict__ targets,
     float coefficient, float margin, float temperature,
     int cols, void* __restrict__ dlogitsRaw,
-    float* __restrict__ rowStats)
+    float* __restrict__ rowStats,
+    float* __restrict__ hardNegativeMass)
 {
 	extern __shared__ float reductions[];
 	float* maxScratch = reductions;
-	float* countScratch = reductions + (blockDim.x + 31) / 32;
+	const int warpCount = (blockDim.x + 31) / 32;
+	float* countScratch = reductions + warpCount;
+	float* thirdScratch = reductions + 2 * warpCount;
 	const int row = blockIdx.x;
 	const int target = targets[row];
 	if (target < 0 || target >= cols) return;
 	const float* logitsF = (const float*)logitsRaw;
 	const unsigned short* logitsB = (const unsigned short*)logitsRaw;
+	const float* probsF = (const float*)probsRaw;
+	const unsigned short* probsB = (const unsigned short*)probsRaw;
 	float localMax = -FLT_MAX;
 	for (int v = threadIdx.x; v < cols; v += blockDim.x)
 	{
@@ -4366,26 +4399,84 @@ __global__ void chiron_crm_forward_backward_kernel(
 		const float s = crm_sigmoid(a);
 		targetAdd = -coefficient * s;
 		tieAdd = coefficient * s / (float)tieCount;
-		float* st = rowStats + (size_t)row * 6;
+		float* st = rowStats + (size_t)row * 12;
 		st[0] = temperature * crm_softplus(a);
 		st[1] = s;
 		st[2] = (float)tieCount;
 		st[3] = (targetQ - maximum < margin) ? 1.0f : 0.0f;
 		st[4] = coefficient * s * sqrtf(1.0f + 1.0f / tieCount);
 		st[5] = targetAdd + tieCount * tieAdd;
+		st[9] = 0.0f;
+		st[10] = 0.0f;
+		st[11] = 0.0f;
 	}
 	__syncthreads();
 	float* dF = (float*)dlogitsRaw;
 	unsigned short* dB = (unsigned short*)dlogitsRaw;
+	float localInjectedSum = 0.0f;
+	float localInjectedSq = 0.0f;
+	float localCertificate = 0.0f;
+	float localCeSq = 0.0f;
+	float localCrmSq = 0.0f;
+	float localCeCrmDot = 0.0f;
 	for (int v = threadIdx.x; v < cols; v += blockDim.x)
 	{
 		const size_t off = (size_t)row * cols + v;
 		const float q = BF16 ? bf16_load(logitsB[off]) : logitsF[off];
 		const float add = (v == target) ? targetAdd
 		                : ((q == maximum) ? tieAdd : 0.0f);
+		if (probsRaw)
+		{
+			const float probability = BF16 ? bf16_load(probsB[off]) : probsF[off];
+			const float ce = probability - (v == target ? 1.0f : 0.0f);
+			localCeSq += ce * ce;
+			localCrmSq += add * add;
+			localCeCrmDot += ce * add;
+		}
+		if (hardNegativeMass && v != target && q == maximum)
+			atomicAdd(hardNegativeMass + v, 1.0f / (float)tieCount);
 		if (add == 0.0f) continue;
-		if (BF16) dB[off] = bf16_store(bf16_load(dB[off]) + add);
-		else dF[off] += add;
+		float delta = 0.0f;
+		if (BF16)
+		{
+			const float before = bf16_load(dB[off]);
+			const float unrounded = before + add;
+			const unsigned short stored = bf16_store(unrounded);
+			const float after = bf16_load(stored);
+			dB[off] = stored;
+			delta = after - before;
+			localCertificate += crm_bf16_half_ulp(unrounded);
+		}
+		else
+		{
+			const float before = dF[off];
+			dF[off] += add;
+			delta = dF[off] - before;
+		}
+		localInjectedSum += delta;
+		localInjectedSq += delta * delta;
+	}
+	blockReduceSum3(localInjectedSum, localInjectedSq, localCertificate,
+	                maxScratch, countScratch, thirdScratch);
+	if (threadIdx.x == 0)
+	{
+		float* st = rowStats + (size_t)row * 12;
+		st[6] = sqrtf(localInjectedSq);
+		st[7] = localInjectedSum;
+		st[8] = localCertificate;
+	}
+	if (probsRaw)
+	{
+		__syncthreads();
+		blockReduceSum3(localCeSq, localCrmSq, localCeCrmDot,
+		                maxScratch, countScratch, thirdScratch);
+		if (threadIdx.x == 0)
+		{
+			float* st = rowStats + (size_t)row * 12;
+			st[9] = localCeSq;
+			st[10] = localCrmSq;
+			st[11] = localCeCrmDot;
+		}
 	}
 }
 
@@ -4864,9 +4955,10 @@ bool chiron_crm_forward_backward(const float* logits, const int* targets,
 	    !std::isfinite(margin) || temperature <= 0.0f ||
 	    !std::isfinite(temperature)) return false;
 	const int block = rowBlockSize(cols);
-	const int smem = 2 * ((block + 31) / 32) * (int)sizeof(float);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
 	chiron_crm_forward_backward_kernel<false><<<rows, block, smem, computeStream()>>>(
-	    logits, targets, coefficient, margin, temperature, cols, dlogits, rowStats);
+	    logits, NULL, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, NULL);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -4883,9 +4975,33 @@ bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
 	    !std::isfinite(margin) || temperature <= 0.0f ||
 	    !std::isfinite(temperature)) return false;
 	const int block = rowBlockSize(cols);
-	const int smem = 2 * ((block + 31) / 32) * (int)sizeof(float);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
 	chiron_crm_forward_backward_kernel<true><<<rows, block, smem, computeStream()>>>(
-	    logits, targets, coefficient, margin, temperature, cols, dlogits, rowStats);
+	    logits, NULL, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_crm_forward_backward_bf16_observed(const unsigned short* logits,
+                                               const unsigned short* probs,
+                                               const int* targets,
+                                               float coefficient, float margin,
+                                               float temperature, int rows, int cols,
+                                               unsigned short* dlogits,
+                                               float* rowStats,
+                                               float* hardNegativeMass)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !probs || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<true><<<rows, block, smem, computeStream()>>>(
+	    logits, probs, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, hardNegativeMass);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

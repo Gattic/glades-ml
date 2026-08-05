@@ -20892,6 +20892,30 @@ void CHIRONCrmCpuMathTest()
 		ASSERT("CRM CPU row sum stat", fabsf(stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_SUM]) < 1e-7f);
 		ASSERT("CRM CPU norm identity", fabs(sqrt(sq) - stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_GRAD_NORM]) < 1e-7);
 		ASSERT("CRM CPU norm bound", sqrt(sq) <= lambda * sqrt(2.0) + 1e-7);
+		ASSERT("CRM CPU injected norm identity", fabs(sqrt(sq) - stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_INJECTED_GRAD_NORM]) < 1e-7);
+		ASSERT("CRM CPU injected row sum", fabsf(stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_INJECTED_SUM]) < 1e-7f);
+		ASSERT("CRM CPU FP32 certificate is zero", stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_INJECTED_SUM_CERTIFICATE] == 0.0f);
+	}
+	{
+		std::vector<float> additive((size_t)rows * cols), before((size_t)rows * cols), additiveStats((size_t)rows * glades::chiron::CRM_ROW_STATS_SIZE, 0.0f);
+		for (size_t i = 0; i < additive.size(); ++i) additive[i] = before[i] = 0.25f;
+		ASSERT("CRM CPU additive dispatch", glades::chiron::chiron_crm_forward_backward_cpu(logits, targets, lambda, delta, tau, rows, cols, &additive[0], &additiveStats[0]));
+		for (int r = 0; r < rows; ++r)
+		{
+			const float maximum = r == 0 ? 1.5f : 1.0f;
+			float tiedDelta = 0.0f;
+			for (int v = 0; v < cols; ++v)
+			{
+				const bool support = v == targets[r] || (v != targets[r] && logits[(size_t)r * cols + v] == maximum);
+				const float change = additive[(size_t)r * cols + v] - before[(size_t)r * cols + v];
+				if (!support) ASSERT("CRM CPU additive support leak", change == 0.0f);
+				else if (v != targets[r])
+				{
+					if (tiedDelta == 0.0f) tiedDelta = change;
+					else ASSERT("CRM CPU additive uniform tied increment", change == tiedDelta);
+				}
+			}
+		}
 	}
 	const float eps = 1e-3f;
 	float worst = 0.0f;
@@ -20931,31 +20955,164 @@ void CHIRONCrmGpuParityTest()
 {
 #ifdef GLADES_HAVE_CUDA
 	if (!glades::gpu::initDevice()) { std::printf("  [CRM GPU parity] no CUDA device — skipped\n"); return; }
-	const int rows = 4, cols = 8; const size_t n = (size_t)rows * cols;
+	const int rows = 6, cols = 8; const size_t n = (size_t)rows * cols;
 	const float lambda = 0.10f, delta = 1.0f, tau = 1.0f;
-	const int targets[rows] = {0, 7, 2, 4};
-	const float hostLogits[rows * cols] = {0,2,-1,-2,-3,-4,-5,-6, 1,1,-2,1,-3,-4,-5,1.25f, 0.5f,3,3,3,-1,-2,-3,-4, -3,-2,-1,0,4,4,4,4};
+	const int targets[rows] = {0, 7, 2, 4, 0, 0};
+	const float hostLogits[rows * cols] = {
+		0,2,-1,-2,-3,-4,-5,-6,
+		1,1,-2,1,-3,-4,-5,1.25f,
+		0.5f,3,3,3,-1,-2,-3,-4,
+		-3,-2,-1,0,4,4,4,4,
+		-1000,1000,-10,-20,-30,-40,-50,-60,
+		1000,-1000,-10,-20,-30,-40,-50,-60
+	};
 	std::vector<float> cpuGrad(n, 0.0f), cpuStats((size_t)rows * glades::chiron::CRM_ROW_STATS_SIZE, 0.0f);
 	ASSERT("CRM FP32 CPU ref", glades::chiron::chiron_crm_forward_backward_cpu(hostLogits, targets, lambda, delta, tau, rows, cols, &cpuGrad[0], &cpuStats[0]));
 	glades::gpu::GpuBuffer<float> dLogits, dGrad, dStats; glades::gpu::GpuBuffer<int> dTargets;
 	dLogits.allocate(n); dLogits.upload(hostLogits, n); dGrad.allocate(n); dGrad.zero(); dStats.allocate(cpuStats.size()); dTargets.allocate(rows); dTargets.upload(targets, rows);
 	ASSERT("CRM FP32 GPU dispatch", glades::gpu::chiron_crm_forward_backward(dLogits.data(), dTargets.data(), lambda, delta, tau, rows, cols, dGrad.data(), dStats.data()));
 	std::vector<float> gpuGrad(n), gpuStats(cpuStats.size()); dGrad.download(&gpuGrad[0], n); dStats.download(&gpuStats[0], gpuStats.size());
-	float fp32Worst = 0.0f; for (size_t i = 0; i < n; ++i) fp32Worst = std::max(fp32Worst, fabsf(cpuGrad[i] - gpuGrad[i]));
-	for (size_t i = 0; i < cpuStats.size(); ++i) fp32Worst = std::max(fp32Worst, fabsf(cpuStats[i] - gpuStats[i]));
+	float fp32Worst = 0.0f;
+	for (size_t i = 0; i < n; ++i) fp32Worst = std::max(fp32Worst, fabsf(cpuGrad[i] - gpuGrad[i]));
+	for (size_t i = 0; i < cpuStats.size(); ++i)
+	{
+		ASSERT("CRM FP32 stable softplus/stat finite", std::isfinite(gpuStats[i]));
+		fp32Worst = std::max(fp32Worst, fabsf(cpuStats[i] - gpuStats[i]));
+	}
+	for (int r = 0; r < rows; ++r)
+	{
+		ASSERT("CRM GPU FP32 ideal row sum", fabsf(gpuStats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_SUM]) <= 1e-7f);
+		ASSERT("CRM GPU FP32 injected row sum", fabsf(gpuStats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_INJECTED_SUM]) <= 1e-7f);
+	}
 	ASSERT("CRM FP32 CPU/GPU parity", fp32Worst <= 1e-6f);
-	std::vector<unsigned short> logitsBf(n), cpuBf(n, 0), gpuBf(n, 0);
-	for (size_t i = 0; i < n; ++i) logitsBf[i] = glades::transformer_kernels::float_to_bf16_rn(hostLogits[i]);
+
+	std::vector<unsigned short> logitsBf(n), baseBf(n), cpuBf(n), gpuBf(n);
+	for (size_t i = 0; i < n; ++i)
+	{
+		logitsBf[i] = glades::transformer_kernels::float_to_bf16_rn(hostLogits[i]);
+		baseBf[i] = cpuBf[i] = gpuBf[i] = glades::transformer_kernels::float_to_bf16_rn(0.25f);
+	}
 	std::vector<float> cpuBfStats(cpuStats.size(), 0.0f), gpuBfStats(cpuStats.size(), 0.0f);
 	ASSERT("CRM BF16 CPU ref", glades::chiron::chiron_crm_forward_backward_bf16_cpu(&logitsBf[0], targets, lambda, delta, tau, rows, cols, &cpuBf[0], &cpuBfStats[0]));
-	glades::gpu::GpuBuffer<unsigned short> dLogitsBf, dGradBf; dLogitsBf.allocate(n); dLogitsBf.upload(&logitsBf[0], n); dGradBf.allocate(n); dGradBf.zero();
+	glades::gpu::GpuBuffer<unsigned short> dLogitsBf, dGradBf; dLogitsBf.allocate(n); dLogitsBf.upload(&logitsBf[0], n); dGradBf.allocate(n); dGradBf.upload(&gpuBf[0], n);
 	ASSERT("CRM BF16 GPU dispatch", glades::gpu::chiron_crm_forward_backward_bf16(dLogitsBf.data(), dTargets.data(), lambda, delta, tau, rows, cols, dGradBf.data(), dStats.data()));
 	dGradBf.download(&gpuBf[0], n); dStats.download(&gpuBfStats[0], gpuBfStats.size());
-	float bf16WorstUlp = 0.0f;
-	for (size_t i = 0; i < n; ++i) { const float a = glades::transformer_kernels::bf16_to_float(cpuBf[i]), b = glades::transformer_kernels::bf16_to_float(gpuBf[i]); const float ulp = std::max(1e-30f, 0.0078125f * std::max(fabsf(a), fabsf(b))); bf16WorstUlp = std::max(bf16WorstUlp, fabsf(a - b) / ulp); }
+	float bf16WorstUlp = 0.0f, bf16StatsWorst = 0.0f;
+	size_t bf16StatsWorstIndex = 0;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float a = glades::transformer_kernels::bf16_to_float(cpuBf[i]);
+		const float b = glades::transformer_kernels::bf16_to_float(gpuBf[i]);
+		const float ulp = std::max(1e-30f, 0.0078125f * std::max(fabsf(a), fabsf(b)));
+		bf16WorstUlp = std::max(bf16WorstUlp, fabsf(a - b) / ulp);
+	}
+	for (size_t i = 0; i < cpuBfStats.size(); ++i)
+	{
+		ASSERT("CRM BF16 GPU stat finite", std::isfinite(gpuBfStats[i]));
+		const float difference = fabsf(cpuBfStats[i] - gpuBfStats[i]);
+		if (difference > bf16StatsWorst) { bf16StatsWorst = difference; bf16StatsWorstIndex = i; }
+	}
+	std::printf("  [CRM BF16 stats] max_abs=%.9g index=%lu cpu=%.9g gpu=%.9g\n",
+	            bf16StatsWorst, (unsigned long)bf16StatsWorstIndex,
+	            cpuBfStats[bf16StatsWorstIndex], gpuBfStats[bf16StatsWorstIndex]);
 	ASSERT("CRM BF16 CPU/GPU beyond one ULP", bf16WorstUlp <= 1.0f);
-	for (int r = 0; r < rows; ++r) { double sum = 0.0, certificate = 0.0; for (int v = 0; v < cols; ++v) { const float g = glades::transformer_kernels::bf16_to_float(gpuBf[(size_t)r * cols + v]); sum += g; if (g != 0.0f) { int exponent = 0; frexpf(fabsf(g), &exponent); certificate += ldexpf(1.0f, exponent - 9); } } ASSERT("CRM BF16 row-sum rounding certificate", fabs(sum) <= certificate + 1e-12); }
-	std::printf("  [CRM CPU/CUDA parity] fp32_max=%.9g bf16_ulp=%.3f PASS\n", fp32Worst, bf16WorstUlp);
+	ASSERT("CRM BF16 loss/stat CPU/GPU parity", bf16StatsWorst <= 1e-6f);
+	for (int r = 0; r < rows; ++r)
+	{
+		const float* q = &hostLogits[(size_t)r * cols];
+		float maximum = -std::numeric_limits<float>::infinity();
+		for (int v = 0; v < cols; ++v) if (v != targets[r] && q[v] > maximum) maximum = q[v];
+		float tiedDelta = 0.0f; double sum = 0.0, sq = 0.0;
+		for (int v = 0; v < cols; ++v)
+		{
+			const size_t off = (size_t)r * cols + v;
+			const bool support = v == targets[r] || (v != targets[r] && q[v] == maximum);
+			const float before = glades::transformer_kernels::bf16_to_float(baseBf[off]);
+			const float after = glades::transformer_kernels::bf16_to_float(gpuBf[off]);
+			const float change = after - before;
+			if (!support) ASSERT("CRM BF16 maximum-set membership/support leak", change == 0.0f);
+			else if (v != targets[r] && change != 0.0f)
+			{
+				if (tiedDelta == 0.0f) tiedDelta = change;
+				else ASSERT("CRM BF16 equal tied increments", change == tiedDelta);
+			}
+			sum += change; sq += (double)change * change;
+		}
+		const float* st = &gpuBfStats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE];
+		ASSERT("CRM BF16 injected sum stat", fabs(sum - st[glades::chiron::CRM_ROW_INJECTED_SUM]) <= 1e-7);
+		ASSERT("CRM BF16 injected norm stat", fabs(sqrt(sq) - st[glades::chiron::CRM_ROW_INJECTED_GRAD_NORM]) <= 1e-7);
+		ASSERT("CRM BF16 row-sum rounding certificate", fabs(sum) <= st[glades::chiron::CRM_ROW_INJECTED_SUM_CERTIFICATE] + 1e-12);
+	}
+
+	// Frozen-step observed path: exact stored CE component reductions and one
+	// unit of hard-negative mass per row, shared uniformly over every tie.
+	{
+		std::vector<unsigned short> probsBf(n), observedGrad(baseBf);
+		for (size_t i = 0; i < n; ++i)
+			probsBf[i] = glades::transformer_kernels::float_to_bf16_rn(0.125f);
+		std::vector<float> observedStats(cpuStats.size(), 0.0f), hardMass(cols, 0.0f);
+		glades::gpu::GpuBuffer<unsigned short> dProbs, dObservedGrad;
+		glades::gpu::GpuBuffer<float> dObservedStats, dHardMass;
+		dProbs.allocate(n); dProbs.upload(&probsBf[0], n);
+		dObservedGrad.allocate(n); dObservedGrad.upload(&observedGrad[0], n);
+		dObservedStats.allocate(observedStats.size()); dHardMass.allocate(cols); dHardMass.zero();
+		ASSERT("CRM BF16 observed GPU dispatch", glades::gpu::chiron_crm_forward_backward_bf16_observed(
+		       dLogitsBf.data(), dProbs.data(), dTargets.data(), lambda, delta, tau,
+		       rows, cols, dObservedGrad.data(), dObservedStats.data(), dHardMass.data()));
+		dObservedGrad.download(&observedGrad[0], n);
+		dObservedStats.download(&observedStats[0], observedStats.size());
+		dHardMass.download(&hardMass[0], hardMass.size());
+		ASSERT("CRM observed path changes same dlogits", observedGrad == gpuBf);
+		double hardTotal = 0.0;
+		for (int v = 0; v < cols; ++v) hardTotal += hardMass[(size_t)v];
+		ASSERT("CRM hard-negative unit mass per row", fabs(hardTotal - rows) <= 1e-6);
+		for (int r = 0; r < rows; ++r)
+		{
+			const float* q = &hostLogits[(size_t)r * cols];
+			float maximum = -std::numeric_limits<float>::infinity();
+			for (int v = 0; v < cols; ++v) if (v != targets[r] && q[v] > maximum) maximum = q[v];
+			int ties = 0; for (int v = 0; v < cols; ++v) if (v != targets[r] && q[v] == maximum) ++ties;
+			const float a = (delta + maximum - q[targets[r]]) / tau;
+			const float sValue = glades::chiron::chiron_crm_sigmoid(a);
+			double ceSq = 0.0, crmSq = 0.0, dot = 0.0;
+			for (int v = 0; v < cols; ++v)
+			{
+				const float ce = 0.125f - (v == targets[r] ? 1.0f : 0.0f);
+				const float add = v == targets[r] ? -lambda * sValue
+				                : ((q[v] == maximum) ? lambda * sValue / ties : 0.0f);
+				ceSq += (double)ce * ce; crmSq += (double)add * add; dot += (double)ce * add;
+			}
+			const float* st = &observedStats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE];
+			ASSERT("CRM observed CE norm parity", fabs(ceSq - st[glades::chiron::CRM_ROW_CE_GRAD_SQ]) <= 2e-6);
+			ASSERT("CRM observed component norm parity", fabs(crmSq - st[glades::chiron::CRM_ROW_CRM_GRAD_SQ]) <= 2e-6);
+			ASSERT("CRM observed component dot parity", fabs(dot - st[glades::chiron::CRM_ROW_CE_CRM_DOT]) <= 2e-6);
+		}
+	}
+
+	// Exact halfway additions distinguish round-to-nearest-even from truncation
+	// or ties-away. Both odd-LSB inputs must round to the even 1.0 endpoint.
+	{
+		const int rneRows = 1, rneCols = 2; const float rneCoef = 0.0078125f;
+		const int rneTarget[1] = {0};
+		std::vector<unsigned short> rneLogits(2, 0), rneBefore(2, 0), rneCpu(2, 0), rneGpu(2, 0);
+		rneLogits[0] = rneLogits[1] = glades::transformer_kernels::float_to_bf16_rn(1.0f);
+		rneBefore[0] = glades::transformer_kernels::float_to_bf16_rn(1.0078125f);
+		rneBefore[1] = glades::transformer_kernels::float_to_bf16_rn(1.0f);
+		rneCpu[0] = rneGpu[0] = rneBefore[0]; rneCpu[1] = rneGpu[1] = rneBefore[1];
+		float rneCpuStats[glades::chiron::CRM_ROW_STATS_SIZE] = {0}, rneGpuStats[glades::chiron::CRM_ROW_STATS_SIZE] = {0};
+		ASSERT("CRM BF16 RNE host dispatch", glades::chiron::chiron_crm_forward_backward_bf16_cpu(&rneLogits[0], rneTarget, rneCoef, 0.0f, 1.0f, rneRows, rneCols, &rneCpu[0], rneCpuStats));
+		glades::gpu::GpuBuffer<unsigned short> dRneLogits, dRneGrad; glades::gpu::GpuBuffer<int> dRneTarget; glades::gpu::GpuBuffer<float> dRneStats;
+		dRneLogits.allocate(2); dRneLogits.upload(&rneLogits[0], 2); dRneGrad.allocate(2); dRneGrad.upload(&rneGpu[0], 2); dRneTarget.allocate(1); dRneTarget.upload(rneTarget, 1); dRneStats.allocate(glades::chiron::CRM_ROW_STATS_SIZE);
+		ASSERT("CRM BF16 RNE GPU dispatch", glades::gpu::chiron_crm_forward_backward_bf16(dRneLogits.data(), dRneTarget.data(), rneCoef, 0.0f, 1.0f, rneRows, rneCols, dRneGrad.data(), dRneStats.data()));
+		dRneGrad.download(&rneGpu[0], 2); dRneStats.download(rneGpuStats, glades::chiron::CRM_ROW_STATS_SIZE);
+		const unsigned short evenOne = glades::transformer_kernels::float_to_bf16_rn(1.0f);
+		ASSERT("CRM BF16 host RNE target halfway", rneCpu[0] == evenOne);
+		ASSERT("CRM BF16 host RNE maximum halfway", rneCpu[1] == evenOne);
+		ASSERT("CRM BF16 device RNE target halfway", rneGpu[0] == evenOne);
+		ASSERT("CRM BF16 device RNE maximum halfway", rneGpu[1] == evenOne);
+		for (int i = 0; i < glades::chiron::CRM_ROW_STATS_SIZE; ++i) ASSERT("CRM BF16 RNE stats parity", fabsf(rneCpuStats[i] - rneGpuStats[i]) <= 1e-6f);
+	}
+	std::printf("  [CRM CPU/CUDA parity] fp32_max=%.9g bf16_ulp=%.3f bf16_stats=%.9g RNE=PASS\n", fp32Worst, bf16WorstUlp, bf16StatsWorst);
 #else
 	std::printf("  [CRM GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif

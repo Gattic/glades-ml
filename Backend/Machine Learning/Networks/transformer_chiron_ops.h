@@ -1922,6 +1922,18 @@ enum ChironCrmRowStatIndex
 	CRM_ROW_VIOLATION,
 	CRM_ROW_GRAD_NORM,
 	CRM_ROW_SUM,
+	// Actual correction observed after adding to caller-owned dlogits.  The
+	// BF16 path records decoded values after round-to-nearest-even so Q0 can
+	// certify the field that training really consumed, not only the ideal
+	// q-space field above.
+	CRM_ROW_INJECTED_GRAD_NORM,
+	CRM_ROW_INJECTED_SUM,
+	CRM_ROW_INJECTED_SUM_CERTIFICATE,
+	// Populated by the observed CUDA entry point at frozen measurement steps.
+	// CE excludes z-loss; CRM is the ideal q-space component before /T.
+	CRM_ROW_CE_GRAD_SQ,
+	CRM_ROW_CRM_GRAD_SQ,
+	CRM_ROW_CE_CRM_DOT,
 	CRM_ROW_STATS_SIZE
 };
 inline float chiron_crm_softplus(float a)
@@ -1962,16 +1974,43 @@ inline bool chiron_crm_forward_backward_cpu(const float* logits, const int* targ
 		const float s = chiron_crm_sigmoid(a);
 		const float targetAdd = -coefficient * s;
 		const float tieAdd = coefficient * s / (float)ties;
+		double injectedSum = 0.0, injectedSq = 0.0;
+		const float targetBefore = g[y];
 		g[y] += targetAdd;
-		for (int v = 0; v < cols; ++v) if (v != y && q[v] == maximum) g[v] += tieAdd;
+		const float targetDelta = g[y] - targetBefore;
+		injectedSum += targetDelta;
+		injectedSq += (double)targetDelta * targetDelta;
+		for (int v = 0; v < cols; ++v) if (v != y && q[v] == maximum)
+		{
+			const float before = g[v];
+			g[v] += tieAdd;
+			const float delta = g[v] - before;
+			injectedSum += delta;
+			injectedSq += (double)delta * delta;
+		}
 		st[CRM_ROW_LOSS] = temperature * chiron_crm_softplus(a);
 		st[CRM_ROW_S] = s;
 		st[CRM_ROW_TIE_COUNT] = (float)ties;
 		st[CRM_ROW_VIOLATION] = (q[y] - maximum < margin) ? 1.0f : 0.0f;
 		st[CRM_ROW_GRAD_NORM] = coefficient * s * sqrtf(1.0f + 1.0f / ties);
 		st[CRM_ROW_SUM] = targetAdd + ties * tieAdd;
+		st[CRM_ROW_INJECTED_GRAD_NORM] = (float)sqrt(injectedSq);
+		st[CRM_ROW_INJECTED_SUM] = (float)injectedSum;
+		st[CRM_ROW_INJECTED_SUM_CERTIFICATE] = 0.0f;
+		st[CRM_ROW_CE_GRAD_SQ] = 0.0f;
+		st[CRM_ROW_CRM_GRAD_SQ] = 0.0f;
+		st[CRM_ROW_CE_CRM_DOT] = 0.0f;
 	}
 	return true;
+}
+
+inline float chiron_crm_bf16_half_ulp(float value)
+{
+	const float magnitude = fabsf(value);
+	if (magnitude == 0.0f) return ldexpf(1.0f, -134);
+	int exponent = 0;
+	frexpf(magnitude, &exponent);
+	return ldexpf(1.0f, exponent - 9);
 }
 
 inline bool chiron_crm_forward_backward_bf16_cpu(const unsigned short* logits,
@@ -1986,16 +2025,46 @@ inline bool chiron_crm_forward_backward_bf16_cpu(const unsigned short* logits,
 	    coefficient < 0.0f || !std::isfinite(coefficient) ||
 	    !std::isfinite(margin) || temperature <= 0.0f ||
 	    !std::isfinite(temperature)) return false;
-	std::vector<float> q((size_t)rows * cols), g((size_t)rows * cols);
+	std::vector<float> q((size_t)rows * cols), g((size_t)rows * cols), before((size_t)rows * cols);
 	for (size_t i = 0; i < q.size(); ++i)
 	{
 		q[i] = transformer_kernels::bf16_to_float(logits[i]);
-		g[i] = transformer_kernels::bf16_to_float(dlogits[i]);
+		g[i] = before[i] = transformer_kernels::bf16_to_float(dlogits[i]);
 	}
 	if (!chiron_crm_forward_backward_cpu(&q[0], targets, coefficient, margin,
 	                                      temperature, rows, cols, &g[0], rowStats)) return false;
 	for (size_t i = 0; i < g.size(); ++i)
 		dlogits[i] = transformer_kernels::float_to_bf16_rn(g[i]);
+	for (int r = 0; r < rows; ++r)
+	{
+		const int y = targets[r];
+		const float* qr = &q[(size_t)r * cols];
+		float maximum = -std::numeric_limits<float>::infinity();
+		for (int v = 0; v < cols; ++v) if (v != y && qr[v] > maximum) maximum = qr[v];
+		int ties = 0;
+		for (int v = 0; v < cols; ++v) if (v != y && qr[v] == maximum) ++ties;
+		const float a = (margin + maximum - qr[y]) / temperature;
+		const float s = chiron_crm_sigmoid(a);
+		const float targetAdd = -coefficient * s;
+		const float tieAdd = coefficient * s / (float)ties;
+		double sum = 0.0, sq = 0.0, certificate = 0.0;
+		for (int v = 0; v < cols; ++v)
+		{
+			if (v != y && qr[v] != maximum) continue;
+			const float add = v == y ? targetAdd : tieAdd;
+			if (add == 0.0f) continue;
+			const size_t off = (size_t)r * cols + v;
+			const float after = transformer_kernels::bf16_to_float(dlogits[off]);
+			const float delta = after - before[off];
+			sum += delta;
+			sq += (double)delta * delta;
+			certificate += chiron_crm_bf16_half_ulp(g[off]);
+		}
+		float* st = rowStats + (size_t)r * CRM_ROW_STATS_SIZE;
+		st[CRM_ROW_INJECTED_GRAD_NORM] = (float)sqrt(sq);
+		st[CRM_ROW_INJECTED_SUM] = (float)sum;
+		st[CRM_ROW_INJECTED_SUM_CERTIFICATE] = (float)certificate;
+	}
 	return true;
 }
 
