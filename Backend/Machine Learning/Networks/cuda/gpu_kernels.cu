@@ -77,6 +77,22 @@ __device__ __forceinline__ float warpReduceMax(float val)
 	return val;
 }
 
+__device__ __forceinline__ void warpReduceMaxCount(float& maximum, float& count)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+	{
+		const float otherMaximum = __shfl_down_sync(0xFFFFFFFF, maximum, offset);
+		const float otherCount = __shfl_down_sync(0xFFFFFFFF, count, offset);
+		if (otherMaximum > maximum)
+		{
+			maximum = otherMaximum;
+			count = otherCount;
+		}
+		else if (otherMaximum == maximum)
+			count += otherCount;
+	}
+}
+
 // Block-wide sum reduction using shared memory.  Caller must provide
 // smem of size >= (blockDim.x / 32) floats.
 __device__ float blockReduceSum(float val, float* smem)
@@ -110,6 +126,25 @@ __device__ void blockReduceSum3(float& a, float& b, float& c,
 	b = (threadIdx.x < (unsigned)numWarps) ? smemB[threadIdx.x] : 0.0f;
 	c = (threadIdx.x < (unsigned)numWarps) ? smemC[threadIdx.x] : 0.0f;
 	if (wid == 0) { a = warpReduceSum(a); b = warpReduceSum(b); c = warpReduceSum(c); }
+}
+
+// Block-wide max/count reduction. Count is the exact multiplicity of maximum.
+__device__ void blockReduceMaxCount(float& maximum, float& count,
+                                    float* maxScratch, float* countScratch)
+{
+	const int lane = threadIdx.x & 31;
+	const int wid = threadIdx.x >> 5;
+	warpReduceMaxCount(maximum, count);
+	if (lane == 0)
+	{
+		maxScratch[wid] = maximum;
+		countScratch[wid] = count;
+	}
+	__syncthreads();
+	const int numWarps = (blockDim.x + 31) / 32;
+	maximum = (threadIdx.x < (unsigned)numWarps) ? maxScratch[threadIdx.x] : -FLT_MAX;
+	count = (threadIdx.x < (unsigned)numWarps) ? countScratch[threadIdx.x] : 0.0f;
+	if (wid == 0) warpReduceMaxCount(maximum, count);
 }
 
 // Block-wide max reduction using shared memory.
@@ -4368,31 +4403,28 @@ __global__ void chiron_crm_forward_backward_kernel(
 	const float* probsF = (const float*)probsRaw;
 	const unsigned short* probsB = (const unsigned short*)probsRaw;
 	float localMax = -FLT_MAX;
-	for (int v = threadIdx.x; v < cols; v += blockDim.x)
-	{
-		if (v == target) continue;
-		const float q = BF16 ? bf16_load(logitsB[(size_t)row * cols + v])
-		                     : logitsF[(size_t)row * cols + v];
-		localMax = fmaxf(localMax, q);
-	}
-	const float reducedMax = blockReduceMax(localMax, maxScratch);
-	__shared__ float maximum;
-	if (threadIdx.x == 0) maximum = reducedMax;
-	__syncthreads();
 	float localCount = 0.0f;
 	for (int v = threadIdx.x; v < cols; v += blockDim.x)
 	{
 		if (v == target) continue;
 		const float q = BF16 ? bf16_load(logitsB[(size_t)row * cols + v])
 		                     : logitsF[(size_t)row * cols + v];
-		if (q == maximum) localCount += 1.0f;
+		if (q > localMax)
+		{
+			localMax = q;
+			localCount = 1.0f;
+		}
+		else if (q == localMax)
+			localCount += 1.0f;
 	}
-	const float reducedCount = blockReduceSum(localCount, countScratch);
+	blockReduceMaxCount(localMax, localCount, maxScratch, countScratch);
+	__shared__ float maximum;
 	__shared__ int tieCount;
 	__shared__ float targetAdd, tieAdd;
 	if (threadIdx.x == 0)
 	{
-		tieCount = (int)reducedCount;
+		maximum = localMax;
+		tieCount = (int)localCount;
 		const float targetQ = BF16 ? bf16_load(logitsB[(size_t)row * cols + target])
 		                           : logitsF[(size_t)row * cols + target];
 		const float a = (margin + maximum - targetQ) / temperature;
