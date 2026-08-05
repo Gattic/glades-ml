@@ -178,6 +178,21 @@ bool echo_scatter_bf16_weighted(const unsigned short* probs,
                                 int rows, int cols, int w,
                                 unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
+
+// Contextual Rank Margin (CRM), training-only and additive. Both entry points
+// add the weighted, unnormalized CRM field to caller-owned dlogits and emit
+// row-major stats matching glades::chiron::ChironCrmRowStatIndex. A zero
+// coefficient is a host-side no-op: no kernel launch and no output mutation.
+bool chiron_crm_forward_backward(const float* logits, const int* targets,
+                                 float coefficient, float margin,
+                                 float temperature, int rows, int cols,
+                                 float* dlogits, float* rowStats);
+bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
+                                      const int* targets,
+                                      float coefficient, float margin,
+                                      float temperature, int rows, int cols,
+                                      unsigned short* dlogits, float* rowStats);
+
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
                                   int T, int vocabSize, int padToken,
@@ -1352,6 +1367,8 @@ inline bool echo_repeat_stats_huber(const unsigned short*, const int*, const int
 enum EchoSummaryIndex { ECHO_SUM_R = 0, ECHO_SUM_PA, ECHO_SUM_PMAX, ECHO_MAX_P, ECHO_ACTIVE_ROWS, ECHO_ACTIVE_IDS, ECHO_HIST_0, ECHO_HIST_1, ECHO_HIST_2, ECHO_HIST_3, ECHO_HIST_4, ECHO_SUMMARY_SIZE };
 inline bool echo_summarize_stats(const float*, const float*, const float*, const int*, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short*, const int*, const float*, float, float, const float*, int, int, unsigned short*) { return false; }
+inline bool chiron_crm_forward_backward(const float*, const int*, float coefficient, float, float, int, int, float*, float*) { return coefficient == 0.0f; }
+inline bool chiron_crm_forward_backward_bf16(const unsigned short*, const int*, float coefficient, float, float, int, int, unsigned short*, float*) { return coefficient == 0.0f; }
 inline bool echo_dense_bwd_bf16(const unsigned short*, float, const float*, int, int, unsigned short*) { return false; }
 inline bool echo_scatter_bf16(const unsigned short*, const int*, const uint32_t*, float, int, int, int, unsigned short*) { return false; }
 inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const uint32_t*, const float*, float, int, int, int, unsigned short*) { return false; }

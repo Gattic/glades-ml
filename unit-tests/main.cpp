@@ -329,6 +329,14 @@ int main(int argc, char* argv[])
 		CHIRONEchoGradFDCpuTest();
 		CHIRONEchoE2CpuTest();
 	    }
+	    else if (strcmp(argv[1], "chiron-crm") == 0 || strcmp(argv[1], "crm") == 0)
+	    {
+		CHIRONCrmCpuMathTest();
+		CHIRONCrmGpuParityTest();
+		CHIRONCrmZeroCoefBitParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-crm-cpu") == 0)
+		CHIRONCrmCpuMathTest();
 	    else if (strcmp(argv[1], "chiron-model") == 0)
 		CHIRONModelUnitTest();
 	    else if (strcmp(argv[1], "chiron-generate-cpu") == 0)

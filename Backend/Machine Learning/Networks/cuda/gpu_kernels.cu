@@ -4301,6 +4301,95 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss(
 }
 
 // ---------------------------------------------------------------------------
+// CRM — Contextual Rank Margin. One deterministic block per row finds the
+// exact stored-logit non-target maximum, counts the full tie set, and adds the
+// uniform max subgradient. The disabled path is guarded in the host wrappers.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float crm_softplus(float a)
+{
+	return fmaxf(a, 0.0f) + log1pf(expf(-fabsf(a)));
+}
+
+__device__ __forceinline__ float crm_sigmoid(float a)
+{
+	if (a >= 0.0f) return 1.0f / (1.0f + expf(-a));
+	const float e = expf(a);
+	return e / (1.0f + e);
+}
+
+template <bool BF16>
+__global__ void chiron_crm_forward_backward_kernel(
+    const void* __restrict__ logitsRaw,
+    const int* __restrict__ targets,
+    float coefficient, float margin, float temperature,
+    int cols, void* __restrict__ dlogitsRaw,
+    float* __restrict__ rowStats)
+{
+	extern __shared__ float reductions[];
+	float* maxScratch = reductions;
+	float* countScratch = reductions + (blockDim.x + 31) / 32;
+	const int row = blockIdx.x;
+	const int target = targets[row];
+	if (target < 0 || target >= cols) return;
+	const float* logitsF = (const float*)logitsRaw;
+	const unsigned short* logitsB = (const unsigned short*)logitsRaw;
+	float localMax = -FLT_MAX;
+	for (int v = threadIdx.x; v < cols; v += blockDim.x)
+	{
+		if (v == target) continue;
+		const float q = BF16 ? bf16_load(logitsB[(size_t)row * cols + v])
+		                     : logitsF[(size_t)row * cols + v];
+		localMax = fmaxf(localMax, q);
+	}
+	const float reducedMax = blockReduceMax(localMax, maxScratch);
+	__shared__ float maximum;
+	if (threadIdx.x == 0) maximum = reducedMax;
+	__syncthreads();
+	float localCount = 0.0f;
+	for (int v = threadIdx.x; v < cols; v += blockDim.x)
+	{
+		if (v == target) continue;
+		const float q = BF16 ? bf16_load(logitsB[(size_t)row * cols + v])
+		                     : logitsF[(size_t)row * cols + v];
+		if (q == maximum) localCount += 1.0f;
+	}
+	const float reducedCount = blockReduceSum(localCount, countScratch);
+	__shared__ int tieCount;
+	__shared__ float targetAdd, tieAdd;
+	if (threadIdx.x == 0)
+	{
+		tieCount = (int)reducedCount;
+		const float targetQ = BF16 ? bf16_load(logitsB[(size_t)row * cols + target])
+		                           : logitsF[(size_t)row * cols + target];
+		const float a = (margin + maximum - targetQ) / temperature;
+		const float s = crm_sigmoid(a);
+		targetAdd = -coefficient * s;
+		tieAdd = coefficient * s / (float)tieCount;
+		float* st = rowStats + (size_t)row * 6;
+		st[0] = temperature * crm_softplus(a);
+		st[1] = s;
+		st[2] = (float)tieCount;
+		st[3] = (targetQ - maximum < margin) ? 1.0f : 0.0f;
+		st[4] = coefficient * s * sqrtf(1.0f + 1.0f / tieCount);
+		st[5] = targetAdd + tieCount * tieAdd;
+	}
+	__syncthreads();
+	float* dF = (float*)dlogitsRaw;
+	unsigned short* dB = (unsigned short*)dlogitsRaw;
+	for (int v = threadIdx.x; v < cols; v += blockDim.x)
+	{
+		const size_t off = (size_t)row * cols + v;
+		const float q = BF16 ? bf16_load(logitsB[off]) : logitsF[off];
+		const float add = (v == target) ? targetAdd
+		                : ((q == maximum) ? tieAdd : 0.0f);
+		if (add == 0.0f) continue;
+		if (BF16) dB[off] = bf16_store(bf16_load(dB[off]) + add);
+		else dF[off] += add;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ECHO — Excess-Copy Hinged Objective (2026-07-09,
 // docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
 // ---------------------------------------------------------------------------
@@ -4760,6 +4849,43 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 	int block = rowBlockSize(cols);
 	softmax_cross_entropy_backward_bf16_zloss<<<rows, block, 0, computeStream()>>>(
 	    probs, targets, logZ, zlossCoef, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_crm_forward_backward(const float* logits, const int* targets,
+                                 float coefficient, float margin,
+                                 float temperature, int rows, int cols,
+                                 float* dlogits, float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 2 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<false><<<rows, block, smem, computeStream()>>>(
+	    logits, targets, coefficient, margin, temperature, cols, dlogits, rowStats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
+                                      const int* targets,
+                                      float coefficient, float margin,
+                                      float temperature, int rows, int cols,
+                                      unsigned short* dlogits, float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 2 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<true><<<rows, block, smem, computeStream()>>>(
+	    logits, targets, coefficient, margin, temperature, cols, dlogits, rowStats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

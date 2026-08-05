@@ -151,6 +151,11 @@ void CHIRONEchoE2CpuTest();
 void CHIRONEchoGpuParityTest();
 void CHIRONEchoZlossZeroCoefBitParityTest();
 
+// CRM — Contextual Rank Margin Q0 engineering qualification.
+void CHIRONCrmCpuMathTest();
+void CHIRONCrmGpuParityTest();
+void CHIRONCrmZeroCoefBitParityTest();
+
 // Focused multi-block token-LM accounting regression.
 void CHIRONTokenLmMetricCountTest();
 

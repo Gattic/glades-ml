@@ -20858,3 +20858,123 @@ void CHIRONEchoZlossZeroCoefBitParityTest()
 	std::printf("  [ECHO zloss zero-coef parity] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+void CHIRONCrmCpuMathTest()
+{
+	const float lambda = 0.10f, delta = 1.0f, tau = 1.0f;
+	ASSERT("CRM CPU zero-row dispatch", glades::chiron::chiron_crm_forward_backward_cpu(NULL, NULL, lambda, delta, tau, 0, 2, NULL, NULL));
+	ASSERT("CRM BF16 CPU zero-row dispatch", glades::chiron::chiron_crm_forward_backward_bf16_cpu(NULL, NULL, lambda, delta, tau, 0, 2, NULL, NULL));
+	const int rows = 2, cols = 5;
+	const int targets[rows] = {0, 4};
+	const float logits[rows * cols] = {
+		0.25f, 1.5f, -2.0f, 0.5f, -1.0f,
+		1.0f, 1.0f, -3.0f, 1.0f, 1.25f
+	};
+	std::vector<float> grad((size_t)rows * cols, 0.0f);
+	std::vector<float> stats((size_t)rows * glades::chiron::CRM_ROW_STATS_SIZE, 0.0f);
+	ASSERT("CRM CPU dispatch failed", glades::chiron::chiron_crm_forward_backward_cpu(logits, targets, lambda, delta, tau, rows, cols, &grad[0], &stats[0]));
+	const float s0 = 1.0f / (1.0f + expf(-(delta + 1.5f - 0.25f)));
+	const float s1 = 1.0f / (1.0f + expf(-(delta + 1.0f - 1.25f)));
+	ASSERT("CRM CPU unique target gradient", fabsf(grad[0] + lambda * s0) < 1e-7f);
+	ASSERT("CRM CPU unique maximum gradient", fabsf(grad[1] - lambda * s0) < 1e-7f);
+	for (int v = 2; v < cols; ++v) ASSERT("CRM CPU unique support leak", grad[v] == 0.0f);
+	ASSERT("CRM CPU tie count", stats[glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_TIE_COUNT] == 3.0f);
+	ASSERT("CRM CPU tie target gradient", fabsf(grad[cols + 4] + lambda * s1) < 1e-7f);
+	ASSERT("CRM CPU uniform tie 0", fabsf(grad[cols + 0] - lambda * s1 / 3.0f) < 1e-7f);
+	ASSERT("CRM CPU uniform tie 1", fabsf(grad[cols + 1] - lambda * s1 / 3.0f) < 1e-7f);
+	ASSERT("CRM CPU uniform tie 3", fabsf(grad[cols + 3] - lambda * s1 / 3.0f) < 1e-7f);
+	ASSERT("CRM CPU tie support leak", grad[cols + 2] == 0.0f);
+	for (int r = 0; r < rows; ++r)
+	{
+		double sum = 0.0, sq = 0.0;
+		for (int v = 0; v < cols; ++v) { const float g = grad[(size_t)r * cols + v]; sum += g; sq += (double)g * g; }
+		ASSERT("CRM CPU ideal row sum", fabs(sum) < 1e-7);
+		ASSERT("CRM CPU row sum stat", fabsf(stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_SUM]) < 1e-7f);
+		ASSERT("CRM CPU norm identity", fabs(sqrt(sq) - stats[(size_t)r * glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_GRAD_NORM]) < 1e-7);
+		ASSERT("CRM CPU norm bound", sqrt(sq) <= lambda * sqrt(2.0) + 1e-7);
+	}
+	const float eps = 1e-3f;
+	float worst = 0.0f;
+	for (int v = 0; v < cols; ++v)
+	{
+		float plus[cols], minus[cols];
+		for (int i = 0; i < cols; ++i) plus[i] = minus[i] = logits[i];
+		plus[v] += eps; minus[v] -= eps;
+		float gp[cols] = {0}, gm[cols] = {0};
+		float sp[glades::chiron::CRM_ROW_STATS_SIZE] = {0}, sm[glades::chiron::CRM_ROW_STATS_SIZE] = {0};
+		const int y = targets[0];
+		ASSERT("CRM CPU FD plus dispatch", glades::chiron::chiron_crm_forward_backward_cpu(plus, &y, lambda, delta, tau, 1, cols, gp, sp));
+		ASSERT("CRM CPU FD minus dispatch", glades::chiron::chiron_crm_forward_backward_cpu(minus, &y, lambda, delta, tau, 1, cols, gm, sm));
+		const float fd = lambda * (sp[glades::chiron::CRM_ROW_LOSS] - sm[glades::chiron::CRM_ROW_LOSS]) / (2.0f * eps);
+		worst = std::max(worst, fabsf(fd - grad[v]));
+	}
+	ASSERT("CRM CPU finite difference", worst <= 2e-4f);
+	const int permutation[cols] = {4, 2, 0, 3, 1};
+	float permuted[cols], unpermutedGrad[cols] = {0}, permGrad[cols] = {0};
+	int permTarget = -1;
+	for (int old = 0; old < cols; ++old) { const int now = permutation[old]; permuted[now] = logits[cols + old]; if (old == targets[1]) permTarget = now; }
+	float permStats[glades::chiron::CRM_ROW_STATS_SIZE] = {0};
+	ASSERT("CRM CPU permutation dispatch", glades::chiron::chiron_crm_forward_backward_cpu(permuted, &permTarget, lambda, delta, tau, 1, cols, permGrad, permStats));
+	for (int old = 0; old < cols; ++old) unpermutedGrad[old] = permGrad[permutation[old]];
+	for (int old = 0; old < cols; ++old) ASSERT("CRM CPU permutation equivariance", fabsf(unpermutedGrad[old] - grad[cols + old]) < 1e-7f);
+	const float extremes[2 * cols] = {-1000.0f, 1000.0f, -10.0f, -20.0f, -30.0f, 1000.0f, -1000.0f, -10.0f, -20.0f, -30.0f};
+	const int ey[2] = {0, 0};
+	float eg[2 * cols] = {0}, es[2 * glades::chiron::CRM_ROW_STATS_SIZE] = {0};
+	ASSERT("CRM CPU extreme dispatch", glades::chiron::chiron_crm_forward_backward_cpu(extremes, ey, lambda, delta, tau, 2, cols, eg, es));
+	for (size_t i = 0; i < sizeof(es) / sizeof(es[0]); ++i) ASSERT("CRM CPU stable softplus finite", std::isfinite(es[i]));
+	ASSERT("CRM CPU active extreme sigmoid", es[glades::chiron::CRM_ROW_S] == 1.0f);
+	ASSERT("CRM CPU inactive extreme sigmoid", es[glades::chiron::CRM_ROW_STATS_SIZE + glades::chiron::CRM_ROW_S] == 0.0f);
+	std::printf("  [CRM CPU math] finite-difference max_abs=%.9g PASS\n", worst);
+}
+
+void CHIRONCrmGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [CRM GPU parity] no CUDA device — skipped\n"); return; }
+	const int rows = 4, cols = 8; const size_t n = (size_t)rows * cols;
+	const float lambda = 0.10f, delta = 1.0f, tau = 1.0f;
+	const int targets[rows] = {0, 7, 2, 4};
+	const float hostLogits[rows * cols] = {0,2,-1,-2,-3,-4,-5,-6, 1,1,-2,1,-3,-4,-5,1.25f, 0.5f,3,3,3,-1,-2,-3,-4, -3,-2,-1,0,4,4,4,4};
+	std::vector<float> cpuGrad(n, 0.0f), cpuStats((size_t)rows * glades::chiron::CRM_ROW_STATS_SIZE, 0.0f);
+	ASSERT("CRM FP32 CPU ref", glades::chiron::chiron_crm_forward_backward_cpu(hostLogits, targets, lambda, delta, tau, rows, cols, &cpuGrad[0], &cpuStats[0]));
+	glades::gpu::GpuBuffer<float> dLogits, dGrad, dStats; glades::gpu::GpuBuffer<int> dTargets;
+	dLogits.allocate(n); dLogits.upload(hostLogits, n); dGrad.allocate(n); dGrad.zero(); dStats.allocate(cpuStats.size()); dTargets.allocate(rows); dTargets.upload(targets, rows);
+	ASSERT("CRM FP32 GPU dispatch", glades::gpu::chiron_crm_forward_backward(dLogits.data(), dTargets.data(), lambda, delta, tau, rows, cols, dGrad.data(), dStats.data()));
+	std::vector<float> gpuGrad(n), gpuStats(cpuStats.size()); dGrad.download(&gpuGrad[0], n); dStats.download(&gpuStats[0], gpuStats.size());
+	float fp32Worst = 0.0f; for (size_t i = 0; i < n; ++i) fp32Worst = std::max(fp32Worst, fabsf(cpuGrad[i] - gpuGrad[i]));
+	for (size_t i = 0; i < cpuStats.size(); ++i) fp32Worst = std::max(fp32Worst, fabsf(cpuStats[i] - gpuStats[i]));
+	ASSERT("CRM FP32 CPU/GPU parity", fp32Worst <= 1e-6f);
+	std::vector<unsigned short> logitsBf(n), cpuBf(n, 0), gpuBf(n, 0);
+	for (size_t i = 0; i < n; ++i) logitsBf[i] = glades::transformer_kernels::float_to_bf16_rn(hostLogits[i]);
+	std::vector<float> cpuBfStats(cpuStats.size(), 0.0f), gpuBfStats(cpuStats.size(), 0.0f);
+	ASSERT("CRM BF16 CPU ref", glades::chiron::chiron_crm_forward_backward_bf16_cpu(&logitsBf[0], targets, lambda, delta, tau, rows, cols, &cpuBf[0], &cpuBfStats[0]));
+	glades::gpu::GpuBuffer<unsigned short> dLogitsBf, dGradBf; dLogitsBf.allocate(n); dLogitsBf.upload(&logitsBf[0], n); dGradBf.allocate(n); dGradBf.zero();
+	ASSERT("CRM BF16 GPU dispatch", glades::gpu::chiron_crm_forward_backward_bf16(dLogitsBf.data(), dTargets.data(), lambda, delta, tau, rows, cols, dGradBf.data(), dStats.data()));
+	dGradBf.download(&gpuBf[0], n); dStats.download(&gpuBfStats[0], gpuBfStats.size());
+	float bf16WorstUlp = 0.0f;
+	for (size_t i = 0; i < n; ++i) { const float a = glades::transformer_kernels::bf16_to_float(cpuBf[i]), b = glades::transformer_kernels::bf16_to_float(gpuBf[i]); const float ulp = std::max(1e-30f, 0.0078125f * std::max(fabsf(a), fabsf(b))); bf16WorstUlp = std::max(bf16WorstUlp, fabsf(a - b) / ulp); }
+	ASSERT("CRM BF16 CPU/GPU beyond one ULP", bf16WorstUlp <= 1.0f);
+	for (int r = 0; r < rows; ++r) { double sum = 0.0, certificate = 0.0; for (int v = 0; v < cols; ++v) { const float g = glades::transformer_kernels::bf16_to_float(gpuBf[(size_t)r * cols + v]); sum += g; if (g != 0.0f) { int exponent = 0; frexpf(fabsf(g), &exponent); certificate += ldexpf(1.0f, exponent - 9); } } ASSERT("CRM BF16 row-sum rounding certificate", fabs(sum) <= certificate + 1e-12); }
+	std::printf("  [CRM CPU/CUDA parity] fp32_max=%.9g bf16_ulp=%.3f PASS\n", fp32Worst, bf16WorstUlp);
+#else
+	std::printf("  [CRM GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+void CHIRONCrmZeroCoefBitParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) return;
+	const int rows = 8, cols = 32; const size_t n = (size_t)rows * cols; LCG rng(20260804u);
+	std::vector<unsigned short> logits(n), before(n), after; std::vector<int> targets(rows);
+	for (size_t i = 0; i < n; ++i) { logits[i] = glades::transformer_kernels::float_to_bf16_rn(rng.next_unit()); before[i] = glades::transformer_kernels::float_to_bf16_rn(rng.next_unit()); }
+	for (int r = 0; r < rows; ++r) targets[r] = r % cols;
+	glades::gpu::GpuBuffer<unsigned short> dLogits, dGrad; glades::gpu::GpuBuffer<int> dTargets; glades::gpu::GpuBuffer<float> dStats;
+	dLogits.allocate(n); dLogits.upload(&logits[0], n); dGrad.allocate(n); dGrad.upload(&before[0], n); dTargets.allocate(rows); dTargets.upload(&targets[0], rows); dStats.allocate((size_t)rows * glades::chiron::CRM_ROW_STATS_SIZE);
+	ASSERT("CRM zero coefficient dispatch", glades::gpu::chiron_crm_forward_backward_bf16(dLogits.data(), dTargets.data(), 0.0f, 1.0f, 1.0f, rows, cols, dGrad.data(), dStats.data()));
+	after.resize(n); dGrad.download(&after[0], n); ASSERT("CRM zero coefficient mutated dlogits", before == after);
+	std::printf("  [CRM zero-coefficient bit identity] %lu values unchanged PASS\n", (unsigned long)n);
+#else
+	std::printf("  [CRM zero coefficient] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}

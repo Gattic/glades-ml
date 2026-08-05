@@ -32,6 +32,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 #include "../rng.h"               // transformer_kernels.h depends on glades::rng
@@ -1909,6 +1910,93 @@ inline void chiron_echo_scatter_cpu(const unsigned short* probs,
 {
 	chiron_echo_scatter_cpu_weighted(probs, activeIds, NULL, activeCount,
 	    echoCoef, T, V, w, dlogits);
+}
+
+// Contextual Rank Margin (CRM) host reference. Implemented after the Q0 tests
+// establish the exact tie, stability, and BF16-addition contract.
+enum ChironCrmRowStatIndex
+{
+	CRM_ROW_LOSS = 0,
+	CRM_ROW_S,
+	CRM_ROW_TIE_COUNT,
+	CRM_ROW_VIOLATION,
+	CRM_ROW_GRAD_NORM,
+	CRM_ROW_SUM,
+	CRM_ROW_STATS_SIZE
+};
+inline float chiron_crm_softplus(float a)
+{
+	return fmaxf(a, 0.0f) + log1pf(expf(-fabsf(a)));
+}
+
+inline float chiron_crm_sigmoid(float a)
+{
+	if (a >= 0.0f) return 1.0f / (1.0f + expf(-a));
+	const float e = expf(a);
+	return e / (1.0f + e);
+}
+
+inline bool chiron_crm_forward_backward_cpu(const float* logits, const int* targets,
+                                             float coefficient, float margin,
+                                             float temperature, int rows, int cols,
+                                             float* dlogits, float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	for (int r = 0; r < rows; ++r)
+	{
+		const int y = targets[r];
+		if (y < 0 || y >= cols) return false;
+		const float* q = logits + (size_t)r * cols;
+		float* g = dlogits + (size_t)r * cols;
+		float* st = rowStats + (size_t)r * CRM_ROW_STATS_SIZE;
+		float maximum = -std::numeric_limits<float>::infinity();
+		for (int v = 0; v < cols; ++v) if (v != y && q[v] > maximum) maximum = q[v];
+		int ties = 0;
+		for (int v = 0; v < cols; ++v) if (v != y && q[v] == maximum) ++ties;
+		if (ties <= 0 || !std::isfinite(maximum) || !std::isfinite(q[y])) return false;
+		const float a = (margin + maximum - q[y]) / temperature;
+		const float s = chiron_crm_sigmoid(a);
+		const float targetAdd = -coefficient * s;
+		const float tieAdd = coefficient * s / (float)ties;
+		g[y] += targetAdd;
+		for (int v = 0; v < cols; ++v) if (v != y && q[v] == maximum) g[v] += tieAdd;
+		st[CRM_ROW_LOSS] = temperature * chiron_crm_softplus(a);
+		st[CRM_ROW_S] = s;
+		st[CRM_ROW_TIE_COUNT] = (float)ties;
+		st[CRM_ROW_VIOLATION] = (q[y] - maximum < margin) ? 1.0f : 0.0f;
+		st[CRM_ROW_GRAD_NORM] = coefficient * s * sqrtf(1.0f + 1.0f / ties);
+		st[CRM_ROW_SUM] = targetAdd + ties * tieAdd;
+	}
+	return true;
+}
+
+inline bool chiron_crm_forward_backward_bf16_cpu(const unsigned short* logits,
+                                                  const int* targets,
+                                                  float coefficient, float margin,
+                                                  float temperature, int rows, int cols,
+                                                  unsigned short* dlogits,
+                                                  float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	std::vector<float> q((size_t)rows * cols), g((size_t)rows * cols);
+	for (size_t i = 0; i < q.size(); ++i)
+	{
+		q[i] = transformer_kernels::bf16_to_float(logits[i]);
+		g[i] = transformer_kernels::bf16_to_float(dlogits[i]);
+	}
+	if (!chiron_crm_forward_backward_cpu(&q[0], targets, coefficient, margin,
+	                                      temperature, rows, cols, &g[0], rowStats)) return false;
+	for (size_t i = 0; i < g.size(); ++i)
+		dlogits[i] = transformer_kernels::float_to_bf16_rn(g[i]);
+	return true;
 }
 
 } // namespace chiron
