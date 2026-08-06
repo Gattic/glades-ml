@@ -39,10 +39,11 @@ Consequences:
   **P4 NO-GO** on eight-document memorization. See
   `docs/superpowers/plans/2026-07-30-chiron-practical-trainability.md`.
 - Contextual Rank Margin (CRM) is an isolated default-off path whose Q0 engineering
-  qualification has passed. It is not a shipped recipe; no E0 or scientific optimizer step
-  has run. Scientific execution remains governed by the exact authorization and gate
-  contract in the trainer's
-  `research/generation-aware/CHIRON_CONTEXTUAL_RANK_MARGIN_INTERVENTION_DRAFT_2026_07_31.md`.
+  qualification and E0 passed. Its authorized scientific run is terminal **NULL** after the
+  seed-1337 A0 step-100 segment because the disabled-CRM sidecar omitted metadata required
+  by the frozen runner. No A1, evaluator, rank audit, P0, G1, G2, or seed-2024 process ran,
+  and the no-rerun rule prohibits continuation. It is not a shipped recipe. See the trainer's
+  `research/generation-aware/CHIRON_CONTEXTUAL_RANK_MARGIN_SCIENTIFIC_RESULT_2026_08_05.md`.
 - SIRA, ECHO, ORBIT, PACT, PIED, FFN/GQA experiments, ARREST, and other research features
   remain opt-in. Follow their latest final/result record; do not revive closed NO-GO arms
   or rerun settled gates without a new approved protocol.
