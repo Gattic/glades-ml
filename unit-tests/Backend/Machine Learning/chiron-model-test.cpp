@@ -20,6 +20,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <string>
@@ -52,6 +53,42 @@ static float ut_bf16_to_fp32(uint16_t b)
 	union { float f; uint32_t u; } v;
 	v.u = ((uint32_t)b) << 16;
 	return v.f;
+}
+
+static bool chiron_decode_vectors_equal(
+	const char* comparison,
+	const std::vector<float>& expected,
+	const std::vector<float>& observed,
+	const glades::chiron::ChironDecodeCache& cache,
+	const std::vector<int>& prompt,
+	int resetEpoch,
+	int prefillEpoch)
+{
+	if (expected == observed) return true;
+	size_t first = 0;
+	while (first < expected.size() && first < observed.size() &&
+	       expected[first] == observed[first]) ++first;
+	union { float f; uint32_t u; } expectedBits, observedBits;
+	expectedBits.f = first < expected.size() ? expected[first] : 0.0f;
+	observedBits.f = first < observed.size() ? observed[first] : 0.0f;
+	const char* campaignRun = std::getenv("CHIRON_DECODE_CAMPAIGN_RUN");
+	std::fprintf(stderr,
+		"CHIRON_DECODE_MISMATCH run=%s comparison=%s first_index=%lu "
+		"expected_size=%lu observed_size=%lu expected_bits=0x%08lx "
+		"observed_bits=0x%08lx abs_diff=%.9g cache_position=%d "
+		"completed_blocks=%d reset_epoch=%d prefill_epoch=%d prompt=",
+		campaignRun ? campaignRun : "unset", comparison,
+		(unsigned long)first, (unsigned long)expected.size(),
+		(unsigned long)observed.size(), (unsigned long)expectedBits.u,
+		(unsigned long)observedBits.u,
+		first < expected.size() && first < observed.size()
+			? (double)std::fabs(expected[first] - observed[first]) : -1.0,
+		cache.position(), cache.completedBlocks(), resetEpoch, prefillEpoch);
+	for (size_t i = 0; i < prompt.size(); ++i)
+		std::fprintf(stderr, "%s%d", i ? "," : "", prompt[i]);
+	std::fprintf(stderr, "\n");
+	std::fflush(stderr);
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1942,8 @@ static void CHIRONDecodeCacheTest()
 	glades::chiron::ChironDecodeCache cache;
 	ASSERT("decode cache alloc", cache.allocate(d, w, cfg));
 	ASSERT("decode cache no sliding", !cache.slidingSupported());
+	int decodeResetEpoch = 0;
+	int decodePrefillEpoch = 0;
 
 	std::vector<int> prefix((size_t)d.T, 0);
 	std::vector<float> cached((size_t)d.V), full((size_t)d.V);
@@ -1947,9 +1986,11 @@ static void CHIRONDecodeCacheTest()
 		d, w, cfg, cachedScratch, 1, cache));
 	ASSERT("decode reject no mutation", cache.position() == fullPosition);
 
+	++decodeResetEpoch;
 	ASSERT("decode reset", cache.reset());
 	ASSERT("decode reset position", cache.position() == 0 && cache.completedBlocks() == 0);
 	std::vector<int> prompt(tokens.begin(), tokens.begin() + 5);
+	++decodePrefillEpoch;
 	ASSERT("decode prefill", glades::chiron::chiron_decode_prefill(
 		d, w, cfg, cachedScratch, prompt, cache));
 	ASSERT("decode prefill position", cache.position() == 5 && cache.completedBlocks() == 2);
@@ -1966,12 +2007,15 @@ static void CHIRONDecodeCacheTest()
 	for (int v = 0; v < d.V; ++v)
 		ASSERT("decode prefill-vs-full logits", std::fabs(cached[v] - full[v]) < 2e-3f);
 	std::vector<float> firstPrefill(cached);
+	++decodeResetEpoch;
 	ASSERT("decode repeated reset", cache.reset());
+	++decodePrefillEpoch;
 	ASSERT("decode repeated prefill", glades::chiron::chiron_decode_prefill(
 		d, w, cfg, cachedScratch, prompt, cache));
 	ASSERT("decode repeated logits", cachedScratch.logits.download(&cached[0], cached.size()));
-	for (int v = 0; v < d.V; ++v)
-		ASSERT("decode reset reproducible", cached[v] == firstPrefill[v]);
+	ASSERT("decode reset reproducible", chiron_decode_vectors_equal(
+		"reset_reproducible", firstPrefill, cached, cache, prompt,
+		decodeResetEpoch, decodePrefillEpoch));
 
 	glades::chiron::ChironDecodeSnapshot snapshot;
 	ASSERT("decode snapshot capture", snapshot.capture(cache, cachedScratch));
@@ -2014,12 +2058,14 @@ static void CHIRONDecodeCacheTest()
 	ASSERT("decode rejects full-length prefill", !glades::chiron::chiron_decode_prefill(
 		d, w, cfg, cachedScratch, tokens, cache));
 	ASSERT("decode oversized prefill no mutation", cache.position() == beforeOversize);
+	++decodeResetEpoch;
 	ASSERT("decode snapshot invalidation reset", cache.reset());
 	ASSERT("decode stale snapshot rejected", !snapshot.restore(cache, cachedScratch));
 
 	std::vector<int> reusePrompt(prompt);
 	for (size_t i = 0; i < reusePrompt.size(); ++i)
 		reusePrompt[i] = (reusePrompt[i] + 5) % d.V;
+	++decodePrefillEpoch;
 	ASSERT("decode reused-cache prefill", glades::chiron::chiron_decode_prefill(
 		d, w, cfg, cachedScratch, reusePrompt, cache));
 	glades::chiron::ChironDecodeCache freshCache;
@@ -2030,14 +2076,18 @@ static void CHIRONDecodeCacheTest()
 		d, w, cfg, freshScratch, reusePrompt, freshCache));
 	ASSERT("decode reused-cache logits", cachedScratch.logits.download(&cached[0], cached.size()));
 	ASSERT("decode fresh-cache logits", freshScratch.logits.download(&full[0], full.size()));
-	ASSERT("decode cross-prompt cache reuse prefill parity", cached == full);
+	ASSERT("decode cross-prompt cache reuse prefill parity", chiron_decode_vectors_equal(
+		"cross_prompt_prefill", full, cached, cache, reusePrompt,
+		decodeResetEpoch, decodePrefillEpoch));
 	ASSERT("decode reused-cache branch", glades::chiron::chiron_decode_step(
 		d, w, cfg, cachedScratch, 11, cache));
 	ASSERT("decode fresh-cache branch", glades::chiron::chiron_decode_step(
 		d, w, cfg, freshScratch, 11, freshCache));
 	ASSERT("decode reused-cache branch logits", cachedScratch.logits.download(&cached[0], cached.size()));
 	ASSERT("decode fresh-cache branch logits", freshScratch.logits.download(&full[0], full.size()));
-	ASSERT("decode cross-prompt cache reuse branch parity", cached == full);
+	ASSERT("decode cross-prompt cache reuse branch parity", chiron_decode_vectors_equal(
+		"cross_prompt_branch", full, cached, cache, reusePrompt,
+		decodeResetEpoch, decodePrefillEpoch));
 
 	glades::chiron::ChironServingConfig denseCfg = cfg;
 	denseCfg.useScfa = false;
