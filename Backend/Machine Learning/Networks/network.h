@@ -3288,6 +3288,12 @@ public:
 	NNetworkStatus transformerLmForwardLastLogitsGpu(const std::vector<unsigned int>& tokenIds,
 	                                                std::vector<float>& outLogits) const;
 
+	// GPU full-sequence next-token metrics. Inputs and targets are position-
+	// aligned; negative targets and the configured pad token are ignored.
+	NNetworkStatus transformerLmEvaluateTokenMetricsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                    const std::vector<int>& targetIds,
+	                                                    TransformerTokenMetrics& outMetrics) const;
+
 	// Diagnostic variant that also captures the last-position hidden row at
 	// input and after every block. The implementation shares the exact full
 	// forward above; normal inference remains uninstrumented.
@@ -3296,6 +3302,14 @@ public:
 	                                            TransformerForwardTrace& outTrace) const;
 
 private:
+	// Shared full-sequence GPU implementation for last-logit downloads and
+	// aggregate token metrics. Exactly one output pointer must be non-NULL.
+	NNetworkStatus transformerLmRunFullSequenceGpu(const char* where,
+	                                              const std::vector<unsigned int>& tokenIds,
+	                                              const std::vector<int>* targetIds,
+	                                              std::vector<float>* outLastLogits,
+	                                              TransformerTokenMetrics* outMetrics) const;
+
 	// Shared implementation for the public logits-only and diagnostic variants.
 	NNetworkStatus transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,
 	                                                std::vector<float>& outLogits,

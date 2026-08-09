@@ -3437,6 +3437,34 @@ void NNTransformerUnitTest()
 			}
 			G_assert(__FILE__, __LINE__, "==============NN::InferApi AppendBounds InitTestStatus() Failed==============", net.test(di).ok());
 
+#ifdef GLADES_HAVE_CUDA
+			// Full-sequence GPU token metrics reduce on device and preserve the
+			// position-aligned target denominator.
+			{
+				net.getTrainingConfigMutable().gpu.enable = true;
+				net.getTrainingConfigMutable().gpu.deviceId = 0;
+				std::vector<unsigned int> inputs;
+				inputs.push_back(1u);
+				inputs.push_back(2u);
+				std::vector<int> targets;
+				targets.push_back(2);
+				targets.push_back(3);
+				glades::TransformerTokenMetrics metrics;
+				const glades::NNetworkStatus st =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsStatus Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCount Failed==============", metrics.tokenCount == 2ULL);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCorrect Failed==============", metrics.correct <= metrics.tokenCount);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFinite Failed==============", std::isfinite(metrics.nllSum));
+
+				targets.pop_back();
+				const glades::NNetworkStatus mismatch =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsMismatchShouldFail Failed==============", !mismatch.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFailureClearsOutput Failed==============", metrics.tokenCount == 0ULL && metrics.correct == 0ULL && metrics.nllSum == 0.0);
+			}
+#endif
+
 			// Append before reset should fail.
 			{
 				glades::NNetwork::TransformerLmSession session; // not initialized

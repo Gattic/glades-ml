@@ -125,6 +125,27 @@ struct TransformerGenerateResult
 	}
 };
 
+// Aggregate next-token metrics from one full-sequence GPU forward.
+// `nllSum` is the sum over valid targets; `tokenCount` is the denominator.
+struct TransformerTokenMetrics
+{
+	double nllSum;
+	unsigned long long tokenCount;
+	unsigned long long correct;
+
+	TransformerTokenMetrics()
+	    : nllSum(0.0), tokenCount(0ULL), correct(0ULL)
+	{
+	}
+
+	void clear()
+	{
+		nllSum = 0.0;
+		tokenCount = 0ULL;
+		correct = 0ULL;
+	}
+};
+
 // Diagnostic-only last-position hidden trace from a full causal forward.
 // `lastHidden` is stage-major: embedded/positioned input first, then one row
 // after each Transformer block. It deliberately excludes attention matrices

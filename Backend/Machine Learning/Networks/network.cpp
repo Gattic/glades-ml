@@ -561,6 +561,15 @@ glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogitsGpu(const 
 	return TransformerPublicAPI::runtime(net).forwardLastLogitsGpu(tokenIds, outLogits);
 }
 
+glades::NNetworkStatus glades::TransformerPublicAPI::evaluateTokenMetricsGpu(
+    const glades::NNetwork& net,
+    const std::vector<glades::TokenId>& tokenIds,
+    const std::vector<glades::TokenLabelId>& targetIds,
+    glades::TransformerTokenMetrics& outMetrics)
+{
+	return TransformerPublicAPI::runtime(net).evaluateTokenMetricsGpu(tokenIds, targetIds, outMetrics);
+}
+
 glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastTrace(const glades::NNetwork& net,
                                                                       const std::vector<glades::TokenId>& tokenIds,
                                                                       std::vector<float>& outLogits,
@@ -604,6 +613,14 @@ glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogitsG
                                                                                    std::vector<float>& outLogits) const
 {
 	return net.transformerLmForwardLastLogitsGpu(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::evaluateTokenMetricsGpu(
+    const std::vector<glades::TokenId>& tokenIds,
+    const std::vector<glades::TokenLabelId>& targetIds,
+    glades::TransformerTokenMetrics& outMetrics) const
+{
+	return net.transformerLmEvaluateTokenMetricsGpu(tokenIds, targetIds, outMetrics);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastTrace(const std::vector<glades::TokenId>& tokenIds,

@@ -4084,8 +4084,8 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
                             float* loss_sum, int* valid_count)
 {
     if (T <= 0 || vocabSize <= 0) return true;
-    GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
-    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
     int block = 256;
     int grid = 1;
     if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
@@ -4150,8 +4150,8 @@ bool argmax_count_matches(const float* probs, const int* targets,
                           int* correct_count, int* valid_count)
 {
     if (T <= 0 || vocabSize <= 0) return true;
-    GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
-    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
     // One thread per row for argmax (vocabSize may be large).
     int block = 128;
     int grid = (T + block - 1) / block;

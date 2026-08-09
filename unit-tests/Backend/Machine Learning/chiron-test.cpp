@@ -11269,18 +11269,25 @@ void CHIRONTokenLmMetricCountTest()
 	ASSERT("token-lm metric output alloc", d_out.allocate(4));
 	ASSERT("token-lm metric probs upload", d_probs.upload(&probs[0], probs.size()));
 	ASSERT("token-lm metric targets upload", d_targets.upload(&targets[0], targets.size()));
-	ASSERT("collect_token_lm_metrics multi-block",
-	       glades::gpu::collect_token_lm_metrics(
-	           d_probs.data(), d_targets.data(), T, V, pad, d_out.data()));
 	int packed[4] = {0, 0, 0, 0};
-	ASSERT("token-lm metric output download", d_out.download(packed, 4));
-	float loss = 0.0f;
-	std::memcpy(&loss, &packed[0], sizeof(loss));
 	const float expectedLoss = (float)T * std::log((float)V);
-	ASSERT("multi-block CE target count is not multiplied by grid size", packed[1] == T);
-	ASSERT("multi-block argmax valid count matches CE count", packed[3] == T);
-	ASSERT("multi-block CE loss counts every row once",
-	       std::fabs(loss - expectedLoss) <= 1e-3f * expectedLoss);
+	const int expectedCorrect = (T + V - 1) / V;
+	bool launchesOk = true;
+	bool countsStable = true;
+	bool lossStable = true;
+	for (int repeat = 0; repeat < 128; ++repeat)
+	{
+		launchesOk = launchesOk && glades::gpu::collect_token_lm_metrics(
+		    d_probs.data(), d_targets.data(), T, V, pad, d_out.data());
+		launchesOk = launchesOk && d_out.download(packed, 4);
+		float loss = 0.0f;
+		std::memcpy(&loss, &packed[0], sizeof(loss));
+		countsStable = countsStable && packed[1] == T && packed[2] == expectedCorrect && packed[3] == T;
+		lossStable = lossStable && std::fabs(loss - expectedLoss) <= 1e-3f * expectedLoss;
+	}
+	ASSERT("collect_token_lm_metrics repeated launches", launchesOk);
+	ASSERT("multi-block CE and argmax counts remain ordered", countsStable);
+	ASSERT("multi-block CE loss counts every row once", lossStable);
 #else
 	std::printf("  [token-lm-metrics] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif

@@ -9597,33 +9597,65 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
     const std::vector<unsigned int>& tokenIds,
     std::vector<float>& outLogits) const
 {
+	return transformerLmRunFullSequenceGpu("transformerLmForwardLastLogitsGpu",
+	    tokenIds, NULL, &outLogits, NULL);
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmEvaluateTokenMetricsGpu(
+    const std::vector<unsigned int>& tokenIds,
+    const std::vector<int>& targetIds,
+    glades::TransformerTokenMetrics& outMetrics) const
+{
+	return transformerLmRunFullSequenceGpu("transformerLmEvaluateTokenMetricsGpu",
+	    tokenIds, &targetIds, NULL, &outMetrics);
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmRunFullSequenceGpu(
+    const char* where,
+    const std::vector<unsigned int>& tokenIds,
+    const std::vector<int>* targetIds,
+    std::vector<float>* outLastLogits,
+    glades::TransformerTokenMetrics* outMetrics) const
+{
+	if (!where || (outLastLogits == NULL) == (outMetrics == NULL))
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		    "transformerLmRunFullSequenceGpu: invalid output selection");
+	if (outMetrics) outMetrics->clear();
 	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
-		    "transformerLmForwardLastLogitsGpu: NNetwork is already running");
+		    std::string(where) + ": NNetwork is already running");
 	if (netType != TYPE_TRANSFORMER_DECODER || !tensorTransformer.tokenModel ||
 	    !tensorTransformer.initialized)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
-		    "transformerLmForwardLastLogitsGpu: initialized token decoder required");
+		    std::string(where) + ": initialized token decoder required");
 	if (tokenIds.empty())
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-		    "transformerLmForwardLastLogitsGpu: tokenIds empty");
+		    std::string(where) + ": tokenIds empty");
+	if (outMetrics && (!targetIds || targetIds->size() != tokenIds.size()))
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		    std::string(where) + ": targetIds size mismatch");
 
 	NNetwork* self = const_cast<NNetwork*>(this);
 	TensorTransformerState& tt = self->tensorTransformer;
 	for (size_t i = 0; i < tokenIds.size(); ++i)
 		if (tokenIds[i] >= tt.vocabSize)
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-			    "transformerLmForwardLastLogitsGpu: tokenId out of range");
+			    std::string(where) + ": tokenId out of range");
+	if (targetIds)
+		for (size_t i = 0; i < targetIds->size(); ++i)
+			if ((*targetIds)[i] >= static_cast<int>(tt.vocabSize))
+				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+				    std::string(where) + ": targetId out of range");
 
 	TransformerRuntimeConfigSnapshot runtimeCfg;
 	NNetworkStatus cfgStatus = buildTransformerRuntimeConfigSnapshot(
-	    "transformerLmForwardLastLogitsGpu", trainingConfig.transformer, runtimeCfg);
+	    where, trainingConfig.transformer, runtimeCfg);
 	if (!cfgStatus.ok()) return cfgStatus;
 	if (!self->ensureGpuState() || !self->gpuTransformerWeights ||
 	    !self->gpuTransformerWeights->initialized)
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-		    "transformerLmForwardLastLogitsGpu: GPU weight initialization failed");
+		    std::string(where) + ": GPU weight initialization failed");
 
 	TransformerEpochCfg cfg;
 	cfg.inputSize = tt.inputSize;
@@ -9637,7 +9669,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
 	if (cfg.nHeads == 0u || cfg.dModel % cfg.nHeads != 0u ||
 	    cfg.nKVHeads == 0u || cfg.nHeads % cfg.nKVHeads != 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
-		    "transformerLmForwardLastLogitsGpu: invalid attention geometry");
+		    std::string(where) + ": invalid attention geometry");
 	cfg.dHead = cfg.dModel / cfg.nHeads;
 	cfg.dModelKV = cfg.nKVHeads * cfg.dHead;
 	cfg.ff1Width = (static_cast<int>(runtimeCfg.ffnKind) ==
@@ -9672,12 +9704,12 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
 	const unsigned int T = static_cast<unsigned int>(tokenIds.size());
 	if (!self->ensureTransformerGpuTrainingScratch(cfg, T))
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-		    "transformerLmForwardLastLogitsGpu: scratch allocation failed");
+		    std::string(where) + ": scratch allocation failed");
 	std::vector<int> ids(T);
 	for (unsigned int i = 0u; i < T; ++i) ids[i] = static_cast<int>(tokenIds[i]);
 	if (!self->gpuTransformerScratch->tokenIds.upload(&ids[0], T))
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-		    "transformerLmForwardLastLogitsGpu: token upload failed");
+		    std::string(where) + ": token upload failed");
 
 	const bool useRope = cfg.posEnc ==
 	    static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE);
@@ -9695,24 +9727,57 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
 		if (!invFreq.empty() &&
 		    !self->gpuTransformerScratch->gpuInvFreq.upload(&invFreq[0], invFreq.size()))
 			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-			    "transformerLmForwardLastLogitsGpu: RoPE upload failed");
+			    std::string(where) + ": RoPE upload failed");
 	}
 
 	if (!self->transformerGpuRunForwardOnly(cfg, T,
 	        false, useRope, false, false, false, false, false, false, false,
 	        false, cfg.ropeDimOverride, NULL) ||
-	    !glades::gpu::synchronizeCheck("transformerLmForwardLastLogitsGpu"))
+	    !glades::gpu::synchronizeCheck(where))
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-		    "transformerLmForwardLastLogitsGpu: forward failed");
+		    std::string(where) + ": forward failed");
 
-	outLogits.assign(cfg.vocabSize, 0.0f);
-	glades::gpu::device_memcpy_d2h(&outLogits[0],
-	    self->gpuTransformerScratch->logits.data() +
-	        static_cast<size_t>(T - 1u) * cfg.vocabSize,
-	    static_cast<size_t>(cfg.vocabSize) * sizeof(float));
-	if (!glades::gpu::synchronizeTransferStream())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-		    "transformerLmForwardLastLogitsGpu: logits download failed");
+	if (outLastLogits)
+	{
+		outLastLogits->assign(cfg.vocabSize, 0.0f);
+		glades::gpu::device_memcpy_d2h(&(*outLastLogits)[0],
+		    self->gpuTransformerScratch->logits.data() +
+		        static_cast<size_t>(T - 1u) * cfg.vocabSize,
+		    static_cast<size_t>(cfg.vocabSize) * sizeof(float));
+		if (!glades::gpu::synchronizeTransferStream())
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    std::string(where) + ": logits download failed");
+	}
+	else
+	{
+		if (!self->gpuTransformerScratch->gpuTargetsT.upload(&(*targetIds)[0], T) ||
+		    !glades::gpu::collect_token_lm_metrics(
+		        self->gpuTransformerScratch->probs.data(),
+		        self->gpuTransformerScratch->gpuTargetsT.data(),
+		        static_cast<int>(T), static_cast<int>(cfg.vocabSize), cfg.padTokenId,
+		        self->gpuTransformerScratch->lossPack.data()) ||
+		    !glades::gpu::synchronizeCheck(where))
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    std::string(where) + ": metric reduction failed");
+		int packed[4] = {0, 0, 0, 0};
+		if (!self->gpuTransformerScratch->lossPack.download(packed, 4))
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    std::string(where) + ": metric download failed");
+		float loss = 0.0f;
+		memcpy(&loss, &packed[0], sizeof(loss));
+		if (packed[1] < 0 || packed[2] < 0 || packed[3] != packed[1])
+		{
+			std::ostringstream oss;
+			oss << where << ": invalid metric reduction output"
+			    << " loss_count=" << packed[1]
+			    << " correct=" << packed[2]
+			    << " valid=" << packed[3];
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
+		}
+		outMetrics->nllSum = static_cast<double>(loss);
+		outMetrics->tokenCount = static_cast<unsigned long long>(packed[1]);
+		outMetrics->correct = static_cast<unsigned long long>(packed[2]);
+	}
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -15498,5 +15563,15 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
 {
 	return NNetworkStatus(NNetworkStatus::INVALID_STATE,
 	    "transformerLmForwardLastLogitsGpu: CUDA support is unavailable");
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmEvaluateTokenMetricsGpu(
+    const std::vector<unsigned int>&,
+    const std::vector<int>&,
+    glades::TransformerTokenMetrics& outMetrics) const
+{
+	outMetrics.clear();
+	return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+	    "transformerLmEvaluateTokenMetricsGpu: CUDA support is unavailable");
 }
 #endif

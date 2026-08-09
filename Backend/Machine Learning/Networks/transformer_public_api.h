@@ -46,6 +46,12 @@ struct TransformerPublicAPI
 		NNetworkStatus forwardLastLogitsGpu(const std::vector<TokenId>& tokenIds,
 		                                    std::vector<float>& outLogits) const;
 
+		// Runs one full causal sequence on GPU and reduces next-token NLL
+		// and top-1 accuracy on device without downloading vocabulary logits.
+		NNetworkStatus evaluateTokenMetricsGpu(const std::vector<TokenId>& tokenIds,
+		                                       const std::vector<TokenLabelId>& targetIds,
+		                                       TransformerTokenMetrics& outMetrics) const;
+
 		// Diagnostic full-forward helper. Returns the same logits as
 		// forwardLastLogits plus the last-position input/post-block hidden rows.
 		NNetworkStatus forwardLastTrace(const std::vector<TokenId>& tokenIds,
@@ -95,6 +101,12 @@ struct TransformerPublicAPI
 
 	// GPU sequence-level full forward; unavailable in non-CUDA builds.
 	static NNetworkStatus forwardLastLogitsGpu(const NNetwork& net, const std::vector<TokenId>& tokenIds, std::vector<float>& outLogits);
+
+	// Full-sequence GPU next-token metric reduction; unavailable in non-CUDA builds.
+	static NNetworkStatus evaluateTokenMetricsGpu(const NNetwork& net,
+	                                              const std::vector<TokenId>& tokenIds,
+	                                              const std::vector<TokenLabelId>& targetIds,
+	                                              TransformerTokenMetrics& outMetrics);
 
 	// Diagnostic full-forward last-logits plus bounded last-position hidden trace.
 	static NNetworkStatus forwardLastTrace(const NNetwork& net,
