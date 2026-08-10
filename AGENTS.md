@@ -38,6 +38,11 @@ Consequences:
 - The practical-v1 program passed causal serving/cache engineering P0-P3 but ended at
   **P4 NO-GO** on eight-document memorization. See
   `docs/superpowers/plans/2026-07-30-chiron-practical-trainability.md`.
+- The repaired-evaluator trainable-D P5 study launched under fresh authorization and ended
+  at terminal **E1 NO-GO** when the T0 seed-1337 trajectory exceeded its cumulative
+  `0.35 GPU-h` cap during the step-500 evaluator. C1 and E2-E6 did not launch, so no paired
+  quality result exists; rerun and continuation are prohibited under that protocol. See the
+  trainer's `research/generation-aware/CHIRON_P5_REPAIRED_EVALUATOR_TRAINABLE_D_E1_RESOURCE_CAP_NO_GO_RESULT_2026_08_08.md`.
 - Contextual Rank Margin (CRM) is an isolated default-off path whose Q0 engineering
   qualification and E0 passed. Its authorized scientific run is terminal **NULL** after the
   seed-1337 A0 step-100 segment because the disabled-CRM sidecar omitted metadata required
