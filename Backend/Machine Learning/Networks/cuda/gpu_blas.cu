@@ -306,6 +306,12 @@ bool get_tf32_enabled() { return g_tf32_enabled; }
 
 bool blasInit()
 {
+	// Handles must bind to the canonical non-blocking compute stream.  Raw
+	// GPU callers can reach BLAS before higher-level device initialization;
+	// creating a handle then would bind it to stream 0 permanently, while
+	// later custom kernels use computeStream(), causing cross-stream races.
+	if (!isAvailable() && !initDevice())
+		return false;
 	if (g_initialized)
 		return true;
 

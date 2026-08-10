@@ -109,13 +109,15 @@ Useful focused selectors include `chiron-token-count`, `chiron-sira`, `chiron-ph
 `chiron-generate-cpu`, and `chiron-generate`. Use `test_project(filter=...)` when the
 harness is available.
 
-### Known verification issue
+### Resolved verification issue
 
-Debug ledger thread `intermittent-chiron-decode-reset-reproducibility` is open. One chained
-`chiron` then `chiron-model` execution intermittently failed the
-`decode reset reproducible` assertion, while unchanged focused runs before and after
-passed. Do not weaken the assertion or retry the already-recorded no-change attempt.
-Consult the ledger first and record only new hypotheses/attempts.
+Debug ledger thread `intermittent-chiron-decode-reset-reproducibility` was resolved on
+2026-08-09. cuBLAS handles could be lazily created on stream 0 before `initDevice()`
+created the canonical non-blocking compute stream, so later decode kernels and GEMMs
+raced across streams. `gpu_blas.cu::blasInit()` must initialize the device before creating
+handles. The existing decode assertions remain unchanged; qualification passed 500/500
+fresh `chiron-model` processes plus Compute Sanitizer initcheck/memcheck. Do not remove
+or reorder that stream-initialization guard without equivalent stress evidence.
 
 ## CHIRON ownership and invariants
 
