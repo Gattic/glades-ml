@@ -1836,6 +1836,7 @@ private:
 		      kSeq16(NULL),
 		      vSeq16(NULL),
 		      outLogits(NULL),
+		      outHidden(NULL),
 		      dModel(0u),
 		      dFF(0u),
 		      nHeads(0u),
@@ -1882,6 +1883,7 @@ private:
 		uint16_t* kSeq16;
 		uint16_t* vSeq16;
 		float* outLogits;
+		float* outHidden;
 
 		unsigned int dModel;
 		unsigned int dFF;
@@ -2874,7 +2876,10 @@ public:
 
 	// Session APIs (const: do not mutate NNetwork inference state).
 	NNetworkStatus transformerLmSessionReset(TransformerLmSession& session, unsigned int maxSeqLen) const;
-	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session, unsigned int tokenId, std::vector<float>* outLogits /* optional */) const;
+	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session,
+	                                         unsigned int tokenId,
+	                                         std::vector<float>* outLogits /* optional */,
+	                                         std::vector<float>* outHidden /* optional */ = NULL) const;
 
 	NNetworkStatus transformerLmBatchSessionReset(TransformerLmBatchSession& session, unsigned int batchSize, unsigned int maxSeqLen) const;
 	// Append one token for each active batch element (ragged-safe):
@@ -3294,6 +3299,11 @@ public:
 	                                                    const std::vector<int>& targetIds,
 	                                                    TransformerTokenMetrics& outMetrics) const;
 
+	// Diagnostic canonical full-sequence final hidden rows and logits.
+	NNetworkStatus transformerLmForwardFeaturesGpu(const std::vector<unsigned int>& tokenIds,
+	                                              TransformerFullSequenceFeatures& out) const;
+	NNetworkStatus transformerLmReadoutParameters(TransformerReadoutParameters& out) const;
+
 	// Diagnostic variant that also captures the last-position hidden row at
 	// input and after every block. The implementation shares the exact full
 	// forward above; normal inference remains uninstrumented.
@@ -3302,13 +3312,15 @@ public:
 	                                            TransformerForwardTrace& outTrace) const;
 
 private:
-	// Shared full-sequence GPU implementation for last-logit downloads and
-	// aggregate token metrics. Exactly one output pointer must be non-NULL.
+	// Shared full-sequence GPU implementation for last-logit downloads,
+	// aggregate token metrics, and bounded diagnostic feature extraction.
+	// Exactly one output pointer must be non-NULL.
 	NNetworkStatus transformerLmRunFullSequenceGpu(const char* where,
 	                                              const std::vector<unsigned int>& tokenIds,
 	                                              const std::vector<int>* targetIds,
 	                                              std::vector<float>* outLastLogits,
-	                                              TransformerTokenMetrics* outMetrics) const;
+	                                              TransformerTokenMetrics* outMetrics,
+	                                              TransformerFullSequenceFeatures* outFeatures) const;
 
 	// Shared implementation for the public logits-only and diagnostic variants.
 	NNetworkStatus transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,

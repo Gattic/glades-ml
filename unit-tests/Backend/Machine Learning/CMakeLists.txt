@@ -34,6 +34,7 @@ atlas-alt-bench.cpp
 vesta-test.cpp
 helios-test.cpp
 chiron-test.cpp
+chiron-rank-cause-test.cpp
 chiron-orbit-test.cpp
 chiron-vitals-test.cpp
 chiron-model-test.cpp

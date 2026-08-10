@@ -1538,7 +1538,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmAppendCpuTokenCore(glades:
 		}
 	}
 
-	if (core.outLogits)
+	if (core.outLogits || core.outHidden)
 	{
 		ScopedTimerMs t(this, breakdown, perf ? &perf->msLogits : NULL);
 		if (!tt.lnFinalGamma.empty())
@@ -1552,7 +1552,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmAppendCpuTokenCore(glades:
 				glades::transformer_kernels::layernorm_forward_rows(&h[0], 1u, core.dModel, tt.lnFinalGamma, tt.lnFinalBeta, core.layerNormEps, &h[0], &mean, &invStd);
 			}
 		}
-		tied_embedding_logits_into(&h[0], core.dModel, tt.tokE, tt.lmBias, vocab, core.outLogits);
+		if (core.outHidden)
+			std::copy(h.begin(), h.end(), core.outHidden);
+		if (core.outLogits)
+			tied_embedding_logits_into(&h[0], core.dModel, tt.tokE, tt.lmBias, vocab, core.outLogits);
 	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
@@ -1560,7 +1563,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmAppendCpuTokenCore(glades:
 
 glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNetwork::TransformerLmSession& session,
                                                                    unsigned int tokenId,
-                                                                   std::vector<float>* outLogits) const
+                                                                   std::vector<float>* outLogits,
+                                                                   std::vector<float>* outHidden) const
 {
 	if (!session.initialized)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmSessionAppend: session not initialized (call transformerLmSessionReset)");
@@ -1707,8 +1711,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 				                        normType, eps, useRope, ropeDim, ropeTheta, gpuPerf);
 			}
 
-			// --- Final norm + logits: tied embedding ---
-			if (outLogits)
+			// --- Final norm + optional hidden/logits: tied embedding ---
+			if (outLogits || outHidden)
 			{
 				glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msAttention : NULL);
 				const float* logitsInput = gs->h.data();
@@ -1737,25 +1741,42 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 					logitsInput = gs->x1.data();
 				}
 
-				// logits[vocab] = tokE[vocab, dModel] * h_final[dModel] + lmBias[vocab]
-				if (gpuPerf)
-					gg::perfRecordKernel(&gpuPerf->counters, 1u);
-				gg::sgemv_rowmajor(static_cast<int>(vocab), dM, 1.0f,
-				                   gw.tokE.data(), dM, logitsInput,
-				                   0.0f, gs->logits.data());
-				if (gw.lmBias.allocated())
+				if (outHidden)
 				{
+					outHidden->assign(dModel, 0.0f);
 					if (gpuPerf)
-						gg::perfRecordKernel(&gpuPerf->counters, 1u);
-					gg::add_bias(gs->logits.data(), gw.lmBias.data(), 1, static_cast<int>(vocab));
+						gg::perfRecordBytesD2H(&gpuPerf->counters,
+						    static_cast<size_t>(dModel) * sizeof(float));
+					glades::gpu::device_memcpy_d2h(&(*outHidden)[0], logitsInput,
+					    static_cast<size_t>(dModel) * sizeof(float));
+					if (!glades::gpu::synchronizeTransferStream())
+						return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "transformerLmSessionAppend: hidden download failed");
 				}
 
-				// Download logits to CPU.
-				if (outLogits->size() != vocab)
-					outLogits->resize(vocab);
-				if (gpuPerf)
-					gg::perfRecordBytesD2H(&gpuPerf->counters, static_cast<size_t>(vocab) * sizeof(float));
-				gs->logits.download(&(*outLogits)[0], vocab);
+				if (outLogits)
+				{
+					// logits[vocab] = tokE[vocab, dModel] * h_final[dModel] + lmBias[vocab]
+					if (gpuPerf)
+						gg::perfRecordKernel(&gpuPerf->counters, 1u);
+					gg::sgemv_rowmajor(static_cast<int>(vocab), dM, 1.0f,
+					                   gw.tokE.data(), dM, logitsInput,
+					                   0.0f, gs->logits.data());
+					if (gw.lmBias.allocated())
+					{
+						if (gpuPerf)
+							gg::perfRecordKernel(&gpuPerf->counters, 1u);
+						gg::add_bias(gs->logits.data(), gw.lmBias.data(), 1,
+						             static_cast<int>(vocab));
+					}
+
+					if (outLogits->size() != vocab)
+						outLogits->resize(vocab);
+					if (gpuPerf)
+						gg::perfRecordBytesD2H(&gpuPerf->counters,
+						    static_cast<size_t>(vocab) * sizeof(float));
+					gs->logits.download(&(*outLogits)[0], vocab);
+				}
 			}
 
 			session.curLen += 1u;
@@ -1783,6 +1804,12 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 		session.posEncCache.ensureRope(ropeDim, ropeTheta);
 	}
 	float* outPtr = NULL;
+	float* hiddenPtr = NULL;
+	if (outHidden)
+	{
+		outHidden->assign(dModel, 0.0f);
+		hiddenPtr = outHidden->empty() ? NULL : &(*outHidden)[0];
+	}
 	if (outLogits)
 	{
 		if (outLogits->capacity() < static_cast<size_t>(vocab))
@@ -1803,6 +1830,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 	core.kSeq16 = session.k16.empty() ? NULL : &session.k16[0];
 	core.vSeq16 = session.v16.empty() ? NULL : &session.v16[0];
 	core.outLogits = outPtr;
+	core.outHidden = hiddenPtr;
 	core.dModel = dModel;
 	core.dFF = dFF;
 	core.nHeads = nHeads;
@@ -2259,6 +2287,40 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		                   activeCount,
 		                   outLogitsFlat != NULL,
 		                   &session.perf);
+	}
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmReadoutParameters(
+    glades::TransformerReadoutParameters& out) const
+{
+	out.clear();
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmReadoutParameters: NNetwork is already running");
+	if (netType != TYPE_TRANSFORMER_DECODER || !tensorTransformer.initialized ||
+	    !tensorTransformer.tokenModel || !tensorTransformer.tieEmbeddings)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmReadoutParameters: initialized tied token decoder required");
+	const TensorTransformerState& tt = tensorTransformer;
+	const size_t expected = static_cast<size_t>(tt.vocabSize) * tt.dModel;
+	if (tt.tokE.size() != expected)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "transformerLmReadoutParameters: embedding geometry mismatch");
+	out.hiddenSize = tt.dModel;
+	out.vocabSize = tt.vocabSize;
+	out.weight.assign(tt.tokE.begin(), tt.tokE.end());
+	out.bias.assign(tt.vocabSize, 0.0f);
+	if (!tt.lmBias.empty())
+	{
+		if (tt.lmBias.size() != tt.vocabSize)
+		{
+			out.clear();
+			return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+			    "transformerLmReadoutParameters: bias geometry mismatch");
+		}
+		out.bias.assign(tt.lmBias.begin(), tt.lmBias.end());
 	}
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }

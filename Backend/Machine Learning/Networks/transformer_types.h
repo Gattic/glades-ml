@@ -151,6 +151,51 @@ struct TransformerTokenMetrics
 // after each Transformer block. It deliberately excludes attention matrices
 // and full-sequence activations so callers cannot accidentally turn this into
 // a high-memory serving path.
+// Diagnostic full-sequence output from the canonical GPU forward. `finalHidden`
+// is the exact row consumed by the tied readout after the final norm; `logits`
+// is transient evaluator evidence and callers should release it after streaming
+// metrics/hashes.
+struct TransformerReadoutParameters
+{
+	unsigned int hiddenSize;
+	unsigned int vocabSize;
+	std::vector<float> weight; // [vocabSize, hiddenSize]
+	std::vector<float> bias;   // [vocabSize], explicit zeros when absent
+
+	TransformerReadoutParameters()
+	    : hiddenSize(0u), vocabSize(0u), weight(), bias()
+	{
+	}
+
+	void clear()
+	{
+		hiddenSize = vocabSize = 0u;
+		weight.clear();
+		bias.clear();
+	}
+};
+
+struct TransformerFullSequenceFeatures
+{
+	unsigned int positions;
+	unsigned int hiddenSize;
+	unsigned int vocabSize;
+	std::vector<float> finalHidden; // [positions, hiddenSize]
+	std::vector<float> logits;      // [positions, vocabSize]
+
+	TransformerFullSequenceFeatures()
+	    : positions(0u), hiddenSize(0u), vocabSize(0u), finalHidden(), logits()
+	{
+	}
+
+	void clear()
+	{
+		positions = hiddenSize = vocabSize = 0u;
+		finalHidden.clear();
+		logits.clear();
+	}
+};
+
 struct TransformerForwardTrace
 {
 	unsigned int hiddenSize;

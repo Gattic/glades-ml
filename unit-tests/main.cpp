@@ -45,6 +45,7 @@
 #include "Backend/Machine Learning/vesta-test.h"
 #include "Backend/Machine Learning/helios-test.h"
 #include "Backend/Machine Learning/chiron-test.h"
+#include "Backend/Machine Learning/chiron-rank-cause-test.h"
 #include "Backend/Machine Learning/chiron-orbit-test.h"
 #include "Backend/Machine Learning/chiron-vitals-test.h"
 #include "Backend/Machine Learning/chiron-model-test.h"
@@ -213,6 +214,8 @@ int main(int argc, char* argv[])
 		CHIRONTokenLmMetricCountTest();
 	    else if (strcmp(argv[1], "chiron") == 0)
 		CHIRONUnitTest();
+	    else if (strcmp(argv[1], "chiron-rank-cause") == 0)
+		ChironRankCauseUnitTest();
 	    else if (strcmp(argv[1], "chiron-sira") == 0 || strcmp(argv[1], "sira") == 0)
 	    {
 		CHIRONSiraConfigDefaultsTest();

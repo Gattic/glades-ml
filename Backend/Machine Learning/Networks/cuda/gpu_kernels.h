@@ -1220,6 +1220,39 @@ bool chunked_cross_entropy_backward(const float* X, const float* W_lm,
                                     float* dX, float* dW_lm,
                                     float* scratch);
 
+// Deterministic chunked squared-hinge max-margin objective used by bounded
+// frozen-feature diagnostics. W_aug is [V,dAug], where the final column is bias
+// and X_aug's final feature is 1. Scratch layout (floats): logits[T*chunk],
+// best_logit[T], target_logit[T], hinge[T]; competitor[T] is a separate int
+// buffer. Loss is the SUM of squared hinges; backward scales by 1/valid_count.
+bool chunked_squared_hinge_loss(const float* X_aug, const float* W_aug,
+                                const int* targets,
+                                int T, int V, int dAug, int V_chunk_size,
+                                float margin,
+                                float* loss_sum, int* valid_count,
+                                int* competitor, float* scratch);
+bool chunked_squared_hinge_backward(const float* X_aug,
+                                    const int* targets,
+                                    const int* competitor,
+                                    const float* hinge,
+                                    int T, int V, int dAug, int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dW_aug, float* scratch);
+
+// Fixed-order vector primitives for deterministic L-BFGS. Dot products emit
+// one partial per 256-element block; callers download and sum partials in order
+// using FP64 host accumulation.
+int deterministic_dot_partial_count(int n);
+bool deterministic_dot_partials(const float* a, const float* b, int n,
+                                float* partials, int partial_count);
+bool add_anchor_regularizer(const float* value, const float* anchor,
+                            int rows, int weight_cols, float lambda,
+                            float* gradient, float* partials,
+                            int partial_count);
+bool project_augmented_bias_gauge(float* value, int rows, int stride,
+                                  float* partials, int partial_count);
+
 // ---------------------------------------------------------------------------
 // Batch zero: zero multiple GPU buffers with a single kernel launch
 // ---------------------------------------------------------------------------
@@ -1506,6 +1539,16 @@ inline bool chunked_cross_entropy_backward(const float*, const float*, const int
                                            const float*, const float*,
                                            int, int, int, int, int, int, bool,
                                            float*, float*, float*) { return false; }
+inline bool chunked_squared_hinge_loss(const float*, const float*, const int*, int, int,
+                                       int, int, float, float*, int*, int*, float*) { return false; }
+inline bool chunked_squared_hinge_backward(const float*, const int*, const int*,
+                                           const float*, int, int, int, int, int,
+                                           bool, float*, float*) { return false; }
+inline int deterministic_dot_partial_count(int) { return 0; }
+inline bool deterministic_dot_partials(const float*, const float*, int, float*, int) { return false; }
+inline bool add_anchor_regularizer(const float*, const float*, int, int, float,
+                                   float*, float*, int) { return false; }
+inline bool project_augmented_bias_gauge(float*, int, int, float*, int) { return false; }
 
 inline bool kv_attention_incremental(const float*, const float*, const float*, float*, const unsigned char*, int, int, int, int, int, int, float, float*) { return false; }
 

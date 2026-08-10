@@ -5750,6 +5750,302 @@ bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
 }
 
 // ===========================================================================
+//  Frozen-feature rank-cause diagnostics: margin objective + L-BFGS vectors
+// ===========================================================================
+
+namespace {
+
+__global__ void k_margin_init(float* best, float* target, float* hinge,
+                              int* competitor, int T)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    best[t] = -INFINITY;
+    target[t] = NAN;
+    hinge[t] = 0.0f;
+    competitor[t] = -1;
+}
+
+// One deterministic thread per row. Vocabulary chunks are visited in ascending
+// token-ID order by the host wrapper; exact ties therefore select the lower ID.
+__global__ void k_margin_chunk_update(const float* logits, const int* targets,
+                                      int T, int Vch, int chunkStart,
+                                      float* best, float* target,
+                                      int* competitor)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const int y = targets[t];
+    const float* row = logits + (size_t)t * Vch;
+    float bestValue = best[t];
+    int bestId = competitor[t];
+    for (int j = 0; j < Vch; ++j)
+    {
+        const int id = chunkStart + j;
+        const float value = row[j];
+        if (id == y) { target[t] = value; continue; }
+        if (value > bestValue || (value == bestValue && (bestId < 0 || id < bestId)))
+        { bestValue = value; bestId = id; }
+    }
+    best[t] = bestValue;
+    competitor[t] = bestId;
+}
+
+__global__ void k_margin_finalize(const float* best, const float* target,
+                                  const int* competitor, int T, float margin,
+                                  float* hinge, float* lossSum, int* validCount)
+{
+    __shared__ float sums[256];
+    __shared__ int counts[256];
+    const int tid = threadIdx.x;
+    float local = 0.0f;
+    int count = 0;
+    for (int t = tid; t < T; t += blockDim.x)
+    {
+        if (competitor[t] >= 0 && isfinite(target[t]) && isfinite(best[t]))
+        {
+            const float h = fmaxf(0.0f, margin - target[t] + best[t]);
+            hinge[t] = h;
+            local += h * h;
+            ++count;
+        }
+        else hinge[t] = 0.0f;
+    }
+    sums[tid] = local;
+    counts[tid] = count;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        { sums[tid] += sums[tid + stride]; counts[tid] += counts[tid + stride]; }
+        __syncthreads();
+    }
+    if (tid == 0) { *lossSum = sums[0]; *validCount = counts[0]; }
+}
+
+__global__ void k_margin_dlogits(float* dlogits, const int* targets,
+                                 const int* competitor, const float* hinge,
+                                 int T, int Vch, int chunkStart, float invValid)
+{
+    const size_t total = (size_t)T * Vch;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (size_t)blockDim.x * gridDim.x)
+    {
+        const int t = (int)(i / Vch);
+        const int id = chunkStart + (int)(i % Vch);
+        const float scale = 2.0f * hinge[t] * invValid;
+        float value = 0.0f;
+        if (id == competitor[t]) value += scale;
+        if (id == targets[t]) value -= scale;
+        dlogits[i] = value;
+    }
+}
+
+__global__ void k_dot_partials(const float* a, const float* b, int n,
+                               float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int begin = blockIdx.x * blockDim.x;
+    const int i = begin + tid;
+    sums[tid] = i < n ? a[i] * b[i] : 0.0f;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride) sums[tid] += sums[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_anchor_regularizer(const float* value, const float* anchor,
+                                     int n, int stride, int weightCols,
+                                     float lambda, float* gradient,
+                                     float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + tid;
+    float contribution = 0.0f;
+    if (i < n)
+    {
+        const int rows = n / stride;
+        const bool bias = (i % stride) >= weightCols;
+        const float denominator = bias ? (float)rows : (float)(rows * weightCols);
+        const float delta = value[i] - anchor[i];
+        contribution = lambda * delta * delta / denominator;
+        gradient[i] += 2.0f * lambda * delta / denominator;
+    }
+    sums[tid] = contribution;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_bias_sum_partials(const float* value, int rows, int stride,
+                                    float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x * blockDim.x + tid;
+    sums[tid] = row < rows ? value[(size_t)row * stride + (stride - 1)] : 0.0f;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_reduce_partials(float* partials, int n)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) local += partials[i];
+    sums[tid] = local;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[0] = sums[0];
+}
+
+__global__ void k_subtract_bias_mean(float* value, int rows, int stride,
+                                     const float* sum)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) value[(size_t)row * stride + (stride - 1)] -= sum[0] / rows;
+}
+
+} // anonymous namespace
+
+bool chunked_squared_hinge_loss(const float* X_aug, const float* W_aug,
+                                const int* targets,
+                                int T, int V, int dAug, int V_chunk_size,
+                                float margin,
+                                float* loss_sum, int* valid_count,
+                                int* competitor, float* scratch)
+{
+    if (!X_aug || !W_aug || !targets || !loss_sum || !valid_count ||
+        !competitor || !scratch || T <= 0 || V <= 1 || dAug <= 1 ||
+        V_chunk_size <= 0 || !(margin > 0.0f)) return false;
+    float* logits = scratch;
+    float* best = logits + (size_t)T * V_chunk_size;
+    float* target = best + T;
+    float* hinge = target + T;
+    const int block = 128;
+    const int grid = (T + block - 1) / block;
+    k_margin_init<<<grid, block, 0, computeStream()>>>(best, target, hinge, competitor, T);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int Vch = ce - cs;
+        if (!sgemm_rowmajor_abt(T, Vch, dAug, 1.0f, X_aug, dAug,
+                                W_aug + (size_t)cs * dAug, dAug,
+                                0.0f, logits, Vch)) return false;
+        k_margin_chunk_update<<<grid, block, 0, computeStream()>>>(
+            logits, targets, T, Vch, cs, best, target, competitor);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+    }
+    k_margin_finalize<<<1, 256, 0, computeStream()>>>(
+        best, target, competitor, T, margin, hinge, loss_sum, valid_count);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool chunked_squared_hinge_backward(const float* X_aug,
+                                    const int* targets,
+                                    const int* competitor,
+                                    const float* hinge,
+                                    int T, int V, int dAug, int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dW_aug, float* scratch)
+{
+    if (!X_aug || !targets || !competitor || !hinge || !dW_aug || !scratch ||
+        T <= 0 || V <= 1 || dAug <= 1 || V_chunk_size <= 0 || valid_count <= 0)
+        return false;
+    if (!accumulate)
+        GLADES_CUDA_CHECK(cudaMemsetAsync(dW_aug, 0,
+            (size_t)V * dAug * sizeof(float), computeStream()));
+    const float invValid = 1.0f / valid_count;
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int Vch = ce - cs;
+        const size_t total = (size_t)T * Vch;
+        const int block = 256;
+        const size_t blocks = (total + block - 1) / block;
+        const int grid = (int)(blocks < (size_t)65535 ? blocks : (size_t)65535);
+        k_margin_dlogits<<<grid, block, 0, computeStream()>>>(
+            scratch, targets, competitor, hinge, T, Vch, cs, invValid);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+        if (!sgemm_rowmajor_atb(Vch, dAug, T, 1.0f,
+                                scratch, Vch, X_aug, dAug, 1.0f,
+                                dW_aug + (size_t)cs * dAug, dAug)) return false;
+    }
+    return true;
+}
+
+int deterministic_dot_partial_count(int n)
+{
+    return n > 0 ? (n + 255) / 256 : 0;
+}
+
+bool deterministic_dot_partials(const float* a, const float* b, int n,
+                                float* partials, int partial_count)
+{
+    const int required = deterministic_dot_partial_count(n);
+    if (!a || !b || !partials || required <= 0 || partial_count < required) return false;
+    k_dot_partials<<<required, 256, 0, computeStream()>>>(a, b, n, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool add_anchor_regularizer(const float* value, const float* anchor,
+                            int rows, int weight_cols, float lambda,
+                            float* gradient, float* partials,
+                            int partial_count)
+{
+    if (!value || !anchor || !gradient || !partials || rows <= 0 ||
+        weight_cols <= 0 || lambda < 0.0f) return false;
+    const int stride = weight_cols + 1;
+    const int n = rows * stride;
+    const int required = deterministic_dot_partial_count(n);
+    if (partial_count < required) return false;
+    k_anchor_regularizer<<<required, 256, 0, computeStream()>>>(
+        value, anchor, n, stride, weight_cols, lambda, gradient, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool project_augmented_bias_gauge(float* value, int rows, int stride,
+                                  float* partials, int partial_count)
+{
+    if (!value || !partials || rows <= 0 || stride <= 1) return false;
+    const int required = deterministic_dot_partial_count(rows);
+    if (partial_count < required || required > 256) return false;
+    k_bias_sum_partials<<<required, 256, 0, computeStream()>>>(
+        value, rows, stride, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    k_reduce_partials<<<1, 256, 0, computeStream()>>>(partials, required);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    k_subtract_bias_mean<<<required, 256, 0, computeStream()>>>(
+        value, rows, stride, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
 //  16. Flash attention (packed multi-head / GQA)
 // ===========================================================================
 //

@@ -9598,7 +9598,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogitsGpu(
     std::vector<float>& outLogits) const
 {
 	return transformerLmRunFullSequenceGpu("transformerLmForwardLastLogitsGpu",
-	    tokenIds, NULL, &outLogits, NULL);
+	    tokenIds, NULL, &outLogits, NULL, NULL);
 }
 
 glades::NNetworkStatus glades::NNetwork::transformerLmEvaluateTokenMetricsGpu(
@@ -9607,7 +9607,15 @@ glades::NNetworkStatus glades::NNetwork::transformerLmEvaluateTokenMetricsGpu(
     glades::TransformerTokenMetrics& outMetrics) const
 {
 	return transformerLmRunFullSequenceGpu("transformerLmEvaluateTokenMetricsGpu",
-	    tokenIds, &targetIds, NULL, &outMetrics);
+	    tokenIds, &targetIds, NULL, &outMetrics, NULL);
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardFeaturesGpu(
+    const std::vector<unsigned int>& tokenIds,
+    glades::TransformerFullSequenceFeatures& out) const
+{
+	return transformerLmRunFullSequenceGpu("transformerLmForwardFeaturesGpu",
+	    tokenIds, NULL, NULL, NULL, &out);
 }
 
 glades::NNetworkStatus glades::NNetwork::transformerLmRunFullSequenceGpu(
@@ -9615,12 +9623,16 @@ glades::NNetworkStatus glades::NNetwork::transformerLmRunFullSequenceGpu(
     const std::vector<unsigned int>& tokenIds,
     const std::vector<int>* targetIds,
     std::vector<float>* outLastLogits,
-    glades::TransformerTokenMetrics* outMetrics) const
+    glades::TransformerTokenMetrics* outMetrics,
+    glades::TransformerFullSequenceFeatures* outFeatures) const
 {
-	if (!where || (outLastLogits == NULL) == (outMetrics == NULL))
+	const int outputs = (outLastLogits ? 1 : 0) + (outMetrics ? 1 : 0)
+	                  + (outFeatures ? 1 : 0);
+	if (!where || outputs != 1)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
 		    "transformerLmRunFullSequenceGpu: invalid output selection");
 	if (outMetrics) outMetrics->clear();
+	if (outFeatures) outFeatures->clear();
 	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
@@ -9747,6 +9759,23 @@ glades::NNetworkStatus glades::NNetwork::transformerLmRunFullSequenceGpu(
 		if (!glades::gpu::synchronizeTransferStream())
 			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			    std::string(where) + ": logits download failed");
+	}
+	else if (outFeatures)
+	{
+		outFeatures->positions = T;
+		outFeatures->hiddenSize = cfg.dModel;
+		outFeatures->vocabSize = cfg.vocabSize;
+		outFeatures->finalHidden.assign(static_cast<size_t>(T) * cfg.dModel, 0.0f);
+		outFeatures->logits.assign(static_cast<size_t>(T) * cfg.vocabSize, 0.0f);
+		glades::gpu::device_memcpy_d2h(&outFeatures->finalHidden[0],
+		    self->gpuTransformerScratch->hPostFinalLN.data(),
+		    outFeatures->finalHidden.size() * sizeof(float));
+		glades::gpu::device_memcpy_d2h(&outFeatures->logits[0],
+		    self->gpuTransformerScratch->logits.data(),
+		    outFeatures->logits.size() * sizeof(float));
+		if (!glades::gpu::synchronizeTransferStream())
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    std::string(where) + ": feature/logit download failed");
 	}
 	else
 	{
@@ -15573,5 +15602,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmEvaluateTokenMetricsGpu(
 	outMetrics.clear();
 	return NNetworkStatus(NNetworkStatus::INVALID_STATE,
 	    "transformerLmEvaluateTokenMetricsGpu: CUDA support is unavailable");
+}
+
+glades::NNetworkStatus glades::NNetwork::transformerLmForwardFeaturesGpu(
+    const std::vector<unsigned int>&,
+    glades::TransformerFullSequenceFeatures& out) const
+{
+	out.clear();
+	return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+	    "transformerLmForwardFeaturesGpu: CUDA support is unavailable");
 }
 #endif
