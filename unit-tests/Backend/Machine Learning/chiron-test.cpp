@@ -11245,9 +11245,9 @@ void CHIRONDfaL16Test()
 }
 
 // CHIRONTokenLmMetricCountTest ----------------------------------------------
-// Regression for multi-block CE reduction: every target row must contribute
-// exactly once. The prior kernel omitted blockIdx from its row loop, so at
-// T=2048 all eight blocks counted and summed every target eight times.
+// Regression for production-length CE coverage and deterministic reduction.
+// Every target row must contribute exactly once, and heterogeneous row losses
+// must produce bit-identical aggregate NLL across repeated launches.
 void CHIRONTokenLmMetricCountTest()
 {
 #ifdef GLADES_HAVE_CUDA
@@ -11259,9 +11259,23 @@ void CHIRONTokenLmMetricCountTest()
 	const int T = 2048;
 	const int V = 7;
 	const int pad = -1;
-	std::vector<float> probs((size_t)T * V, 1.0f / (float)V);
+	std::vector<float> probs((size_t)T * V, 0.0f);
 	std::vector<int> targets(T, 0);
-	for (int t = 0; t < T; ++t) targets[t] = t % V;
+	const float targetProb[8] = {0.9f, 0.1f, 0.8f, 0.01f,
+	                             0.7f, 0.001f, 0.6f, 0.0001f};
+	double expectedLossDouble = 0.0;
+	int expectedCorrect = 0;
+	for (int t = 0; t < T; ++t)
+	{
+		const int target = t % V;
+		const float p = targetProb[(t / 256) % 8];
+		const float other = (1.0f - p) / (float)(V - 1);
+		targets[t] = target;
+		for (int v = 0; v < V; ++v)
+			probs[(size_t)t * V + v] = v == target ? p : other;
+		expectedLossDouble += -std::log((double)p);
+		if (p > other) ++expectedCorrect;
+	}
 	glades::gpu::GpuBuffer<float> d_probs;
 	glades::gpu::GpuBuffer<int> d_targets, d_out;
 	ASSERT("token-lm metric probs alloc", d_probs.allocate(probs.size()));
@@ -11270,11 +11284,12 @@ void CHIRONTokenLmMetricCountTest()
 	ASSERT("token-lm metric probs upload", d_probs.upload(&probs[0], probs.size()));
 	ASSERT("token-lm metric targets upload", d_targets.upload(&targets[0], targets.size()));
 	int packed[4] = {0, 0, 0, 0};
-	const float expectedLoss = (float)T * std::log((float)V);
-	const int expectedCorrect = (T + V - 1) / V;
+	const float expectedLoss = (float)expectedLossDouble;
 	bool launchesOk = true;
 	bool countsStable = true;
 	bool lossStable = true;
+	bool lossBitsExact = true;
+	int firstLossBits = 0;
 	for (int repeat = 0; repeat < 128; ++repeat)
 	{
 		launchesOk = launchesOk && glades::gpu::collect_token_lm_metrics(
@@ -11284,10 +11299,13 @@ void CHIRONTokenLmMetricCountTest()
 		std::memcpy(&loss, &packed[0], sizeof(loss));
 		countsStable = countsStable && packed[1] == T && packed[2] == expectedCorrect && packed[3] == T;
 		lossStable = lossStable && std::fabs(loss - expectedLoss) <= 1e-3f * expectedLoss;
+		if (repeat == 0) firstLossBits = packed[0];
+		else lossBitsExact = lossBitsExact && packed[0] == firstLossBits;
 	}
 	ASSERT("collect_token_lm_metrics repeated launches", launchesOk);
-	ASSERT("multi-block CE and argmax counts remain ordered", countsStable);
-	ASSERT("multi-block CE loss counts every row once", lossStable);
+	ASSERT("token-lm CE and argmax counts remain exact", countsStable);
+	ASSERT("token-lm CE loss counts every row once", lossStable);
+	ASSERT("token-lm CE loss is bit-exact across repeated launches", lossBitsExact);
 #else
 	std::printf("  [token-lm-metrics] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif

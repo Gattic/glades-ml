@@ -4037,7 +4037,10 @@ bool causal_softmax_with_bwd_attn(float* S, const float* dP,
 
 namespace {
 
-// One block total (simple reduction).  Each thread handles a subset of rows.
+// One block total (deterministic reduction). Each thread handles a fixed
+// strided subset of rows, then the block writes one ordered FP32 sum. Token
+// NLL only reads the target probability, so a single block keeps this path
+// cheap while avoiding schedule-dependent cross-block atomic accumulation.
 __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
                                          const int* __restrict__ targets,
                                          int T, int vocabSize, int padToken,
@@ -4050,8 +4053,7 @@ __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
 
     float localLoss = 0.0f;
     int localCount = 0;
-    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
-         t += blockDim.x * gridDim.x)
+    for (int t = threadIdx.x; t < T; t += blockDim.x)
     {
         int tgt = targets[t];
         if (padToken >= 0 && tgt == padToken) continue;
@@ -4064,17 +4066,17 @@ __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
         ++localCount;
     }
 
-    // Reduce loss.
+    // One block gives the reduction a fixed order across every launch.
     localLoss = blockReduceSum(localLoss, sLoss);
     if (threadIdx.x == 0)
-        atomicAdd(loss_sum, localLoss);
+        *loss_sum = localLoss;
 
     // Reduce count (reuse warp reduce as floats, cast back).
     __syncthreads();
     float countF = (float)localCount;
     countF = blockReduceSum(countF, sLoss);
     if (threadIdx.x == 0)
-        atomicAdd(valid_count, (int)countF);
+        *valid_count = (int)countF;
 }
 
 } // anonymous namespace
@@ -4086,11 +4088,9 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
     if (T <= 0 || vocabSize <= 0) return true;
     GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
     GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
-    int block = 256;
-    int grid = 1;
-    if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
-    int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
-    cross_entropy_nll_kernel<<<grid, block, smemBytes, computeStream()>>>(
+    const int block = 256;
+    const int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
+    cross_entropy_nll_kernel<<<1, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, loss_sum, valid_count, NULL);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
@@ -4179,9 +4179,8 @@ bool chiron_vitals_output_vectors(const float* probs, const int* targets,
 	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenNll, 0, (size_t)T * sizeof(float), computeStream()));
 	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenTop1, 0, (size_t)T * sizeof(unsigned char), computeStream()));
 	const int blockLoss = 256;
-	int gridLoss = (T + blockLoss - 1) / blockLoss; if (gridLoss > 128) gridLoss = 128;
 	const int smemLoss = (blockLoss / 32 + 2) * (int)sizeof(float);
-	cross_entropy_nll_kernel<<<gridLoss, blockLoss, smemLoss, computeStream()>>>(
+	cross_entropy_nll_kernel<<<1, blockLoss, smemLoss, computeStream()>>>(
 	    probs, targets, T, vocabSize, padToken, loss_sum, loss_count, perTokenNll);
 	const int blockArg = 128;
 	int gridArg = (T + blockArg - 1) / blockArg; if (gridArg > 128) gridArg = 128;
@@ -7549,11 +7548,11 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 	// inside one block.  At T=2048, vocabSize=32000 this was ~24 ms/call,
 	// consuming ~8% of GPU time per training step.
 	//
-	// The properly-parallelized implementation is already present as two
-	// separate kernels (cross_entropy_nll_loss + argmax_count_matches) —
-	// both use grid=(T+block-1)/block clamped at 128 blocks.  Route
-	// collect_token_lm_metrics through those to restore the pre-eecdb97c1
-	// throughput.
+	// Keep the work split between the target-only CE reduction and the
+	// vocabulary-wide argmax. CE uses one deterministic block over T target
+	// probabilities; argmax remains parallel across up to 128 blocks. This
+	// avoids serializing the expensive T×vocabSize scan while preserving a
+	// bit-exact NLL reduction order across launches.
 	//
 	// Output layout (unchanged for call-site compatibility):
 	//   out[0] = loss_sum  (bit-cast float)
