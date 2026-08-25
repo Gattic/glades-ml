@@ -345,12 +345,13 @@ inline void add_sinusoidal_positional_encoding_inplace(float* h, unsigned int po
 inline void add_sinusoidal_positional_encoding_inplace(float* h,
                                                        unsigned int pos,
                                                        unsigned int dModel,
-                                                       const std::vector<double>& invDenomPair)
+                                                       const double* invDenomPair,
+                                                       unsigned int invDenomPairSize)
 {
 	if (!h || dModel == 0u)
 		return;
 	const unsigned int needPairs = (dModel + 1u) / 2u;
-	if (invDenomPair.size() < static_cast<size_t>(needPairs))
+	if (!invDenomPair || invDenomPairSize < needPairs)
 	{
 		// Precondition violation: caller must provide a correctly-sized cache.
 		GLADES_KERNEL_ASSERT(false && "add_sinusoidal_positional_encoding_inplace: invDenomPair cache too small");
@@ -363,6 +364,17 @@ inline void add_sinusoidal_positional_encoding_inplace(float* h,
 		const float pe = ((i % 2u) == 0u) ? static_cast<float>(sin(angle)) : static_cast<float>(cos(angle));
 		h[i] += pe;
 	}
+}
+
+// Overload using a precomputed invDenomPair (avoids pow() in inner loop).
+inline void add_sinusoidal_positional_encoding_inplace(float* h,
+                                                       unsigned int pos,
+                                                       unsigned int dModel,
+                                                       const std::vector<double>& invDenomPair)
+{
+	add_sinusoidal_positional_encoding_inplace(h, pos, dModel,
+	                                           invDenomPair.empty() ? NULL : &invDenomPair[0],
+	                                           static_cast<unsigned int>(invDenomPair.size()));
 }
 
 inline void add_sinusoidal_positional_encoding_inplace(std::vector<float>& h, unsigned int pos, unsigned int dModel)
@@ -397,15 +409,26 @@ inline void add_sinusoidal_positional_encoding_seq_inplace(float* h, unsigned in
 inline void add_sinusoidal_positional_encoding_seq_inplace(float* h,
                                                            unsigned int T,
                                                            unsigned int dModel,
-                                                           const std::vector<double>& invDenomPair)
+                                                           const double* invDenomPair,
+                                                           unsigned int invDenomPairSize)
 {
 	if (!h || T == 0u || dModel == 0u)
 		return;
 	for (unsigned int t = 0; t < T; ++t)
 	{
 		float* ht = h + (static_cast<size_t>(t) * static_cast<size_t>(dModel));
-		add_sinusoidal_positional_encoding_inplace(ht, t, dModel, invDenomPair);
+		add_sinusoidal_positional_encoding_inplace(ht, t, dModel, invDenomPair, invDenomPairSize);
 	}
+}
+
+inline void add_sinusoidal_positional_encoding_seq_inplace(float* h,
+                                                           unsigned int T,
+                                                           unsigned int dModel,
+                                                           const std::vector<double>& invDenomPair)
+{
+	add_sinusoidal_positional_encoding_seq_inplace(h, T, dModel,
+	                                               invDenomPair.empty() ? NULL : &invDenomPair[0],
+	                                               static_cast<unsigned int>(invDenomPair.size()));
 }
 
 // === Linear ===
@@ -442,16 +465,18 @@ inline void linear_into(const float* x,
 // Intended for inference/training hot paths where throughput matters more than double-accum parity.
 inline void linear_into_opt(const float* x,
                             unsigned int inSize,
-                            const std::vector<float>& W,
-                            const std::vector<float>& b,
+                            const float* W,
+                            size_t WSize,
+                            const float* b,
+                            unsigned int bSize,
                             unsigned int outSize,
                             float* y)
 {
-	if (!x || !y)
+	if (!x || !W || !y)
 		return;
 	{
 		const size_t need = static_cast<size_t>(outSize) * static_cast<size_t>(inSize);
-		if (W.size() < need)
+		if (WSize < need)
 		{
 			GLADES_KERNEL_ASSERT(false && "linear_into_opt: W is smaller than outSize*inSize");
 			return;
@@ -459,10 +484,25 @@ inline void linear_into_opt(const float* x,
 	}
 	for (unsigned int o = 0; o < outSize; ++o)
 	{
-		const float bias = (o < b.size()) ? b[o] : 0.0f;
-		const float* wRow = &W[static_cast<size_t>(o) * static_cast<size_t>(inSize)];
+		const float bias = (b && o < bSize) ? b[o] : 0.0f;
+		const float* wRow = W + static_cast<size_t>(o) * static_cast<size_t>(inSize);
 		y[o] = bias + dot_f32(wRow, x, inSize);
 	}
+}
+
+// Optimized matvec (float accumulation + optional AVX2).
+// Intended for inference/training hot paths where throughput matters more than double-accum parity.
+inline void linear_into_opt(const float* x,
+                            unsigned int inSize,
+                            const std::vector<float>& W,
+                            const std::vector<float>& b,
+                            unsigned int outSize,
+                            float* y)
+{
+	linear_into_opt(x, inSize,
+	                W.empty() ? NULL : &W[0], W.size(),
+	                b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                outSize, y);
 }
 
 // Blocked GEMV specialization for row-major W:
@@ -627,12 +667,14 @@ inline void linear_vec(const float* x,
 inline void linear_forward_opt(const float* X,
                                unsigned int T,
                                unsigned int inSize,
-                               const std::vector<float>& W,
-                               const std::vector<float>& b,
+                               const float* W,
+                               size_t WSize,
+                               const float* b,
+                               unsigned int bSize,
                                unsigned int outSize,
                                float* Y)
 {
-	if (!X || !Y)
+	if (!X || !W || !Y)
 		return;
 	if (T == 0u || inSize == 0u || outSize == 0u)
 		return;
@@ -640,8 +682,22 @@ inline void linear_forward_opt(const float* X,
 	{
 		const float* xt = X + static_cast<size_t>(t) * static_cast<size_t>(inSize);
 		float* yt = Y + static_cast<size_t>(t) * static_cast<size_t>(outSize);
-		linear_into_opt(xt, inSize, W, b, outSize, yt);
+		linear_into_opt(xt, inSize, W, WSize, b, bSize, outSize, yt);
 	}
+}
+
+inline void linear_forward_opt(const float* X,
+                               unsigned int T,
+                               unsigned int inSize,
+                               const std::vector<float>& W,
+                               const std::vector<float>& b,
+                               unsigned int outSize,
+                               float* Y)
+{
+	linear_forward_opt(X, T, inSize,
+	                   W.empty() ? NULL : &W[0], W.size(),
+	                   b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                   outSize, Y);
 }
 
 // Y[t,out] = b[out] + sum_in W[out,in] * X[t,in]
@@ -677,7 +733,8 @@ inline void linear_forward_lowp(const float* X,
                                 unsigned int inSize,
                                 const uint16_t* GLADES_RESTRICT W,
                                 int lowpDType,
-                                const std::vector<float>& b,
+                                const float* GLADES_RESTRICT b,
+                                unsigned int bSize,
                                 unsigned int outSize,
                                 float* Y)
 {
@@ -689,13 +746,29 @@ inline void linear_forward_lowp(const float* X,
 		const size_t yOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
 		for (unsigned int o = 0; o < outSize; ++o)
 		{
-			double acc = (o < b.size() ? static_cast<double>(b[o]) : 0.0);
+			double acc = (b && o < bSize) ? static_cast<double>(b[o]) : 0.0;
 			const size_t wOff = static_cast<size_t>(o) * static_cast<size_t>(inSize);
 			for (unsigned int i = 0; i < inSize; ++i)
 				acc += static_cast<double>(lowp_to_float(W[wOff + i], lowpDType)) * static_cast<double>(X[xOff + i]);
 			Y[yOff + o] = static_cast<float>(acc);
 		}
 	}
+}
+
+// Low-precision linear forward:
+// Y[t,out] = b[out] + sum_in W_lowp[out,in] * X[t,in]
+inline void linear_forward_lowp(const float* X,
+                                unsigned int T,
+                                unsigned int inSize,
+                                const uint16_t* GLADES_RESTRICT W,
+                                int lowpDType,
+                                const std::vector<float>& b,
+                                unsigned int outSize,
+                                float* Y)
+{
+	linear_forward_lowp(X, T, inSize, W, lowpDType,
+	                    b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                    outSize, Y);
 }
 
 // === Normalization ===
@@ -877,7 +950,8 @@ inline void rope_apply_inplace_strided(float* buf,
                                       unsigned int rowStride,
                                       unsigned int dHead,
                                       unsigned int ropeDim,
-                                      const std::vector<double>& invFreq,
+                                      const double* invFreq,
+                                      unsigned int invFreqSize,
                                       bool inverse)
 {
 	if (!buf)
@@ -888,7 +962,7 @@ inline void rope_apply_inplace_strided(float* buf,
 		ropeDim -= 1u;
 	if (ropeDim > dHead)
 		ropeDim = dHead - (dHead % 2u);
-	if (invFreq.size() < static_cast<size_t>(ropeDim / 2u))
+	if (!invFreq || invFreqSize < (ropeDim / 2u))
 	{
 		GLADES_KERNEL_ASSERT(false && "rope_apply_inplace_strided: invFreq cache too small");
 		return;
@@ -911,6 +985,23 @@ inline void rope_apply_inplace_strided(float* buf,
 			vec[j + 1u] = x0 * s + x1 * c;
 		}
 	}
+}
+
+// Strided RoPE apply: rotate a [T, dHead] view where each timestep vector has stride `rowStride`.
+// This allows applying RoPE in-place to packed Q/K buffers laid out as [T, dModel] (stride=dModel)
+// or [T, dModelKV] (stride=dModelKV) without gathering into contiguous temporaries.
+inline void rope_apply_inplace_strided(float* buf,
+                                      unsigned int T,
+                                      unsigned int rowStride,
+                                      unsigned int dHead,
+                                      unsigned int ropeDim,
+                                      const std::vector<double>& invFreq,
+                                      bool inverse)
+{
+	rope_apply_inplace_strided(buf, T, rowStride, dHead, ropeDim,
+	                           invFreq.empty() ? NULL : &invFreq[0],
+	                           static_cast<unsigned int>(invFreq.size()),
+	                           inverse);
 }
 
 // === Softmax ===
@@ -1023,6 +1114,82 @@ inline void softmax_stable_into(const float* logits, size_t n, float* probsOut)
 	const float inv = static_cast<float>(1.0 / sum);
 	for (size_t i = 0; i < n; ++i)
 		probsOut[i] *= inv;
+}
+
+// Fused softmax-CE forward with Z-loss auxiliary term.
+// Inputs:
+//   logits[cols]   — pre-softmax FP32 logits for a single position.
+//   cols           — vocab size.
+//   target         — ground-truth token id (in [0, cols)).
+//   zlossCoef      — auxiliary loss coefficient λ_z. At 0.0f, *zlossOut
+//                    is exactly 0 and *ceOut is bit-identical to the
+//                    standalone softmax-CE.
+// Outputs:
+//   *ceOut         — -log(softmax(logits)[target]).
+//   *zlossOut      — zlossCoef * (logsumexp(logits))^2.
+//   *lseOut        — logsumexp(logits) (optional, NULL to skip). Use this
+//                    to avoid reconstructing lse via the lossy round-trip
+//                    (ceOut + logits[target]) at the call site, which sheds
+//                    ~2 ULP of precision at FP32.
+// Note: total loss is ceOut + zlossOut. Caller sums across positions.
+inline void softmax_ce_with_zloss(const float* logits, int cols, int target,
+                                  float zlossCoef, float* ceOut, float* zlossOut,
+                                  float* lseOut = NULL)
+{
+	// Compute logsumexp in a numerically stable way, accumulating into a
+	// double to match the project's softmax_stable_into pattern (FP32
+	// accumulation across V=32000 introduces meaningful rounding error).
+	float maxLogit = logits[0];
+	for (int i = 1; i < cols; ++i) if (logits[i] > maxLogit) maxLogit = logits[i];
+	double sumExp = 0.0;
+	for (int i = 0; i < cols; ++i) sumExp += static_cast<double>(expf(logits[i] - maxLogit));
+	const float lse = maxLogit + static_cast<float>(log(sumExp));
+
+	// Main CE: -log(softmax(logits)[target]) = lse - logits[target].
+	*ceOut = lse - logits[target];
+
+	// Z-loss: λ_z * log²(Z) = λ_z * lse².
+	// At λ_z == 0 this returns exactly 0.0f (no FP rounding from multiply
+	// since the result IS the constant 0).
+	if (zlossCoef == 0.0f)
+		*zlossOut = 0.0f;
+	else
+		*zlossOut = zlossCoef * (lse * lse);
+
+	// Direct lse output avoids the lossy round-trip (ceOut + logits[target])
+	// that sheds ~2 ULP at FP32, compounding to ~3 ULP of gradient error in
+	// the Task 1.4 backward kernel (2 * λ_z * lse * probs[i]).
+	if (lseOut != NULL) *lseOut = lse;
+}
+
+// Fused softmax-CE backward with Z-loss gradient contribution.
+// Inputs:
+//   probs[cols]    — softmax(logits) (computed earlier).
+//   cols, target   — as above.
+//   lse            — logsumexp(logits) (precomputed; reuses the value
+//                    from softmax_ce_with_zloss for free).
+//   zlossCoef      — auxiliary loss coefficient λ_z.
+// Output:
+//   gradOut[cols]  — d(L_main + L_zloss)/d(logit_i)
+//                  = (probs[i] - (i==target)) + 2*λ_z*lse*probs[i].
+// At zlossCoef = 0.0f, gradOut is bit-identical to the standalone
+// softmax-CE gradient.
+inline void softmax_ce_with_zloss_grad(const float* probs, int cols, int target,
+                                       float lse, float zlossCoef,
+                                       float* gradOut)
+{
+	// Main CE grad: probs - one_hot(target).
+	// Z-loss grad: 2 * λ_z * lse * probs.
+	// At λ_z == 0 the Z-loss contribution is skipped entirely → bit-identical
+	// to the standalone CE grad.
+	const float zlossScale = (zlossCoef == 0.0f) ? 0.0f
+	                                              : (2.0f * zlossCoef * lse);
+	for (int i = 0; i < cols; ++i)
+	{
+		float g = probs[i] - (i == target ? 1.0f : 0.0f);
+		if (zlossScale != 0.0f) g += zlossScale * probs[i];
+		gradOut[i] = g;
+	}
 }
 
 // === Normalization backward kernels (training) ===
@@ -1343,6 +1510,112 @@ inline void generate_dropout_mask(EngineT& eng, unsigned char* mask, size_t n, f
 	}
 }
 
+// === LayerDrop schedule helper ===
+//
+// Linear-rising stochastic-depth schedule:
+//   p_l = (l / (L - 1)) * pMax,    l ∈ {0, 1, ..., L-1}
+// So p_0 = 0 (layer 0 never drops; protects embedding-adjacent state),
+// p_{L-1} = pMax (deepest layer drops with probability pMax).
+// When L == 1, returns 0 (the only layer is never dropped).
+inline float layer_drop_p_l(unsigned int l, unsigned int L, float pMax, bool linearSchedule)
+{
+	if (pMax <= 0.0f || L == 0u)
+		return 0.0f;
+	if (!linearSchedule)
+		return pMax;
+	if (L == 1u)
+		return 0.0f;
+	return (static_cast<float>(l) / static_cast<float>(L - 1u)) * pMax;
+}
+
+// Single-Bernoulli draw helper (returns true = "keep this layer", false = "drop").
+// Reuses generate_dropout_mask with n=1 to share the determinism path.
+template <typename EngineT>
+inline bool layer_drop_keep(EngineT& eng, float p_l)
+{
+	if (p_l <= 0.0f)
+		return true;
+	if (p_l >= 1.0f)
+		return false;
+	unsigned char mask = 1;
+	generate_dropout_mask(eng, &mask, 1u, p_l);
+	return mask != 0u;
+}
+
+// === UL2 span-mask sampler (Tay et al. 2022 mixture-of-denoisers) ===
+//
+// Samples a per-position bit-mask of length T indicating which positions
+// will be corrupted.  Span lengths are drawn from Poisson(mu); spans are
+// placed at uniformly random start indices; corruption continues until
+// the total corrupted positions reach floor(p_target * T) OR the rejection
+// attempt budget (T/2) is exhausted.
+//
+// Args:
+//   eng        — random engine (templated; uses next_u64 / portable next).
+//   T          — sequence length.
+//   p_target   — target corruption rate in [0, 1).
+//   mu         — Poisson mean for span length (>= 1).
+//   mask_out   — output buffer of length T; written entirely.
+//
+// Returns:
+//   actual_corrupted — number of positions actually corrupted (≤ floor(p_target*T)).
+//                       May be slightly below target if span overlap saturates
+//                       the rejection budget.
+template <typename EngineT>
+inline unsigned int ul2_sample_span_mask(EngineT& eng, unsigned int T,
+                                         float p_target, int mu,
+                                         unsigned char* mask_out)
+{
+	if (!mask_out || T == 0u) return 0u;
+	// Initialize mask to 0.
+	for (unsigned int i = 0; i < T; ++i) mask_out[i] = 0u;
+	if (p_target <= 0.0f || mu < 1) return 0u;
+	const unsigned int target_corrupted =
+	    (unsigned int)((float)T * p_target);
+	if (target_corrupted == 0u) return 0u;
+	unsigned int corrupted_so_far = 0u;
+	const unsigned int max_attempts = (T / 2u) + 1u;  // +1 ensures >=1 attempt at small T
+	for (unsigned int attempt = 0u; attempt < max_attempts; ++attempt)
+	{
+		// Sample Poisson span length using Knuth's method with native u64 draws.
+		// At mu in [1, 64], Knuth is exact and fast.  Each iteration draws
+		// a uniform [0, 1) by mapping (u64 >> 40) / 2^24.
+		unsigned int span_len = 0u;
+		{
+			const float L_thresh = expf(-(float)mu);
+			float p_cum = 1.0f;
+			unsigned int knuth_iters = 0u;
+			while (p_cum > L_thresh && knuth_iters < 256u)
+			{
+				const uint64_t r = glades::rng::next_u64(eng);
+				const float u = (float)((r >> 40) & 0xFFFFFFull) / 16777216.0f;
+				p_cum *= u;
+				++span_len;
+				++knuth_iters;
+			}
+			// Knuth's algorithm counts the number of uniform draws k;
+			// the Poisson sample is k-1.  Subtract one before clamping.
+			if (span_len > 0u) span_len -= 1u;
+			if (span_len == 0u) span_len = 1u;  // min span length 1
+		}
+		// Sample uniform start in [0, T) from one u64 draw.
+		const uint64_t r_start = glades::rng::next_u64(eng);
+		const unsigned int start = (unsigned int)((r_start >> 32) % (uint64_t)T);
+		const unsigned int end = (start + span_len > T) ? T : (start + span_len);
+		for (unsigned int i = start; i < end; ++i)
+		{
+			if (mask_out[i] == 0u)
+			{
+				mask_out[i] = 1u;
+				++corrupted_so_far;
+				if (corrupted_so_far >= target_corrupted) break;
+			}
+		}
+		if (corrupted_so_far >= target_corrupted) break;
+	}
+	return corrupted_so_far;
+}
+
 // Apply dropout mask in-place: x[i] *= mask[i] * scale
 inline void apply_dropout_mask_inplace(float* x, const unsigned char* mask, float scale, size_t n)
 {
@@ -1410,6 +1683,67 @@ inline void gelu_backward_buf(const float* x, float* dAct, size_t n)
 	}
 }
 
+	// QK-Norm forward: L2-normalize each row (per-head, per-token) in place.
+	// Input/output: x has shape (T, nHeads * dHead). Normalization is over
+	// dHead within each head, per token. Adds eps inside the norm for
+	// numerical safety.
+	inline void qknorm_forward(float* x, int T, int nHeads, int dHead, float eps)
+	{
+		for (int t = 0; t < T; ++t)
+		{
+			for (int h = 0; h < nHeads; ++h)
+			{
+				float* row = x + (size_t)t * nHeads * dHead + (size_t)h * dHead;
+				double ss = 0.0;
+				for (int i = 0; i < dHead; ++i)
+					ss += static_cast<double>(row[i]) * static_cast<double>(row[i]);
+				const float invNorm = static_cast<float>(1.0 / sqrt(ss + (double)eps));
+				for (int i = 0; i < dHead; ++i) row[i] *= invNorm;
+			}
+		}
+	}
+
+	// QK-Norm backward: given xNorm (post-norm), normInv = 1/||x_orig|| per
+	// (token, head), and dxNorm (gradient at normalized output), compute
+	// gradient at x_orig:
+	//   dx = normInv * (dxNorm - (xNorm · dxNorm) * xNorm)
+	// Operates per-token, per-head. xNorm, dxNorm, dxOrig all have shape
+	// (T, nHeads * dHead); normInv has shape (T, nHeads).
+	inline void qknorm_backward(const float* xNorm, const float* normInv,
+	                            const float* dxNorm, int T, int nHeads, int dHead,
+	                            float* dxOrig)
+	{
+		for (int t = 0; t < T; ++t)
+		{
+			for (int h = 0; h < nHeads; ++h)
+			{
+				const size_t off = (size_t)t * nHeads * dHead + (size_t)h * dHead;
+				const float* xn = xNorm + off;
+				const float* dn = dxNorm + off;
+				const float ni = normInv[(size_t)t * nHeads + h];
+
+				double xnDotDn = 0.0;
+				for (int i = 0; i < dHead; ++i)
+					xnDotDn += static_cast<double>(xn[i]) * static_cast<double>(dn[i]);
+
+				float* dox = dxOrig + off;
+				const float xnDotDnF = static_cast<float>(xnDotDn);
+				for (int i = 0; i < dHead; ++i)
+					dox[i] = ni * (dn[i] - xnDotDnF * xn[i]);
+			}
+		}
+	}
+
+	// Compute MTP +2-offset target IDs from a sequence of +1-offset targets.
+	// targetIds[t] is the token at position t+1 (standard next-token target).
+	// targetsMtp[t] = targetIds[t+1] for t < T-1; targetsMtp[T-1] = ignoreLabel.
+	// Used by the MTP auxiliary head to predict the token 2 positions ahead.
+	inline void compute_mtp_targets(const int* targetIds, int T, int ignoreLabel,
+	                                int* targetsMtp)
+	{
+		for (int t = 0; t < T - 1; ++t) targetsMtp[t] = targetIds[t + 1];
+		if (T > 0) targetsMtp[T - 1] = ignoreLabel;
+	}
+
 } // namespace transformer_kernels
 } // namespace glades
-

@@ -39,6 +39,7 @@ class Trainer
 {
 public:
 	// Run a single train/test loop using the provided callbacks (may be NULL).
+	// Performs fail-fast data/shape/sequence preflight and does not retain data or callbacks.
 	// This function is synchronous and does not retain the callbacks pointer.
 	static NNetworkStatus run(NNetwork& net, const DataInput* data, int runType, ITrainingCallbacks* callbacks);
 };
@@ -46,4 +47,3 @@ public:
 } // namespace glades
 
 #endif
-

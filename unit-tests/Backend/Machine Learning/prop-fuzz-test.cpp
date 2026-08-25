@@ -3,7 +3,7 @@
 // Goals:
 // - Exercise hostile / edge-case inputs without hand-writing exhaustive cases.
 // - Assert invariants and "no-crash" behavior for high-risk surfaces:
-//   - TokenInput table import + view APIs
+//   - TokenInput table import + token-id APIs
 //   - Transformer generation / KV inference robustness under random prompts/configs
 //   - Checkpoint load hardening against manifest corruption
 //
@@ -211,6 +211,7 @@ struct SmallDecoderLmFixture
 		}
 
 		di.setPadTokenId(static_cast<int>(padTokenId));
+		di.setMirrorTrainToTestOnImplicitSplit(true);
 		di.import(tbl);
 		PROP_REQUIRE("==============PropFuzz: fixture TokenInput import failed==============", di.loadedOk());
 
@@ -374,17 +375,15 @@ static void prop_tokeninput_table_import(uint64_t seed, unsigned int cases)
 
 				const float* p = NULL;
 				unsigned int sz = 0u;
-				PROP_REQUIRE("==============PropTokenInput: getTrainRowView must succeed==============", ti.getTrainRowView(idx, p, sz));
-				PROP_REQUIRE("==============PropTokenInput: row view size must be 1==============", sz == 1u);
-				PROP_REQUIRE("==============PropTokenInput: row view ptr must be non-null==============", p != NULL);
-				PROP_REQUIRE("==============PropTokenInput: row view must match token id==============", static_cast<int>(*p) == tok);
+				PROP_REQUIRE("==============PropTokenInput: getTrainRowView must be unsupported==============", !ti.getTrainRowView(idx, p, sz));
+				PROP_REQUIRE("==============PropTokenInput: unsupported row view size must be 0==============", sz == 0u);
+				PROP_REQUIRE("==============PropTokenInput: unsupported row view ptr must be null==============", p == NULL);
 
 				const float* q = NULL;
 				unsigned int qsz = 0u;
-				PROP_REQUIRE("==============PropTokenInput: getTrainExpectedRowView must succeed==============", ti.getTrainExpectedRowView(idx, q, qsz));
-				PROP_REQUIRE("==============PropTokenInput: expected view size must be 1==============", qsz == 1u);
-				PROP_REQUIRE("==============PropTokenInput: expected view ptr must be non-null==============", q != NULL);
-				PROP_REQUIRE("==============PropTokenInput: expected view must match expected token id==============", static_cast<int>(*q) == nextTok);
+				PROP_REQUIRE("==============PropTokenInput: getTrainExpectedRowView must be unsupported==============", !ti.getTrainExpectedRowView(idx, q, qsz));
+				PROP_REQUIRE("==============PropTokenInput: unsupported expected view size must be 0==============", qsz == 0u);
+				PROP_REQUIRE("==============PropTokenInput: unsupported expected view ptr must be null==============", q == NULL);
 			}
 		}
 		else
@@ -567,4 +566,3 @@ void PropFuzzUnitTest()
 
 	printf("\n============================================================\n");
 }
-

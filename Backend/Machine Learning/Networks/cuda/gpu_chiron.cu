@@ -1,0 +1,4419 @@
+// CHIRON reversible-flow transformer GPU primitives.
+//
+// See gpu_chiron.h for the wrapper declarations and research/CHIRON_framework.md
+// for the math. This file implements the CUDA kernels and host wrappers.
+//
+// Design notes:
+//   - Shears are trivially element-wise and use a simple saxpy-like kernel.
+//     No shared memory, one thread per element.
+//   - ReLN forward/inverse are per-row kernels: one block per token, warp
+//     reductions for mean/variance. Direct port of the layernorm kernel
+//     style from gpu_kernels.cu, extended with stats output/input.
+//   - Sketch project/lift are batched matvecs. We route through cuBLAS
+//     sgemm_rowmajor wrappers since the math is pure GEMM.
+
+#include "gpu_chiron.h"
+#include "gpu_device.h"
+#include "gpu_blas.h"
+#include "gpu_blas_fp8.h"
+#include "gpu_kernels.h"
+#include "gpu_buffer.h"
+
+#ifdef GLADES_HAVE_CUDA
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cmath>
+#include <cstdio>
+
+namespace glades {
+namespace gpu {
+
+namespace {
+
+#define GLADES_CUDA_CHECK(call)                                               \
+	do {                                                                      \
+		cudaError_t err_ = (call);                                            \
+		if (err_ != cudaSuccess) {                                            \
+			fprintf(stderr, "[chiron-cuda] %s:%d  %s  -> %s\n",               \
+			        __FILE__, __LINE__, #call, cudaGetErrorString(err_));     \
+			return false;                                                     \
+		}                                                                     \
+	} while (0)
+
+static constexpr int kBlockElem = 256;
+static constexpr int kMaxBlockRow = 1024;
+
+inline int rowBlockSize(int cols)
+{
+	int b = cols < kMaxBlockRow ? cols : kMaxBlockRow;
+	b = ((b + 31) / 32) * 32;
+	if (b < 32) b = 32;
+	if (b > kMaxBlockRow) b = kMaxBlockRow;
+	return b;
+}
+
+// ---------------------------------------------------------------------------
+// Warp/block reductions. Mirror the implementations in gpu_kernels.cu so each
+// translation unit has its own static copy (separable compilation is off).
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float warpReduceSum(float val)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+	return val;
+}
+
+__device__ float blockReduceSum(float val, float* smem)
+{
+	int lane = threadIdx.x & 31;
+	int wid  = threadIdx.x >> 5;
+
+	val = warpReduceSum(val);
+	if (lane == 0) smem[wid] = val;
+	__syncthreads();
+
+	int numWarps = (blockDim.x + 31) / 32;
+	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : 0.0f;
+	if (wid == 0) val = warpReduceSum(val);
+	return val;
+}
+
+} // anonymous namespace
+
+// ===========================================================================
+//  1. Symplectic shears — element-wise add/subtract.
+// ===========================================================================
+
+namespace {
+
+__global__ void chiron_shear_add_kernel(float* __restrict__ p,
+                                        const float* __restrict__ u, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) p[i] += u[i];
+}
+
+__global__ void chiron_shear_sub_kernel(float* __restrict__ p,
+                                        const float* __restrict__ u, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) p[i] -= u[i];
+}
+
+} // anonymous namespace
+
+bool chiron_shear_add(float* p, const float* u, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	chiron_shear_add_kernel<<<grid, kBlockElem, 0, computeStream()>>>(p, u, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_shear_sub(float* p, const float* u, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	chiron_shear_sub_kernel<<<grid, kBlockElem, 0, computeStream()>>>(p, u, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  1b. SCFA stream-op fused kernels (ralph-loop iter 5, 2026-05-14).
+// ===========================================================================
+//
+// The SCFA forward/backward chain in glades-trainer/trainer/chiron_main.cpp
+// issues 6-7 axpy/memcpy operations per layer per direction over the FP32
+// residual stream buffers (T·m floats = 67 MB at T=8192, m=2048).  Each
+// memcpy_d2d that's immediately followed by an axpy can be folded into a
+// single fused kernel that halves the memory traffic for that step.  The
+// math is bit-identical (these are element-wise FP32 ops, no precision
+// loss).  Behavior is gated behind --scfa-fuse-streams in the trainer.
+
+namespace {
+
+__global__ void chiron_scfa_sub_kernel(float* __restrict__ c,
+                                       const float* __restrict__ a,
+                                       const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) c[i] = a[i] - b[i];
+}
+
+__global__ void chiron_scfa_axpy2_kernel(float* __restrict__ p,
+                                         float alpha,
+                                         const float* __restrict__ a,
+                                         const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) p[i] += alpha * (a[i] + b[i]);
+}
+
+__global__ void chiron_scfa_scaled_copy_kernel(float* __restrict__ c,
+                                               float alpha,
+                                               const float* __restrict__ a, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) c[i] = alpha * a[i];
+}
+
+// ---------------------------------------------------------------------------
+// PIED — Phase-Increment Ensemble Dropout (2026-07-01).
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md
+//
+// Mean-one two-point mask on the SCFA attention increment at the shear
+// commit: p += alpha * eta_i * (a[i] + b[i]), with eta regenerated from a
+// stateless counter hash — no RNG state, no stored masks.  The inverse walk
+// calls the same kernel with -alpha: fl((-alpha)*x) == -fl(alpha*x) exactly
+// (IEEE sign flip), so the subtracted increment is bit-identical to the
+// added one and p-reconstruction matches the unmasked shear's tolerance
+// class.  The backward dy hand-off uses the scale-copy variant with the
+// same key so the increment-branch adjoint sees the identical eta field.
+//
+//   eta_i = (mix32(key ^ i*0x9E3779B9) >= thr) ? hi : lo
+//   Bernoulli arm:  thr = floor(pi * 2^32), lo = 0,      hi = 1/(1-pi)
+//   Symmetric arm:  thr = 0x80000000,       lo = 1-amp,  hi = 1+amp
+//
+// Must stay bit-identical to the CPU reference (transformer_chiron_ops.h
+// glades::chiron::chiron_pied_eta) — guarded by the chiron-pied E1 parity
+// unit test.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ unsigned int chiron_pied_mix32_dev(unsigned int x)
+{
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__device__ __forceinline__ float chiron_pied_eta_dev(unsigned int key, unsigned int i,
+                                                     unsigned int thr, float lo, float hi)
+{
+	const unsigned int h = chiron_pied_mix32_dev(key ^ (i * 0x9E3779B9u));
+	return (h >= thr) ? hi : lo;
+}
+
+__global__ void chiron_scfa_axpy2_masked_kernel(float* __restrict__ p, float alpha,
+                                                const float* __restrict__ a,
+                                                const float* __restrict__ b, int n,
+                                                unsigned int key, unsigned int thr,
+                                                float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	p[i] += alpha * (eta * (a[i] + b[i]));
+}
+
+__global__ void chiron_incdrop_scale_copy_kernel(float* __restrict__ dst, float alpha,
+                                                 const float* __restrict__ src, int n,
+                                                 unsigned int key, unsigned int thr,
+                                                 float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	dst[i] = alpha * (eta * src[i]);
+}
+
+
+// iter 63 (Arc 2, BF16 residual-p — 2026-05-16): BF16-p storage variants.
+// Per PARADIGM_BF16_RESIDUAL_P_DESIGN.md §4.2:
+//   p̂ := round_RN( bf16_to_fp32(p̂) + α·(a + b) )           (axpy2)
+//   p̂ := round_RN( bf16_to_fp32(p̂) + α·x )                  (axpy)
+//   c  := round_RN( α·a )                                    (scaled-copy)
+// All accumulation is FP32-internal; only the final write rounds back to BF16.
+// RN-even (deterministic) for iter 63; stochastic-rounding (SR) variant in iter 64.
+
+__device__ __forceinline__ unsigned short fp32_to_bf16_rn_dev(float x)
+{
+	union { float f; unsigned int u; } v;
+	v.f = x;
+	if (isnan(x)) {
+		// Quiet NaN; preserve sign.
+		return (unsigned short)(((v.u & 0x80000000u) | 0x7FC00000u) >> 16);
+	}
+	// Round-to-nearest, ties-to-even.
+	const unsigned int lsb = (v.u >> 16) & 1u;
+	const unsigned int bias = 0x7FFFu + lsb;
+	return (unsigned short)((v.u + bias) >> 16);
+}
+
+__device__ __forceinline__ float bf16_to_fp32_dev(unsigned short b)
+{
+	union { unsigned int u; float f; } v;
+	v.u = ((unsigned int)b) << 16;
+	return v.f;
+}
+
+__global__ void chiron_scfa_axpy2_bf16p_rn_kernel(unsigned short* __restrict__ p_bf,
+                                                   float alpha,
+                                                   const float* __restrict__ a,
+                                                   const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * (a[i] + b[i]);
+	p_bf[i] = fp32_to_bf16_rn_dev(acc);
+}
+
+__global__ void chiron_axpy_bf16p_rn_kernel(unsigned short* __restrict__ p_bf,
+                                             float alpha,
+                                             const float* __restrict__ x, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * x[i];
+	p_bf[i] = fp32_to_bf16_rn_dev(acc);
+}
+
+__global__ void chiron_scfa_scaled_copy_bf16p_rn_kernel(unsigned short* __restrict__ c_bf,
+                                                         float alpha,
+                                                         const float* __restrict__ a, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	c_bf[i] = fp32_to_bf16_rn_dev(alpha * a[i]);
+}
+
+// Read BF16 p, add to FP32 q: q[i] += alpha * bf16_to_fp32(p_bf[i]).
+// Used at the LN+axpy step (q += p) when --bf16-residual-p routes p to BF16
+// storage but q stays FP32.
+__global__ void chiron_bf16_to_fp32_axpy_kernel(float* __restrict__ q,
+                                                 float alpha,
+                                                 const unsigned short* __restrict__ p_bf,
+                                                 int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	q[i] += alpha * bf16_to_fp32_dev(p_bf[i]);
+}
+
+// iter 64 (Arc 2): stochastic-rounding variants.  Same FP32-internal accum
+// as RN, but final BF16 encode uses xorshift-mixed hash of (idx, step, seed)
+// to decide round-up vs round-down — making per-element error mean-zero by
+// construction.  Drift over L=12 reversible writes becomes random walk
+// O(sqrt(L) * ULP_BF16) instead of biased O(L * ULP_BF16).  Same RNG infra
+// as iter 49's cast_f32_to_bf16_stochastic.
+__device__ __forceinline__ uint32_t sr_hash32_dev(uint32_t a, uint32_t b, uint32_t c)
+{
+	uint32_t x = a ^ (b * 0x9E3779B1u) ^ (c * 0x85EBCA6Bu);
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__device__ __forceinline__ unsigned short fp32_to_bf16_sr_dev(float x,
+                                                               uint32_t idx,
+                                                               uint32_t stepIdx,
+                                                               uint32_t baseSeed)
+{
+	union { float f; uint32_t u; } v;
+	v.f = x;
+	if (isnan(x)) {
+		return (unsigned short)(((v.u & 0x80000000u) | 0x7FC00000u) >> 16);
+	}
+	const uint32_t low16 = v.u & 0xFFFFu;
+	const uint32_t rnd = sr_hash32_dev(idx, stepIdx, baseSeed) & 0xFFFFu;
+	uint32_t high16 = v.u >> 16;
+	if (rnd < low16) high16 += 1u;
+	return (unsigned short)(high16 & 0xFFFFu);
+}
+
+__global__ void chiron_scfa_axpy2_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
+                                                   float alpha,
+                                                   const float* __restrict__ a,
+                                                   const float* __restrict__ b,
+                                                   int n,
+                                                   uint32_t srBaseSeed,
+                                                   uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * (a[i] + b[i]);
+	p_bf[i] = fp32_to_bf16_sr_dev(acc, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// iter 70 (2026-05-19): Fused dual-output axpy2 for the iter 65 BF16-residual-p
+// mirror.  Computes new FP32 p = p_fp32 + alpha*(a+b) in an FP32 register and
+// writes BOTH the FP32 canonical (s.p) AND a BF16 SR-rounded mirror (s.p_bf16)
+// in a single pass.  Replaces the two-kernel sequence at chiron_main.cpp:6439+
+// (chiron_scfa_axpy2 then cast_f32_to_bf16_stochastic) used at every SCFA shear
+// commit under --bf16-residual-p.  SR hash matches k_cast_f32_to_bf16_stochastic
+// for bit-identical NLL when (srBaseSeed, srStepIdx) is preserved across calls.
+// Saves: 1 launch + 1 HBM read of p (Tm × 4 B) per layer per direction.
+__global__ void chiron_scfa_axpy2_dual_p_kernel(float* __restrict__ p_fp32,
+                                                 unsigned short* __restrict__ p_bf16,
+                                                 float alpha,
+                                                 const float* __restrict__ a,
+                                                 const float* __restrict__ b,
+                                                 int n,
+                                                 uint32_t srBaseSeed,
+                                                 uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	// Match chiron_scfa_axpy2_kernel's exact arithmetic form (p[i] += alpha *
+	// (a[i] + b[i])) so NVCC contracts to the same FMA emit — otherwise the
+	// register-pressure delta from the added BF16-SR computation can shift
+	// FMA decisions, producing ULP-scale FP32 drift (iter 50 pattern).
+	float p_val = p_fp32[i];
+	p_val += alpha * (a[i] + b[i]);
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// PIED perf pass (2026-07-02): masked variant of the iter 70 dual-output
+// commit — the fused FP32+BF16-SR write with the PIED eta folded in, so the
+// --bf16-residual-p path pays no extra [T×m] SR-cast pass while PIED is
+// active.  FP32 arithmetic form matches chiron_scfa_axpy2_masked_kernel
+// exactly (p += alpha*(eta*(a+b))) and the SR hash matches
+// chiron_scfa_axpy2_dual_p, so the fused call is bit-identical to the
+// (masked axpy2 then cast_f32_to_bf16_stochastic) pair at equal
+// (srBaseSeed, srStepIdx) — guarded by the chiron-pied unit test.
+// PIED perf pass (2026-07-02): dual-output dy hand-off — writes the masked
+// FP32 dy AND its BF16 round-to-nearest mirror in one pass.  The trainer
+// registers (dy_fp32, dy_bf16) via register_fast16bf_constant so the
+// downstream B^T·dy FAST_16BF GEMM skips its per-layer re-cast of the full
+// [T×m] buffer (the castElimDy once-per-backward dp mirror cannot apply
+// under PIED because dy = eta⊙dp changes per layer).  RN cast matches
+// cast_f32_to_bf16 (the dp-mirror precedent) so the GEMM input is
+// bit-identical to the unregistered path.  FP32 arithmetic matches
+// chiron_incdrop_scale_copy exactly.
+__global__ void chiron_incdrop_scale_copy_dual_kernel(float* __restrict__ dst,
+                                                      unsigned short* __restrict__ dst_bf,
+                                                      float alpha,
+                                                      const float* __restrict__ src, int n,
+                                                      unsigned int key, unsigned int thr,
+                                                      float lo, float hi)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	const float v = alpha * (eta * src[i]);
+	dst[i] = v;
+	dst_bf[i] = fp32_to_bf16_rn_dev(v);
+}
+
+__global__ void chiron_scfa_axpy2_masked_dual_p_kernel(float* __restrict__ p_fp32,
+                                                       unsigned short* __restrict__ p_bf16,
+                                                       float alpha,
+                                                       const float* __restrict__ a,
+                                                       const float* __restrict__ b,
+                                                       int n,
+                                                       unsigned int key, unsigned int thr,
+                                                       float lo, float hi,
+                                                       uint32_t srBaseSeed,
+                                                       uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	float p_val = p_fp32[i];
+	p_val += alpha * (eta * (a[i] + b[i]));
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// V3/V8 telemetry commit. The existing kernels remain the default-off path.
+// The write-enabled mode mirrors the commit for kernel parity tests. Production
+// uses readOnly after the canonical commit so stochastic-rounding counters are
+// untouched; warp/block reductions emit six layer scalars or a Fisher sum.
+// energy6 = {count, sum p_before^2, sum p_after^2, sum y^2,
+//            sum committed_increment^2, sum p_before*committed_increment}.
+__global__ void chiron_scfa_axpy2_vitals_kernel(
+    float* __restrict__ p_fp32, unsigned short* __restrict__ p_bf16,
+    float alpha, const float* __restrict__ a, const float* __restrict__ b,
+    int n, int useMask, unsigned int key, unsigned int thr, float lo, float hi,
+    uint32_t srBaseSeed, uint32_t srStepIdx,
+    float* __restrict__ energy6, const float* __restrict__ dp,
+    float* __restrict__ fisher, int readOnly)
+{
+	float acc[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+	float fsum = 0.0f;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += blockDim.x * gridDim.x)
+	{
+		const float eta = useMask ? chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi) : 1.0f;
+		const float y = a[i] + b[i];
+		const float committed = alpha * (eta * y);
+		float before, after;
+		if (readOnly)
+		{
+			after = p_fp32[i];
+			before = after - committed; // telemetry reconstruction only; no model write
+		}
+		else
+		{
+			before = p_fp32[i];
+			after = before + committed;
+			p_fp32[i] = after;
+			if (p_bf16)
+				p_bf16[i] = fp32_to_bf16_sr_dev(after, (uint32_t)i, srStepIdx, srBaseSeed);
+		}
+		if (energy6)
+		{
+			acc[0] += 1.0f;
+			acc[1] += before * before;
+			acc[2] += after * after;
+			acc[3] += y * y;
+			acc[4] += committed * committed;
+			acc[5] += before * committed;
+		}
+		if (fisher && dp)
+		{
+			const float yd = y * dp[i];
+			fsum += yd * yd;
+		}
+	}
+	const int lane = threadIdx.x & 31;
+	const int warp = threadIdx.x >> 5;
+	for (int off = 16; off > 0; off >>= 1)
+	{
+		for (int j = 0; j < 6; ++j)
+			acc[j] += __shfl_down_sync(0xFFFFFFFFu, acc[j], off);
+		fsum += __shfl_down_sync(0xFFFFFFFFu, fsum, off);
+	}
+	__shared__ float warpAcc[7][32];
+	if (lane == 0)
+	{
+		for (int j = 0; j < 6; ++j) warpAcc[j][warp] = acc[j];
+		warpAcc[6][warp] = fsum;
+	}
+	__syncthreads();
+	if (warp == 0)
+	{
+		const int nWarp = blockDim.x / 32;
+		for (int j = 0; j < 6; ++j) acc[j] = lane < nWarp ? warpAcc[j][lane] : 0.0f;
+		fsum = lane < nWarp ? warpAcc[6][lane] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			for (int j = 0; j < 6; ++j)
+				acc[j] += __shfl_down_sync(0xFFFFFFFFu, acc[j], off);
+			fsum += __shfl_down_sync(0xFFFFFFFFu, fsum, off);
+		}
+		if (lane == 0)
+		{
+			if (energy6) for (int j = 0; j < 6; ++j) atomicAdd(energy6 + j, acc[j]);
+			if (fisher) atomicAdd(fisher, fsum);
+		}
+	}
+}
+
+__global__ void chiron_vitals_reanchor_residual_kernel(
+    const float* __restrict__ savedStats,
+    const float* __restrict__ recomputedSplit,
+    int T, int sampleStride, float* __restrict__ residual)
+{
+	const int sample = blockIdx.x * blockDim.x + threadIdx.x;
+	const int row = sample * sampleStride;
+	if (row >= T) return;
+	const float muSaved = savedStats[(size_t)row * 2u];
+	const float sigmaSaved = savedStats[(size_t)row * 2u + 1u];
+	const float muRecomputed = recomputedSplit[row];
+	const float invRecomputed = recomputedSplit[T + row];
+	const float scaleProduct = fmaxf(sigmaSaved * invRecomputed, 1e-30f);
+	residual[sample] = fabsf(logf(1.0f / scaleProduct))
+	                 + fabsf(muSaved - muRecomputed) * invRecomputed;
+}
+
+__global__ void chiron_axpy_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
+                                             float alpha,
+                                             const float* __restrict__ x,
+                                             int n,
+                                             uint32_t srBaseSeed,
+                                             uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * x[i];
+	p_bf[i] = fp32_to_bf16_sr_dev(acc, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+__global__ void chiron_scfa_scaled_copy_bf16p_sr_kernel(unsigned short* __restrict__ c_bf,
+                                                         float alpha,
+                                                         const float* __restrict__ a,
+                                                         int n,
+                                                         uint32_t srBaseSeed,
+                                                         uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	c_bf[i] = fp32_to_bf16_sr_dev(alpha * a[i], (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// Reln forward: reads BF16 p row by row, computes FP32-internal mean / var /
+// normalize, writes FP32 q_out.  Stats stay FP32.  Identical math to
+// chiron_reln_forward_rows but with BF16-decoded reads.
+__global__ void chiron_reln_forward_rows_bf16p_kernel(
+    const unsigned short* __restrict__ p_bf_in,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float eps, int cols,
+    float* __restrict__ q_out,
+    float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const unsigned short* xRow = p_bf_in + (size_t)row * cols;
+	float*       oRow = q_out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean (decode BF16 inline).
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += bf16_to_fp32_dev(xRow[i]);
+	// reuse the blockReduceSum from gpu_chiron.cu by manual reduction:
+	// SMEM tree-reduce over blockDim.x threads → warp tail.
+	{
+		// Single-block warp reduce; simpler form since the existing
+		// blockReduceSum lives in anon namespace of this file.
+		__shared__ float sShared[33];
+		const int lane = threadIdx.x & 31;
+		const int warpId = threadIdx.x >> 5;
+		for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
+		if (lane == 0) sShared[warpId] = s;
+		__syncthreads();
+		if (warpId == 0) {
+			s = (threadIdx.x < (blockDim.x + 31) / 32) ? sShared[lane] : 0.0f;
+			for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
+		}
+		if (threadIdx.x == 0) sMean = s / (float)cols;
+	}
+	__syncthreads();
+	const float mu = sMean;
+	(void)sSumA;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = bf16_to_fp32_dev(xRow[i]) - mu;
+		v += d * d;
+	}
+	{
+		__shared__ float vShared[33];
+		const int lane = threadIdx.x & 31;
+		const int warpId = threadIdx.x >> 5;
+		for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, o);
+		if (lane == 0) vShared[warpId] = v;
+		__syncthreads();
+		if (warpId == 0) {
+			v = (threadIdx.x < (blockDim.x + 31) / 32) ? vShared[lane] : 0.0f;
+			for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, o);
+		}
+		if (threadIdx.x == 0) {
+			float var = v / (float)cols + eps;
+			sSigma = sqrtf(var);
+		}
+	}
+	__syncthreads();
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+	(void)sSumB;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = gamma[i] * (bf16_to_fp32_dev(xRow[i]) - mu) * inv_sigma + beta[i];
+
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
+// Reln inverse: reads FP32 q_out + stats, undoes affine + LN, SR-writes BF16 p.
+// p = ((q_out - beta) / gamma) * sigma + mu, then BF16 SR encode.
+__global__ void chiron_reln_inverse_rows_bf16p_sr_kernel(
+    const float* __restrict__ q_out,
+    const float* __restrict__ stats,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    int cols,
+    unsigned short* __restrict__ p_bf_out,
+    uint32_t srBaseSeed,
+    uint32_t srStepIdx)
+{
+	int row = blockIdx.x;
+	const float* oRow = q_out + (size_t)row * cols;
+	unsigned short* pRow = p_bf_out + (size_t)row * cols;
+	const float mu    = stats[(size_t)row * 2 + 0];
+	const float sigma = stats[(size_t)row * 2 + 1];
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float y = (oRow[i] - beta[i]) / gamma[i];
+		const float v = fmaf(sigma, y, mu);
+		pRow[i] = fp32_to_bf16_sr_dev(v, (uint32_t)((size_t)row * cols + i),
+		                              srStepIdx, srBaseSeed);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_scfa_sub(float* c, const float* a, const float* b, int n,
+                     cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_sub_kernel<<<grid, kBlockElem, 0, s>>>(c, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2(float* p, float alpha,
+                       const float* a, const float* b, int n,
+                       cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked shear-commit (see kernel comment above).
+bool chiron_scfa_axpy2_masked(float* p, float alpha,
+                              const float* a, const float* b, int n,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n,
+	                                                            key, thr, lo, hi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked dy hand-off (see kernel comment above).
+bool chiron_incdrop_scale_copy(float* dst, float alpha,
+                               const float* src, int n,
+                               unsigned int key, unsigned int thr,
+                               float lo, float hi,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_kernel<<<grid, kBlockElem, 0, s>>>(dst, alpha, src, n,
+	                                                             key, thr, lo, hi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 63 (Arc 2): BF16-p host wrappers.
+bool chiron_scfa_axpy2_bf16p_rn(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(p_bf, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_axpy_bf16p_rn(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_axpy_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(p_bf, alpha, x, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy_bf16p_rn(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(c_bf, alpha, a, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_bf16_to_fp32_axpy(float* q, float alpha,
+                               const unsigned short* p_bf, int n,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_bf16_to_fp32_axpy_kernel<<<grid, kBlockElem, 0, s>>>(q, alpha, p_bf, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 64: SR variants of the BF16-p kernels.  Same FP32 accum semantics as
+// the RN variants but with mean-zero rounding.  Caller supplies a per-tensor
+// seed + step counter (typically W.bf16WeightsSeed + step) so per-(model,
+// step, element) randomness is reproducible across runs with the same seed.
+bool chiron_scfa_axpy2_bf16p_sr(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 unsigned int srBaseSeed,
+                                 unsigned int srStepIdx,
+                                 cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_bf, alpha, a, b, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_axpy_bf16p_sr(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           unsigned int srBaseSeed,
+                           unsigned int srStepIdx,
+                           cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_axpy_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_bf, alpha, x, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 70 host wrapper for the fused dual-output axpy2 kernel.
+bool chiron_scfa_axpy2_dual_p(float* p_fp32, unsigned short* p_bf16,
+                               float alpha,
+                               const float* a, const float* b, int n,
+                               unsigned int srBaseSeed,
+                               unsigned int srStepIdx,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED dual-output dy hand-off (see kernel comment above).
+bool chiron_incdrop_scale_copy_dual(float* dst, unsigned short* dst_bf,
+                                    float alpha,
+                                    const float* src, int n,
+                                    unsigned int key, unsigned int thr,
+                                    float lo, float hi,
+                                    cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_dual_kernel<<<grid, kBlockElem, 0, s>>>(
+	    dst, dst_bf, alpha, src, n, key, thr, lo, hi);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// PIED masked dual-output commit (see kernel comment above).
+bool chiron_scfa_axpy2_masked_dual_p(float* p_fp32, unsigned short* p_bf16,
+                                     float alpha,
+                                     const float* a, const float* b, int n,
+                                     unsigned int key, unsigned int thr,
+                                     float lo, float hi,
+                                     unsigned int srBaseSeed,
+                                     unsigned int srStepIdx,
+                                     cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, key, thr, lo, hi, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2_vitals(float* p_fp32, unsigned short* p_bf16,
+                              float alpha,
+                              const float* a, const float* b, int n,
+                              bool useMask,
+                              unsigned int key, unsigned int thr,
+                              float lo, float hi,
+                              unsigned int srBaseSeed,
+                              unsigned int srStepIdx,
+                              float* energy6,
+                              const float* dp, float* fisher,
+                              bool readOnly,
+                              cudaStream_t stream)
+{
+	if (!p_fp32 || !a || !b || n <= 0) return false;
+	if (!energy6 && !fisher) return false;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	if (grid > 256) grid = 256;
+	cudaStream_t s = stream != 0 ? stream : computeStream();
+	chiron_scfa_axpy2_vitals_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, useMask ? 1 : 0,
+	    key, thr, lo, hi, srBaseSeed, srStepIdx, energy6, dp, fisher,
+	    readOnly ? 1 : 0);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_vitals_reanchor_residual(const float* savedStats,
+                                      const float* recomputedSplit,
+                                      int T, float* residual,
+                                      int sampleStride)
+{
+	if (!savedStats || !recomputedSplit || !residual || T <= 0 || sampleStride <= 0) return false;
+	const int block = 256;
+	const int samples = (T + sampleStride - 1) / sampleStride;
+	const int grid = (samples + block - 1) / block;
+	chiron_vitals_reanchor_residual_kernel<<<grid, block, 0, computeStream()>>>(
+	    savedStats, recomputedSplit, T, sampleStride, residual);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// PACT — Profile Anti-Cancellation Tax kernels (2026-07-04).  See gpu_chiron.h
+// and transformer_chiron_ops.h (CPU refs / spec of record).
+// ---------------------------------------------------------------------------
+
+__global__ void chiron_pact_cos_row_kernel(const float* __restrict__ phi,
+                                           float thetaMax, float* __restrict__ cosRow,
+                                           int m)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	cosRow[i] = cosf(thetaMax * tanhf(phi[i]));
+}
+
+// One thread per channel; walks layers L-1..0 accumulating the suffix product.
+__global__ void chiron_pact_damp_finalize_kernel(const float* __restrict__ cosTable,
+                                                 int L, int m,
+                                                 float* __restrict__ D,
+                                                 float* __restrict__ Dsq,
+                                                 float* __restrict__ D1)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	double suffix = 1.0;
+	double dsq = 0.0, d1 = 0.0;
+	for (int l = L - 1; l >= 0; --l)
+	{
+		suffix *= (double)cosTable[(size_t)l * (size_t)m + (size_t)i];
+		const float d = (float)suffix;
+		D[(size_t)l * (size_t)m + (size_t)i] = d;
+		dsq += (double)d * (double)d;
+		d1 += (double)d;
+	}
+	Dsq[i] = (float)dsq;
+	D1[i] = (float)d1;
+}
+
+// One thread per channel; sequential T-loop (deterministic, atomic-free).
+__global__ void chiron_pact_sigma_update_kernel(const float* __restrict__ Macc,
+                                                const float* __restrict__ D1,
+                                                int T, int m, float beta,
+                                                float eps0, int firstTouch,
+                                                float* __restrict__ sigma)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m) return;
+	double acc = 0.0;
+	for (int t = 0; t < T; ++t) acc += (double)Macc[(size_t)t * (size_t)m + (size_t)i];
+	const double colmean = acc / (double)T;
+	const float d1 = D1[i];
+	float s = (d1 > 0.0f) ? (float)(colmean / (double)d1) : 0.0f;
+	if (firstTouch) sigma[i] = s;
+	else            sigma[i] = (1.0f - beta) * sigma[i] + beta * s;
+	if (sigma[i] < eps0) sigma[i] = eps0;
+}
+
+// Fused masked dual-p commit + A/M accumulation.  The p-path statements are
+// textually identical to chiron_scfa_axpy2_masked_dual_p_kernel (bit-parity).
+__global__ void chiron_scfa_axpy2_masked_dual_p_pact_kernel(
+    float* __restrict__ p_fp32, unsigned short* __restrict__ p_bf16, float alpha,
+    const float* __restrict__ a, const float* __restrict__ b, int n, int m,
+    unsigned int key, unsigned int thr, float lo, float hi,
+    uint32_t srBaseSeed, uint32_t srStepIdx,
+    const float* __restrict__ Drow, float* __restrict__ Aacc, float* __restrict__ Macc)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+	float p_val = p_fp32[i];
+	p_val += alpha * (eta * (a[i] + b[i]));
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+	// PACT accumulation on the CLEAN increment (pre-mask).
+	const float u = a[i] + b[i];
+	const float d = Drow[i % m];
+	Aacc[i] += d * u;
+	Macc[i] += d * fabsf(u);
+}
+
+// Fused dy hand-off + PACT field.  The task branch (dyt, BF16-RN mirror) is
+// textually identical to chiron_incdrop_scale_copy_dual_kernel.  stats4 (may
+// be NULL) reduced per-block in shared memory then one atomicAdd per block.
+__global__ void chiron_incdrop_scale_copy_dual_pact_kernel(
+    float* __restrict__ dst, unsigned short* __restrict__ dst_bf, float alpha,
+    const float* __restrict__ src, const float* __restrict__ a,
+    const float* __restrict__ b, const float* __restrict__ Aacc,
+    const float* __restrict__ Macc, const float* __restrict__ Drow,
+    const float* __restrict__ Dsq, const float* __restrict__ sigma,
+    float coef, float kappa, float epsM, float eps0, int gateOn,
+    int n, int m, unsigned int key, unsigned int thr, float lo, float hi,
+    float* __restrict__ stats4)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	double c0 = 0.0, c1 = 0.0, c2 = 0.0, c3 = 0.0;
+	if (i < n)
+	{
+		const float eta = chiron_pied_eta_dev(key, (unsigned int)i, thr, lo, hi);
+		const float dyt = alpha * (eta * src[i]);
+		const int ch = i % m;
+		const float u = a[i] + b[i];
+		const float A = Aacc[i];
+		const float M = Macc[i];
+		const float Dl = Drow[ch];
+		const float dsq = Dsq[ch];
+		float sg = sigma[ch];
+		if (sg < eps0) sg = eps0;
+		const float res = u - A * Dl / dsq;
+		const float r = res / sg;
+		float rc = r;
+		if (rc > kappa) rc = kappa;
+		if (rc < -kappa) rc = -kappa;
+		float chi = 1.0f;
+		if (gateOn)
+		{
+			const float num = M * M - A * A;
+			const float den = M * M + epsM * dsq * (sg * sg);
+			chi = (den > 0.0f) ? (num / den) : 0.0f;
+			if (chi < 0.0f) chi = 0.0f;
+			if (chi > 1.0f) chi = 1.0f;
+		}
+		// Energy-scaled field: g ~ O(res) ~ O(increment) (2026-07-04 E2 refine —
+		// sigma is the Huber knee only, not a 1/sigma magnitude divisor).
+		const float g = coef * chi * sg * rc / dsq;
+		const float out = dyt + g;
+		dst[i] = out;
+		dst_bf[i] = fp32_to_bf16_rn_dev(out);
+		if (stats4)
+		{
+			const float ar = (r < 0.0f) ? -r : r;
+			const float H = (ar <= kappa) ? (r * r) : (kappa * (2.0f * ar - kappa));
+			c0 = (double)(chi * (sg * sg) * H / dsq);
+			c1 = (ar > kappa) ? 1.0 : 0.0;
+			c2 = (double)g * (double)g;
+			c3 = (double)dyt * (double)dyt;
+		}
+	}
+	if (stats4)
+	{
+		// Warp-shuffle reduction (2026-07-04 perf pass): the original all-threads
+		// shared double-atomicAdd serialized on 4 addresses (CAS contention →
+		// 17.8 ms/call, 39% of GPU time per nsys).  Reduce in-register per warp,
+		// one shared slot per warp, one block-level global atomicAdd.  Diagnostic
+		// only — the field output (dst/dst_bf) above is untouched/bit-identical.
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			c0 += __shfl_down_sync(0xffffffffu, c0, off);
+			c1 += __shfl_down_sync(0xffffffffu, c1, off);
+			c2 += __shfl_down_sync(0xffffffffu, c2, off);
+			c3 += __shfl_down_sync(0xffffffffu, c3, off);
+		}
+		__shared__ double ws0[32], ws1[32], ws2[32], ws3[32];
+		const int warp = threadIdx.x >> 5;
+		const int lane = threadIdx.x & 31;
+		if (lane == 0) { ws0[warp] = c0; ws1[warp] = c1; ws2[warp] = c2; ws3[warp] = c3; }
+		__syncthreads();
+		if (threadIdx.x == 0)
+		{
+			const int nw = (blockDim.x + 31) >> 5;
+			double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+			for (int w = 0; w < nw; ++w) { s0 += ws0[w]; s1 += ws1[w]; s2 += ws2[w]; s3 += ws3[w]; }
+			atomicAdd(&stats4[0], (float)s0);
+			atomicAdd(&stats4[1], (float)s1);
+			atomicAdd(&stats4[2], (float)s2);
+			atomicAdd(&stats4[3], (float)s3);
+		}
+	}
+}
+
+bool chiron_pact_cos_row(const float* phi, float thetaMax, float* cosRow,
+                         int m, cudaStream_t stream)
+{
+	if (m <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_cos_row_kernel<<<grid, kBlockElem, 0, s>>>(phi, thetaMax, cosRow, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_pact_damp_finalize(const float* cosTable, int L, int m,
+                               float* D, float* Dsq, float* D1, cudaStream_t stream)
+{
+	if (m <= 0 || L <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_damp_finalize_kernel<<<grid, kBlockElem, 0, s>>>(cosTable, L, m, D, Dsq, D1);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_pact_sigma_update(const float* Macc, const float* D1, int T, int m,
+                              float beta, float eps0, int firstTouch,
+                              float* sigma, cudaStream_t stream)
+{
+	if (m <= 0 || T <= 0) return true;
+	int grid = (m + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_pact_sigma_update_kernel<<<grid, kBlockElem, 0, s>>>(
+	    Macc, D1, T, m, beta, eps0, firstTouch, sigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2_masked_dual_p_pact(float* p_fp32, unsigned short* p_bf16,
+                                          float alpha, const float* a, const float* b,
+                                          int n, int m, unsigned int key, unsigned int thr,
+                                          float lo, float hi, unsigned int srBaseSeed,
+                                          unsigned int srStepIdx, const float* Drow,
+                                          float* Aacc, float* Macc, cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_masked_dual_p_pact_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, m, key, thr, lo, hi, srBaseSeed, srStepIdx,
+	    Drow, Aacc, Macc);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_incdrop_scale_copy_dual_pact(float* dst, unsigned short* dst_bf,
+                                         float alpha, const float* src,
+                                         const float* a, const float* b,
+                                         const float* Aacc, const float* Macc,
+                                         const float* Drow, const float* Dsq,
+                                         const float* sigma, float coef, float kappa,
+                                         float epsM, float eps0, int gateOn,
+                                         int n, int m, unsigned int key, unsigned int thr,
+                                         float lo, float hi, float* stats4,
+                                         cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_incdrop_scale_copy_dual_pact_kernel<<<grid, kBlockElem, 0, s>>>(
+	    dst, dst_bf, alpha, src, a, b, Aacc, Macc, Drow, Dsq, sigma,
+	    coef, kappa, epsM, eps0, gateOn, n, m, key, thr, lo, hi, stats4);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy_bf16p_sr(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       unsigned int srBaseSeed,
+                                       unsigned int srStepIdx,
+                                       cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    c_bf, alpha, a, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_forward_rows_bf16p(const unsigned short* p_bf_in,
+                                     float* q_out, float* stats,
+                                     const float* gamma, const float* beta,
+                                     int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	const int block = rowBlockSize(m);
+	const int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_reln_forward_rows_bf16p_kernel<<<T, block, smemBytes, computeStream()>>>(
+	    p_bf_in, gamma, beta, eps, m, q_out, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_inverse_rows_bf16p_sr(const float* q_out, const float* stats,
+                                        const float* gamma, const float* beta,
+                                        int T, int m,
+                                        unsigned short* p_bf_out,
+                                        unsigned int srBaseSeed,
+                                        unsigned int srStepIdx)
+{
+	if (T <= 0 || m <= 0) return true;
+	const int block = rowBlockSize(m);
+	chiron_reln_inverse_rows_bf16p_sr_kernel<<<T, block, 0, computeStream()>>>(
+	    q_out, stats, gamma, beta, m, p_bf_out, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n,
+                              cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_kernel<<<grid, kBlockElem, 0, s>>>(c, alpha, a, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  2. Reversible LayerNorm (ReLN) forward.
+// ===========================================================================
+//
+// One block per token.  Each block computes the row mean and variance via
+// warp/block reductions, writes the normalized row, and records
+// (mu, sigma) into stats[row, 0..1].
+
+namespace {
+
+__global__ void chiron_reln_forward_rows(const float* __restrict__ q_in,
+                                         const float* __restrict__ gamma,
+                                         const float* __restrict__ beta,
+                                         float eps, int cols,
+                                         float* __restrict__ q_out,
+                                         float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const float* xRow = q_in + (size_t)row * cols;
+	float*       oRow = q_out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+
+	const float mu = sMean;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: normalize + affine.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
+
+	// Stats: { mu, sigma } for this row.
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
+// Port A (cast-elimination arc, 2026-06-12): reln forward with a BF16 mirror
+// side-write.  Identical math to chiron_reln_forward_rows; pass 3 also
+// writes the RNE-rounded BF16 encoding of each output element, bit-identical
+// to running k_cast_f32_to_bf16 on q_out afterwards.  Lets the downstream
+// FAST_16BF outer GEMM consume the mirror via the fast16bf constant table
+// instead of launching a standalone T×m cast (iter 97/99/101 side-write
+// mechanism class).  See research/CAST_CENSUS_2026_06_12.md.
+__global__ void chiron_reln_forward_rows_dual(const float* __restrict__ q_in,
+                                              const float* __restrict__ gamma,
+                                              const float* __restrict__ beta,
+                                              float eps, int cols,
+                                              float* __restrict__ q_out,
+                                              unsigned short* __restrict__ q_out_bf16,
+                                              float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const float* xRow = q_in + (size_t)row * cols;
+	float*       oRow = q_out + (size_t)row * cols;
+	unsigned short* bRow = q_out_bf16 + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+
+	const float mu = sMean;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: normalize + affine, with BF16 RNE side-write (same encoding as
+	// k_cast_f32_to_bf16: round-to-nearest-even via lsb bias; NaN flushed to
+	// sign-preserving quiet NaN).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float o = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
+		oRow[i] = o;
+		union { float f; uint32_t u; } enc;
+		enc.f = o;
+		if (isnan(o)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			bRow[i] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			bRow[i] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+
+	// Stats: { mu, sigma } for this row.
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
+// Fused WhiSC rotation + q-side ReLN (dual: FP32 + BF16 mirror).  Perf pass
+// 2026-07-04: eliminates the separate chiron_rot_forward [T*m] pass.  Pass 0
+// applies the folded 3-shear rotation per channel (writing p_rot in place and
+// stashing q_rot in shared), then the standard 3-pass ReLN reads q_rot from
+// shared — so q never round-trips through global between rotation and ReLN.
+// BIT-IDENTICAL to { chiron_rot_forward_rows(+1); chiron_reln_forward_rows_dual }:
+// the per-channel shear math and FMA order match rot_forward_rows exactly, and
+// the ReLN reduction operates on the same rotated FP32 values.
+__global__ void chiron_rot_reln_forward_rows_dual(
+        float* __restrict__ q_io, float* __restrict__ p_io,
+        const float* __restrict__ rot_a, const float* __restrict__ rot_c,
+        const float* __restrict__ gamma, const float* __restrict__ beta,
+        float eps, int cols,
+        unsigned short* __restrict__ q_out_bf16,
+        float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	float* qRow = q_io + (size_t)row * cols;
+	float* pRow = p_io + (size_t)row * cols;
+	unsigned short* bRow = q_out_bf16 + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	float* sQrot = smem + 2 * (blockDim.x / 32 + 1);   // cols floats: rotated q row
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 0: folded 3-shear rotation.  q_rot -> shared, p_rot -> global.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float qv = qRow[i], pv = pRow[i], ai = rot_a[i], ci = rot_c[i];
+		qv += ai * pv;   // shear1: q1 = q0 + a*p0
+		pv += ci * qv;   // shear2: p1 = p0 + c*q1
+		qv += ai * pv;   // shear3: q2 = q1 + a*p1
+		pRow[i] = pv;    // write p_rot (in place; one thread per element)
+		sQrot[i] = qv;   // stash rotated q for the ReLN passes
+	}
+	__syncthreads();
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += sQrot[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = sQrot[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: normalize + affine, in-place q write + BF16 RNE mirror (encoding
+	// identical to chiron_reln_forward_rows_dual / k_cast_f32_to_bf16).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float o = gamma[i] * (sQrot[i] - mu) * inv_sigma + beta[i];
+		qRow[i] = o;
+		union { float f; uint32_t u; } enc;
+		enc.f = o;
+		if (isnan(o)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			bRow[i] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			bRow[i] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
+                          const float* gamma, const float* beta,
+                          int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	// iter 9 (2026-05-14): in-place safe — kernel reads xRow then writes oRow
+	// per-element within a single thread iteration; if q_in == q_out the read
+	// precedes the write per address.  __syncthreads between passes ensures
+	// reductions complete before the normalize pass starts.  The 3-pass row
+	// pattern (mean → variance → normalize+affine) is bit-identical whether
+	// q_in == q_out or not.
+	chiron_reln_forward_rows<<<T, block, smemBytes, computeStream()>>>(
+		q_in, gamma, beta, eps, m, q_out, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_forward_dual(const float* q_in, float* q_out,
+                              unsigned short* q_out_bf16, float* stats,
+                              const float* gamma, const float* beta,
+                              int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	if (!q_out_bf16)
+		return chiron_reln_forward(q_in, q_out, stats, gamma, beta, T, m, eps);
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	// In-place safe for q_in == q_out by the same per-element read-then-write
+	// argument as chiron_reln_forward (iter 9 note above).
+	chiron_reln_forward_rows_dual<<<T, block, smemBytes, computeStream()>>>(
+		q_in, gamma, beta, eps, m, q_out, q_out_bf16, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Fused WhiSC rotation + q-side ReLN (dual).  In-place on q, p.  Replaces the
+// { chiron_rot_forward(+1); chiron_reln_forward_dual } pair — bit-identical,
+// one fewer [T*m] pass.  rot_a/rot_c are the already-folded WhiSC coefficients.
+bool chiron_rot_reln_forward_dual(float* q, float* p,
+                                  const float* rot_a, const float* rot_c,
+                                  const float* gamma, const float* beta,
+                                  float eps, int T, int m,
+                                  unsigned short* q_out_bf16, float* stats)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	// reduction scratch (2*(block/32+1) floats, +2 pad) + the rotated q row (m).
+	int smemBytes = ((block / 32 + 2) * 2 + m) * (int)sizeof(float);
+	chiron_rot_reln_forward_rows_dual<<<T, block, smemBytes, computeStream()>>>(
+		q, p, rot_a, rot_c, gamma, beta, eps, m, q_out_bf16, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  2b. Fused reln-forward + axpy-into-q (ralph-loop iter 9, 2026-05-14).
+// ===========================================================================
+//
+// Replaces the 2-call pattern in CHIRON's per-layer-fuse path:
+//     chiron_reln_forward(p, p_norm, stats, gamma_p, beta_p, T, m, eps);
+//     axpy(alpha, p_norm, q, T*m);  // q += alpha · p_norm
+// with a single kernel that computes normalized p AND accumulates it into q
+// in one pass.  Eliminates the p_norm round-trip (1 write + 1 read of a
+// T·m FP32 buffer = ~128 MB per call at T=8192 m=2048).
+//
+// Math is bit-identical FP32 modulo associativity of the inner FMA
+// (alpha·(γ·(p-μ)/σ + β) is computed as one expression per element, so
+// the rounding may differ by 1 ULP from the two-call form — sub-ULP at
+// FP32 mantissa).
+//
+// Caller responsibility: alpha can be positive (forward q += α·reln(p))
+// or negative (backward step 2: q -= α·reln(p) ≡ q += (-α)·reln(p)).
+// stats[T, 2] is written exactly as chiron_reln_forward writes them.
+
+namespace {
+
+__global__ void chiron_reln_axpy_into_q_rows(const float* __restrict__ p,
+                                              const float* __restrict__ gamma,
+                                              const float* __restrict__ beta,
+                                              float alpha, float eps, int cols,
+                                              float* __restrict__ q,
+                                              float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const float* xRow = p + (size_t)row * cols;
+	float*       qRow = q + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean of p.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+
+	const float mu = sMean;
+
+	// Pass 2: variance of p.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: q[i] += alpha · (gamma[i] · (p[i] - mu) / sigma + beta[i]).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p_norm_i = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
+		qRow[i] += alpha * p_norm_i;
+	}
+
+	// Stats: { mu, sigma } for this row (same format as chiron_reln_forward).
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = sigma;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
+                              const float* gamma, const float* beta,
+                              float alpha, int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_reln_axpy_into_q_rows<<<T, block, smemBytes, computeStream()>>>(
+		p, gamma, beta, alpha, eps, m, q, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  2c. OBSD per-layer drift (richer symplectic block — Task 2).
+// ===========================================================================
+//
+// Forward (sign=+1): q[i] += scale·a[i]·tanh(gamma[i]·x̂ + beta[i]),
+//   x̂ = (p[i] − μ) / σ, with μ,σ the per-row mean/std of p (parameter-free
+//   normalize, μ,σ over the m channels of the row).  Inverse (sign=−1)
+//   subtracts the same term.  The drift never modifies p, so the inverse
+//   recomputes x̂ from p exactly and reconstructs q.  No stats are emitted
+//   (μ,σ are re-derived from p in both directions and in the backward).
+
+namespace {
+
+__global__ void chiron_drift_into_q_rows(const float* __restrict__ p,
+                                         const float* __restrict__ a,
+                                         const float* __restrict__ gamma,
+                                         const float* __restrict__ beta,
+                                         float sign, float scale, float eps, int cols,
+                                         float* __restrict__ q)
+{
+	int row = blockIdx.x;
+	const float* xRow = p + (size_t)row * cols;
+	float*       qRow = q + (size_t)row * cols;
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	__shared__ float sMean, sSigma;
+
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) { float d = xRow[i]-mu; v += d*d; }
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) { float var = v/(float)cols + eps; sSigma = sqrtf(var); }
+	__syncthreads();
+	const float inv_sigma = 1.0f / sSigma;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float xhat = (xRow[i] - mu) * inv_sigma;
+		float u = gamma[i] * xhat + beta[i];
+		qRow[i] += sign * scale * a[i] * tanhf(u);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_drift_into_q(const float* p, float* q, const float* a,
+                         const float* gamma, const float* beta,
+                         float sign, float scale, int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_drift_into_q_rows<<<T, block, smemBytes, computeStream()>>>(
+	    p, a, gamma, beta, sign, scale, eps, m, q);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  3. Reversible LayerNorm (ReLN) inverse.
+// ===========================================================================
+//
+// Given q_out, stats[row, 0..1] = { mu, sigma }, recover q_in.
+// Single-pass per row.
+
+namespace {
+
+__global__ void chiron_reln_inverse_rows(const float* __restrict__ q_out,
+                                         const float* __restrict__ stats,
+                                         const float* __restrict__ gamma,
+                                         const float* __restrict__ beta,
+                                         int cols,
+                                         float* __restrict__ q_in)
+{
+	int row = blockIdx.x;
+	const float* yRow = q_out + (size_t)row * cols;
+	float*       xRow = q_in  + (size_t)row * cols;
+
+	const float mu    = stats[(size_t)row * 2 + 0];
+	const float sigma = stats[(size_t)row * 2 + 1];
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		// x = fma(sigma, (y - beta) / gamma, mu)
+		const float y = (yRow[i] - beta[i]) / gamma[i];
+		xRow[i] = fmaf(sigma, y, mu);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
+                          const float* gamma, const float* beta,
+                          int T, int m)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	chiron_reln_inverse_rows<<<T, block, 0, computeStream()>>>(
+		q_out, stats, gamma, beta, m, q_in);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  3b. Reversible LayerNorm backward (wraps layernorm_backward).
+// ===========================================================================
+//
+// ReLN forward is numerically identical to LayerNorm forward — the only
+// novelty is where (mu, sigma) are stored. For the backward pass
+// we convert the external (mu, sigma) stats buffer into the
+// (mean[T], invStd[T]) format that the existing layernorm_backward
+// kernel expects, then defer to that kernel.
+
+namespace {
+
+// Kernel to split [T, 2] (mu, sigma) -> two separate [T] buffers
+// (mean, invStd).  One thread per row.
+__global__ void chiron_stats_split_kernel(const float* __restrict__ stats,
+                                          int T,
+                                          float* __restrict__ mean,
+                                          float* __restrict__ invStd)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < T)
+	{
+		mean[i]   = stats[(size_t)i * 2 + 0];
+		invStd[i] = 1.0f / stats[(size_t)i * 2 + 1];
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_backward(const float* dq_out, const float* q_in,
+                           const float* gamma, const float* stats,
+                           int T, int m,
+                           float* dq_in, float* dgamma, float* dbeta,
+                           float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+
+	// Split stats[T, 2] into mean[T] and invStd[T] via a small kernel.
+	float* d_mean  = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	const int grid = (T + kBlockElem - 1) / kBlockElem;
+	chiron_stats_split_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    stats, T, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Delegate to the existing LayerNorm backward kernel, which
+	// already handles the complex dx / dgamma / dbeta computation.
+	return layernorm_backward(dq_out, q_in, gamma, d_mean, d_invStd,
+	                           T, m, dq_in, dgamma, dbeta);
+}
+
+// Phase 3 (q-side source cure, 2026-06-17): bounded ReLN backward — clamps the
+// normalized xhat to [-xhatMax, xhatMax] in the dgamma/dbeta reduction, so the
+// BF16-inverse reconstruction drift that inflates xhat (and overflows dgamma)
+// is bounded at its source.  xhatMax<=0 = plain chiron_reln_backward.
+bool chiron_reln_backward_bounded(const float* dq_out, const float* q_in,
+                                   const float* gamma, const float* stats,
+                                   int T, int m,
+                                   float* dq_in, float* dgamma, float* dbeta,
+                                   float* scratch_stats_split, float xhatMax)
+{
+	if (T <= 0 || m <= 0) return true;
+	float* d_mean  = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	const int grid = (T + kBlockElem - 1) / kBlockElem;
+	chiron_stats_split_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    stats, T, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return layernorm_backward_bounded(dq_out, q_in, gamma, d_mean, d_invStd,
+	                                   T, m, dq_in, dgamma, dbeta, xhatMax);
+}
+
+// ===========================================================================
+//  3c. ReLN reverse-consistency backward (q-side instability cure, 2026-06-23).
+// ===========================================================================
+//
+// Root cause (grad-trigger evidence, seed 2024 step 24070): the backward
+// normalizes the recomputed activation q_in with the SAVED forward stats,
+// which have drifted, inflating xhat ~13x BEFORE the sum-over-T forms dgamma
+// and overflows it.  This backward re-derives (mean, invStd) from q_in itself
+// (mirroring chiron_reln_forward_rows' two-pass reduction), so the xhat that
+// layernorm_backward forms is unit-RMS by construction.  On a healthy step
+// (recompute == forward) the re-derived stats equal the saved stats up to
+// fp reduction order -> near-identity.  See
+// docs/superpowers/specs/2026-06-23-reln-reverse-consistency-design.md.
+
+namespace {
+
+// One block per row: recompute mean and invStd from q_in over the m columns.
+// Writes mean[T] into split[0..T) and invStd[T] into split[T..2T), matching the
+// (mean, invStd) layout chiron_reln_backward feeds to layernorm_backward.
+__global__ void chiron_reln_reanchor_stats_kernel(const float* __restrict__ q_in,
+                                                  int cols, float eps,
+                                                  float* __restrict__ mean,
+                                                  float* __restrict__ invStd)
+{
+	int row = blockIdx.x;
+	const float* xRow = q_in + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+	__shared__ float sMean, sInvStd;
+
+	// Pass 1: mean.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+	const float mu = sMean;
+
+	// Pass 2: variance -> invStd.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sInvStd = 1.0f / sqrtf(var);
+	}
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		mean[row]   = mu;
+		invStd[row] = sInvStd;
+	}
+}
+
+} // anonymous namespace
+
+// Re-anchored ReLN backward: identical interface to chiron_reln_backward, but
+// derives (mean, invStd) from q_in rather than the saved stats.  `eps` must
+// match the forward's eps_reln so healthy steps reproduce the saved stats.
+bool chiron_reln_backward_reanchor(const float* dq_out, const float* q_in,
+                                    const float* gamma,
+                                    int T, int m, float eps,
+                                    float* dq_in, float* dgamma, float* dbeta,
+                                    float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+	float* d_mean   = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	int block = rowBlockSize(m);
+	size_t smemBytes = 2u * (size_t)(block / 32 + 1) * sizeof(float);
+	chiron_reln_reanchor_stats_kernel<<<T, block, smemBytes, computeStream()>>>(
+	    q_in, m, eps, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return layernorm_backward(dq_out, q_in, gamma, d_mean, d_invStd,
+	                          T, m, dq_in, dgamma, dbeta);
+}
+
+// ===========================================================================
+//  3d. OBSD per-layer drift backward.
+// ===========================================================================
+//
+// Chain: u = gamma·x̂ + beta ; s = tanh(u) ; q_out = q_in + scale·a·s, with
+// x̂ = (p−μ)/σ and μ,σ per row of p (reanchored — recomputed from p).  Given
+// dq_out this accumulates:
+//   da     += Σ_t scale·s·dq_out
+//   du      = scale·a·(1−s²)·dq_out ; dgamma += Σ_t du·x̂ ; dbeta += Σ_t du
+//   dp      = parameter-free-normalize-backward of g = du⊙gamma
+// The dp/dgamma/dbeta computation is delegated to chiron_reln_backward_reanchor
+// called with dq_out:=du, gamma:=gamma_p — it forms g=du⊙gamma internally and
+// also returns dgamma=Σ du·x̂ and dbeta=Σ du.  This pre-backward kernel only
+// materializes du[T,m] and sdq[T,m]=scale·s·dq_out; da is the column-sum of sdq.
+
+namespace {
+
+// Per row: recompute μ,σ,x̂,u from p; write du and sdq.  Mirrors the two-pass
+// reduction of chiron_drift_into_q_rows / chiron_reln_reanchor_stats_kernel.
+__global__ void chiron_drift_pre_backward_rows(const float* __restrict__ p,
+                                               const float* __restrict__ dq,
+                                               const float* __restrict__ a,
+                                               const float* __restrict__ gamma,
+                                               const float* __restrict__ beta,
+                                               float scale, float eps, int cols,
+                                               float* __restrict__ du,
+                                               float* __restrict__ sdq)
+{
+	int row = blockIdx.x;
+	const float* pr = p + (size_t)row*cols; const float* dr = dq + (size_t)row*cols;
+	float* duR = du + (size_t)row*cols; float* sdqR = sdq + (size_t)row*cols;
+	extern __shared__ float smem[];
+	float* sA = smem; float* sB = smem + (blockDim.x/32 + 1);
+	__shared__ float sMean, sSigma;
+	float s=0.f; for (int i=threadIdx.x;i<cols;i+=blockDim.x) s+=pr[i];
+	s=blockReduceSum(s,sA); if(threadIdx.x==0) sMean=s/(float)cols; __syncthreads();
+	const float mu=sMean;
+	float v=0.f; for (int i=threadIdx.x;i<cols;i+=blockDim.x){ float d=pr[i]-mu; v+=d*d; }
+	v=blockReduceSum(v,sB); if(threadIdx.x==0){ float var=v/(float)cols+eps; sSigma=sqrtf(var);} __syncthreads();
+	const float inv=1.0f/sSigma;
+	for (int i=threadIdx.x;i<cols;i+=blockDim.x){
+		float xhat=(pr[i]-mu)*inv; float u=gamma[i]*xhat+beta[i]; float sa=tanhf(u); float sp=1.0f-sa*sa;
+		duR[i]  = scale*a[i]*sp*dr[i];
+		sdqR[i] = scale*sa*dr[i];
+	}
+}
+
+// Deterministic column sum: one block per channel column, loop over rows.
+//   out[j] += Σ_t in[t*cols+j].
+__global__ void chiron_col_accumulate(const float* __restrict__ in, int rows, int cols,
+                                      float* __restrict__ out)
+{
+	int j = blockIdx.x; if (j>=cols) return;
+	float acc=0.f; for (int t=threadIdx.x; t<rows; t+=blockDim.x) acc += in[(size_t)t*cols + j];
+	extern __shared__ float red[];
+	acc = blockReduceSum(acc, red);
+	if (threadIdx.x==0) out[j] += acc;
+}
+
+} // anonymous namespace
+
+bool chiron_drift_backward(const float* dq_out, const float* p, const float* a,
+                           const float* gamma, const float* beta, float scale,
+                           int T, int m, float eps,
+                           float* dp, float* da, float* dgamma, float* dbeta,
+                           float* scratch_du, float* scratch_sdq,
+                           float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+	// du and sdq scratch (each [T, m]) are caller-owned (clobbered) — no
+	// per-call cudaMalloc on the training hot path (Task 6 wires these in).
+
+	int block = rowBlockSize(m);
+	int smemBytes = (block/32 + 2) * 2 * sizeof(float);
+	chiron_drift_pre_backward_rows<<<T, block, smemBytes, computeStream()>>>(
+	    p, dq_out, a, gamma, beta, scale, eps, m, scratch_du, scratch_sdq);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// da += colsum(sdq).  One block per channel; deterministic.  Consumes
+	// scratch_sdq for da BEFORE we reuse it as the reanchor dp-temp below
+	// (both run on computeStream() → ordered).
+	int rblock = 256; int rsmem = (rblock/32 + 1) * sizeof(float);
+	chiron_col_accumulate<<<m, rblock, rsmem, computeStream()>>>(scratch_sdq, T, m, da);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// dgamma/dbeta ACCUMULATE into the caller's buffers; the reanchor's dq_in
+	// path OVERWRITES, so route its dp output to scratch_sdq (free after
+	// col_accumulate) instead of the caller's dp.
+	if (!chiron_reln_backward_reanchor(scratch_du, p, gamma, T, m, eps,
+	                                   /*dq_in=*/scratch_sdq, dgamma, dbeta,
+	                                   scratch_stats_split))
+		return false;
+
+	// dp += drift dp contribution (so dp accumulates onto the downstream adjoint
+	// already held in dp, rather than clobbering it).
+	return axpy(1.0f, scratch_sdq, dp, T * m);
+}
+
+// ===========================================================================
+//  3b. SORC per-channel symplectic rotation coupling.
+// ===========================================================================
+//
+// Rotates the (q,p) state via per-channel angle theta(phi) = s_warm * theta_max * tanh(phi).
+// The rotation is realized as 3 shears: q += a*p, p += c*q, q += a*p,
+// where a = -tan(theta/2) and c = sin(theta).
+
+namespace {
+
+__global__ void chiron_rot_coeffs_kernel(const float* __restrict__ phi, float theta_max, float s_warm, int m,
+                                         float* __restrict__ a, float* __restrict__ c) {
+	int i = blockIdx.x*blockDim.x + threadIdx.x; if (i>=m) return;
+	float th = s_warm*theta_max*tanhf(phi[i]);
+	a[i] = -tanf(0.5f*th); c[i] = sinf(th);
+}
+
+// sign=+1 forward (3 shears), sign=-1 inverse (3 negated shears reversed). One block-stride over T*m.
+__global__ void chiron_rot_forward_rows(float* __restrict__ q, float* __restrict__ p,
+                                        const float* __restrict__ a, const float* __restrict__ c,
+                                        float sign, int T, int m) {
+	long n=(long)T*m;
+	for (long k=blockIdx.x*(long)blockDim.x+threadIdx.x; k<n; k+=(long)gridDim.x*blockDim.x) {
+		int i=k%m; float qv=q[k], pv=p[k], ai=a[i], ci=c[i];
+		if (sign>0.f) { qv+=ai*pv; pv+=ci*qv; qv+=ai*pv; }       // forward
+		else          { qv-=ai*pv; pv-=ci*qv; qv-=ai*pv; }       // inverse
+		q[k]=qv; p[k]=pv;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_rot_coeffs(const float* phi, float theta_max, float s_warm, int m, float* a, float* c) {
+	if (m<=0) return true; int blk=256, grd=(m+blk-1)/blk;
+	chiron_rot_coeffs_kernel<<<grd,blk,0,computeStream()>>>(phi,theta_max,s_warm,m,a,c);
+	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
+}
+
+bool chiron_rot_forward(float* q, float* p, const float* a, const float* c, float sign, int T, int m) {
+	if (T<=0||m<=0) return true; long n=(long)T*m; int blk=256; int grd=(int)((n+blk-1)/blk); if(grd>65535)grd=65535;
+	chiron_rot_forward_rows<<<grd,blk,0,computeStream()>>>(q,p,a,c,sign,T,m);
+	GLADES_CUDA_CHECK(cudaGetLastError()); return true;
+}
+
+// Two-pass fused rot backward: eliminates the 2x[T*m] (~536 MB/call) da_el/dc_el
+// scratch traffic by reducing directly into [ROT_NCHUNK*m] partials (~256 KB each).
+//
+// Pass 1 (chiron_rot_fused_backward): grid (ceil(m/256), ROT_NCHUNK), block 256.
+//   Thread cx = blockIdx.x*256+threadIdx.x owns one channel (guard cx<m).
+//   blockIdx.y = by covers token chunk [by*chunk, min(...,T)).
+//   For each token: recomputes shear intermediates, transforms dq/dp in-place
+//   (coalesced at fixed t, consecutive cx), accumulates local da/dc in registers.
+//   Writes partialDa[by*m+cx] and partialDc[by*m+cx] (ROT_NCHUNK*m each).
+//
+// Pass 2 (chiron_rot_fused_chain_kernel): one thread per channel.
+//   Sums ROT_NCHUNK partials, applies whisc_a scaling, applies chain rule -> dphi.
+//   Folds the former chiron_rot_chain_kernel so no separate finalize pass is needed.
+//
+// Internal scratch (partialDa, partialDc) is function-static; lazily allocated/
+// resized. The public chiron_rot_backward signature is unchanged.
+// scratch_da/scratch_dc arguments are accepted but unused (kept for ABI stability).
+
+static const int ROT_NCHUNK = 32;
+
+__global__ void chiron_rot_fused_backward(
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ q_in, const float* __restrict__ p_in,
+        const float* __restrict__ a, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int cx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (cx >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	float ai = a[cx], ci = c_coeff[cx];
+	float local_da = 0.0f, local_dc = 0.0f;
+	for (int t = t_start; t < t_end; ++t) {
+		long k = (long)t * m + cx;
+		float q0 = q_in[k], p0 = p_in[k];
+		float q1 = q0 + ai*p0; float p1 = p0 + ci*q1;
+		float dq2 = dqo[k], dp1 = dpo[k];
+		float dq1 = dq2; float dp1a = dp1 + ai*dq2; float dael = p1*dq2;    // shear3 bwd
+		float dp0 = dp1a; dq1 += ci*dp1a; float dcel = q1*dp1a;             // shear2 bwd
+		float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;                     // shear1 bwd
+		dqi[k] = dq0; dpi[k] = dp0;
+		local_da += dael; local_dc += dcel;
+	}
+	partialDa[(long)by*m + cx] = local_da;
+	partialDc[(long)by*m + cx] = local_dc;
+}
+
+// Finalize + chain: sums ROT_NCHUNK partials, applies optional whisc_a scaling,
+// maps (da,dc,phi) -> dphi (ACCUMULATE). whisc_a=NULL on the SORC path.
+__global__ void chiron_rot_fused_chain_kernel(
+        const float* __restrict__ partialDa, const float* __restrict__ partialDc,
+        const float* __restrict__ phi, float theta_max, float s_warm, int m, int nchunk,
+        float* __restrict__ dphi, const float* __restrict__ whisc_a) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= m) return;
+	float sumDa = 0.0f, sumDc = 0.0f;
+	for (int by = 0; by < nchunk; ++by) {
+		sumDa += partialDa[(long)by*m + i];
+		sumDc += partialDc[(long)by*m + i];
+	}
+	float th = s_warm*theta_max*tanhf(phi[i]);  // FIXED: include s_warm in effective angle theta_eff
+	float dadth = -0.5f/(cosf(0.5f*th)*cosf(0.5f*th)); float dcdth = cosf(th);
+	float dthdphi = s_warm*theta_max*(1.f - tanhf(phi[i])*tanhf(phi[i]));
+	float da_eff, dc_eff;
+	if (whisc_a != NULL) {
+		float wa2 = whisc_a[i]*whisc_a[i];
+		da_eff = sumDa*wa2; dc_eff = sumDc/wa2;
+	} else {
+		da_eff = sumDa; dc_eff = sumDc;
+	}
+	dphi[i] += (da_eff*dadth + dc_eff*dcdth)*dthdphi;   // ACCUMULATE
+}
+
+bool chiron_rot_backward(const float* dq_out, const float* dp_out,
+                         const float* q_in, const float* p_in,
+                         const float* a, const float* c,
+                         const float* phi, float theta_max, float s_warm,
+                         int T, int m,
+                         float* dq_in, float* dp_in, float* dphi,
+                         float* scratch_da, float* scratch_dc,
+                         const float* whisc_a) {
+	if (T <= 0 || m <= 0) return true;
+	(void)scratch_da; (void)scratch_dc;  // caller scratch no longer needed; kept for ABI
+
+	// Lazily allocate/resize internal partial-reduction scratch (ROT_NCHUNK*m each).
+	static glades::gpu::GpuBuffer<float> partialDa_buf, partialDc_buf;
+	size_t need = (size_t)ROT_NCHUNK * m;
+	if (partialDa_buf.size() < need) {
+		partialDa_buf.allocate(need);
+		partialDc_buf.allocate(need);
+	}
+
+	// Pass 1: per-element backward + partial column reduction (no T*m scratch writes).
+	int chunk = (T + ROT_NCHUNK - 1) / ROT_NCHUNK;
+	int blk = 256;
+	dim3 grid1((m + blk - 1) / blk, ROT_NCHUNK);
+	chiron_rot_fused_backward<<<grid1, blk, 0, computeStream()>>>(
+	    dq_out, dp_out, q_in, p_in, a, c, T, m, chunk,
+	    dq_in, dp_in, partialDa_buf.data(), partialDc_buf.data());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Pass 2: finalize partials + chain rule -> dphi (ACCUMULATE).
+	int grid2 = (m + blk - 1) / blk;
+	chiron_rot_fused_chain_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialDa_buf.data(), partialDc_buf.data(),
+	    phi, theta_max, s_warm, m, ROT_NCHUNK,
+	    dphi, whisc_a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pass-4 perf: fused inverse-walk + backward in one [T*m] pass.
+//
+// chiron_rot_backward_invwalk takes the POST-coupling state (q2, p1) in the
+// q/p buffers (as they stand after the forward pass), performs the 3-shear
+// inverse walk entirely in registers, writes back the recovered pre-coupling
+// (q0, p0), then runs the standard 3-shear backward. Eliminates the separate
+// chiron_rot_forward(sign=-1) pass — one T*m read+write pass per layer saved.
+//
+// The intermediate q1 and p1 needed by the backward are FREE — they arise
+// naturally during the inverse walk, so no recompute is required.
+// ---------------------------------------------------------------------------
+
+__global__ void chiron_rot_invwalk_backward_kernel(
+        float* __restrict__ q_io,           // in: post-coupling q2; out: pre-coupling q0
+        float* __restrict__ p_io,           // in: post-coupling p1; out: pre-coupling p0
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ a_coeff, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int cx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (cx >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	float ai = a_coeff[cx], ci = c_coeff[cx];
+	float local_da = 0.0f, local_dc = 0.0f;
+	for (int t = t_start; t < t_end; ++t) {
+		long k = (long)t * m + cx;
+		// Inverse walk in registers: (q2, p1) -> (q1, p0, q0).
+		// Negated shears in reverse order (see rot_inverse in transformer_chiron_ops.h).
+		float q2  = q_io[k];
+		float p1  = p_io[k];
+		float q1  = q2 - ai * p1;     // shear3 inv: q1 = q2 - a*p1
+		float p0  = p1 - ci * q1;     // shear2 inv: p0 = p1 - c*q1
+		float q0  = q1 - ai * p0;     // shear1 inv: q0 = q1 - a*p0
+		q_io[k] = q0; p_io[k] = p0;   // write back recovered pre-coupling state
+		// Standard 3-shear backward (same math as chiron_rot_fused_backward).
+		// q0, p0, q1, p1 are already in registers — no recompute needed.
+		float dq2 = dqo[k], dp1a = dpo[k];
+		float dq1 = dq2; float dp1b = dp1a + ai*dq2; float dael = p1*dq2;   // shear3 bwd
+		float dp0 = dp1b; dq1 += ci*dp1b; float dcel = q1*dp1b;             // shear2 bwd
+		float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;                     // shear1 bwd
+		dqi[k] = dq0; dpi[k] = dp0;
+		local_da += dael; local_dc += dcel;
+	}
+	partialDa[(long)by*m + cx] = local_da;
+	partialDc[(long)by*m + cx] = local_dc;
+}
+
+// float4-vectorized variant: one thread per 4-channel group (128-bit loads/stores),
+// with a scalar tail thread for the m%4 remainder.  The per-lane arithmetic is
+// structurally identical to the scalar kernel above -> identical FMA contraction ->
+// bit-identical results (validated by WhiSCInvWalkBackwardParityTest at m=3 and m=8).
+// Production m=2048 is all-float4 (no tail).  Memory-bound kernel: 128-bit transactions
+// close the last ~23% to the memory-bandwidth floor.
+__global__ void chiron_rot_invwalk_backward_kernel_v4(
+        float* __restrict__ q_io, float* __restrict__ p_io,
+        const float* __restrict__ dqo, const float* __restrict__ dpo,
+        const float* __restrict__ a_coeff, const float* __restrict__ c_coeff,
+        int T, int m, int chunk,
+        float* __restrict__ dqi, float* __restrict__ dpi,
+        float* __restrict__ partialDa, float* __restrict__ partialDc) {
+	int g = blockIdx.x * blockDim.x + threadIdx.x;   // channel-group index
+	int nfull = m >> 2;                               // number of full float4 groups
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+
+	if (g < nfull) {
+		int cx = g << 2;
+		float4 a4 = *reinterpret_cast<const float4*>(a_coeff + cx);
+		float4 c4 = *reinterpret_cast<const float4*>(c_coeff + cx);
+		float4 lda = make_float4(0.f, 0.f, 0.f, 0.f);
+		float4 ldc = make_float4(0.f, 0.f, 0.f, 0.f);
+		for (int t = t_start; t < t_end; ++t) {
+			long k = (long)t * m + cx;
+			float4 q2   = *reinterpret_cast<float4*>(q_io + k);
+			float4 p1   = *reinterpret_cast<float4*>(p_io + k);
+			float4 dq2  = *reinterpret_cast<const float4*>(dqo + k);
+			float4 dp1a = *reinterpret_cast<const float4*>(dpo + k);
+			float4 q0o, p0o, dq0o, dp0o;
+			// Each lane replays the scalar kernel's inverse-walk + 3-shear backward
+			// verbatim (same op sequence -> same rounding).
+			#define RIWB_LANE(L) do { \
+				float q1 = q2.L - a4.L * p1.L;                                    \
+				float p0 = p1.L - c4.L * q1;                                      \
+				float q0 = q1 - a4.L * p0;                                        \
+				q0o.L = q0; p0o.L = p0;                                           \
+				float dq1 = dq2.L; float dp1b = dp1a.L + a4.L*dq2.L;              \
+				float dael = p1.L*dq2.L;                                          \
+				float dp0 = dp1b; dq1 += c4.L*dp1b; float dcel = q1*dp1b;         \
+				float dq0 = dq1; dp0 += a4.L*dq1; dael += p0*dq1;                 \
+				dq0o.L = dq0; dp0o.L = dp0;                                       \
+				lda.L += dael; ldc.L += dcel;                                     \
+			} while (0)
+			RIWB_LANE(x); RIWB_LANE(y); RIWB_LANE(z); RIWB_LANE(w);
+			#undef RIWB_LANE
+			*reinterpret_cast<float4*>(q_io + k) = q0o;
+			*reinterpret_cast<float4*>(p_io + k) = p0o;
+			*reinterpret_cast<float4*>(dqi + k)  = dq0o;
+			*reinterpret_cast<float4*>(dpi + k)  = dp0o;
+		}
+		*reinterpret_cast<float4*>(partialDa + (long)by*m + cx) = lda;
+		*reinterpret_cast<float4*>(partialDc + (long)by*m + cx) = ldc;
+	} else if (g == nfull) {
+		// Scalar tail: the m%4 remainder channels (only when m not a multiple of 4).
+		for (int cx = nfull << 2; cx < m; ++cx) {
+			float ai = a_coeff[cx], ci = c_coeff[cx];
+			float local_da = 0.0f, local_dc = 0.0f;
+			for (int t = t_start; t < t_end; ++t) {
+				long k = (long)t * m + cx;
+				float q2  = q_io[k];
+				float p1  = p_io[k];
+				float q1  = q2 - ai * p1;
+				float p0  = p1 - ci * q1;
+				float q0  = q1 - ai * p0;
+				q_io[k] = q0; p_io[k] = p0;
+				float dq2 = dqo[k], dp1a = dpo[k];
+				float dq1 = dq2; float dp1b = dp1a + ai*dq2; float dael = p1*dq2;
+				float dp0 = dp1b; dq1 += ci*dp1b; float dcel = q1*dp1b;
+				float dq0 = dq1; dp0 += ai*dq1; dael += p0*dq1;
+				dqi[k] = dq0; dpi[k] = dp0;
+				local_da += dael; local_dc += dcel;
+			}
+			partialDa[(long)by*m + cx] = local_da;
+			partialDc[(long)by*m + cx] = local_dc;
+		}
+	}
+}
+
+bool chiron_rot_backward_invwalk(const float* dq_out, const float* dp_out,
+                                  float* q, float* p,
+                                  const float* a, const float* c,
+                                  const float* phi, float theta_max, float s_warm,
+                                  int T, int m,
+                                  float* dq_in, float* dp_in, float* dphi,
+                                  float* scratch_da, float* scratch_dc,
+                                  const float* whisc_a) {
+	if (T <= 0 || m <= 0) return true;
+	(void)scratch_da; (void)scratch_dc;  // kept for ABI symmetry with chiron_rot_backward
+
+	static glades::gpu::GpuBuffer<float> partialDa_buf, partialDc_buf;
+	size_t need = (size_t)ROT_NCHUNK * m;
+	if (partialDa_buf.size() < need) {
+		partialDa_buf.allocate(need);
+		partialDc_buf.allocate(need);
+	}
+
+	// Pass 1: per-element inverse-walk + backward + partial column reduction.
+	// float4-vectorized: one thread per 4-channel group + a scalar tail thread.
+	int chunk = (T + ROT_NCHUNK - 1) / ROT_NCHUNK;
+	int blk = 256;
+	int ngroups = (m + 3) / 4;   // full float4 groups + up to one tail group
+	dim3 grid1((ngroups + blk - 1) / blk, ROT_NCHUNK);
+	chiron_rot_invwalk_backward_kernel_v4<<<grid1, blk, 0, computeStream()>>>(
+	    q, p, dq_out, dp_out, a, c, T, m, chunk,
+	    dq_in, dp_in, partialDa_buf.data(), partialDc_buf.data());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Pass 2: finalize partials + chain rule -> dphi (ACCUMULATE).
+	int grid2 = (m + blk - 1) / blk;
+	chiron_rot_fused_chain_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialDa_buf.data(), partialDc_buf.data(),
+	    phi, theta_max, s_warm, m, ROT_NCHUNK,
+	    dphi, whisc_a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+// ===========================================================================
+//  WhiSC: per-channel whitening scale + EMA second-moment stats.
+// ===========================================================================
+
+__global__ void whisc_scale_kernel(float* __restrict__ q, float* __restrict__ p,
+                                   const float* __restrict__ a, float sign, int T, int m) {
+	long k = (long)blockIdx.x * blockDim.x + threadIdx.x;
+	long n = (long)T * m;
+	if (k >= n) return;
+	int i = (int)(k % m);
+	float ai = a[i];
+	if (sign > 0.0f) { q[k] = q[k] / ai; p[k] = p[k] * ai; }
+	else             { q[k] = q[k] * ai; p[k] = p[k] / ai; }
+}
+
+bool chiron_whisc_scale(float* q, float* p, const float* a, float sign, int T, int m) {
+	if (!q || !p || !a || T <= 0 || m <= 0) return false;
+	long n = (long)T * m; int blk = 256; int grid = (int)((n + blk - 1) / blk);
+	whisc_scale_kernel<<<grid, blk, 0, computeStream()>>>(q, p, a, sign, T, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// WhiSC coefficient folding: absorbs whitening scale wa into rotation coeffs a,c in place.
+// a[i] *= wa[i]^2 ; c[i] /= wa[i]^2. Eliminates the explicit whiten/unwhiten passes.
+__global__ void whisc_fold_coeffs_kernel(float* __restrict__ a, float* __restrict__ c,
+                                          const float* __restrict__ wa, int m) {
+	int i = blockIdx.x*blockDim.x + threadIdx.x; if (i >= m) return;
+	float wa2 = wa[i]*wa[i];
+	a[i] *= wa2; c[i] /= wa2;
+}
+
+bool chiron_whisc_fold_coeffs(float* a, float* c, const float* wa, int m) {
+	if (!a || !c || !wa || m <= 0) return false;
+	int blk = 256, grd = (m + blk - 1) / blk;
+	whisc_fold_coeffs_kernel<<<grd, blk, 0, computeStream()>>>(a, c, wa, m);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Coalesced two-pass per-channel second-moment stats.
+//
+// Pass 1 (whisc_partial_kernel): coalesced partial reduction.
+//   Grid (ceil(m/256), WHISC_NCHUNK), block 256.
+//   Thread c = blockIdx.x*256 + threadIdx.x covers one channel (guard c<m).
+//   Token chunk blockIdx.y covers [by*chunk, (by+1)*chunk) tokens.
+//   Consecutive threads read consecutive channels at a fixed t  =>  fully coalesced.
+//   Writes partialQ[by*m + c] and partialP[by*m + c].
+//
+// Pass 2 (whisc_finalize_kernel): one thread per channel.
+//   Sums the WHISC_NCHUNK partial values, applies EMA and computes a[c].
+//
+// Internal scratch (partialQ, partialP) is function-static; lazily allocated/
+// resized so the public signature needs no scratch parameter.
+
+static const int WHISC_NCHUNK = 32;
+
+__global__ void whisc_partial_kernel(const float* __restrict__ q, const float* __restrict__ p,
+                                     int T, int m, int chunk,
+                                     float* __restrict__ partialQ, float* __restrict__ partialP) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	int by = blockIdx.y;
+	int t_start = by * chunk;
+	int t_end   = t_start + chunk; if (t_end > T) t_end = T;
+	float lq = 0.0f, lp = 0.0f;
+	for (int t = t_start; t < t_end; ++t) {
+		float qv = q[(long)t*m + c];
+		float pv = p[(long)t*m + c];
+		lq += qv*qv; lp += pv*pv;
+	}
+	partialQ[(long)by*m + c] = lq;
+	partialP[(long)by*m + c] = lp;
+}
+
+__global__ void whisc_finalize_kernel(const float* __restrict__ partialQ,
+                                      const float* __restrict__ partialP,
+                                      int T, int m, int nchunk,
+                                      float ema, float eps, float clamp_val,
+                                      float* __restrict__ Pbar, float* __restrict__ Qbar,
+                                      float* __restrict__ a) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	float sumQ = 0.0f, sumP = 0.0f;
+	for (int by = 0; by < nchunk; ++by) {
+		sumQ += partialQ[(long)by*m + c];
+		sumP += partialP[(long)by*m + c];
+	}
+	float mq = sumQ / (float)T;
+	float mp = sumP / (float)T;
+	float qb = (1.0f - ema)*Qbar[c] + ema*mq;
+	float pb = (1.0f - ema)*Pbar[c] + ema*mp;
+	Qbar[c] = qb; Pbar[c] = pb;
+	float ai = powf(qb / (pb + eps), 0.25f);
+	float lo = 1.0f/clamp_val, hi = clamp_val;
+	a[c] = (ai < lo) ? lo : ((ai > hi) ? hi : ai);
+}
+
+bool chiron_whisc_update_stats(const float* q, const float* p, int T, int m,
+                               float ema, float eps, float clamp, float* Pbar, float* Qbar, float* a) {
+	if (!q || !p || !Pbar || !Qbar || !a || T <= 0 || m <= 0) return false;
+
+	// Lazily allocate/resize internal scratch buffers (function-static lifetime).
+	static glades::gpu::GpuBuffer<float> partialQ, partialP;
+	size_t need = (size_t)WHISC_NCHUNK * m;
+	if (partialQ.size() < need) {
+		partialQ.allocate(need);
+		partialP.allocate(need);
+	}
+
+	int chunk = (T + WHISC_NCHUNK - 1) / WHISC_NCHUNK;
+	int blk = 256;
+	dim3 grid1((m + blk - 1) / blk, WHISC_NCHUNK);
+	whisc_partial_kernel<<<grid1, blk, 0, computeStream()>>>(
+	    q, p, T, m, chunk, partialQ.data(), partialP.data());
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	int grid2 = (m + blk - 1) / blk;
+	whisc_finalize_kernel<<<grid2, blk, 0, computeStream()>>>(
+	    partialQ.data(), partialP.data(), T, m, WHISC_NCHUNK, ema, eps, clamp, Pbar, Qbar, a);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+// ===========================================================================
+//  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
+// ===========================================================================
+//
+// Routed through cuBLAS sgemm with B-transpose: this is exactly
+// sgemm_rowmajor_abt(M=T, N=r, K=Ntok, A=X, B=S, C=Z).
+
+bool chiron_sketch_project(const float* X, const float* S,
+                            int T, int Ntok, int r, float* Z)
+{
+	if (T <= 0 || Ntok <= 0 || r <= 0) return true;
+	// Z = 1.0 * X · S^T + 0.0 * Z, all row-major, A is [T, Ntok] ld=Ntok,
+	// B is [r, Ntok] ld=Ntok, C is [T, r] ld=r.
+	return sgemm_rowmajor_abt(T, r, Ntok,
+	                           1.0f,
+	                           X, Ntok,
+	                           S, Ntok,
+	                           0.0f,
+	                           Z, r);
+}
+
+// ===========================================================================
+//  5. Sketch lift-add — X += (1/r) · R · S   (R: [T, r], S: [r, Ntok], X: [T, Ntok]).
+// ===========================================================================
+
+bool chiron_sketch_lift_add(float* X, const float* R, const float* S,
+                             int T, int Ntok, int r)
+{
+	if (T <= 0 || Ntok <= 0 || r <= 0) return true;
+	const float alpha = 1.0f / static_cast<float>(r);
+	// Standard row-major GEMM: C = alpha * A · B + 1.0 * C.
+	// A = R [T, r] ld=r, B = S [r, Ntok] ld=Ntok, C = X [T, Ntok] ld=Ntok.
+	return sgemm_rowmajor(T, Ntok, r,
+	                       alpha,
+	                       R, r,
+	                       S, Ntok,
+	                       1.0f,
+	                       X, Ntok);
+}
+
+// ===========================================================================
+//  5b. SIRA terminal phase loss — final-state active loss + gradient.
+// ===========================================================================
+
+namespace {
+
+__device__ __forceinline__ float sira_safe_positive_d(float x, float eps)
+{
+	const float e = (eps > 0.0f) ? eps : 1e-12f;
+	return (x > e) ? x : e;
+}
+
+__device__ __forceinline__ float sira_pseudo_huber_d(float z, float tau)
+{
+	const float t = (tau > 0.0f) ? tau : 0.2f;
+	const float r = z / t;
+	return t * t * (sqrtf(1.0f + r * r) - 1.0f);
+}
+
+__device__ __forceinline__ float sira_pseudo_huber_grad_d(float z, float tau)
+{
+	const float t = (tau > 0.0f) ? tau : 0.2f;
+	const float r = z / t;
+	return z / sqrtf(1.0f + r * r);
+}
+
+__global__ void chiron_sira_terminal_stats_kernel(const float* __restrict__ q,
+                                                  const float* __restrict__ p,
+                                                  int n,
+                                                  float* __restrict__ stats3)
+{
+	extern __shared__ float smem[];
+	float sp = 0.0f;
+	float sq = 0.0f;
+	float sd = 0.0f;
+	const int stride = gridDim.x * blockDim.x;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+	{
+		const float pv = p[i];
+		const float qv = q[i];
+		sp += pv * pv;
+		sq += qv * qv;
+		sd += pv * qv;
+	}
+
+	const float bp = blockReduceSum(sp, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 0, bp);
+	__syncthreads();
+	const float bq = blockReduceSum(sq, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 1, bq);
+	__syncthreads();
+	const float bd = blockReduceSum(sd, smem);
+	if (threadIdx.x == 0) atomicAdd(stats3 + 2, bd);
+}
+
+__global__ void chiron_sira_terminal_loss_kernel(const float* __restrict__ stats3,
+                                                 int n,
+                                                 float coef,
+                                                 float energyWeight,
+                                                 float balanceWeight,
+                                                 float actionWeight,
+                                                 float huberTau,
+                                                 float eps,
+                                                 float* __restrict__ loss1)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0) return;
+	const float invN = 1.0f / static_cast<float>(n);
+	const float p2MeanRaw = stats3[0] * invN;
+	const float q2MeanRaw = stats3[1] * invN;
+	const float pqMean    = stats3[2] * invN;
+	const float p2 = sira_safe_positive_d(p2MeanRaw, eps);
+	const float q2 = sira_safe_positive_d(q2MeanRaw, eps);
+	const float energyZ = logf(sira_safe_positive_d(0.5f * (p2MeanRaw + q2MeanRaw), eps));
+	const float balanceZ = 0.5f * (logf(p2) - logf(q2));
+	const float actionDenom = sqrtf(p2 * q2);
+	const float actionZ = (actionDenom > eps) ? (pqMean / actionDenom) : 0.0f;
+
+	float loss = 0.0f;
+	if (energyWeight > 0.0f)
+		loss += energyWeight * sira_pseudo_huber_d(energyZ, huberTau);
+	if (balanceWeight > 0.0f)
+		loss += balanceWeight * sira_pseudo_huber_d(balanceZ, huberTau);
+	if (actionWeight > 0.0f)
+		loss += actionWeight * sira_pseudo_huber_d(actionZ, huberTau);
+	loss1[0] = coef * loss;
+}
+
+__global__ void chiron_sira_terminal_grad_kernel(const float* __restrict__ q,
+                                                 const float* __restrict__ p,
+                                                 int n,
+                                                 float coef,
+                                                 float energyWeight,
+                                                 float balanceWeight,
+                                                 float actionWeight,
+                                                 float huberTau,
+                                                 float eps,
+                                                 const float* __restrict__ stats3,
+                                                 float gradScale,
+                                                 float* __restrict__ dq,
+                                                 float* __restrict__ dp)
+{
+	const float invN = 1.0f / static_cast<float>(n);
+	const float p2MeanRaw = stats3[0] * invN;
+	const float q2MeanRaw = stats3[1] * invN;
+	const float pqMean    = stats3[2] * invN;
+	const float p2 = sira_safe_positive_d(p2MeanRaw, eps);
+	const float q2 = sira_safe_positive_d(q2MeanRaw, eps);
+	const float energy = sira_safe_positive_d(0.5f * (p2MeanRaw + q2MeanRaw), eps);
+	const float energyZ = logf(energy);
+	const float balanceZ = 0.5f * (logf(p2) - logf(q2));
+	const float actionDenom = sqrtf(p2 * q2);
+	const float invActionDenom = (actionDenom > eps) ? (1.0f / actionDenom) : 0.0f;
+	const float actionZ = (actionDenom > eps) ? (pqMean * invActionDenom) : 0.0f;
+
+	const float energyCoeff = (energyWeight > 0.0f)
+	    ? (coef * energyWeight * sira_pseudo_huber_grad_d(energyZ, huberTau))
+	    : 0.0f;
+	const float balanceCoeff = (balanceWeight > 0.0f)
+	    ? (coef * balanceWeight * sira_pseudo_huber_grad_d(balanceZ, huberTau))
+	    : 0.0f;
+	const float actionCoeff = (actionWeight > 0.0f)
+	    ? (coef * actionWeight * sira_pseudo_huber_grad_d(actionZ, huberTau))
+	    : 0.0f;
+
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+	{
+		const float pv = p[i];
+		const float qv = q[i];
+		float gp = 0.0f;
+		float gq = 0.0f;
+		if (energyCoeff != 0.0f)
+		{
+			const float c = energyCoeff * invN / energy;
+			gp += c * pv;
+			gq += c * qv;
+		}
+		if (balanceCoeff != 0.0f)
+		{
+			gp += balanceCoeff * invN * pv / p2;
+			gq -= balanceCoeff * invN * qv / q2;
+		}
+		if (actionCoeff != 0.0f && invActionDenom > 0.0f)
+		{
+			gp += actionCoeff * invN * (qv * invActionDenom - actionZ * pv / p2);
+			gq += actionCoeff * invN * (pv * invActionDenom - actionZ * qv / q2);
+		}
+		if (dp) dp[i] += gradScale * gp;
+		if (dq) dq[i] += gradScale * gq;
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_sira_terminal_forward(const float* q, const float* p,
+                                  int n,
+                                  float coef,
+                                  float energyWeight,
+                                  float balanceWeight,
+                                  float actionWeight,
+                                  float huberTau,
+                                  float eps,
+                                  float* stats3,
+                                  float* loss1)
+{
+	if (coef <= 0.0f) return true;
+	if (n <= 0) return true;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f)
+	{
+		if (loss1) GLADES_CUDA_CHECK(cudaMemsetAsync(loss1, 0, sizeof(float), computeStream()));
+		return true;
+	}
+	if (!q || !p || !stats3 || !loss1) return false;
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(stats3, 0, sizeof(float) * 3u, computeStream()));
+	const int gridRaw = (n + kBlockElem - 1) / kBlockElem;
+	const int grid = (gridRaw > 4096) ? 4096 : gridRaw;
+	const int smemBytes = ((kBlockElem + 31) / 32) * sizeof(float);
+	chiron_sira_terminal_stats_kernel<<<grid, kBlockElem, smemBytes, computeStream()>>>(
+	    q, p, n, stats3);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	chiron_sira_terminal_loss_kernel<<<1, 1, 0, computeStream()>>>(
+	    stats3, n, coef, energyWeight, balanceWeight, actionWeight,
+	    huberTau, safeEps, loss1);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_sira_terminal_add_grad(const float* q, const float* p,
+                                   int n,
+                                   float coef,
+                                   float energyWeight,
+                                   float balanceWeight,
+                                   float actionWeight,
+                                   float huberTau,
+                                   float eps,
+                                   const float* stats3,
+                                   float gradScale,
+                                   float* dq,
+                                   float* dp)
+{
+	if (coef <= 0.0f) return true;
+	if (n <= 0 || gradScale == 0.0f) return true;
+	if (energyWeight <= 0.0f && balanceWeight <= 0.0f && actionWeight <= 0.0f) return true;
+	if (!q || !p || !stats3 || (!dq && !dp)) return false;
+	const float safeEps = (eps > 0.0f) ? eps : 1e-12f;
+	const int gridRaw = (n + kBlockElem - 1) / kBlockElem;
+	const int grid = (gridRaw > 4096) ? 4096 : gridRaw;
+	chiron_sira_terminal_grad_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    q, p, n, coef, energyWeight, balanceWeight, actionWeight,
+	    huberTau, safeEps, stats3, gradScale, dq, dp);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  5e. Reversible SwiGLU FFN shear.
+// ===========================================================================
+
+namespace {
+
+__global__ void chiron_ffn_swiglu_f32_kernel(const float* gate, const float* up,
+                                              float* hidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=gate[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		hidden[i]=(g*sig)*up[i];
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_f32_kernel(float* gate, float* up,
+                                                  const float* dHidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=gate[i], u=up[i], dh=dHidden[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		const float silu=g*sig;
+		gate[i]=dh*u*(sig+g*sig*(1.0f-sig));
+		up[i]=dh*silu;
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bf16_kernel(const __nv_bfloat16* gate,
+                                               const __nv_bfloat16* up,
+                                               __nv_bfloat16* hidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]);
+		const float u=__bfloat162float(up[i]);
+		const float sig=1.0f/(1.0f+expf(-g));
+		hidden[i]=__float2bfloat16_rn((g*sig)*u);
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_bf16_kernel(__nv_bfloat16* gate,
+                                                   __nv_bfloat16* up,
+                                                   const float* dHidden, size_t n)
+{
+	for (size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; i<n;
+	     i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]);
+		const float u=__bfloat162float(up[i]);
+		const float dh=dHidden[i];
+		const float sig=1.0f/(1.0f+expf(-g));
+		gate[i]=__float2bfloat16_rn(dh*u*(sig+g*sig*(1.0f-sig)));
+		up[i]=__float2bfloat16_rn(dh*(g*sig));
+	}
+}
+
+__global__ void chiron_ffn_swiglu_bwd_bf16_dh_kernel(__nv_bfloat16* gate,
+                                                      __nv_bfloat16* up,
+                                                      const __nv_bfloat16* dHidden,size_t n)
+{
+	for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)blockDim.x*gridDim.x)
+	{
+		const float g=__bfloat162float(gate[i]),u=__bfloat162float(up[i]);
+		const float dh=__bfloat162float(dHidden[i]);const float sig=1.0f/(1.0f+expf(-g));
+		gate[i]=__float2bfloat16_rn(dh*u*(sig+g*sig*(1.0f-sig)));
+		up[i]=__float2bfloat16_rn(dh*(g*sig));
+	}
+}
+
+__global__ void chiron_ffn_add_two_bf16_kernel(float* dq,const __nv_bfloat16* a,
+                                                const __nv_bfloat16* b,size_t n)
+{
+	for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)blockDim.x*gridDim.x)
+		dq[i]+=__bfloat162float(a[i])+__bfloat162float(b[i]);
+}
+
+inline int chiron_ffn_grid(size_t n)
+{
+	const size_t raw=(n+(size_t)kBlockElem-1)/(size_t)kBlockElem;
+	return (int)(raw>4096u?4096u:(raw?raw:1u));
+}
+
+} // anonymous namespace
+
+bool chiron_ffn_shear_forward(const float* q, float* p,
+                               const float* W_gate, const float* W_up,
+                               const float* W_down,
+                               int T, int m, int H, float sign,
+                               float* gate, float* up, float* hidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!q || !p || !W_gate || !W_up || !W_down || !gate || !up || !hidden) return false;
+	if (!sgemm_rowmajor(T,H,m,1.0f,q,m,W_gate,H,0.0f,gate,H)) return false;
+	if (!sgemm_rowmajor(T,H,m,1.0f,q,m,W_up,H,0.0f,up,H)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_f32_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(gate,up,hidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return sgemm_rowmajor(T,m,H,sign,hidden,H,W_down,m,1.0f,p,m);
+}
+
+bool chiron_ffn_shear_backward_invwalk(
+    const float* q, float* p, const float* dp,
+    const float* W_gate, const float* W_up, const float* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    float* gate, float* up, float* hidden, float* dHidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!chiron_ffn_shear_forward(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,gate,up,hidden)) return false;
+	if (!sgemm_rowmajor_abt(T,H,m,1.0f,dp,m,W_down,m,0.0f,dHidden,H)) return false;
+	if (!sgemm_rowmajor_atb(H,m,T,1.0f,hidden,H,dp,m,1.0f,dW_down,m)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bwd_f32_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(gate,up,dHidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (!sgemm_rowmajor_abt(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_atb(m,H,T,1.0f,q,m,gate,H,1.0f,dW_gate,H)) return false;
+	return sgemm_rowmajor_atb(m,H,T,1.0f,q,m,up,H,1.0f,dW_up,H);
+}
+
+bool chiron_ffn_shear_forward_bf16w(
+    const float* q, float* p,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H, float sign,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden)
+{
+	if (T<=0 || m<=0 || H<=0) return true;
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	if(!sgemm_pair_bf16_dst_bf16(false,T,H,m,1.0f,
+	        qbf,qbf,m,W_gate,W_up,H,0.0f,gate,up,H))return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+	    reinterpret_cast<const __nv_bfloat16*>(gate),
+	    reinterpret_cast<const __nv_bfloat16*>(up),
+	    reinterpret_cast<__nv_bfloat16*>(hidden),n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return sgemm_rowmajor_bf16(T,m,H,sign,hidden,H,W_down,m,1.0f,p,m);
+}
+
+bool chiron_ffn_shear_backward_invwalk_bf16w(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, float* dW_gate, float* dW_up, float* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden)
+{
+	if (!chiron_ffn_shear_forward_bf16w(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,qbf,gate,up,hidden)) return false;
+	if (!cast_f32_to_bf16(dp,qbf,(size_t)T*m)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dHidden,H)) return false;
+	if (!sgemm_rowmajor_atb_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m)) return false;
+	const size_t n=(size_t)T*H;
+	chiron_ffn_swiglu_bwd_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),dHidden,n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m)) return false;
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	if (!sgemm_rowmajor_atb_bf16(m,H,T,1.0f,qbf,m,gate,H,1.0f,dW_gate,H)) return false;
+	return sgemm_rowmajor_atb_bf16(m,H,T,1.0f,qbf,m,up,H,1.0f,dW_up,H);
+}
+
+bool chiron_ffn_shear_backward_invwalk_bf16w_bf16g(
+    const float* q, float* p, const float* dp,
+    const unsigned short* W_gate, const unsigned short* W_up,
+    const unsigned short* W_down,
+    int T, int m, int H,
+    float* dq, unsigned short* dW_gate, unsigned short* dW_up,
+    unsigned short* dW_down,
+    unsigned short* qbf, unsigned short* gate,
+    unsigned short* up, unsigned short* hidden, float* dHidden)
+{
+	if (!chiron_ffn_shear_forward_bf16w(q,p,W_gate,W_up,W_down,T,m,H,-1.0f,qbf,gate,up,hidden)) return false;
+	if (!cast_f32_to_bf16(dp,qbf,(size_t)T*m)) return false;
+	const size_t n=(size_t)T*H;
+	if(H>=m)
+	{
+		unsigned short* dhbf=reinterpret_cast<unsigned short*>(dHidden);
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dhbf,H))return false;
+		if(!sgemm_rowmajor_atb_bf16_dst_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m))return false;
+		chiron_ffn_swiglu_bwd_bf16_dh_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+		    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),
+		    reinterpret_cast<const __nv_bfloat16*>(dhbf),n);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,m,H,1.0f,gate,H,W_gate,H,0.0f,hidden,m))return false;
+		if(!sgemm_rowmajor_abt_bf16_bf16out(T,m,H,1.0f,up,H,W_up,H,0.0f,dhbf,m))return false;
+		const size_t nq=(size_t)T*m;
+		chiron_ffn_add_two_bf16_kernel<<<chiron_ffn_grid(nq),kBlockElem,0,computeStream()>>>(
+		    dq,reinterpret_cast<const __nv_bfloat16*>(hidden),reinterpret_cast<const __nv_bfloat16*>(dhbf),nq);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	else
+	{
+		if(!sgemm_rowmajor_abt_bf16(T,H,m,1.0f,qbf,m,W_down,m,0.0f,dHidden,H))return false;
+		if(!sgemm_rowmajor_atb_bf16_dst_bf16(H,m,T,1.0f,hidden,H,qbf,m,1.0f,dW_down,m))return false;
+		chiron_ffn_swiglu_bwd_bf16_kernel<<<chiron_ffn_grid(n),kBlockElem,0,computeStream()>>>(
+		    reinterpret_cast<__nv_bfloat16*>(gate),reinterpret_cast<__nv_bfloat16*>(up),dHidden,n);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		if(!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,gate,H,W_gate,H,1.0f,dq,m))return false;
+		if(!sgemm_rowmajor_abt_bf16(T,m,H,1.0f,up,H,W_up,H,1.0f,dq,m))return false;
+	}
+	if (!cast_f32_to_bf16(q,qbf,(size_t)T*m)) return false;
+	return sgemm_pair_bf16_dst_bf16(true,m,H,T,1.0f,
+	        qbf,qbf,m,gate,up,H,1.0f,dW_gate,dW_up,H);
+}
+
+// ===========================================================================
+//  6. Symplectic attention shear — composition wrapper.
+// ===========================================================================
+//
+// Layered on top of existing GPU primitives:
+//   Q = q · Wq       (sgemm_rowmajor: [T,m] · [m,dH] -> [T,dH])
+//   K = q · Wk
+//   V = q · Wv
+//   O = flash_attention_multihead_forward(Q, K, V)
+//   p += ± O · Wo    (sgemm_rowmajor with alpha=±1, beta=1: accumulates into p)
+//
+// For the inverse shear, the caller passes invert=true and we use alpha=-1
+// in the final GEMM (equivalent to p -= Y(q) since q is unchanged).
+
+bool chiron_attention_shear(const float* q, float* p,
+                             const float* Wq, const float* Wk,
+                             const float* Wv, const float* Wo,
+                             int T, int m, int nHeads, int nKVHeads, int dHead,
+                             bool causal, bool invert,
+                             float* scratch_Q, float* scratch_K,
+                             float* scratch_V, float* scratch_O)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Q = q · Wq.  q: [T, m] ld=m; Wq: [m, dModel] ld=dModel; Q: [T, dModel] ld=dModel.
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	// Flash attention: O[T, dModel] = softmax(Q K^T / sqrt(dHead)) · V.
+	if (!flash_attention_multihead_forward(scratch_Q, scratch_K, scratch_V,
+	                                        T, nHeads, nKVHeads,
+	                                        dHead, dModel, dModelKV,
+	                                        causal, scratch_O))
+		return false;
+
+	// p += ±  O · Wo.  O: [T, dModel] ld=dModel; Wo: [dModel, m] ld=m; p: [T, m] ld=m.
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// BF16-tensor-core variant of chiron_attention_shear_tiled.  Same math as
+// chiron_attention_shear, but the attention-core GEMMs (QK^T and P·V) run
+// with BF16 inputs via flash_attention_cublas_tiled_bf16.  On RTX 4080 SUPER
+// this is ~2× over the TF32 variant on large shapes.  The Q/K/V projections
+// and output projection remain FP32 (they're only 3+1 GEMMs per block and
+// gain little from BF16).
+//
+// Extra scratch (all caller-owned):
+//   scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16 — BF16
+//     staging buffers for the BF16 attention kernel.  Sized [T, dModel]
+//     for Q/K/V and [nH, T, T] for P.
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+	if (!sgemm_rowmajor(T,dModel,m,1.0f,q,m,Wq,dModel,0.0f,scratch_Q,dModel)) return false;
+	if (!sgemm_rowmajor(T,dModelKV,m,1.0f,q,m,Wk,dModelKV,0.0f,scratch_K,dModelKV)) return false;
+	if (!sgemm_rowmajor(T,dModelKV,m,1.0f,q,m,Wv,dModelKV,0.0f,scratch_V,dModelKV)) return false;
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q,scratch_K,scratch_V,T,nHeads,nKVHeads,dHead,dModel,dModelKV,causal,
+	        scratch_O,scratch_S,scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16)) return false;
+	const float sign=invert?-1.0f:1.0f;
+	return sgemm_rowmajor(T,m,dModel,sign,scratch_O,dModel,Wo,m,1.0f,p,m);
+}
+
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16)
+{
+	return chiron_attention_shear_bf16_tiled(q,p,Wq,Wk,Wv,Wo,T,m,nHeads,nHeads,dHead,
+	    causal,invert,scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16);
+}
+
+// Cast-elim Port C fwd slice (2026-06-12): library toggle.  When ON, the
+// bf16w shear's Q/K/V projections write BF16-D directly into the
+// scratch_*bf16 buffers (sgemm_rowmajor_bf16_dst_bf16) and the inner
+// attention skips its three standalone casts.  The FP32 scratch_Q/K/V are
+// then NOT materialized — callers that consume them (FP32-host checkpoint
+// caches) must keep the toggle off; the trainer gates accordingly.
+// Default OFF; set once at trainer init (not capture-safe to flip mid-run).
+static bool g_cast_elim_inner_fwd = false;
+void set_cast_elim_inner_fwd(bool on) { g_cast_elim_inner_fwd = on; }
+bool get_cast_elim_inner_fwd() { return g_cast_elim_inner_fwd; }
+static bool flash_attention_cublas_tiled_bf16_precast(
+    const unsigned short* Qbf16, const unsigned short* Kbf16,
+    const unsigned short* Vbf16,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Pbf16);
+
+// BF16-weight variant of chiron_attention_shear_bf16_tiled.  Takes BF16
+// weight pointers directly — no per-layer FP32 cast scratch needed for
+// weights.  Q/K/V/O projections run through sgemm_rowmajor_bf16
+// (BF16 x BF16 -> FP32 via BF16 tensor cores, ~2x TF32 throughput on
+// Ampere/Ada).
+//
+// Extra scratch (caller-owned):
+//   scratch_qbf   [T, m]     — BF16 cast of q (one cast per layer)
+//   scratch_Obf   [T, dModel] — BF16 cast of attention output for Wo proj
+//
+// Combined with --bf16-weights on the trainer: eliminates 4 weight-cast
+// kernels per layer and replaces 4 TF32-TC GEMMs with BF16-TC GEMMs.
+// Projected 8% e2e throughput improvement at 2 B scale (see
+// research/BF16_PROJECTION_OPT.md).
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int nKVHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+
+	// Cast q FP32 -> BF16 once per layer.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// Cast-elim Port C fwd slice: project straight to BF16-D and skip the
+	// inner attention's standalone casts.  FP32 scratch_Q/K/V are NOT
+	// written on this path (sole fwd consumers were the casts; checkpoint
+	// saves read the BF16 scratches — trainer gates configs that need the
+	// FP32 copies).  cuBLAS rounds the FP32 accumulator to BF16 (RNE) on
+	// store — same rounding as the standalone cast; algorithm selection
+	// for the D-type change is the gate-decided parity risk.
+	if (g_cast_elim_inner_fwd)
+	{
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Qbf16, dModel))
+			return false;
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_Kbf16, dModelKV))
+			return false;
+		if (!sgemm_rowmajor_bf16_dst_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_Vbf16, dModelKV))
+			return false;
+		if (!flash_attention_cublas_tiled_bf16_precast(
+		        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
+		        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+		        scratch_O, scratch_S, scratch_Pbf16))
+			return false;
+	}
+	else
+	{
+	// BF16 x BF16 -> FP32 projections via BF16 tensor cores.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	// Attention core (BF16 inputs, FP32 output).
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q, scratch_K, scratch_V,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	        scratch_O, scratch_S,
+	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
+		return false;
+	}
+
+	// Cast scratch_O -> BF16 for the output projection.
+	if (!cast_f32_to_bf16(scratch_O, scratch_Obf, static_cast<size_t>(T) * dModel))
+		return false;
+
+	// Output projection: p += sign * scratch_Obf @ Wo_bf (BF16 TC, FP32 accum).
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor_bf16(T, m, dModel, sign, scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16)
+{
+	return chiron_attention_shear_bf16w_tiled(q,p,Wq_bf,Wk_bf,Wv_bf,Wo_bf,
+	    T,m,nHeads,nHeads,dHead,causal,invert,scratch_qbf,scratch_Obf,
+	    scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16);
+}
+
+// FP8 (E4M3) projection variant of chiron_attention_shear_bf16w_tiled.
+// See gpu_chiron.h for the full contract.  All 4 projection GEMMs run
+// through cuBLASLt's FP8 path with per-tensor scales computed on the fly
+// via amax reductions.  Attention core stays BF16-TC (the tiled
+// flash_attention path needs BF16 inputs, not FP8).  Each projection
+// scale is computed once per call; in steady state weights change
+// slowly enough that this is fine, and the amax kernels are tiny
+// (T·m bytes total, sub-ms).
+//
+// Math (per projection):
+//   stored_x = clamp(real_x * scale, ±448)  in E4M3
+//   stored_w = clamp(real_w * scale_w, ±448)  in E4M3
+//   real_out = (1 / (scale * scale_w)) · sum(stored_x · stored_w)
+//
+// The unscale is done in kernel_cast_bf16_to_fp32_scaled inside the
+// sgemm_rowmajor_fp8_e4m3_bf16 wrapper.
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// Cast q FP32 → BF16 once per layer (same as the BF16 path; the FP8
+	// wrapper takes BF16 inputs and re-casts to E4M3 internally).
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// Calibrate per-tensor scales from amax.  These are tiny reductions
+	// (≤ 4 KB output per kernel) and pipeline on the same stream as the
+	// GEMMs, so they don't add measurable latency vs. the projections.
+	if (!fp8_calibrate_amax_e4m3_bf16(scratch_qbf, (size_t)T * m, d_scale_q)) return false;
+	const int dModelKV = nKVHeads * dHead;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wq_bf, (size_t)m * dModel, d_scale_Wq)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wk_bf, (size_t)m * dModelKV, d_scale_Wk)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wv_bf, (size_t)m * dModelKV, d_scale_Wv)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wo_bf, (size_t)dModel * m, d_scale_Wo)) return false;
+
+	// FP8 Q/K/V projections (BF16 inputs, FP8 GEMM core, FP32 output).
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
+	        scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel,
+	        d_scale_q, d_scale_Wq))
+		return false;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModelKV, m, 1.0f,
+	        scratch_qbf, m, Wk_bf, dModelKV, 0.0f, scratch_K, dModelKV,
+	        d_scale_q, d_scale_Wk))
+		return false;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModelKV, m, 1.0f,
+	        scratch_qbf, m, Wv_bf, dModelKV, 0.0f, scratch_V, dModelKV,
+	        d_scale_q, d_scale_Wv))
+		return false;
+
+	// Attention core stays BF16 (cuBLAS sgemm_batched_strided_bf16 + custom softmax).
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q, scratch_K, scratch_V,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	        scratch_O, scratch_S,
+	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
+		return false;
+
+	// Cast scratch_O → BF16 for the output projection.
+	if (!cast_f32_to_bf16(scratch_O, scratch_Obf, static_cast<size_t>(T) * dModel))
+		return false;
+	// Calibrate scratch_O scale (attention output magnitude is config-
+	// dependent so we recalibrate per layer).
+	if (!fp8_calibrate_amax_e4m3_bf16(scratch_Obf, (size_t)T * dModel, d_scale_O)) return false;
+
+	// FP8 output projection: p += sign · scratch_Obf @ Wo_bf.
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, m, dModel, sign,
+	        scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m,
+	        d_scale_O, d_scale_Wo))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O)
+{
+	return chiron_attention_shear_fp8w_tiled(q,p,Wq_bf,Wk_bf,Wv_bf,Wo_bf,
+	    T,m,nHeads,nHeads,dHead,causal,invert,scratch_qbf,scratch_Obf,
+	    scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S,
+	    scratch_Qbf16,scratch_Kbf16,scratch_Vbf16,scratch_Pbf16,
+	    d_scale_q,d_scale_Wq,d_scale_Wk,d_scale_Wv,d_scale_Wo,d_scale_O);
+}
+
+// BF16-weight backward counterpart to chiron_attention_shear_bf16w_tiled.
+// Eliminates weight casts on the backward path by using BF16-TC GEMMs for
+// the projections, the dq-projection (abt), and the forward recompute.
+// The weight-grad GEMMs (dWq += q^T · sdQ etc.) stay FP32 — caller may
+// pair with --bf16-grads to accumulate them into BF16 persistent storage
+// via bf16_accum_axpy downstream.
+//
+// Extra scratch (caller-owned):
+//   scratch_qbf    [T, m]      — reused for q cast and for dp_new cast
+//   scratch_sdbf   [T, dModel] — rotates through sdQ/sdK/sdV casts
+//
+// Savings vs chiron_attention_shear_backward_tiled (with bf16-weights
+// caller casting each weight to FP32): 7 fewer weight casts per layer,
+// 7 BF16-TC GEMMs instead of TF32-TC (projection + abt dq-projection),
+// net ~200 MB HBM cast traffic saved per layer at 2 B scale.
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+
+	// 1. Cast q -> BF16 for projections.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	                                    sO, scratch_P))
+		return false;
+
+	// 3. Output-projection backward.  dO = dp_new · Wo^T.  Cast dp_new to
+	//    BF16 (overwriting scratch_qbf — q_bf is no longer needed here)
+	//    and use abt_bf16 for BF16 × BF16 × Wo^T.
+	if (!cast_f32_to_bf16(dp_new, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
+		return false;
+
+	// 4. dWo += sO^T · dp_new.  2026-05-13: switched to BF16 tensor cores —
+	// scratch_qbf currently holds bf16(dp_new) from step 3 above; cast sO to
+	// bf16 in scratch_sdbf and run atb_bf16.  ~2× faster than the previous
+	// FP32 sgemm_rowmajor_atb on Ada.
+	if (!cast_f32_to_bf16(sO, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16(dModel, m, T, 1.0f,
+	        scratch_sdbf, dModel,  // sO^T   (BF16)
+	        scratch_qbf, m,        // dp_new (BF16, from step 3)
+	        1.0f, dWo, m))
+		return false;
+
+	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	// 2026-05-13 (paradigm-stack fix #1): weight gradients now also use BF16
+	// tensor cores.  Pattern per X in {Q, K, V}: recast bf16(q) → scratch_qbf
+	// only once (between steps 5 and 6), then for each X cast sdX → scratch_sdbf
+	// and do both the activation grad (step 6) AND the weight grad (step 7) in
+	// BF16 before moving to the next X.  This avoids needing extra scratches.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 6+7 fused per direction.
+	// Q:
+	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWq, dModel))
+		return false;
+	// K:
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wk_bf, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	// V:
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wv_bf, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq, float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf, unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	return chiron_attention_shear_backward_bf16w_tiled(
+	    q,dp_new,Wq_bf,Wk_bf,Wv_bf,Wo_bf,T,m,nHeads,nHeads,dHead,causal,
+	    dq,dWq,dWk,dWv,dWo,scratch_qbf,scratch_sdbf,sQ,sK,sV,sO,
+	    sdO,sdQ,sdK,sdV,scratch_P,scratch_dP);
+}
+
+// iter 61 (2026-05-16): BF16-grad variant.  Same math as the FP32-grad
+// _bf16w_tiled above, but the 4 dW weight-grad GEMMs route through
+// sgemm_rowmajor_atb_bf16_dst_bf16 (cuBLAS gemmEx with D=BF16, beta=1) to
+// write directly into the persistent BF16 dW buffers.  Eliminates the
+// downstream bf16_accum_axpy commit kernel and the FP32 grad scratch
+// traffic (~3.1% of GPU time, ~14 launches/step on the iter60 stack).
+//
+// Caller must pre-zero the BF16 dW buffers at the start of each
+// gradient-accumulation window (matches the bf16_accum_axpy protocol).
+// The FP32 internal accumulator inside cuBLAS gemmEx is identical to the
+// old FP32-out path; only the final BF16 rounding step is folded into
+// the GEMM rather than the standalone kernel.
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP,
+    bool dw_beta_zero)  // iter 108 FAIL: when true, dW_bf cuBLAS would use
+                          // beta=0 (overwrite).  Math was non-bit-identical at
+                          // production — NLL +0.5 nat drift.  Param retained
+                          // for API stability but dw_beta forced to 1.0f
+                          // (legacy behavior) regardless.
+{
+	(void)dw_beta_zero;  // iter 108 FAIL — param ignored, beta stays at 1.0f.
+	const float dw_beta = 1.0f;
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0 || nKVHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+	const int groupSize = nHeads / nKVHeads;
+	if (nHeads % nKVHeads != 0) return false;
+
+	// 1. Cast q -> BF16 for projections.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wk_bf, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModelKV, m, 1.0f, scratch_qbf, m, Wv_bf, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+	// BF16G backward is parity-sensitive here: keep strict FP32 P·V.
+	{
+		const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+		if (nKVHeads == nHeads)
+		{
+			if (!sgemm_batched_strided_abt(T,T,dHead,invSqrtDH,
+			        sQ,dModel,(long long)dHead,sK,dModelKV,(long long)dHead,
+			        0.0f,scratch_P,T,(long long)T*T,nHeads)) return false;
+		}
+		else if(!sgemm_batched_grouped_abt(T,T,dHead,invSqrtDH,
+		        sQ,dModel,(long long)dHead,sK,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_P,T,(long long)T*T,nHeads))return false;
+		if (causal) { if (!causal_mask_softmax_inplace(scratch_P,nHeads,T)) return false; }
+		else if (!softmax_forward(scratch_P,nHeads*T,T,scratch_P)) return false;
+		if (nKVHeads == nHeads)
+		{
+			if (!sgemm_batched_strided_exact(T,dHead,T,1.0f,
+			        scratch_P,T,(long long)T*T,sV,dModelKV,(long long)dHead,
+			        0.0f,sO,dModel,(long long)dHead,nHeads)) return false;
+		}
+		else if(!sgemm_batched_grouped_exact(T,dHead,T,1.0f,
+		        scratch_P,T,(long long)T*T,sV,dModelKV,(long long)dHead,
+		        groupSize,0.0f,sO,dModel,(long long)dHead,nHeads))return false;
+	}
+
+	// 3. Output-projection backward.  dO = dp_new · Wo^T.
+	if (!cast_f32_to_bf16(dp_new, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
+		return false;
+
+	// 4. dWo += sO^T · dp_new.  BF16-out: commits to persistent dWo_bf.
+	// iter 108: beta is dw_beta (0=overwrite when caller skips pre-zero
+	// for accumSteps==1, 1=accumulate for multi-micro-batch grad accum).
+	if (!cast_f32_to_bf16(sO, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(dModel, m, T, 1.0f,
+	        scratch_sdbf, dModel,
+	        scratch_qbf, m,
+	        dw_beta, dWo_bf, m))
+		return false;
+
+	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	// Recast q to BF16 for the weight-grad GEMMs.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 6+7 fused per direction.  dq accumulates FP32 (beta=1 — cross-Q/K/V dq
+	// contributions sum into single dq buffer).  dW_bf uses dw_beta (iter 108:
+	// 0=overwrite for single micro-batch, 1=accumulate for grad accum).
+	// Q:
+	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWq_bf, dModel))
+		return false;
+	// K:
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wk_bf, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWk_bf, dModelKV))
+		return false;
+	// V:
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModelKV, 1.0f, scratch_sdbf, dModelKV, Wv_bf, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModelKV, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModelKV, dw_beta, dWv_bf, dModelKV))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf, unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP, bool dw_beta_zero)
+{
+	return chiron_attention_shear_backward_bf16w_bf16g_tiled(
+	    q,dp_new,Wq_bf,Wk_bf,Wv_bf,Wo_bf,T,m,nHeads,nHeads,dHead,causal,
+	    dq,dWq_bf,dWk_bf,dWv_bf,dWo_bf,scratch_qbf,scratch_sdbf,
+	    sQ,sK,sV,sO,sdO,sdQ,sdK,sdV,scratch_P,scratch_dP,dw_beta_zero);
+}
+
+// Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
+// but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
+// (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock
+// improvement at T≥512 on Ampere/Ada hardware, at the cost of an [nH, T, T]
+// scratch buffer (caller-owned).
+//
+// Compact K/V heads are broadcast over contiguous query-head groups without
+// materializing an expanded K/V tensor.
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int nKVHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	const int dModelKV = nKVHeads * dHead;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	if (!flash_attention_cublas_tiled(scratch_Q, scratch_K, scratch_V,
+	                                    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	                                    scratch_O, scratch_S))
+		return false;
+
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S)
+{
+	return chiron_attention_shear_tiled(q,p,Wq,Wk,Wv,Wo,T,m,nHeads,nHeads,dHead,
+	    causal,invert,scratch_Q,scratch_K,scratch_V,scratch_O,scratch_S);
+}
+
+// Tiled variant of the shear backward.  Replaces flash_attention_multihead_backward
+// with flash_attention_backward_cublas_tiled — TF32 tensor-core batched GEMMs for
+// P = softmax(QK^T), dV += P^T dO, dP = dO V^T, dS = softmax_bwd(P, dP),
+// dQ = dS K, dK += dS^T Q.  Extra scratch: scratch_P and scratch_dP, each [nH, T, T].
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	const int dModelKV = nKVHeads * dHead;
+	// Recompute Q, K, V, O from q.
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	                                    sO, scratch_P))
+		return false;
+
+	// dO = dp_new · Wo^T
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+	// dWo += O^T · dp_new
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// Tiled attention backward: writes dQ/dK/dV via beta=0 overwrite (iter 107).
+	// iter 107 (2026-05-21): pre-zero memsets eliminated — flash_attention_backward
+	// _cublas_tiled now writes with beta=0 (overwrite) for all 3 grads, making
+	// the caller pre-zero redundant.
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	if (!sgemm_rowmajor_abt(T,m,dModel,1.0f,sdQ,dModel,Wq,dModel,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,dModelKV,1.0f,sdK,dModelKV,Wk,dModelKV,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_abt(T,m,dModelKV,1.0f,sdV,dModelKV,Wv,dModelKV,1.0f,dq,m)) return false;
+	if (!sgemm_rowmajor_atb(m,dModel,T,1.0f,q,m,sdQ,dModel,1.0f,dWq,dModel)) return false;
+	if (!sgemm_rowmajor_atb(m,dModelKV,T,1.0f,q,m,sdK,dModelKV,1.0f,dWk,dModelKV)) return false;
+	if (!sgemm_rowmajor_atb(m,dModelKV,T,1.0f,q,m,sdV,dModelKV,1.0f,dWv,dModelKV)) return false;
+	return true;
+}
+
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int dHead, bool causal,
+    float* dq, float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	return chiron_attention_shear_backward_tiled(q,dp_new,Wq,Wk,Wv,Wo,
+	    T,m,nHeads,nHeads,dHead,causal,dq,dWq,dWk,dWv,dWo,
+	    sQ,sK,sV,sO,sdO,sdQ,sdK,sdV,scratch_P,scratch_dP);
+}
+
+// ===========================================================================
+//  5b. cuBLAS-tiled flash attention (Stage-1 tensor-core variant).
+// ===========================================================================
+
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int nKVHeads, int dHead,
+                                    int dModel, int dModelKV, bool causal,
+                                    float* O, float* scratch_S)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0 || dModel < nHeads * dHead || dModelKV < nKVHeads * dHead)
+		return false;
+
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
+
+	// Preserve the historical one-call path exactly when GQA is a no-op.
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt(
+		        T, T, dHead, invSqrtDH,
+		        Q, dModel, (long long)dHead,
+		        K, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_abt(
+	        T,T,dHead,invSqrtDH,Q,dModel,(long long)dHead,
+	        K,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
+
+	if (causal)
+	{
+		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T)) return false;
+	}
+	else if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S))
+	{
+		return false;
+	}
+
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided(
+		        T, dHead, T, 1.0f,
+		        scratch_S, T, (long long)T * T,
+		        V, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped(
+	        T,dHead,T,1.0f,scratch_S,T,(long long)T*T,
+	        V,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
+	return true;
+}
+
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int dHead, int dModel,
+                                    bool causal, float* O, float* scratch_S)
+{
+	return flash_attention_cublas_tiled(Q, K, V, T, nHeads, nHeads, dHead,
+	                                     dModel, dModel, causal, O, scratch_S);
+}
+
+// ===========================================================================
+//  5b2. BF16 cuBLAS-tiled flash attention (tensor-core path).
+// ===========================================================================
+//
+// Same algorithm as flash_attention_cublas_tiled but with Q/K/V cast to
+// BF16 and GEMMs running on BF16 tensor cores (2x over TF32 on 4080 SUPER).
+// Softmax runs on the FP32 scratch_S; P is cast to BF16 for the PV GEMM.
+//
+// iter 118 (2026-05-21): when set_iter118_fa_inner_fwd(true) is called,
+// the cuBLAS+softmax+PV pipeline is replaced by a single FA-style fused
+// kernel (flash_attention_multihead_forward).  FP32 compute (no tensor
+// cores) — math validation Gate-0.  iter 119 will port to BF16/MMA for
+// wall improvement.
+
+namespace {
+static bool g_iter118_fa_inner_fwd = false;
+static bool g_iter119_fa_inner_bf16 = false;
+}
+
+void set_iter118_fa_inner_fwd(bool on)
+{
+	g_iter118_fa_inner_fwd = on;
+}
+
+// iter 119 (2026-05-21): BF16-input FA kernel.  Q/K/V are pre-cast to BF16
+// by the cuBLAS pipeline already (scratch_Qbf16/Kbf16/Vbf16); when this
+// toggle is on, we use those BF16 buffers directly with the BF16 FA kernel
+// (flash_attention_multihead_forward_bf16) instead of the cuBLAS+softmax+PV
+// pipeline.  Still FP32 compute inside the kernel (no tensor cores yet —
+// iter 120+ for MMA wmma path).
+void set_iter119_fa_inner_bf16(bool on)
+{
+	g_iter119_fa_inner_bf16 = on;
+}
+
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const size_t nPackedQ = static_cast<size_t>(T) * dModel;
+	const size_t nPackedKV = static_cast<size_t>(T) * dModelKV;
+	const int groupSize = nHeads / nKVHeads;
+	if (g_iter118_fa_inner_fwd)
+	{
+		return flash_attention_multihead_forward(
+		    Q, K, V, T, nHeads, nKVHeads,
+		    dHead, dModel, dModelKV, causal, O);
+	}
+	if (g_iter119_fa_inner_bf16)
+	{
+		if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPackedQ)) return false;
+		if (!cast_f32_to_bf16(K, scratch_Kbf16, nPackedKV)) return false;
+		if (!cast_f32_to_bf16(V, scratch_Vbf16, nPackedKV)) return false;
+		return flash_attention_multihead_forward_bf16(
+		    scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
+		    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal, O);
+	}
+
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPackedQ)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPackedKV)) return false;
+	if (!cast_f32_to_bf16(V, scratch_Vbf16, nPackedKV)) return false;
+
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt_bf16(
+		        T, T, dHead, invSqrtDH,
+		        scratch_Qbf16, dModel, (long long)dHead,
+		        scratch_Kbf16, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_abt_bf16(
+	        T,T,dHead,invSqrtDH,scratch_Qbf16,dModel,(long long)dHead,
+	        scratch_Kbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
+
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
+		const size_t nScores = static_cast<size_t>(nHeads) * T * T;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores)) return false;
+	}
+
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16(
+		        T, dHead, T, 1.0f,
+		        scratch_Pbf16, T, (long long)T * T,
+		        scratch_Vbf16, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads))
+			return false;
+	}
+	else if (!sgemm_batched_grouped_bf16(
+	        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+	        scratch_Vbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
+	return true;
+}
+
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    float* O, float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
+{
+	return flash_attention_cublas_tiled_bf16(
+	    Q, K, V, T, nHeads, nHeads, dHead, dModel, dModel, causal,
+	    O, scratch_S, scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16);
+}
+
+// Cast-elim Port C fwd slice (2026-06-12): pre-cast variant — identical
+// pipeline to flash_attention_cublas_tiled_bf16 from the S GEMM onward,
+// with Q/K/V already BF16 (the dst-BF16 projections wrote them).  The
+// legacy function is untouched (no codegen risk to the default path).
+static bool flash_attention_cublas_tiled_bf16_precast(
+    const unsigned short* Qbf16, const unsigned short* Kbf16,
+    const unsigned short* Vbf16,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt_bf16(
+		        T, T, dHead, invSqrtDH,
+		        Qbf16, dModel, (long long)dHead,
+		        Kbf16, dModelKV, (long long)dHead,
+		        0.0f, scratch_S, T, (long long)T * T, nHeads)) return false;
+	}
+	else if (!sgemm_batched_grouped_abt_bf16(
+	        T,T,dHead,invSqrtDH,Qbf16,dModel,(long long)dHead,
+	        Kbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        scratch_S,T,(long long)T*T,nHeads)) return false;
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S, scratch_Pbf16, nHeads, T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S, nHeads*T, T, scratch_S)) return false;
+		if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, (size_t)nHeads*T*T)) return false;
+	}
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16(
+		        T, dHead, T, 1.0f,
+		        scratch_Pbf16, T, (long long)T*T,
+		        Vbf16, dModelKV, (long long)dHead,
+		        0.0f, O, dModel, (long long)dHead, nHeads)) return false;
+	}
+	else if (!sgemm_batched_grouped_bf16(
+	        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+	        Vbf16,dModelKV,(long long)dHead,groupSize,0.0f,
+	        O,dModel,(long long)dHead,nHeads)) return false;
+	return true;
+}
+
+// Cast-elim V+O slice (2026-06-12): Task-4B (QK-Norm) production variant.
+// Q and K arrive FP32 (post qknorm_forward_gpu + per-head scale — they MUST
+// stay FP32 through QK-Norm) and are cast here exactly as the legacy
+// pipeline does; V arrives PRE-CAST BF16 (the dst-BF16 projection wrote
+// it); O is written directly as BF16 by the dst-BF16 P·V GEMM (RNE on
+// store — same rounding as the legacy FP32-write + standalone cast).
+// Eliminates the V input cast and the O output cast per call.
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    unsigned short* O_bf16,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, (size_t)T*dModel)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, (size_t)T*dModelKV)) return false;
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt_bf16(
+		        T,T,dHead,invSqrtDH,
+		        scratch_Qbf16,dModel,(long long)dHead,
+		        scratch_Kbf16,dModelKV,(long long)dHead,
+		        0.0f,scratch_S,T,(long long)T*T,nHeads)) return false;
+	}
+	else
+	{
+		for (int kv=0; kv<nKVHeads; ++kv)
+		{
+			const int h0=kv*groupSize;
+			if (!sgemm_batched_strided_abt_bf16(
+			        T,T,dHead,invSqrtDH,
+			        scratch_Qbf16+(size_t)h0*dHead,dModel,(long long)dHead,
+			        scratch_Kbf16+(size_t)kv*dHead,dModelKV,0,
+			        0.0f,scratch_S+(size_t)h0*T*T,T,(long long)T*T,groupSize)) return false;
+		}
+	}
+	if (causal)
+	{
+		if (!causal_mask_softmax_bf16_out(scratch_S,scratch_Pbf16,nHeads,T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S,nHeads*T,T,scratch_S)) return false;
+		if (!cast_f32_to_bf16(scratch_S,scratch_Pbf16,(size_t)nHeads*T*T)) return false;
+	}
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_bf16_dst_bf16(
+		        T,dHead,T,1.0f,scratch_Pbf16,T,(long long)T*T,
+		        Vbf16,dModelKV,(long long)dHead,0.0f,
+		        O_bf16,dModel,(long long)dHead,nHeads)) return false;
+	}
+	else
+	{
+		for (int kv=0; kv<nKVHeads; ++kv)
+		{
+			const int h0=kv*groupSize;
+			if (!sgemm_batched_strided_bf16_dst_bf16(
+			        T,dHead,T,1.0f,
+			        scratch_Pbf16+(size_t)h0*T*T,T,(long long)T*T,
+			        Vbf16+(size_t)kv*dHead,dModelKV,0,0.0f,
+			        O_bf16+(size_t)h0*dHead,dModel,(long long)dHead,groupSize)) return false;
+		}
+	}
+	return true;
+}
+
+bool flash_attention_cublas_tiled_bf16_vpre_obf16(
+    const float* Q, const float* K, const unsigned short* Vbf16,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    unsigned short* O_bf16, float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Pbf16)
+{
+	return flash_attention_cublas_tiled_bf16_vpre_obf16(
+	    Q,K,Vbf16,T,nHeads,nHeads,dHead,dModel,dModel,causal,
+	    O_bf16,scratch_S,scratch_Qbf16,scratch_Kbf16,scratch_Pbf16);
+}
+
+// ===========================================================================
+//  5c. cuBLAS-tiled flash attention — BACKWARD.
+// ===========================================================================
+//
+// Math:
+//   P   = softmax_row(causal((1/sqrt(dH)) Q K^T))   [recompute]
+//   dV += P^T · dO
+//   dP  = dO · V^T
+//   dS  = softmax_backward_attn(P, dP)              [existing kernel]
+//   dQ  = (1/sqrt(dH)) · dS · K
+//   dK += (1/sqrt(dH)) · dS^T · Q
+
+__global__ void gqa_reduce_full_head_grads_kernel(const float* full,float* compact,
+                                                   int T,int nHeads,int nKVHeads,int dHead)
+{
+	const int i=blockIdx.x*blockDim.x+threadIdx.x;
+	const int n=T*nKVHeads*dHead;
+	if(i>=n)return;
+	const int j=i%dHead;
+	const int x=i/dHead;
+	const int kv=x%nKVHeads;
+	const int t=x/nKVHeads;
+	const int group=nHeads/nKVHeads;
+	float sum=0.0f;
+	for(int g=0;g<group;++g)sum+=full[(size_t)t*(nHeads*dHead)+(kv*group+g)*dHead+j];
+	compact[(size_t)t*(nKVHeads*dHead)+kv*dHead+j]=sum;
+}
+
+static bool gqa_reduce_full_head_grads(const float* full,float* compact,
+                                        int T,int nHeads,int nKVHeads,int dHead)
+{
+	const int n=T*nKVHeads*dHead;
+	gqa_reduce_full_head_grads_kernel<<<(n+255)/256,256,0,computeStream()>>>(full,compact,T,nHeads,nKVHeads,dHead);
+	return cudaGetLastError()==cudaSuccess;
+}
+
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* /*O unused*/, const float* dO,
+    int T, int nHeads, int nKVHeads, int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0) return true;
+	if (nHeads % nKVHeads != 0) return false;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const int groupSize = nHeads / nKVHeads;
+
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_abt(
+		        T,T,dHead,invSqrtDH,Q,dModel,(long long)dHead,
+		        K,dModelKV,(long long)dHead,0.0f,
+		        scratch_P,T,(long long)T*T,nHeads)) return false;
+		if (!sgemm_batched_strided_abt(
+		        T,T,dHead,1.0f,dO,dModel,(long long)dHead,
+		        V,dModelKV,(long long)dHead,0.0f,
+		        scratch_dP,T,(long long)T*T,nHeads)) return false;
+	}
+	else
+	{
+		if(!sgemm_batched_grouped_abt(T,T,dHead,invSqrtDH,
+		        Q,dModel,(long long)dHead,K,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_P,T,(long long)T*T,nHeads))return false;
+		if(!sgemm_batched_grouped_abt(T,T,dHead,1.0f,
+		        dO,dModel,(long long)dHead,V,dModelKV,(long long)dHead,
+		        groupSize,0.0f,scratch_dP,T,(long long)T*T,nHeads))return false;
+	}
+
+	if (causal)
+	{
+		if (!causal_softmax_with_bwd_attn(scratch_P,scratch_dP,nHeads,T,1.0f,scratch_dP)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_P,nHeads*T,T,scratch_P)) return false;
+		if (!softmax_backward_attn(scratch_P,scratch_dP,nHeads,T,1.0f,scratch_dP)) return false;
+	}
+
+	if (nKVHeads == nHeads)
+	{
+		if (!sgemm_batched_strided_atb(
+		        T,dHead,T,1.0f,scratch_P,T,(long long)T*T,
+		        dO,dModel,(long long)dHead,0.0f,
+		        dV,dModelKV,(long long)dHead,nHeads)) return false;
+		if (!sgemm_batched_strided_exact(
+		        T,dHead,T,invSqrtDH,scratch_dP,T,(long long)T*T,
+		        K,dModelKV,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads)) return false;
+		if (!sgemm_batched_strided_atb_exact(
+		        T,dHead,T,invSqrtDH,scratch_dP,T,(long long)T*T,
+		        Q,dModel,(long long)dHead,0.0f,
+		        dK,dModelKV,(long long)dHead,nHeads)) return false;
+	}
+	else
+	{
+		// Materialize only full per-query-head gradients in dQ, which is free
+		// until the final dQ GEMM. This replaces 2*nHeads tiny GEMM launches
+		// with two batched GEMMs plus deterministic compact reductions.
+		if(!sgemm_batched_strided_atb(T,dHead,T,1.0f,
+		        scratch_P,T,(long long)T*T,dO,dModel,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads))return false;
+		if(!gqa_reduce_full_head_grads(dQ,dV,T,nHeads,nKVHeads,dHead))return false;
+		if(!sgemm_batched_strided_atb_exact(T,dHead,T,invSqrtDH,
+		        scratch_dP,T,(long long)T*T,Q,dModel,(long long)dHead,0.0f,
+		        dQ,dModel,(long long)dHead,nHeads))return false;
+		if(!gqa_reduce_full_head_grads(dQ,dK,T,nHeads,nKVHeads,dHead))return false;
+		if(!sgemm_batched_grouped_exact(T,dHead,T,invSqrtDH,
+		        scratch_dP,T,(long long)T*T,K,dModelKV,(long long)dHead,
+		        groupSize,0.0f,dQ,dModel,(long long)dHead,nHeads))return false;
+	}
+	return true;
+}
+
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int dHead, int dModel, bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP)
+{
+	return flash_attention_backward_cublas_tiled(
+	    Q,K,V,O,dO,T,nHeads,nHeads,dHead,dModel,dModel,causal,
+	    dQ,dK,dV,scratch_P,scratch_dP);
+}
+
+// ===========================================================================
+//  6b. Symplectic attention shear — backward.
+// ===========================================================================
+//
+// Backward through the forward:
+//   Q = q · Wq,   K = q · Wk,   V = q · Wv
+//   O = flash_attn(Q, K, V)
+//   Y = O · Wo
+//   p_new = p + Y
+//
+// Gradients (composition of chain rule):
+//   dL/dp      = dL/dp_new                                         (identity)
+//   dL/dY      = dL/dp_new                                         (identity)
+//   dL/dO      = dL/dY · Wo^T          (sgemm_rowmajor_abt)
+//   dL/dWo    += O^T · dL/dY           (sgemm_rowmajor_atb)
+//   dL/dQ, dK, dV  ← flash_attention_multihead_backward(Q, K, V, O, dO)
+//   dL/dq     += dL/dQ · Wq^T          (sgemm_rowmajor_abt, beta=1)
+//   dL/dq     += dL/dK · Wk^T
+//   dL/dq     += dL/dV · Wv^T
+//   dL/dWq    += q^T · dL/dQ           (sgemm_rowmajor_atb, beta=1)
+//   dL/dWk    += q^T · dL/dK
+//   dL/dWv    += q^T · dL/dV
+//
+// All the sgemms are existing cuBLAS wrappers.  The flash-attention
+// backward is the existing kernel.  This function is pure orchestration.
+
+bool chiron_attention_shear_backward(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// --- Recompute forward intermediates (Q, K, V, O) from q ---
+	if (!sgemm_rowmajor(T, dModel,   m, 1.0f, q, m, Wq, dModel,   0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+	if (!flash_attention_multihead_forward(sQ, sK, sV,
+	                                        T, nHeads, nKVHeads,
+	                                        dHead, dModel, dModelKV,
+	                                        causal, sO))
+		return false;
+
+	// --- Output-projection backward: dL/dO = dL/dp_new · Wo^T ---
+	// dp_new: [T, m]; Wo: [dModel, m]; dO: [T, dModel]; dO = dp_new · Wo^T
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+
+	// --- dL/dWo += O^T · dp_new ---
+	// O: [T, dModel]; dp_new: [T, m]; dWo: [dModel, m]; dWo += O^T · dp_new
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// --- Attention backward: given dO, produce dQ, dK, dV ---
+	// Note: flash_attention_multihead_backward WRITES to dQ and ACCUMULATES
+	// into dK, dV (via atomicAdd for the shared K/V case).  Zero them first.
+	// We use sdQ/sdK/sdV as LOCAL dQ/dK/dV accumulators.
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel,   computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModelKV, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModelKV, computeStream()));
+	if (!flash_attention_multihead_backward(sQ, sK, sV, sO, sdO,
+	                                         T, nHeads, nKVHeads,
+	                                         dHead, dModel, dModelKV,
+	                                         causal, sdQ, sdK, sdV))
+		return false;
+
+	// --- Project dQ/dK/dV back into q space.  dq += dQ · Wq^T (etc.) ---
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdK, dModelKV, Wk, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdV, dModelKV, Wv, dModelKV, 1.0f, dq, m))
+		return false;
+
+	// --- Weight gradients: dWq += q^T · dQ (etc.) ---
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdK, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdV, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+
+	return true;
+}
+
+// ===========================================================================
+//  7. Symplectic attention shear — BF16-input flash-attention variant.
+// ===========================================================================
+//
+// Same control flow as chiron_attention_shear, but the flash-attention core
+// runs with BF16 Q/K/V. On profiling hardware (RTX 4080 SUPER), the BF16
+// kernel is 50-200x faster than the FP32 variant at training-scale T and
+// dHead; this variant closes the gap between CHIRON's attention path and
+// cuBLAS's sgemm throughput.
+//
+// Cast overhead: one device-side BF16 cast per Q/K/V buffer, each O(T*dModel)
+// — negligible compared to the T*T*dHead attention work.
+
+// Backward counterpart to chiron_attention_shear_bf16 (non-materialized
+// flash attention).  Same orchestration as chiron_attention_shear_backward
+// (FP32 projections, O recomputation, output-projection backward, attention
+// backward, weight-grad accumulation) except the attention backward uses
+// flash_attention_multihead_backward_bf16 — which recomputes softmax
+// probabilities block-wise instead of reading a materialized probs tensor.
+//
+// Scratch: same as chiron_attention_shear_backward plus BF16 staging
+// buffers for Q/K/V (same as the forward).  No scratch_P / scratch_dP
+// (the whole point of flash attention).
+//
+// Intended for long-context (T >= 4096) training where the tiled variant's
+// O(nH*T^2) scratch_P + scratch_dP exceeds the GPU's remaining VRAM.
+bool chiron_attention_shear_backward_bf16(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    uint16_t* scratch_Qbf, uint16_t* scratch_Kbf, uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Recompute forward intermediates.
+	if (!sgemm_rowmajor(T, dModel,   m, 1.0f, q, m, Wq, dModel,   0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+
+	// Cast to BF16 for flash attention.
+	if (!cast_f32_to_bf16(sQ, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(sK, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(sV, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	// Forward (recompute O in FP32) — needed by the tiled PV backward path
+	// that flash_attention_multihead_backward_bf16 takes as input.
+	if (!flash_attention_multihead_forward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                             T, nHeads, nKVHeads,
+	                                             dHead, dModel, dModelKV,
+	                                             causal, sO))
+		return false;
+
+	// Output-projection backward.
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// Attention backward (flash, BF16 inputs).
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel,   computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModelKV, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModelKV, computeStream()));
+	if (!flash_attention_multihead_backward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                              sO, sdO,
+	                                              T, nHeads, nKVHeads,
+	                                              dHead, dModel, dModelKV,
+	                                              causal, sdQ, sdK, sdV))
+		return false;
+
+	// Project dQ/dK/dV back into q space.
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdK, dModelKV, Wk, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdV, dModelKV, Wv, dModelKV, 1.0f, dq, m))
+		return false;
+
+	// Weight gradients.
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdK, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdV, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+	return true;
+}
+
+// Local-window BF16 shear forward.  Same orchestration as
+// chiron_attention_shear_bf16 but uses the windowed flash kernel —
+// per-query attention restricted to ±windowSize tokens.  At T=16384,
+// windowSize=256 that's a 64× reduction on attention-core compute.
+// windowSize <= 0 or >= T degenerates to the full-attention variant.
+bool chiron_attention_shear_local_bf16(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert, int windowSize,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
+                                         uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	if (!cast_f32_to_bf16(scratch_Q, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(scratch_K, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(scratch_V, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	if (!flash_attention_multihead_forward_bf16_local(
+	        scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV,
+	        causal, windowSize, scratch_O))
+		return false;
+
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
+// Local-window BF16 shear backward.  Mirrors chiron_attention_shear_backward_bf16
+// but swaps the flash backward for the windowed variant.
+bool chiron_attention_shear_backward_local_bf16(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal, int windowSize,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    uint16_t* scratch_Qbf, uint16_t* scratch_Kbf, uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	if (!sgemm_rowmajor(T, dModel,   m, 1.0f, q, m, Wq, dModel,   0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+
+	if (!cast_f32_to_bf16(sQ, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(sK, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(sV, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	if (!flash_attention_multihead_forward_bf16_local(
+	        scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV,
+	        causal, windowSize, sO))
+		return false;
+
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel,   computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModelKV, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModelKV, computeStream()));
+	if (!flash_attention_multihead_backward_bf16_local(
+	        scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	        sO, sdO,
+	        T, nHeads, nKVHeads, dHead, dModel, dModelKV,
+	        causal, windowSize, sdQ, sdK, sdV))
+		return false;
+
+	if (!sgemm_rowmajor_abt(T, m, dModel,   1.0f, sdQ, dModel,   Wq, dModel,   1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdK, dModelKV, Wk, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdV, dModelKV, Wv, dModelKV, 1.0f, dq, m))
+		return false;
+
+	if (!sgemm_rowmajor_atb(m, dModel,   T, 1.0f, q, m, sdQ, dModel,   1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdK, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdV, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+	return true;
+}
+
+bool chiron_attention_shear_bf16(const float* q, float* p,
+                                  const float* Wq, const float* Wk,
+                                  const float* Wv, const float* Wo,
+                                  int T, int m, int nHeads, int nKVHeads, int dHead,
+                                  bool causal, bool invert,
+                                  float* scratch_Q, float* scratch_K,
+                                  float* scratch_V, float* scratch_O,
+                                  uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
+                                  uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Projections in FP32 (fast on cuBLAS).
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	// Cast Q/K/V FP32 -> BF16 for the flash-attention core.
+	if (!cast_f32_to_bf16(scratch_Q, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(scratch_K, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(scratch_V, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	// BF16-input flash attention. Output stays FP32 (written to scratch_O).
+	if (!flash_attention_multihead_forward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                             T, nHeads, nKVHeads,
+	                                             dHead, dModel, dModelKV,
+	                                             causal, scratch_O))
+		return false;
+
+	// Output projection (FP32).
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+
+	return true;
+}
+
+} // namespace gpu
+} // namespace glades
+
+#endif // GLADES_HAVE_CUDA

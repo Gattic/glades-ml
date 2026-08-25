@@ -30,13 +30,16 @@ public:
 	// Upload `count` elements from host `src` to device.
 	// If count==0, uses the full allocation size.
 	bool upload(const T* src, size_t count = 0);
+	bool uploadAsync(const T* src, size_t count = 0);
 
 	// Download `count` elements from device to host `dst`.
 	// If count==0, uses the full allocation size.
 	bool download(T* dst, size_t count = 0) const;
+	bool downloadAsync(T* dst, size_t count = 0) const;
 
 	// Zero-fill the device buffer.
 	bool zero();
+	bool zeroAsync();
 
 	// Accessors.
 	T* data() { return d_ptr; }
@@ -72,8 +75,11 @@ public:
 	bool allocate(size_t) { return false; }
 	void free() {}
 	bool upload(const T*, size_t = 0) { return false; }
+	bool uploadAsync(const T*, size_t = 0) { return false; }
 	bool download(T*, size_t = 0) const { return false; }
+	bool downloadAsync(T*, size_t = 0) const { return false; }
 	bool zero() { return false; }
+	bool zeroAsync() { return false; }
 	T* data() { return 0; }
 	const T* data() const { return 0; }
 	size_t size() const { return 0; }

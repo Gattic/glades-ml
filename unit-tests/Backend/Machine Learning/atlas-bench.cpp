@@ -1,27 +1,159 @@
 #include "atlas-bench.h"
-#include "../../unit-test.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/training_callbacks.h"
-#include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
+#include "../../../Backend/Machine Learning/Networks/training_config.h"
+#include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/image.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <unistd.h>
 #include <cmath>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace {
+
 static int64_t now_ms()
 {
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return static_cast<int64_t>(tv.tv_sec) * 1000LL + static_cast<int64_t>(tv.tv_usec) / 1000LL;
+}
+
+static bool streq(const char* a, const char* b)
+{
+	return (a && b && strcmp(a, b) == 0);
+}
+
+static bool is_finite(float v)
+{
+	return (v == v) && ((v - v) == 0.0f);
+}
+
+static bool path_exists(const std::string& path)
+{
+	struct stat st;
+	return (::stat(path.c_str(), &st) == 0);
+}
+
+static bool is_directory(const std::string& path)
+{
+	struct stat st;
+	if (::stat(path.c_str(), &st) != 0)
+		return false;
+	return S_ISDIR(st.st_mode) != 0;
+}
+
+static std::string join_path(const std::string& a, const std::string& b)
+{
+	if (b.empty())
+		return a;
+	if (!b.empty() && b[0] == '/')
+		return b;
+	if (a.empty())
+		return b;
+	if (a[a.size() - 1u] == '/')
+		return a + b;
+	return a + "/" + b;
+}
+
+static std::string to_lower_copy(const std::string& s)
+{
+	std::string out = s;
+	for (size_t i = 0; i < out.size(); ++i)
+	{
+		if (out[i] >= 'A' && out[i] <= 'Z')
+			out[i] = static_cast<char>(out[i] - 'A' + 'a');
+	}
+	return out;
+}
+
+static bool has_image_manifests(const std::string& dir)
+{
+	return is_directory(dir) &&
+	       path_exists(join_path(dir, "train.csv")) &&
+	       path_exists(join_path(dir, "test.csv"));
+}
+
+enum BenchMode
+{
+	BENCH_MODE_ALL = 0,
+	BENCH_MODE_STANDARD = 1,
+	BENCH_MODE_ENDURANCE = 2,
+	BENCH_MODE_FC_HEAVY = 3
+};
+
+enum BenchModelKind
+{
+	BENCH_MODEL_LENET = 0,
+	BENCH_MODEL_DFF_MLP = 1
+};
+
+static bool parse_uint_arg(const char* text, unsigned int& outValue)
+{
+	if (!text || !*text)
+		return false;
+	char* end = NULL;
+	const unsigned long v = strtoul(text, &end, 10);
+	if (!end || *end != '\0')
+		return false;
+	outValue = static_cast<unsigned int>(v);
+	return true;
+}
+
+static bool parse_float_arg(const char* text, float& outValue)
+{
+	if (!text || !*text)
+		return false;
+	char* end = NULL;
+	const double v = strtod(text, &end);
+	if (!end || *end != '\0')
+		return false;
+	outValue = static_cast<float>(v);
+	return true;
+}
+
+static unsigned int max_u32(unsigned int a, unsigned int b)
+{
+	return (a > b) ? a : b;
+}
+
+static bool parse_mode_arg(const char* text, BenchMode& outMode)
+{
+	if (!text || !*text)
+		return false;
+	if (streq(text, "all"))
+	{
+		outMode = BENCH_MODE_ALL;
+		return true;
+	}
+	if (streq(text, "standard") || streq(text, "short"))
+	{
+		outMode = BENCH_MODE_STANDARD;
+		return true;
+	}
+	if (streq(text, "endurance") || streq(text, "big") || streq(text, "long"))
+	{
+		outMode = BENCH_MODE_ENDURANCE;
+		return true;
+	}
+	if (streq(text, "fc-heavy") || streq(text, "fc") || streq(text, "mlp"))
+	{
+		outMode = BENCH_MODE_FC_HEAVY;
+		return true;
+	}
+	return false;
 }
 
 class CaptureMetricsCallbacks : public glades::ITrainingCallbacks
@@ -41,141 +173,1833 @@ public:
 	bool saw;
 };
 
-struct BenchResult
+struct BenchConfig
 {
-	const char* netType;
-	const char* optimizer;
-	long long trainMs;
-	float finalLoss;
-	bool ok;
-	std::string err;
-	BenchResult() : netType(""), optimizer(""), trainMs(0), finalLoss(0.0f), ok(true) {}
+	BenchMode mode;
+	std::string datasetRequest;
+	unsigned int trainLimit;
+	unsigned int testLimit;
+	unsigned int epochs;
+	unsigned int repeats;
+	unsigned int batchSize;
+	unsigned int atlasRank;
+	unsigned int atlasComplementRank;
+	unsigned int atlasTSub;
+	unsigned int atlasPrismEnabled;
+	unsigned int atlasResolveEnabled;
+	unsigned int atlasResolveLagHorizon;
+	unsigned int atlasHeroEnabled;
+	unsigned int atlasHeroLagHorizon;
+	unsigned int atlasCobaltEnabled;
+	unsigned int atlasCobaltLagHorizon;
+	unsigned int atlasBirchEnabled;
+	unsigned int atlasBirchPastHorizon;
+	unsigned int atlasBirchFutureHorizon;
+	unsigned int atlasGhostEnabled;
+	unsigned int atlasGhostLagHorizon;
+	unsigned int atlasSparrowEnabled;
+	unsigned int atlasSparrowModeRank;
+	unsigned int atlasSparrowAutoModeGate;
+	unsigned int atlasQbrtEnabled;
+	unsigned int atlasQbrtLagHorizon;
+	unsigned int atlasQrcEnabled;
+	unsigned int atlasQrcLagHorizon;
+	unsigned int atlasRiftEnabled;
+	unsigned int atlasRiftLagHorizon;
+	unsigned int atlasOrbitEnabled;
+	BenchModelKind modelKind;
+	unsigned int seed;
+	float clipNorm;
+	float sgdLR;
+	float sgdMomentum;
+	float adamLR;
+	float atlasLR;
+	float atlasKappaMax;
+	float atlasSectorLrScale;
+	float atlasSectorKappaMax;
+	float atlasPrismMemoryScale;
+	float atlasPrismEdgeThreshold;
+	float atlasResolveMemoryScale;
+	float atlasResolveEdgeThreshold;
+	float atlasHeroMemoryScale;
+	float atlasHeroEdgeThreshold;
+	float atlasCobaltMemoryScale;
+	float atlasCobaltEdgeThreshold;
+	float atlasBirchMemoryScale;
+	float atlasBirchEdgeThreshold;
+	float atlasGhostMemoryScale;
+	float atlasGhostEdgeThreshold;
+	float atlasSparrowMemoryScale;
+	float atlasSparrowEdgeThreshold;
+	float atlasSparrowSecondEdgeThreshold;
+	float atlasSparrowSecondEdgeFraction;
+	float atlasSparrowPoleMax;
+	float atlasQbrtMemoryScale;
+	float atlasQbrtEdgeThreshold;
+	float atlasQbrtPoleMax;
+	float atlasQrcMemoryScale;
+	float atlasQrcEdgeThreshold;
+	float atlasQrcPoleMax;
+	float atlasRiftMemoryScale;
+	float atlasRiftEdgeThreshold;
+	float atlasRiftPoleMax;
+	float atlasOrbitMemoryScale;
+	float atlasOrbitEdgeThreshold;
+	float atlasOrbitPoleMax;
+
+	BenchConfig()
+	    : mode(BENCH_MODE_ALL),
+	      datasetRequest("auto"),
+	      trainLimit(5000u),
+	      testLimit(1000u),
+	      epochs(5u),
+	      repeats(1u),
+	      batchSize(64u),
+	      atlasRank(16u),
+	      atlasComplementRank(0u),
+	      atlasTSub(200u),
+	      atlasPrismEnabled(0u),
+	      atlasResolveEnabled(0u),
+	      atlasResolveLagHorizon(4u),
+	      atlasHeroEnabled(0u),
+	      atlasHeroLagHorizon(4u),
+	      atlasCobaltEnabled(0u),
+	      atlasCobaltLagHorizon(4u),
+	      atlasBirchEnabled(0u),
+	      atlasBirchPastHorizon(3u),
+	      atlasBirchFutureHorizon(2u),
+	      atlasGhostEnabled(0u),
+	      atlasGhostLagHorizon(4u),
+	      atlasSparrowEnabled(0u),
+	      atlasSparrowModeRank(1u),
+	      atlasSparrowAutoModeGate(0u),
+	      atlasQbrtEnabled(0u),
+	      atlasQbrtLagHorizon(4u),
+	      atlasQrcEnabled(0u),
+		      atlasQrcLagHorizon(4u),
+		      atlasRiftEnabled(0u),
+		      atlasRiftLagHorizon(4u),
+		      atlasOrbitEnabled(0u),
+		      modelKind(BENCH_MODEL_LENET),
+		      seed(1337u),
+	      clipNorm(5.0f),
+	      sgdLR(0.01f),
+	      sgdMomentum(0.9f),
+	      adamLR(0.0015f),
+	      atlasLR(0.08f),
+	      atlasKappaMax(10.0f),
+	      atlasSectorLrScale(0.25f),
+	      atlasSectorKappaMax(0.5f),
+	      atlasPrismMemoryScale(0.15f),
+	      atlasPrismEdgeThreshold(0.05f),
+	      atlasResolveMemoryScale(0.10f),
+	      atlasResolveEdgeThreshold(0.05f),
+	      atlasHeroMemoryScale(0.10f),
+	      atlasHeroEdgeThreshold(0.10f),
+	      atlasCobaltMemoryScale(0.08f),
+	      atlasCobaltEdgeThreshold(0.10f),
+	      atlasBirchMemoryScale(0.08f),
+	      atlasBirchEdgeThreshold(0.10f),
+	      atlasGhostMemoryScale(0.05f),
+	      atlasGhostEdgeThreshold(0.10f),
+	      atlasSparrowMemoryScale(0.05f),
+	      atlasSparrowEdgeThreshold(0.10f),
+	      atlasSparrowSecondEdgeThreshold(0.10f),
+	      atlasSparrowSecondEdgeFraction(0.50f),
+	      atlasSparrowPoleMax(0.95f),
+	      atlasQbrtMemoryScale(0.05f),
+	      atlasQbrtEdgeThreshold(0.10f),
+	      atlasQbrtPoleMax(0.95f),
+	      atlasQrcMemoryScale(0.05f),
+	      atlasQrcEdgeThreshold(0.10f),
+	      atlasQrcPoleMax(0.95f),
+	      atlasRiftMemoryScale(0.05f),
+	      atlasRiftEdgeThreshold(0.05f),
+	      atlasRiftPoleMax(0.95f),
+	      atlasOrbitMemoryScale(0.04f),
+	      atlasOrbitEdgeThreshold(0.05f),
+	      atlasOrbitPoleMax(0.95f)
+	{
+	}
 };
 
-static BenchResult runBench(int netType, bool useAtlas,
-                            int epochs, int hiddenSize, unsigned int atlasRank,
-                            unsigned int seed)
+struct DatasetInfo
 {
-	BenchResult r;
-	r.netType = (netType == glades::NNetwork::TYPE_DFF) ? "DFF" : "RNN";
-	r.optimizer = useAtlas ? "ATLAS" : "SGD";
+	std::string resolvedDir;
+	std::string datasetName;
+	std::string note;
+	unsigned int originalTrainSize;
+	unsigned int originalTestSize;
 
-	// Dataset: simple regression (sum of inputs)
-	glades::NumberInput di;
-	di.trainMatrix = shmea::GMatrix(8, shmea::GVector<float>(2, 0.0f));
-	di.trainExpectedMatrix = shmea::GMatrix(8, shmea::GVector<float>(1, 0.0f));
-	for (int i = 0; i < 8; ++i)
+	DatasetInfo()
+	    : resolvedDir(),
+	      datasetName(),
+	      note(),
+	      originalTrainSize(0u),
+	      originalTestSize(0u)
 	{
-		float x = static_cast<float>(i) / 8.0f;
-		float y = static_cast<float>(i + 1) / 8.0f;
-		di.trainMatrix[i][0] = x;
-		di.trainMatrix[i][1] = y;
-		di.trainExpectedMatrix[i][0] = (x + y) * 0.5f;
 	}
-	di.testMatrix = di.trainMatrix;
-	di.testExpectedMatrix = di.trainExpectedMatrix;
+};
 
+struct SingleRunResult
+{
+	const char* optimizerLabel;
+	long long trainMs;
+	long long testMs;
+	float trainLoss;
+	float trainAcc;
+	float testLoss;
+	float testAcc;
+	double trainImagesPerSec;
+	bool ok;
+	std::string err;
+
+	SingleRunResult()
+	    : optimizerLabel(""),
+	      trainMs(0LL),
+	      testMs(0LL),
+	      trainLoss(0.0f),
+	      trainAcc(0.0f),
+	      testLoss(0.0f),
+	      testAcc(0.0f),
+	      trainImagesPerSec(0.0),
+	      ok(true),
+	      err()
+	{
+	}
+};
+
+struct AggregateStats
+{
+	double mean;
+	double stddev;
+	AggregateStats() : mean(0.0), stddev(0.0) {}
+};
+
+struct BenchmarkSummary
+{
+	const char* label;
+	AggregateStats trainSec;
+	AggregateStats imgPerSec;
+	AggregateStats trainLoss;
+	AggregateStats trainAcc;
+	AggregateStats testLoss;
+	AggregateStats testAcc;
+	bool ok;
+	std::string status;
+
+	BenchmarkSummary()
+	    : label(""),
+	      trainSec(),
+	      imgPerSec(),
+	      trainLoss(),
+	      trainAcc(),
+	      testLoss(),
+	      testAcc(),
+	      ok(false),
+	      status()
+	{
+	}
+};
+
+enum OptimizerVariant
+{
+	OPT_SGD = 0,
+	OPT_ADAMW = 1,
+	OPT_ATLAS_BRSP = 2
+};
+
+struct BenchmarkCase
+{
+	std::string label;
+	std::string description;
+	BenchConfig cfg;
+
+	BenchmarkCase()
+	    : label(),
+	      description(),
+	      cfg()
+	{
+	}
+};
+
+static void print_usage()
+{
+	printf("Usage: glades-unit-tests atlas-bench [options]\n");
+	printf("Options:\n");
+	printf("  --mode all|standard|endurance|fc-heavy Run the short CNN case, the minutes-scale CNN case, or the FC-heavy MLP case (default: all)\n");
+	printf("  --dataset auto|mnist|mnist-small|PATH   Dataset directory with train.csv/test.csv (default: auto)\n");
+	printf("  --train-limit N                         Class-balanced train subset size; 0 = full split (default: 5000)\n");
+	printf("  --test-limit N                          Class-balanced test subset size; 0 = full split (default: 1000)\n");
+	printf("  --epochs N                              Training epochs per run (default: 5)\n");
+	printf("  --repeats N                             Repeats per optimizer in each case (default: 1)\n");
+	printf("  --batch-size N                          Mini-batch size (default: 64)\n");
+	printf("  --clip-norm X                           Global grad clip norm (default: 5.0)\n");
+	printf("  --sgd-lr X                              SGD learning rate (default: 0.01)\n");
+	printf("  --sgd-momentum X                        SGD momentum factor (default: 0.9)\n");
+	printf("  --adam-lr X                             AdamW learning rate (default: 0.0015)\n");
+	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.08)\n");
+	printf("  --atlas-kappa-max X                     ATLAS baseline/active kappaMax (default: 10.0)\n");
+	printf("  --rank N                                ATLAS subspace rank (default: 16)\n");
+	printf("  --atlas-complement-rank N               ATLAS complement rank cap (default: 0)\n");
+	printf("  --atlas-sector-lr-scale X               ATLAS complement-sector lr scale (default: 0.25)\n");
+	printf("  --atlas-sector-kappa-max X              ATLAS complement-sector kappaMax (default: 0.5)\n");
+	printf("  --atlas-prism 0|1                       Enable PRISM memory / predictive-edge gate (default: 0)\n");
+	printf("  --atlas-prism-memory-scale X            PRISM active-memory scale (default: 0.15)\n");
+	printf("  --atlas-prism-edge-threshold X          PRISM complement predictive-edge threshold (default: 0.05)\n");
+	printf("  --atlas-resolve 0|1                     Enable RESOLVE transfer-edge gate / memory kernel (default: 0)\n");
+	printf("  --atlas-resolve-lag-horizon N           RESOLVE lag horizon (default: 4)\n");
+	printf("  --atlas-resolve-memory-scale X          RESOLVE active-memory scale (default: 0.10)\n");
+	printf("  --atlas-resolve-edge-threshold X        RESOLVE complement transfer-edge threshold (default: 0.05)\n");
+	printf("  --atlas-hero 0|1                        Enable HERO Hankel-edge gate / memory fallback (default: 0)\n");
+	printf("  --atlas-hero-lag-horizon N              HERO lag horizon (default: 4)\n");
+	printf("  --atlas-hero-memory-scale X             HERO active-memory scale (default: 0.10)\n");
+	printf("  --atlas-hero-edge-threshold X           HERO complement Hankel-edge threshold (default: 0.10)\n");
+	printf("  --atlas-cobalt 0|1                      Enable COBALT transfer-edge gate / memory fallback (default: 0)\n");
+	printf("  --atlas-cobalt-lag-horizon N            COBALT lag horizon (default: 4)\n");
+	printf("  --atlas-cobalt-memory-scale X           COBALT active-memory scale (default: 0.08)\n");
+	printf("  --atlas-cobalt-edge-threshold X         COBALT complement transfer-edge threshold (default: 0.10)\n");
+	printf("  --atlas-birch 0|1                       Enable BIRCH Hankel-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-birch-past-horizon N            BIRCH past-state horizon (default: 3)\n");
+	printf("  --atlas-birch-future-horizon N          BIRCH future-state horizon (default: 2)\n");
+	printf("  --atlas-birch-memory-scale X            BIRCH active-memory scale (default: 0.08)\n");
+	printf("  --atlas-birch-edge-threshold X          BIRCH Hankel transfer-edge threshold (default: 0.10)\n");
+	printf("  --atlas-ghost 0|1                       Enable GHOST quotient-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-ghost-lag-horizon N             GHOST lag horizon (default: 4)\n");
+	printf("  --atlas-ghost-memory-scale X            GHOST active-memory scale (default: 0.05)\n");
+	printf("  --atlas-ghost-edge-threshold X          GHOST quotient-transfer edge threshold (default: 0.10)\n");
+	printf("  --atlas-sparrow 0|1                     Enable SPARROW streaming quotient-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-sparrow-memory-scale X          SPARROW active-memory scale (default: 0.05)\n");
+	printf("  --atlas-sparrow-edge-threshold X        SPARROW canonical edge threshold (default: 0.10)\n");
+	printf("  --atlas-sparrow-auto-mode-gate 0|1      Treat SPARROW mode rank as a cap with auto mode-2 admission (default: 0)\n");
+	printf("  --atlas-sparrow-second-edge-threshold X Minimum raw mode-2 SPARROW edge for auto admission (default: 0.10)\n");
+	printf("  --atlas-sparrow-second-edge-fraction X  Minimum mode-2/mode-1 edge ratio for auto admission (default: 0.50)\n");
+	printf("  --atlas-sparrow-pole-max X              SPARROW latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-sparrow-mode-rank N             SPARROW retained transfer mode rank (default: 1)\n");
+	printf("  --atlas-qbrt 0|1                        Enable QBRT quotient-balanced transfer memory fallback (default: 0)\n");
+	printf("  --atlas-qbrt-lag-horizon N              QBRT lag horizon (default: 4)\n");
+	printf("  --atlas-qbrt-memory-scale X             QBRT active-memory scale (default: 0.05)\n");
+	printf("  --atlas-qbrt-edge-threshold X           QBRT transfer edge threshold (default: 0.10)\n");
+	printf("  --atlas-qbrt-pole-max X                 QBRT latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-qrc 0|1                         Enable QRC quotient resolvent-control memory fallback (default: 0)\n");
+	printf("  --atlas-qrc-lag-horizon N               QRC lag horizon (default: 4)\n");
+	printf("  --atlas-qrc-memory-scale X              QRC active-memory scale (default: 0.05)\n");
+	printf("  --atlas-qrc-edge-threshold X            QRC closed-loop edge threshold (default: 0.10)\n");
+	printf("  --atlas-qrc-pole-max X                  QRC latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-rift 0|1                        Enable RIFT signature-memory fallback (default: 0)\n");
+	printf("  --atlas-rift-lag-horizon N              RIFT path lag horizon (default: 4)\n");
+	printf("  --atlas-rift-memory-scale X             RIFT active-memory scale (default: 0.05)\n");
+	printf("  --atlas-rift-edge-threshold X           RIFT path-edge threshold (default: 0.05)\n");
+	printf("  --atlas-rift-pole-max X                 RIFT latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-orbit 0|1                       Enable ORBIT-Lite output-head memory fallback (default: 0)\n");
+	printf("  --atlas-orbit-memory-scale X            ORBIT-Lite active-memory scale (default: 0.04)\n");
+	printf("  --atlas-orbit-edge-threshold X          ORBIT-Lite functional edge threshold (default: 0.05)\n");
+	printf("  --atlas-orbit-pole-max X                ORBIT-Lite latent pole clamp (default: 0.95)\n");
+	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
+	printf("  --seed N                                Base seed for repeats (default: 1337)\n");
+	printf("  --help                                  Show this message\n");
+}
+
+static BenchConfig make_endurance_config(const BenchConfig& base)
+{
+	BenchConfig endurance = base;
+	endurance.mode = BENCH_MODE_ENDURANCE;
+	if (base.trainLimit != 0u)
+	{
+		const unsigned long scaledTrain = static_cast<unsigned long>(base.trainLimit) * 4ul;
+		endurance.trainLimit = static_cast<unsigned int>((scaledTrain > 20000ul) ? scaledTrain : 20000ul);
+	}
+	else
+	{
+		endurance.trainLimit = 0u;
+	}
+	if (base.testLimit != 0u)
+	{
+		const unsigned long scaledTest = static_cast<unsigned long>(base.testLimit) * 4ul;
+		endurance.testLimit = static_cast<unsigned int>((scaledTest > 4000ul) ? scaledTest : 4000ul);
+	}
+	else
+	{
+		endurance.testLimit = 0u;
+	}
+	endurance.epochs = max_u32(base.epochs * 2u, 10u);
+	endurance.atlasTSub = max_u32(base.atlasTSub, 500u);
+	return endurance;
+}
+
+static BenchConfig make_fc_heavy_config(const BenchConfig& base)
+{
+	BenchConfig fcHeavy = base;
+	fcHeavy.mode = BENCH_MODE_FC_HEAVY;
+	fcHeavy.modelKind = BENCH_MODEL_DFF_MLP;
+	fcHeavy.batchSize = max_u32(base.batchSize, 128u);
+	if (base.trainLimit == 0u || base.trainLimit > 2000u)
+		fcHeavy.trainLimit = 2000u;
+	if (base.testLimit == 0u || base.testLimit > 1000u)
+		fcHeavy.testLimit = 1000u;
+	if (base.epochs > 3u)
+		fcHeavy.epochs = 3u;
+	fcHeavy.atlasTSub = max_u32(base.atlasTSub, 200u);
+	return fcHeavy;
+}
+
+static void build_benchmark_cases(const BenchConfig& base, std::vector<BenchmarkCase>& outCases)
+{
+	outCases.clear();
+
+	if (base.mode == BENCH_MODE_ALL || base.mode == BENCH_MODE_STANDARD)
+	{
+		BenchmarkCase standard;
+		standard.label = "standard";
+		standard.description = "Reference MNIST run sized to finish quickly while still showing real optimizer behavior.";
+		standard.cfg = base;
+		standard.cfg.mode = BENCH_MODE_STANDARD;
+		outCases.push_back(standard);
+	}
+
+	if (base.mode == BENCH_MODE_ALL || base.mode == BENCH_MODE_ENDURANCE)
+	{
+		BenchmarkCase endurance;
+		endurance.label = "endurance";
+		endurance.description = "Scaled-up MNIST run sized to take minutes instead of seconds on CPU builds.";
+		endurance.cfg = make_endurance_config(base);
+		outCases.push_back(endurance);
+	}
+
+	if (base.mode == BENCH_MODE_FC_HEAVY)
+	{
+		BenchmarkCase fcHeavy;
+		fcHeavy.label = "fc-heavy";
+		fcHeavy.description = "FC-heavy MNIST DFF/MLP run for testing whether ATLAS transfer memory helps when residual structure is concentrated in fully connected layers.";
+		fcHeavy.cfg = make_fc_heavy_config(base);
+		outCases.push_back(fcHeavy);
+	}
+}
+
+static unsigned long long planned_train_images(const BenchConfig& cfg,
+                                               unsigned int trainSize,
+                                               size_t optimizerCount)
+{
+	return static_cast<unsigned long long>(cfg.epochs) *
+	       static_cast<unsigned long long>(cfg.repeats) *
+	       static_cast<unsigned long long>(trainSize) *
+	       static_cast<unsigned long long>(optimizerCount);
+}
+
+static bool find_named_dataset(const char* leafName, std::string& outDir)
+{
+	std::vector<std::string> candidates;
+	candidates.push_back(std::string("datasets/images/") + leafName);
+	candidates.push_back(std::string("unit-tests/datasets/images/") + leafName);
+	candidates.push_back(std::string("../datasets/images/") + leafName);
+	candidates.push_back(std::string("../unit-tests/datasets/images/") + leafName);
+	candidates.push_back(std::string("../../datasets/images/") + leafName);
+	candidates.push_back(std::string("../../unit-tests/datasets/images/") + leafName);
+
+	for (size_t i = 0; i < candidates.size(); ++i)
+	{
+		if (has_image_manifests(candidates[i]))
+		{
+			outDir = candidates[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool resolve_dataset_info(const std::string& request, DatasetInfo& outInfo, std::string& outErr)
+{
+	outInfo = DatasetInfo();
+	outErr.clear();
+
+	const std::string lower = to_lower_copy(request);
+	if (lower == "auto")
+	{
+		if (find_named_dataset("MNIST", outInfo.resolvedDir))
+		{
+			outInfo.datasetName = "MNIST";
+			return true;
+		}
+		if (find_named_dataset("MNIST_small", outInfo.resolvedDir))
+		{
+			outInfo.datasetName = "MNIST_small";
+			outInfo.note = "Full MNIST not found; using MNIST_small fallback.";
+			return true;
+		}
+		outErr = "Could not find MNIST or MNIST_small under the repo/unit-tests datasets.";
+		return false;
+	}
+
+	if (lower == "mnist")
+	{
+		if (find_named_dataset("MNIST", outInfo.resolvedDir))
+		{
+			outInfo.datasetName = "MNIST";
+			return true;
+		}
+		outErr = "Requested dataset 'mnist' was not found.";
+		return false;
+	}
+
+	if (lower == "mnist-small" || lower == "mnist_small")
+	{
+		if (find_named_dataset("MNIST_small", outInfo.resolvedDir))
+		{
+			outInfo.datasetName = "MNIST_small";
+			return true;
+		}
+		outErr = "Requested dataset 'mnist-small' was not found.";
+		return false;
+	}
+
+	if (has_image_manifests(request))
+	{
+		outInfo.resolvedDir = request;
+		outInfo.datasetName = request;
+		return true;
+	}
+
+	if (find_named_dataset(request.c_str(), outInfo.resolvedDir))
+	{
+		outInfo.datasetName = request;
+		return true;
+	}
+
+	outErr = std::string("Dataset path does not contain train.csv/test.csv: ") + request;
+	return false;
+}
+
+static shmea::GTable table_from_indices(const shmea::GTable& src, const std::vector<unsigned int>& idx)
+{
+	shmea::GTable out(src.getDelimiter(), src.getHeaders());
+	for (unsigned int c = 0; c < src.numberOfCols(); ++c)
+	{
+		if (src.isOutput(c))
+			out.toggleOutput(c);
+	}
+	for (size_t i = 0; i < idx.size(); ++i)
+		out.addRow(src.getRow(idx[i]));
+	return out;
+}
+
+static std::vector<unsigned int> make_balanced_indices(const shmea::GTable& legend, unsigned int limit)
+{
+	const unsigned int rowCount = legend.numberOfRows();
+	std::vector<unsigned int> out;
+	if (limit == 0u || limit >= rowCount)
+	{
+		out.reserve(rowCount);
+		for (unsigned int i = 0; i < rowCount; ++i)
+			out.push_back(i);
+		return out;
+	}
+
+	std::map<std::string, std::vector<unsigned int> > byLabel;
+	for (unsigned int i = 0; i < rowCount; ++i)
+	{
+		const std::string label = legend.getCell(i, 1).c_str();
+		byLabel[label].push_back(i);
+	}
+
+	std::vector<std::string> labels;
+	for (std::map<std::string, std::vector<unsigned int> >::const_iterator it = byLabel.begin();
+	     it != byLabel.end(); ++it)
+	{
+		labels.push_back(it->first);
+	}
+
+	std::vector<size_t> cursor(labels.size(), 0u);
+	out.reserve(limit);
+	while (out.size() < limit)
+	{
+		bool madeProgress = false;
+		for (size_t i = 0; i < labels.size() && out.size() < limit; ++i)
+		{
+			const std::vector<unsigned int>& bucket = byLabel[labels[i]];
+			if (cursor[i] >= bucket.size())
+				continue;
+			out.push_back(bucket[cursor[i]]);
+			++cursor[i];
+			madeProgress = true;
+		}
+		if (!madeProgress)
+			break;
+	}
+
+	return out;
+}
+
+static bool load_image_dataset(glades::ImageInput& di,
+                               DatasetInfo& datasetInfo,
+                               unsigned int trainLimit,
+                               unsigned int testLimit,
+                               std::string& outErr)
+{
+	outErr.clear();
+
+	const std::string trainManifest = join_path(datasetInfo.resolvedDir, "train.csv");
+	const std::string testManifest = join_path(datasetInfo.resolvedDir, "test.csv");
+
+	const shmea::GTable trainRaw(shmea::GString(trainManifest.c_str()), ',', shmea::GTable::TYPE_FILE_STRINGS_ONLY);
+	const shmea::GTable testRaw(shmea::GString(testManifest.c_str()), ',', shmea::GTable::TYPE_FILE_STRINGS_ONLY);
+	if (trainRaw.numberOfRows() == 0u || testRaw.numberOfRows() == 0u)
+	{
+		outErr = "Dataset manifests loaded, but one of the splits is empty.";
+		return false;
+	}
+
+	datasetInfo.originalTrainSize = trainRaw.numberOfRows();
+	datasetInfo.originalTestSize = testRaw.numberOfRows();
+
+	const std::vector<unsigned int> trainIdx = make_balanced_indices(trainRaw, trainLimit);
+	const std::vector<unsigned int> testIdx = make_balanced_indices(testRaw, testLimit);
+
+	di.loaded = false;
+	di.name = shmea::GString(datasetInfo.datasetName.c_str());
+	di.trainingLegend = table_from_indices(trainRaw, trainIdx);
+	di.testingLegend = table_from_indices(testRaw, testIdx);
+	di.trainingOHEMaps.clear();
+	di.trainingFeatureIsCategorical.clear();
+	di.testingOHEMaps.clear();
+	di.testingFeatureIsCategorical.clear();
+	di.trainingPaths.clear();
+	di.testingPaths.clear();
+	di.featureCount = 0u;
+	di.rowCacheOrder.clear();
+	di.rowCache.clear();
+	di.scratchRow.clear();
+	di.scratchExpected.clear();
+	di.oneHotByIndex.clear();
+	di.emptyRow.clear();
+
+	di.importHelper(di.trainingLegend, di.trainingOHEMaps, di.trainingFeatureIsCategorical);
+	if (di.trainingOHEMaps.size() <= 1u || !di.trainingOHEMaps[1])
+	{
+		outErr = "Failed to build label encoding for the training split.";
+		return false;
+	}
+	di.testingOHEMaps = di.trainingOHEMaps;
+	di.testingFeatureIsCategorical = di.trainingFeatureIsCategorical;
+
+	const unsigned int classCount = static_cast<unsigned int>(di.trainingOHEMaps[1]->size());
+	di.oneHotByIndex.resize(classCount);
+	for (unsigned int i = 0; i < classCount; ++i)
+	{
+		di.oneHotByIndex[i] = shmea::GVector<float>(classCount, 0.0f);
+		di.oneHotByIndex[i][i] = 1.0f;
+	}
+
+	di.trainingPaths.reserve(di.trainingLegend.numberOfRows());
+	for (unsigned int i = 0; i < di.trainingLegend.numberOfRows(); ++i)
+		di.trainingPaths.push_back(join_path(datasetInfo.resolvedDir, di.trainingLegend.getCell(i, 0).c_str()));
+
+	di.testingPaths.reserve(di.testingLegend.numberOfRows());
+	for (unsigned int i = 0; i < di.testingLegend.numberOfRows(); ++i)
+		di.testingPaths.push_back(join_path(datasetInfo.resolvedDir, di.testingLegend.getCell(i, 0).c_str()));
+
+	if (di.trainingPaths.empty())
+	{
+		outErr = "Selected training split is empty after subsetting.";
+		return false;
+	}
+
+	shmea::Image img;
+	img.LoadPNG(shmea::GString(di.trainingPaths[0].c_str()));
+	di.featureCount = img.getPixelCount();
+	if (di.featureCount == 0u)
+	{
+		outErr = std::string("Failed to load the first training image: ") + di.trainingPaths[0];
+		return false;
+	}
+
+	di.rowCacheMaxEntries = di.getTrainSize() + di.getTestSize();
+	di.loaded = true;
+	return true;
+}
+
+static bool warm_image_cache(glades::ImageInput& di, long long& outMs, std::string& outErr)
+{
+	outMs = 0LL;
+	outErr.clear();
+
+	const int64_t t0 = now_ms();
+	for (unsigned int i = 0; i < di.getTrainSize(); ++i)
+	{
+		const float* data = NULL;
+		unsigned int size = 0u;
+		if (!di.getTrainRowView(i, data, size) || !data || size != di.getFeatureCount())
+		{
+			outErr = "Failed to materialize a training image while warming the cache.";
+			return false;
+		}
+	}
+	for (unsigned int i = 0; i < di.getTestSize(); ++i)
+	{
+		const float* data = NULL;
+		unsigned int size = 0u;
+		if (!di.getTestRowView(i, data, size) || !data || size != di.getFeatureCount())
+		{
+			outErr = "Failed to materialize a test image while warming the cache.";
+			return false;
+		}
+	}
+	const int64_t t1 = now_ms();
+	outMs = static_cast<long long>(t1 - t0);
+	return true;
+}
+
+static std::unique_ptr<glades::NNetwork> make_lenet_mnist(const std::string& name,
+                                         float learningRate,
+                                         float momentum,
+                                         int batchSize,
+                                         unsigned int seed)
+{
 	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-	    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
+	    batchSize,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f);
 
 	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
-	    hiddenSize, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
+	    128,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
 
-	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-	std::string name = std::string("bench_atlas_") + r.netType + "_" + r.optimizer;
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
+	    10,
+	    glades::OutputLayerInfo::CLASSIFICATION);
+
 	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_CNN);
+	net->setSeed(seed);
 
-	glades::NNetwork net(info, netType);
-	net.setSeed(static_cast<uint64_t>(seed));
-	net.getTerminatorMutable().setEpoch(epochs);
-	net.getTerminatorMutable().setAccuracy(0);
+	glades::CNNConfig::ConvLayerSpec conv1;
+	conv1.outChannels = 8u;
+	conv1.kernelH = 5u; conv1.kernelW = 5u;
+	conv1.strideH = 1u; conv1.strideW = 1u;
+	conv1.padH = 0u; conv1.padW = 0u;
+	conv1.useBatchNorm = false;
+	conv1.useMaxPool = true;
+	conv1.poolH = 2u; conv1.poolW = 2u;
+	conv1.poolStrideH = 2u; conv1.poolStrideW = 2u;
 
-	if (useAtlas)
-	{
-		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
-		cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
-		cfg.atlas.rank = atlasRank;
-		cfg.atlas.tSub = 50;
-	}
+	glades::CNNConfig::ConvLayerSpec conv2;
+	conv2.outChannels = 16u;
+	conv2.kernelH = 5u; conv2.kernelW = 5u;
+	conv2.strideH = 1u; conv2.strideW = 1u;
+	conv2.padH = 0u; conv2.padW = 0u;
+	conv2.useBatchNorm = false;
+	conv2.useMaxPool = true;
+	conv2.poolH = 2u; conv2.poolW = 2u;
+	conv2.poolStrideH = 2u; conv2.poolStrideW = 2u;
 
-	CaptureMetricsCallbacks cb;
-	const int64_t t0 = now_ms();
-	const glades::NNetworkStatus st = net.train(&di, &cb);
-	const int64_t t1 = now_ms();
-
-	r.trainMs = static_cast<long long>(t1 - t0);
-	if (!st.ok())
-	{
-		r.ok = false;
-		r.err = st.message;
-	}
-	if (cb.saw)
-		r.finalLoss = cb.last.totalError;
+	glades::TrainingConfig& cfg = net->getTrainingConfigMutable();
+	cfg.cnn.inputC = 1u;
+	cfg.cnn.inputH = 28u;
+	cfg.cnn.inputW = 28u;
+	cfg.cnn.convLayers.clear();
+	cfg.cnn.convLayers.push_back(conv1);
+	cfg.cnn.convLayers.push_back(conv2);
 
 	delete info;
-	return r;
+	return net;
 }
+
+static std::unique_ptr<glades::NNetwork> make_mlp_mnist(const std::string& name,
+                                       float learningRate,
+                                       float momentum,
+                                       int batchSize,
+                                       unsigned int seed)
+{
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
+	    batchSize,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::LINEAR,
+	    1.0f);
+
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
+	    512,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
+	    256,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
+	    128,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
+	    10,
+	    glades::OutputLayerInfo::CLASSIFICATION);
+
+	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_DFF);
+	net->setSeed(seed);
+
+	delete info;
+	return net;
+}
+
+static const char* benchmark_model_description(const BenchConfig& cfg)
+{
+	switch (cfg.modelKind)
+	{
+	case BENCH_MODEL_DFF_MLP:
+		return "DFF MLP (784 -> 512 -> 256 -> 128 -> 10)";
+	case BENCH_MODEL_LENET:
+	default:
+		return "LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)";
+	}
+}
+
+static void configure_optimizer(glades::NNetwork& net,
+                                OptimizerVariant optimizer,
+                                const BenchConfig& cfg)
+{
+	glades::TrainingConfig& tc = net.getTrainingConfigMutable();
+	tc.globalGradClipNorm = cfg.clipNorm;
+
+	if (optimizer == OPT_SGD)
+	{
+		tc.optimizer.type = glades::OptimizerConfig::SGD_MOMENTUM;
+	}
+	else if (optimizer == OPT_ADAMW)
+	{
+		tc.optimizer.type = glades::OptimizerConfig::ADAMW;
+		tc.optimizer.adamBeta1 = 0.9f;
+		tc.optimizer.adamBeta2 = 0.999f;
+		tc.optimizer.adamEps = 1e-8f;
+		tc.optimizer.adamBiasCorrection = true;
+	}
+	else
+	{
+		tc.optimizer.type = glades::OptimizerConfig::ATLAS;
+		tc.atlas.rank = cfg.atlasRank;
+		tc.atlas.complementRank = cfg.atlasComplementRank;
+		tc.atlas.complementLrScale = cfg.atlasSectorLrScale;
+		tc.atlas.complementKappaMax = cfg.atlasSectorKappaMax;
+		tc.atlas.prismEnabled = (cfg.atlasPrismEnabled != 0u);
+		tc.atlas.prismMemoryScale = cfg.atlasPrismMemoryScale;
+		tc.atlas.prismPredictiveEdgeThreshold = cfg.atlasPrismEdgeThreshold;
+		tc.atlas.resolveEnabled = (cfg.atlasResolveEnabled != 0u);
+		tc.atlas.resolveLagHorizon = cfg.atlasResolveLagHorizon;
+		tc.atlas.resolveMemoryScale = cfg.atlasResolveMemoryScale;
+		tc.atlas.resolvePredictiveEdgeThreshold = cfg.atlasResolveEdgeThreshold;
+		tc.atlas.heroEnabled = (cfg.atlasHeroEnabled != 0u);
+		tc.atlas.heroLagHorizon = cfg.atlasHeroLagHorizon;
+		tc.atlas.heroMemoryScale = cfg.atlasHeroMemoryScale;
+		tc.atlas.heroEdgeThreshold = cfg.atlasHeroEdgeThreshold;
+		tc.atlas.cobaltEnabled = (cfg.atlasCobaltEnabled != 0u);
+		tc.atlas.cobaltLagHorizon = cfg.atlasCobaltLagHorizon;
+		tc.atlas.cobaltMemoryScale = cfg.atlasCobaltMemoryScale;
+		tc.atlas.cobaltEdgeThreshold = cfg.atlasCobaltEdgeThreshold;
+		tc.atlas.birchEnabled = (cfg.atlasBirchEnabled != 0u);
+		tc.atlas.birchPastHorizon = cfg.atlasBirchPastHorizon;
+		tc.atlas.birchFutureHorizon = cfg.atlasBirchFutureHorizon;
+		tc.atlas.birchMemoryScale = cfg.atlasBirchMemoryScale;
+		tc.atlas.birchEdgeThreshold = cfg.atlasBirchEdgeThreshold;
+		tc.atlas.ghostEnabled = (cfg.atlasGhostEnabled != 0u);
+		tc.atlas.ghostLagHorizon = cfg.atlasGhostLagHorizon;
+		tc.atlas.ghostMemoryScale = cfg.atlasGhostMemoryScale;
+		tc.atlas.ghostEdgeThreshold = cfg.atlasGhostEdgeThreshold;
+		tc.atlas.sparrowEnabled = (cfg.atlasSparrowEnabled != 0u);
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.qbrtEnabled = (cfg.atlasQbrtEnabled != 0u);
+		tc.atlas.qbrtLagHorizon = cfg.atlasQbrtLagHorizon;
+		tc.atlas.qbrtMemoryScale = cfg.atlasQbrtMemoryScale;
+		tc.atlas.qbrtEdgeThreshold = cfg.atlasQbrtEdgeThreshold;
+		tc.atlas.qbrtPoleMax = cfg.atlasQbrtPoleMax;
+		tc.atlas.qrcEnabled = (cfg.atlasQrcEnabled != 0u);
+		tc.atlas.qrcLagHorizon = cfg.atlasQrcLagHorizon;
+		tc.atlas.qrcMemoryScale = cfg.atlasQrcMemoryScale;
+		tc.atlas.qrcEdgeThreshold = cfg.atlasQrcEdgeThreshold;
+		tc.atlas.qrcPoleMax = cfg.atlasQrcPoleMax;
+		tc.atlas.riftEnabled = (cfg.atlasRiftEnabled != 0u);
+		tc.atlas.riftLagHorizon = cfg.atlasRiftLagHorizon;
+		tc.atlas.riftMemoryScale = cfg.atlasRiftMemoryScale;
+		tc.atlas.riftEdgeThreshold = cfg.atlasRiftEdgeThreshold;
+		tc.atlas.riftPoleMax = cfg.atlasRiftPoleMax;
+		tc.atlas.orbitEnabled = (cfg.atlasOrbitEnabled != 0u);
+		tc.atlas.orbitMemoryScale = cfg.atlasOrbitMemoryScale;
+		tc.atlas.orbitEdgeThreshold = cfg.atlasOrbitEdgeThreshold;
+		tc.atlas.orbitPoleMax = cfg.atlasOrbitPoleMax;
+		tc.atlas.tSub = cfg.atlasTSub;
+		tc.atlas.beta = 0.999f;
+		tc.atlas.betaRefresh = 0.5f;
+		tc.atlas.kappaMax = cfg.atlasKappaMax;
+	}
+}
+
+static const char* optimizer_label(OptimizerVariant optimizer)
+{
+	switch (optimizer)
+	{
+	case OPT_SGD: return "SGD";
+	case OPT_ADAMW: return "AdamW";
+	case OPT_ATLAS_BRSP: return "ATLAS-BSRP";
+	default: return "Unknown";
+	}
+}
+
+static float optimizer_learning_rate(OptimizerVariant optimizer, const BenchConfig& cfg)
+{
+	switch (optimizer)
+	{
+	case OPT_SGD: return cfg.sgdLR;
+	case OPT_ADAMW: return cfg.adamLR;
+	case OPT_ATLAS_BRSP: return cfg.atlasLR;
+	default: return cfg.sgdLR;
+	}
+}
+
+static float optimizer_momentum(OptimizerVariant optimizer, const BenchConfig& cfg)
+{
+	return (optimizer == OPT_SGD) ? cfg.sgdMomentum : 0.0f;
+}
+
+static SingleRunResult run_single_benchmark(glades::ImageInput& data,
+                                            OptimizerVariant optimizer,
+                                            const BenchConfig& cfg,
+                                            unsigned int seed)
+{
+	SingleRunResult out;
+	out.optimizerLabel = optimizer_label(optimizer);
+
+	const float lr = optimizer_learning_rate(optimizer, cfg);
+	const float momentum = optimizer_momentum(optimizer, cfg);
+	const std::string netName = std::string("atlas_bench_") + out.optimizerLabel;
+
+	auto net = (cfg.modelKind == BENCH_MODEL_DFF_MLP)
+	               ? make_mlp_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed)
+	               : make_lenet_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed);
+	configure_optimizer(*net, optimizer, cfg);
+	net->getTerminatorMutable().setEpoch(static_cast<int>(cfg.epochs));
+	net->getTerminatorMutable().setAccuracy(0.0f);
+
+	CaptureMetricsCallbacks trainCb;
+	const int64_t t0 = now_ms();
+	const glades::NNetworkStatus trainStatus = net->train(&data, &trainCb);
+	const int64_t t1 = now_ms();
+	out.trainMs = static_cast<long long>(t1 - t0);
+	if (!trainStatus.ok())
+	{
+		out.ok = false;
+		out.err = trainStatus.message;
+		return out;
+	}
+	if (!trainCb.saw)
+	{
+		out.ok = false;
+		out.err = "Training completed without reporting epoch metrics.";
+		return out;
+	}
+
+	CaptureMetricsCallbacks testCb;
+	const int64_t t2 = now_ms();
+	const glades::NNetworkStatus testStatus = net->test(&data, &testCb);
+	const int64_t t3 = now_ms();
+	out.testMs = static_cast<long long>(t3 - t2);
+	if (!testStatus.ok())
+	{
+		out.ok = false;
+		out.err = testStatus.message;
+		return out;
+	}
+	if (!testCb.saw)
+	{
+		out.ok = false;
+		out.err = "Evaluation completed without reporting metrics.";
+		return out;
+	}
+
+	out.trainLoss = trainCb.last.totalError;
+	out.trainAcc = trainCb.last.classAccuracy;
+	out.testLoss = testCb.last.totalError;
+	out.testAcc = testCb.last.classAccuracy;
+	if (!is_finite(out.trainLoss) || !is_finite(out.trainAcc) ||
+	    !is_finite(out.testLoss) || !is_finite(out.testAcc))
+	{
+		out.ok = false;
+		out.err = "Non-finite loss/accuracy detected.";
+		return out;
+	}
+
+	const double totalTrainImages = static_cast<double>(cfg.epochs) * static_cast<double>(data.getTrainSize());
+	const double seconds = static_cast<double>(out.trainMs) / 1000.0;
+	out.trainImagesPerSec = (seconds > 0.0) ? (totalTrainImages / seconds) : 0.0;
+	return out;
+}
+
+static AggregateStats compute_stats(const std::vector<double>& values)
+{
+	AggregateStats stats;
+	if (values.empty())
+		return stats;
+
+	double sum = 0.0;
+	for (size_t i = 0; i < values.size(); ++i)
+		sum += values[i];
+	stats.mean = sum / static_cast<double>(values.size());
+
+	if (values.size() == 1u)
+		return stats;
+
+	double sumsq = 0.0;
+	for (size_t i = 0; i < values.size(); ++i)
+	{
+		const double d = values[i] - stats.mean;
+		sumsq += d * d;
+	}
+	stats.stddev = sqrt(sumsq / static_cast<double>(values.size()));
+	return stats;
+}
+
+static void print_summary_row(const char* label,
+                              const AggregateStats& trainSec,
+                              const AggregateStats& imgPerSec,
+                              const AggregateStats& trainLoss,
+                              const AggregateStats& trainAcc,
+                              const AggregateStats& testLoss,
+                              const AggregateStats& testAcc,
+                              const char* status)
+{
+	printf("%-11s  %7.2f +/- %-7.2f  %8.1f +/- %-8.1f  %8.4f +/- %-8.4f  %7.2f +/- %-7.2f  %8.4f +/- %-8.4f  %7.2f +/- %-7.2f  %s\n",
+	       label,
+	       trainSec.mean, trainSec.stddev,
+	       imgPerSec.mean, imgPerSec.stddev,
+	       trainLoss.mean, trainLoss.stddev,
+	       trainAcc.mean, trainAcc.stddev,
+	       testLoss.mean, testLoss.stddev,
+	       testAcc.mean, testAcc.stddev,
+	       status);
+}
+
+static bool run_benchmark_case(const BenchmarkCase& benchCase,
+                               const DatasetInfo& resolvedDatasetInfo)
+{
+	DatasetInfo datasetInfo = resolvedDatasetInfo;
+	std::string err;
+	glades::ImageInput data;
+	if (!load_image_dataset(data, datasetInfo, benchCase.cfg.trainLimit, benchCase.cfg.testLimit, err))
+	{
+		printf("Case '%s' dataset load failed: %s\n", benchCase.label.c_str(), err.c_str());
+		return false;
+	}
+
+	long long warmMs = 0LL;
+	if (!warm_image_cache(data, warmMs, err))
+	{
+		printf("Case '%s' cache warmup failed: %s\n", benchCase.label.c_str(), err.c_str());
+		return false;
+	}
+
+	const OptimizerVariant optimizers[] = { OPT_SGD, OPT_ADAMW, OPT_ATLAS_BRSP };
+	const size_t optimizerCount = sizeof(optimizers) / sizeof(optimizers[0]);
+	const int64_t caseStartMs = now_ms();
+
+	printf("------------------------------------------------------------\n");
+	printf("Case: %s\n", benchCase.label.c_str());
+	printf("Description: %s\n", benchCase.description.c_str());
+	printf("Dataset: %s\n", datasetInfo.datasetName.c_str());
+	printf("Path: %s\n", datasetInfo.resolvedDir.c_str());
+	printf("Train split: %u / %u\n", data.getTrainSize(), datasetInfo.originalTrainSize);
+	printf("Test split:  %u / %u\n", data.getTestSize(), datasetInfo.originalTestSize);
+	if (!datasetInfo.note.empty())
+		printf("Note: %s\n", datasetInfo.note.c_str());
+	printf("Model: %s\n", benchmark_model_description(benchCase.cfg));
+	printf("Config: epochs=%u repeats=%u batch=%u clip=%.2f\n",
+	       benchCase.cfg.epochs, benchCase.cfg.repeats, benchCase.cfg.batchSize, benchCase.cfg.clipNorm);
+	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u cRank=%u tSub=%u\n",
+	       benchCase.cfg.sgdLR, benchCase.cfg.sgdMomentum, benchCase.cfg.adamLR,
+	       benchCase.cfg.atlasLR, benchCase.cfg.atlasRank,
+	       benchCase.cfg.atlasComplementRank, benchCase.cfg.atlasTSub);
+	printf("ATLAS caps: kappaMax=%.3f sectorLrScale=%.3f sectorKappaMax=%.3f\n",
+	       benchCase.cfg.atlasKappaMax,
+	       benchCase.cfg.atlasSectorLrScale,
+	       benchCase.cfg.atlasSectorKappaMax);
+	printf("ATLAS PRISM: enabled=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasPrismEnabled,
+	       benchCase.cfg.atlasPrismMemoryScale,
+	       benchCase.cfg.atlasPrismEdgeThreshold);
+	printf("ATLAS RESOLVE: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasResolveEnabled,
+	       benchCase.cfg.atlasResolveLagHorizon,
+	       benchCase.cfg.atlasResolveMemoryScale,
+	       benchCase.cfg.atlasResolveEdgeThreshold);
+	printf("ATLAS HERO: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasHeroEnabled,
+	       benchCase.cfg.atlasHeroLagHorizon,
+	       benchCase.cfg.atlasHeroMemoryScale,
+	       benchCase.cfg.atlasHeroEdgeThreshold);
+	printf("ATLAS COBALT: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasCobaltEnabled,
+	       benchCase.cfg.atlasCobaltLagHorizon,
+	       benchCase.cfg.atlasCobaltMemoryScale,
+	       benchCase.cfg.atlasCobaltEdgeThreshold);
+	printf("ATLAS BIRCH: enabled=%u pastHorizon=%u futureHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasBirchEnabled,
+	       benchCase.cfg.atlasBirchPastHorizon,
+	       benchCase.cfg.atlasBirchFutureHorizon,
+	       benchCase.cfg.atlasBirchMemoryScale,
+	       benchCase.cfg.atlasBirchEdgeThreshold);
+	printf("ATLAS GHOST: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasGhostEnabled,
+	       benchCase.cfg.atlasGhostLagHorizon,
+	       benchCase.cfg.atlasGhostMemoryScale,
+	       benchCase.cfg.atlasGhostEdgeThreshold);
+	printf("ATLAS SPARROW: enabled=%u modeRankCap=%u autoGate=%u memoryScale=%.3f edgeThreshold=%.3f secondEdgeThreshold=%.3f secondEdgeFraction=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasSparrowEnabled,
+	       benchCase.cfg.atlasSparrowModeRank,
+	       benchCase.cfg.atlasSparrowAutoModeGate,
+	       benchCase.cfg.atlasSparrowMemoryScale,
+	       benchCase.cfg.atlasSparrowEdgeThreshold,
+	       benchCase.cfg.atlasSparrowSecondEdgeThreshold,
+	       benchCase.cfg.atlasSparrowSecondEdgeFraction,
+	       benchCase.cfg.atlasSparrowPoleMax);
+	printf("ATLAS RIFT: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasRiftEnabled,
+	       benchCase.cfg.atlasRiftLagHorizon,
+	       benchCase.cfg.atlasRiftMemoryScale,
+	       benchCase.cfg.atlasRiftEdgeThreshold,
+	       benchCase.cfg.atlasRiftPoleMax);
+	printf("ATLAS ORBIT: enabled=%u memoryScale=%.3f edgeThreshold=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasOrbitEnabled,
+	       benchCase.cfg.atlasOrbitMemoryScale,
+	       benchCase.cfg.atlasOrbitEdgeThreshold,
+	       benchCase.cfg.atlasOrbitPoleMax);
+	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
+	       warmMs, data.getTrainSize() + data.getTestSize());
+	printf("Planned train image passes across all optimizers: %llu\n",
+	       planned_train_images(benchCase.cfg, data.getTrainSize(), optimizerCount));
+	printf("\n");
+
+	std::vector<BenchmarkSummary> summaries;
+	summaries.reserve(optimizerCount);
+
+	for (size_t opt = 0; opt < optimizerCount; ++opt)
+	{
+		printf("Running %s\n", optimizer_label(optimizers[opt]));
+
+		std::vector<double> trainSecVals;
+		std::vector<double> imgPerSecVals;
+		std::vector<double> trainLossVals;
+		std::vector<double> trainAccVals;
+		std::vector<double> testLossVals;
+		std::vector<double> testAccVals;
+		bool allOk = true;
+		std::string firstErr;
+
+		for (unsigned int rep = 0u; rep < benchCase.cfg.repeats; ++rep)
+		{
+			const unsigned int seed = benchCase.cfg.seed + rep;
+			const SingleRunResult r = run_single_benchmark(data, optimizers[opt], benchCase.cfg, seed);
+			if (!r.ok)
+			{
+				allOk = false;
+				if (firstErr.empty())
+					firstErr = r.err;
+				printf("  [%u/%u] seed=%u failed: %s\n",
+				       rep + 1u, benchCase.cfg.repeats, seed, r.err.c_str());
+				continue;
+			}
+
+			printf("  [%u/%u] seed=%u train=%.2fs test=%.2fs trainLoss=%.4f trainAcc=%.2f%% testLoss=%.4f testAcc=%.2f%% img/s=%.1f\n",
+			       rep + 1u, benchCase.cfg.repeats, seed,
+			       static_cast<double>(r.trainMs) / 1000.0,
+			       static_cast<double>(r.testMs) / 1000.0,
+			       r.trainLoss, r.trainAcc,
+			       r.testLoss, r.testAcc,
+			       r.trainImagesPerSec);
+
+			trainSecVals.push_back(static_cast<double>(r.trainMs) / 1000.0);
+			imgPerSecVals.push_back(r.trainImagesPerSec);
+			trainLossVals.push_back(r.trainLoss);
+			trainAccVals.push_back(r.trainAcc);
+			testLossVals.push_back(r.testLoss);
+			testAccVals.push_back(r.testAcc);
+		}
+
+		BenchmarkSummary summary;
+		summary.label = optimizer_label(optimizers[opt]);
+		summary.ok = allOk && !trainSecVals.empty();
+		if (!summary.ok)
+		{
+			summary.status = firstErr.empty() ? "FAILED" : firstErr;
+		}
+		else
+		{
+			summary.trainSec = compute_stats(trainSecVals);
+			summary.imgPerSec = compute_stats(imgPerSecVals);
+			summary.trainLoss = compute_stats(trainLossVals);
+			summary.trainAcc = compute_stats(trainAccVals);
+			summary.testLoss = compute_stats(testLossVals);
+			summary.testAcc = compute_stats(testAccVals);
+			summary.status = "OK";
+		}
+		summaries.push_back(summary);
+
+		printf("\n");
+	}
+
+	printf("%s summary\n", benchCase.label.c_str());
+	printf("Optimizer     Train(s)              Img/s                 TrainLoss             TrainAcc(%%)          TestLoss              TestAcc(%%)           Status\n");
+	printf("------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------\n");
+	for (size_t i = 0; i < summaries.size(); ++i)
+	{
+		if (!summaries[i].ok)
+		{
+			printf("%-11s  %-20s  %-20s  %-20s  %-20s  %-20s  %-20s  %s\n",
+			       summaries[i].label,
+			       "-", "-", "-", "-", "-", "-", summaries[i].status.c_str());
+			continue;
+		}
+		print_summary_row(
+		    summaries[i].label,
+		    summaries[i].trainSec,
+		    summaries[i].imgPerSec,
+		    summaries[i].trainLoss,
+		    summaries[i].trainAcc,
+		    summaries[i].testLoss,
+		    summaries[i].testAcc,
+		    summaries[i].status.c_str());
+	}
+	const int64_t caseEndMs = now_ms();
+	printf("Case wall time: %.2f minutes\n",
+	       static_cast<double>(caseEndMs - caseStartMs) / 60000.0);
+	printf("\n");
+	return true;
+}
+
 } // anonymous namespace
 
 void ATLASBenchmark(int argc, char* argv[])
 {
-	printf("============================================================\n");
-	printf("ATLAS vs SGD Benchmark\n");
-	printf("============================================================\n");
-
-	// Parse args
-	int epochs = 200;
-	int hiddenSize = 8;
-	unsigned int atlasRank = 4;
-	int repeats = 3;
-
+	BenchConfig cfg;
 	for (int i = 2; i < argc; ++i)
 	{
-		if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) epochs = atoi(argv[++i]);
-		else if (strcmp(argv[i], "--hidden") == 0 && i + 1 < argc) hiddenSize = atoi(argv[++i]);
-		else if (strcmp(argv[i], "--rank") == 0 && i + 1 < argc) atlasRank = static_cast<unsigned int>(atoi(argv[++i]));
-		else if (strcmp(argv[i], "--repeats") == 0 && i + 1 < argc) repeats = atoi(argv[++i]);
-	}
-
-	printf("Config: epochs=%d hidden=%d rank=%u repeats=%d\n\n", epochs, hiddenSize, atlasRank, repeats);
-
-	// Header
-	printf("Type\tOptimizer\tTrain(ms)\tFinalLoss\tStatus\n");
-	printf("----\t---------\t---------\t---------\t------\n");
-
-	int netTypes[] = { glades::NNetwork::TYPE_DFF, glades::NNetwork::TYPE_RNN };
-	const char* typeNames[] = { "DFF", "RNN" };
-	const int nTypes = 2;
-
-	for (int t = 0; t < nTypes; ++t)
-	{
-		for (int useAtlas = 0; useAtlas <= 1; ++useAtlas)
+		if (streq(argv[i], "--help"))
 		{
-			long long totalMs = 0;
-			float totalLoss = 0.0f;
-			bool allOk = true;
-			std::string lastErr;
-
-			for (int rep = 0; rep < repeats; ++rep)
+			print_usage();
+			return;
+		}
+		else if (streq(argv[i], "--mode") && i + 1 < argc)
+		{
+			if (!parse_mode_arg(argv[++i], cfg.mode))
 			{
-				const unsigned int seed = static_cast<unsigned int>(42 + rep);
-				BenchResult r = runBench(netTypes[t], (useAtlas != 0),
-				                         epochs, hiddenSize, atlasRank, seed);
-				totalMs += r.trainMs;
-				totalLoss += r.finalLoss;
-				if (!r.ok) { allOk = false; lastErr = r.err; }
+				printf("Invalid value for --mode\n");
+				return;
 			}
-
-			const long long avgMs = totalMs / repeats;
-			const float avgLoss = totalLoss / static_cast<float>(repeats);
-			printf("%s\t%s\t\t%lld\t\t%.6f\t%s\n",
-				typeNames[t],
-				useAtlas ? "ATLAS" : "SGD",
-				avgMs, avgLoss,
-				allOk ? "OK" : lastErr.c_str());
+		}
+		else if (streq(argv[i], "--dataset") && i + 1 < argc)
+			cfg.datasetRequest = argv[++i];
+		else if (streq(argv[i], "--train-limit") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.trainLimit))
+			{
+				printf("Invalid value for --train-limit\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--test-limit") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.testLimit))
+			{
+				printf("Invalid value for --test-limit\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--epochs") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.epochs))
+			{
+				printf("Invalid value for --epochs\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--repeats") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.repeats))
+			{
+				printf("Invalid value for --repeats\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--batch-size") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.batchSize))
+			{
+				printf("Invalid value for --batch-size\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--clip-norm") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.clipNorm))
+			{
+				printf("Invalid value for --clip-norm\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--sgd-lr") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.sgdLR))
+			{
+				printf("Invalid value for --sgd-lr\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--sgd-momentum") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.sgdMomentum))
+			{
+				printf("Invalid value for --sgd-momentum\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--adam-lr") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.adamLR))
+			{
+				printf("Invalid value for --adam-lr\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-lr") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasLR))
+			{
+				printf("Invalid value for --atlas-lr\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kappa-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasKappaMax))
+			{
+				printf("Invalid value for --atlas-kappa-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRank))
+			{
+				printf("Invalid value for --rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-complement-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasComplementRank))
+			{
+				printf("Invalid value for --atlas-complement-rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sector-lr-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSectorLrScale))
+			{
+				printf("Invalid value for --atlas-sector-lr-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sector-kappa-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSectorKappaMax))
+			{
+				printf("Invalid value for --atlas-sector-kappa-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-prism") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasPrismEnabled) || cfg.atlasPrismEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-prism\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-prism-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPrismMemoryScale))
+			{
+				printf("Invalid value for --atlas-prism-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-prism-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPrismEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-prism-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasResolveEnabled) || cfg.atlasResolveEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-resolve\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasResolveLagHorizon))
+			{
+				printf("Invalid value for --atlas-resolve-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasResolveMemoryScale))
+			{
+				printf("Invalid value for --atlas-resolve-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasResolveEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-resolve-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasHeroEnabled) || cfg.atlasHeroEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-hero\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasHeroLagHorizon))
+			{
+				printf("Invalid value for --atlas-hero-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasHeroMemoryScale))
+			{
+				printf("Invalid value for --atlas-hero-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasHeroEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-hero-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasCobaltEnabled) || cfg.atlasCobaltEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-cobalt\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasCobaltLagHorizon))
+			{
+				printf("Invalid value for --atlas-cobalt-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasCobaltMemoryScale))
+			{
+				printf("Invalid value for --atlas-cobalt-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasCobaltEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-cobalt-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchEnabled) || cfg.atlasBirchEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-birch\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-past-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchPastHorizon))
+			{
+				printf("Invalid value for --atlas-birch-past-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-future-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchFutureHorizon))
+			{
+				printf("Invalid value for --atlas-birch-future-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBirchMemoryScale))
+			{
+				printf("Invalid value for --atlas-birch-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBirchEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-birch-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasGhostEnabled) || cfg.atlasGhostEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-ghost\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasGhostLagHorizon))
+			{
+				printf("Invalid value for --atlas-ghost-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGhostMemoryScale))
+			{
+				printf("Invalid value for --atlas-ghost-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGhostEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-ghost-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowEnabled) || cfg.atlasSparrowEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-sparrow\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowMemoryScale))
+			{
+				printf("Invalid value for --atlas-sparrow-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-sparrow-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-auto-mode-gate") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowAutoModeGate) || cfg.atlasSparrowAutoModeGate > 1u)
+			{
+				printf("Invalid value for --atlas-sparrow-auto-mode-gate\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-second-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowSecondEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-sparrow-second-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-second-edge-fraction") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowSecondEdgeFraction))
+			{
+				printf("Invalid value for --atlas-sparrow-second-edge-fraction\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowPoleMax))
+			{
+				printf("Invalid value for --atlas-sparrow-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-mode-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowModeRank) || cfg.atlasSparrowModeRank == 0u)
+			{
+				printf("Invalid value for --atlas-sparrow-mode-rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQbrtEnabled) || cfg.atlasQbrtEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-qbrt\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQbrtLagHorizon))
+			{
+				printf("Invalid value for --atlas-qbrt-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtMemoryScale))
+			{
+				printf("Invalid value for --atlas-qbrt-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-qbrt-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtPoleMax))
+			{
+				printf("Invalid value for --atlas-qbrt-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQrcEnabled) || cfg.atlasQrcEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-qrc\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQrcLagHorizon))
+			{
+				printf("Invalid value for --atlas-qrc-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcMemoryScale))
+			{
+				printf("Invalid value for --atlas-qrc-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-qrc-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcPoleMax))
+			{
+				printf("Invalid value for --atlas-qrc-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRiftEnabled) || cfg.atlasRiftEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-rift\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRiftLagHorizon))
+			{
+				printf("Invalid value for --atlas-rift-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftMemoryScale))
+			{
+				printf("Invalid value for --atlas-rift-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-rift-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftPoleMax))
+			{
+				printf("Invalid value for --atlas-rift-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasOrbitEnabled) || cfg.atlasOrbitEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-orbit\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitMemoryScale))
+			{
+				printf("Invalid value for --atlas-orbit-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-orbit-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitPoleMax))
+			{
+				printf("Invalid value for --atlas-orbit-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--tsub") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasTSub))
+			{
+				printf("Invalid value for --tsub\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--seed") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.seed))
+			{
+				printf("Invalid value for --seed\n");
+				return;
+			}
+		}
+		else
+		{
+			printf("Unknown argument: %s\n", argv[i]);
+			print_usage();
+			return;
 		}
 	}
 
-	printf("\n");
+	printf("============================================================\n");
+	printf("ATLAS-BSRP vs SGD vs AdamW Benchmark\n");
+	printf("============================================================\n");
+
+	DatasetInfo datasetInfo;
+	std::string err;
+	if (!resolve_dataset_info(cfg.datasetRequest, datasetInfo, err))
+	{
+		printf("Dataset resolution failed: %s\n", err.c_str());
+		return;
+	}
+
+	std::vector<BenchmarkCase> cases;
+	build_benchmark_cases(cfg, cases);
+	for (size_t i = 0; i < cases.size(); ++i)
+	{
+		if (!run_benchmark_case(cases[i], datasetInfo))
+			return;
+	}
+	printf("============================================================\n");
 }

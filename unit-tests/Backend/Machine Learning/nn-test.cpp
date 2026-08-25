@@ -17,8 +17,10 @@
 
 #include "nn-test.h"
 #include "../../unit-test.h"
+#include "test_token_id_input_fixture.h"
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_public_api.h"
 #include "../../../Backend/Machine Learning/Networks/training_callbacks.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
@@ -144,194 +146,6 @@ struct StopAtMinThen100Cb : public glades::ITrainingCallbacks
 	virtual void onRunEnd(const glades::NNetwork&, int) {}
 };
 
-// In-memory token-id dataset for token language model tests.
-//
-// IMPORTANT:
-// Token LM training now requires integer token-id accessors (`get*TokenId` / `get*ExpectedTokenId`).
-// This DataInput provides those without representing token IDs as floats internally.
-class InMemoryTokenIdInput : public glades::DataInput
-{
-public:
-	InMemoryTokenIdInput()
-	    : padTokenId(-1),
-	      scratchTok(0.0f),
-	      scratchNext(0.0f),
-	      one(1, 0.0f),
-	      empty()
-	{
-	}
-
-	void setTrainTokens(const std::vector<unsigned int>& toks, int pad)
-	{
-		padTokenId = pad;
-		trainTok.clear();
-		trainNextTok.clear();
-		trainTok.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-			trainTok.push_back(static_cast<int>(toks[i]));
-		build_next(trainTok, padTokenId, trainNextTok);
-	}
-
-	void setTestTokens(const std::vector<unsigned int>& toks, int pad)
-	{
-		padTokenId = pad;
-		testTok.clear();
-		testNextTok.clear();
-		testTok.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-			testTok.push_back(static_cast<int>(toks[i]));
-		build_next(testTok, padTokenId, testNextTok);
-	}
-
-	void mirrorTrainToTest()
-	{
-		testTok = trainTok;
-		testNextTok = trainNextTok;
-	}
-
-	// DataInput API (no-op imports; dataset is constructed programmatically).
-	virtual void import(shmea::GString, int = 0) {}
-	virtual void import(const shmea::GTable&, int = 0) {}
-
-	virtual shmea::GVector<float> getTrainRow(unsigned int i) const
-	{
-		if (i >= trainTok.size())
-			return empty;
-		one[0] = static_cast<float>(trainTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int i) const
-	{
-		if (i >= trainNextTok.size())
-			return empty;
-		one[0] = static_cast<float>(trainNextTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTestRow(unsigned int i) const
-	{
-		if (i >= testTok.size())
-			return empty;
-		one[0] = static_cast<float>(testTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTestExpectedRow(unsigned int i) const
-	{
-		if (i >= testNextTok.size())
-			return empty;
-		one[0] = static_cast<float>(testNextTok[i]);
-		return one;
-	}
-
-	virtual bool getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= trainTok.size())
-			return false;
-		scratchTok = static_cast<float>(trainTok[index]);
-		outData = &scratchTok;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= trainNextTok.size())
-			return false;
-		scratchNext = static_cast<float>(trainNextTok[index]);
-		outData = &scratchNext;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= testTok.size())
-			return false;
-		scratchTok = static_cast<float>(testTok[index]);
-		outData = &scratchTok;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= testNextTok.size())
-			return false;
-		scratchNext = static_cast<float>(testNextTok[index]);
-		outData = &scratchNext;
-		outSize = 1u;
-		return true;
-	}
-
-	// Token-id accessors (first-class ints).
-	virtual bool getTrainTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= trainTok.size())
-			return false;
-		outTokenId = trainTok[index];
-		return true;
-	}
-	virtual bool getTrainExpectedTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= trainNextTok.size())
-			return false;
-		outTokenId = trainNextTok[index];
-		return true;
-	}
-	virtual bool getTestTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= testTok.size())
-			return false;
-		outTokenId = testTok[index];
-		return true;
-	}
-	virtual bool getTestExpectedTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= testNextTok.size())
-			return false;
-		outTokenId = testNextTok[index];
-		return true;
-	}
-
-	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
-	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
-	virtual unsigned int getFeatureCount() const { return 1u; }
-	virtual int getType() const { return TEXT; }
-
-private:
-	static void build_next(const std::vector<int>& toks, int pad, std::vector<int>& outNext)
-	{
-		outNext.clear();
-		outNext.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-		{
-			if (i + 1u < toks.size())
-				outNext.push_back(toks[i + 1u]);
-			else
-				outNext.push_back(pad);
-		}
-	}
-
-	int padTokenId;
-	std::vector<int> trainTok;
-	std::vector<int> trainNextTok;
-	std::vector<int> testTok;
-	std::vector<int> testNextTok;
-
-	mutable float scratchTok;
-	mutable float scratchNext;
-	mutable shmea::GVector<float> one;
-	shmea::GVector<float> empty;
-};
-
 static bool read_u32_le(std::istream& in, unsigned int& outV)
 {
 	unsigned char b[4];
@@ -444,6 +258,103 @@ static bool write_weights_header_bin(std::ostream& out, unsigned int netType)
 	return static_cast<bool>(out);
 }
 
+struct TransformerWeightVecWriteRef
+{
+	const std::vector<float>* values;
+
+	explicit TransformerWeightVecWriteRef(const std::vector<float>& fieldValues)
+	    : values(&fieldValues)
+	{
+	}
+};
+
+static void append_transformer_weight_write_ref(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                const std::vector<float>& values)
+{
+	fields.push_back(TransformerWeightVecWriteRef(values));
+}
+
+static bool write_transformer_weight_vecs(std::ostream& out,
+                                          const std::vector<TransformerWeightVecWriteRef>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!write_vec_f32(out, *fields[i].values))
+			return false;
+	}
+	return true;
+}
+
+static void append_transformer_global_weight_write_refs(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                        const std::vector<float>& WIn,
+                                                        const std::vector<float>& bIn,
+                                                        const std::vector<float>& WOut,
+                                                        const std::vector<float>& bOut,
+                                                        const std::vector<float>& tokE,
+                                                        const std::vector<float>& lmBias,
+                                                        const std::vector<float>& lnFinalGamma,
+                                                        const std::vector<float>& lnFinalBeta)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_weight_write_ref(fields, WIn);
+	append_transformer_weight_write_ref(fields, bIn);
+	append_transformer_weight_write_ref(fields, WOut);
+	append_transformer_weight_write_ref(fields, bOut);
+	append_transformer_weight_write_ref(fields, tokE);
+	append_transformer_weight_write_ref(fields, lmBias);
+	append_transformer_weight_write_ref(fields, lnFinalGamma);
+	append_transformer_weight_write_ref(fields, lnFinalBeta);
+}
+
+static void append_transformer_block_weight_write_refs(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                       const std::vector<float>& ln1Gamma,
+                                                       const std::vector<float>& ln1Beta,
+                                                       const std::vector<float>& Wq,
+                                                       const std::vector<float>& Wk,
+                                                       const std::vector<float>& Wv,
+                                                       const std::vector<float>& Wo,
+                                                       const std::vector<float>& bq,
+                                                       const std::vector<float>& bk,
+                                                       const std::vector<float>& bv,
+                                                       const std::vector<float>& bo,
+                                                       const std::vector<float>& ln2Gamma,
+                                                       const std::vector<float>& ln2Beta,
+                                                       const std::vector<float>& W1,
+                                                       const std::vector<float>& b1,
+                                                       const std::vector<float>& W2,
+                                                       const std::vector<float>& b2)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_weight_write_ref(fields, ln1Gamma);
+	append_transformer_weight_write_ref(fields, ln1Beta);
+	append_transformer_weight_write_ref(fields, Wq);
+	append_transformer_weight_write_ref(fields, Wk);
+	append_transformer_weight_write_ref(fields, Wv);
+	append_transformer_weight_write_ref(fields, Wo);
+	append_transformer_weight_write_ref(fields, bq);
+	append_transformer_weight_write_ref(fields, bk);
+	append_transformer_weight_write_ref(fields, bv);
+	append_transformer_weight_write_ref(fields, bo);
+	append_transformer_weight_write_ref(fields, ln2Gamma);
+	append_transformer_weight_write_ref(fields, ln2Beta);
+	append_transformer_weight_write_ref(fields, W1);
+	append_transformer_weight_write_ref(fields, b1);
+	append_transformer_weight_write_ref(fields, W2);
+	append_transformer_weight_write_ref(fields, b2);
+}
+
+static bool read_transformer_weight_group_l2(std::istream& in, size_t fieldCount, double& sumsq)
+{
+	for (size_t i = 0; i < fieldCount; ++i)
+	{
+		if (!read_and_accum_vec_l2(in, sumsq))
+			return false;
+	}
+	return true;
+}
+
 static bool transformer_weights_l2_from_file(const std::string& weightsPath, double& outL2)
 {
 	outL2 = 0.0;
@@ -489,34 +400,15 @@ static bool transformer_weights_l2_from_file(const std::string& weightsPath, dou
 	(void)causal; (void)inputSize; (void)dModel; (void)dFF; (void)nHeads; (void)outSize;
 
 	double ss = 0.0;
-	// global vectors
-	if (!read_and_accum_vec_l2(in, ss)) return false; // WIn
-	if (!read_and_accum_vec_l2(in, ss)) return false; // bIn
-	if (!read_and_accum_vec_l2(in, ss)) return false; // WOut
-	if (!read_and_accum_vec_l2(in, ss)) return false; // bOut
-	if (!read_and_accum_vec_l2(in, ss)) return false; // tokE
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lmBias
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalGamma
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalBeta
+	// Canonical transformer section order in weights.bin:
+	// globals = WIn, bIn, WOut, bOut, tokE, lmBias, lnFinalGamma, lnFinalBeta
+	if (!read_transformer_weight_group_l2(in, 8u, ss))
+		return false;
 	for (unsigned int l = 0; l < nLayers; ++l)
 	{
-		// block vectors (fixed order, 18 vectors)
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Gamma
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Beta
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wq
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wk
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wv
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wo
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bq
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bk
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bv
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bo
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Gamma
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Beta
-		if (!read_and_accum_vec_l2(in, ss)) return false; // W1
-		if (!read_and_accum_vec_l2(in, ss)) return false; // b1
-		if (!read_and_accum_vec_l2(in, ss)) return false; // W2
-		if (!read_and_accum_vec_l2(in, ss)) return false; // b2
+		// block = ln1Gamma, ln1Beta, Wq, Wk, Wv, Wo, bq, bk, bv, bo, ln2Gamma, ln2Beta, W1, b1, W2, b2
+		if (!read_transformer_weight_group_l2(in, 16u, ss))
+			return false;
 	}
 	outL2 = sqrt(ss);
 	return true;
@@ -608,21 +500,16 @@ static bool write_transformer_decoder_tokenlm_weights(const std::string& weights
 		std::vector<float> bLm = lmBias;
 		if (bLm.empty())
 			bLm.assign(vocabSize, 0.0f);
-
-		if (!write_vec_f32(fp, WIn)) return false;
-		if (!write_vec_f32(fp, bIn)) return false;
-		if (!write_vec_f32(fp, WOut)) return false;
-		if (!write_vec_f32(fp, bOut)) return false;
-		if (!write_vec_f32(fp, tokE)) return false;
-		if (!write_vec_f32(fp, bLm)) return false;
-	}
-
-	// Final LayerNorm (gamma=1, beta=0 => identity)
-	{
 		std::vector<float> lnFinalGamma(dModel, 1.0f);
 		std::vector<float> lnFinalBeta(dModel, 0.0f);
-		if (!write_vec_f32(fp, lnFinalGamma)) return false;
-		if (!write_vec_f32(fp, lnFinalBeta)) return false;
+
+		std::vector<TransformerWeightVecWriteRef> fields;
+		append_transformer_global_weight_write_refs(fields,
+		                                           WIn, bIn,
+		                                           WOut, bOut,
+		                                           tokE, bLm,
+		                                           lnFinalGamma, lnFinalBeta);
+		if (!write_transformer_weight_vecs(fp, fields)) return false;
 	}
 
 	for (unsigned int l = 0; l < nLayers; ++l)
@@ -658,22 +545,14 @@ static bool write_transformer_decoder_tokenlm_weights(const std::string& weights
 			if (b2.size() >= 1u) b2[0] = 0.01f;
 		}
 
-		if (!write_vec_f32(fp, ln1Gamma)) return false;
-		if (!write_vec_f32(fp, ln1Beta)) return false;
-		if (!write_vec_f32(fp, Wq)) return false;
-		if (!write_vec_f32(fp, Wk)) return false;
-		if (!write_vec_f32(fp, Wv)) return false;
-		if (!write_vec_f32(fp, Wo)) return false;
-		if (!write_vec_f32(fp, bq)) return false;
-		if (!write_vec_f32(fp, bk)) return false;
-		if (!write_vec_f32(fp, bv)) return false;
-		if (!write_vec_f32(fp, bo)) return false;
-		if (!write_vec_f32(fp, ln2Gamma)) return false;
-		if (!write_vec_f32(fp, ln2Beta)) return false;
-		if (!write_vec_f32(fp, W1)) return false;
-		if (!write_vec_f32(fp, b1)) return false;
-		if (!write_vec_f32(fp, W2)) return false;
-		if (!write_vec_f32(fp, b2)) return false;
+		std::vector<TransformerWeightVecWriteRef> fields;
+		append_transformer_block_weight_write_refs(fields,
+		                                          ln1Gamma, ln1Beta,
+		                                          Wq, Wk, Wv, Wo,
+		                                          bq, bk, bv, bo,
+		                                          ln2Gamma, ln2Beta,
+		                                          W1, b1, W2, b2);
+		if (!write_transformer_weight_vecs(fp, fields)) return false;
 	}
 
 	return static_cast<bool>(fp);
@@ -3329,11 +3208,11 @@ void NNTransformerUnitTest()
 		glades::NNetwork::TransformerLmSession session;
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionReset Failed==============",
 		         net.transformerLmSessionReset(session, /*maxSeqLen*/ 4u).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen0 Failed==============", session.curLen == 0u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen0 Failed==============", session.getCurrentLength() == 0u);
 		std::vector<float> logitsKv;
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionAppend Failed==============",
 		         net.transformerLmSessionAppend(session, /*tokenId*/ 2u, &logitsKv).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen1 Failed==============", session.curLen == 1u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen1 Failed==============", session.getCurrentLength() == 1u);
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsSize Failed==============", logitsKv.size() == vocab);
 		for (unsigned int i = 0; i < vocab; ++i)
 			G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsMismatch Failed==============", fabs(logitsKv[i] - logits[i]) < 1e-6f);
@@ -3523,32 +3402,23 @@ void NNTransformerUnitTest()
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			{
-				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				glades::TrainingConfig cfg = net.getTrainingConfig();
 				cfg.transformer.enableTokenEmbedding = true;
 				cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
 				cfg.transformer.tieEmbeddings = true;
 				cfg.transformer.nHeadsOverride = 2;
 				cfg.transformer.dFFOverride = 16;
 				cfg.transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				const glades::NNetworkStatus stCfg = net.setTrainingConfig(cfg);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc SetTrainingConfigShouldFail Failed==============", !stCfg.ok());
 			}
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc InitTestStatus() Failed==============", net.test(di).ok());
-			glades::NNetwork::TransformerLmSession session;
-			const glades::NNetworkStatus stReset = net.transformerLmSessionReset(session, 4u);
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc KvResetShouldFail Failed==============", !stReset.ok());
-
-			// Also validate the full forward API rejects the unknown encoding.
-			std::vector<unsigned int> toks;
-			toks.push_back(1u);
-			std::vector<float> logits;
-			const glades::NNetworkStatus stF = net.transformerLmForwardLastLogits(toks, logits);
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc ForwardShouldFail Failed==============", !stF.ok());
 
 			delete di;
 			delete info;
 		}
 
-		// Append/forward argument validation (uninitialized cache, tokenId bounds, empty prefix).
-		{
+			// Append/forward argument validation (uninitialized cache, tokenId bounds, empty prefix).
+			{
 			const unsigned int vocab = 8u;
 			InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
 			{
@@ -3576,6 +3446,34 @@ void NNTransformerUnitTest()
 				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
 			}
 			G_assert(__FILE__, __LINE__, "==============NN::InferApi AppendBounds InitTestStatus() Failed==============", net.test(di).ok());
+
+#ifdef GLADES_HAVE_CUDA
+			// Full-sequence GPU token metrics reduce on device and preserve the
+			// position-aligned target denominator.
+			{
+				net.getTrainingConfigMutable().gpu.enable = true;
+				net.getTrainingConfigMutable().gpu.deviceId = 0;
+				std::vector<unsigned int> inputs;
+				inputs.push_back(1u);
+				inputs.push_back(2u);
+				std::vector<int> targets;
+				targets.push_back(2);
+				targets.push_back(3);
+				glades::TransformerTokenMetrics metrics;
+				const glades::NNetworkStatus st =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsStatus Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCount Failed==============", metrics.tokenCount == 2ULL);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCorrect Failed==============", metrics.correct <= metrics.tokenCount);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFinite Failed==============", std::isfinite(metrics.nllSum));
+
+				targets.pop_back();
+				const glades::NNetworkStatus mismatch =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsMismatchShouldFail Failed==============", !mismatch.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFailureClearsOutput Failed==============", metrics.tokenCount == 0ULL && metrics.correct == 0ULL && metrics.nllSum == 0.0);
+			}
+#endif
 
 			// Append before reset should fail.
 			{
@@ -3612,12 +3510,124 @@ void NNTransformerUnitTest()
 				G_assert(__FILE__, __LINE__, "==============NN::InferApi TokenOutOfRange ShouldFail Failed==============", !st.ok());
 			}
 
-			delete di;
-			delete info;
-		}
+			// Session reset snapshots transformer runtime knobs used by append.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
 
-		// Token LM enabled but tensors not initialized yet.
-		{
+				glades::NNetwork::TransformerLmSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotReset Failed==============", net.transformerLmSessionReset(session, 3u).ok());
+				net.getTrainingConfigMutable().transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				net.getTrainingConfigMutable().transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+				net.getTrainingConfigMutable().transformer.layerNormEps = 0.0f;
+
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmSessionAppend(session, 1u, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotAppend Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
+			// Batch session reset snapshots the same runtime knobs.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
+
+				glades::NNetwork::TransformerLmBatchSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotReset Failed==============", net.transformerLmBatchSessionReset(session, 1u, 3u).ok());
+				net.getTrainingConfigMutable().transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				net.getTrainingConfigMutable().transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+				net.getTrainingConfigMutable().transformer.layerNormEps = 0.0f;
+
+				std::vector<unsigned int> tokenIds(1, 1u);
+				std::vector<unsigned char> active(1, 1u);
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmBatchSessionAppendSelective(session, tokenIds, active, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotAppend Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotLogits Failed==============", logits.size() == vocab);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
+			// Typed KV-session allocation cap should fail fast without relying on env state.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
+				glades::TrainingConfig cappedCfg = savedCfg;
+				cappedCfg.transformer.kvSessionMaxBytes = 64ULL;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapConfig Failed==============", net.setTrainingConfig(cappedCfg).ok());
+
+				glades::NNetwork::TransformerLmSession session;
+				const glades::NNetworkStatus st = net.transformerLmSessionReset(session, 64u);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapResetShouldFail Failed==============", !st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
+				delete di;
+				delete info;
+			}
+
+			// Serving buffer hardening: fail fast when the configured logits-buffer cap is too small.
+			{
+				const unsigned int vocab = 8u;
+				InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+				{
+					std::vector<unsigned int> toks;
+					toks.push_back(1u);
+					toks.push_back(2u);
+					di->setTrainTokens(toks, -1);
+					di->mirrorTrainToTest();
+				}
+
+				auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+				std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+				hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+				auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				glades::NNInfo* info = new glades::NNInfo("ut_transformer_serve_buffer_cap", in, hidden, out);
+
+				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+				{
+					glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+					cfg.transformer.enableTokenEmbedding = true;
+					cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+					cfg.transformer.tieEmbeddings = true;
+					cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+					cfg.transformer.nHeadsOverride = 2;
+					cfg.transformer.dFFOverride = 16;
+					cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+				}
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap InitTestStatus() Failed==============", net.test(di).ok());
+
+				net.getTrainingConfigMutable().transformer.serveLogitsMaxBytes = 64ULL;
+
+				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+				reqs.resize(2);
+				reqs[0].promptTokens.push_back(1u);
+				reqs[1].promptTokens.push_back(2u);
+				reqs[0].cfg.maxNewTokens = 1u;
+				reqs[1].cfg.maxNewTokens = 1u;
+
+				glades::NNetwork::TransformerServeBatchResult outBatch;
+				const glades::NNetworkStatus stServe = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap GenerateShouldFail Failed==============", !stServe.ok());
+
+				glades::NNetwork::TransformerServeBatcher batcher;
+				glades::NNetwork::TransformerServeBatcherConfig bcfg;
+				bcfg.maxBatchSize = 2u;
+				bcfg.maxSeqLen = 4u;
+				const glades::NNetworkStatus stBatcher = net.transformerLmServeBatcherReset(batcher, bcfg);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherResetShouldFail Failed==============", !stBatcher.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherResetShouldLeaveUninitialized Failed==============", !batcher.isInitialized());
+
+				glades::NNetwork::TransformerServeRequest serveReq;
+				serveReq.promptTokens.push_back(1u);
+				serveReq.cfg.maxNewTokens = 1u;
+				unsigned int submitSlot = 123u;
+				const glades::NNetworkStatus stSubmit = net.transformerLmServeBatcherSubmit(batcher, serveReq, submitSlot);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherSubmitAfterResetFailureShouldFail Failed==============", !stSubmit.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherSubmitAfterResetFailureSlotReset Failed==============", submitSlot == 0u);
+
+				delete di;
+				delete info;
+			}
+
+			// Token LM enabled but tensors not initialized yet.
+			{
 			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
 			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
@@ -3629,22 +3639,159 @@ void NNTransformerUnitTest()
 			dec.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
 			dec.getTrainingConfigMutable().transformer.tieEmbeddings = true;
 			glades::NNetwork::TransformerLmSession session;
-			const glades::NNetworkStatus st = dec.transformerLmSessionReset(session, 4u);
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi UninitializedTensors() Failed==============", !st.ok());
+				const glades::NNetworkStatus st = dec.transformerLmSessionReset(session, 4u);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi UninitializedTensors() Failed==============", !st.ok());
 
-			delete info;
+				delete info;
+			}
+
+			// Public infer/generate entry points should reject re-entry while the network is already running.
+			{
+				struct InferWhileRunningCb : public glades::ITrainingCallbacks
+				{
+					bool sawRunStart;
+					glades::NNetworkStatus genStatus;
+					glades::NNetworkStatus batchStatus;
+					glades::NNetworkStatus forwardStatus;
+
+					InferWhileRunningCb()
+					    : sawRunStart(false),
+					      genStatus(glades::NNetworkStatus::OK, std::string()),
+					      batchStatus(glades::NNetworkStatus::OK, std::string()),
+					      forwardStatus(glades::NNetworkStatus::OK, std::string())
+					{
+					}
+
+					virtual void onRunStart(const glades::NNetwork& net, int)
+					{
+						sawRunStart = true;
+						std::vector<unsigned int> prompt;
+						prompt.push_back(1u);
+						prompt.push_back(2u);
+
+						glades::NNetwork::TransformerGenerateConfig cfg;
+						cfg.maxNewTokens = 1u;
+
+						glades::NNetwork::TransformerGenerateResult out;
+						genStatus = net.transformerLmGenerate(prompt, cfg, out, NULL);
+
+						std::vector<glades::NNetwork::TransformerServeRequest> reqs(1);
+						reqs[0].promptTokens = prompt;
+						reqs[0].cfg = cfg;
+						glades::NNetwork::TransformerServeBatchResult outBatch;
+						batchStatus = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+
+						std::vector<float> logits;
+						forwardStatus = net.transformerLmForwardLastLogits(prompt, logits);
+					}
+
+					virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics&)
+					{
+						return true;
+					}
+
+					virtual void onRunEnd(const glades::NNetwork&, int) {}
+				};
+
+				const unsigned int vocab = 8u;
+				InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+				{
+					std::vector<unsigned int> toks;
+					toks.push_back(1u);
+					toks.push_back(2u);
+					toks.push_back(3u);
+					di->setTrainTokens(toks, -1);
+					di->mirrorTrainToTest();
+				}
+
+				auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+				std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+				hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+				auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_runlock", in, hidden, out);
+
+				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+				{
+					glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+					cfg.transformer.enableTokenEmbedding = true;
+					cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+					cfg.transformer.tieEmbeddings = true;
+					cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+					cfg.transformer.nHeadsOverride = 2;
+					cfg.transformer.dFFOverride = 16;
+					cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+				}
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock InitTestStatus() Failed==============", net.test(di).ok());
+
+				InferWhileRunningCb cb;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock TrainStatus Failed==============", net.train(di, &cb).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock CallbackSeen Failed==============", cb.sawRunStart);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock GenerateRejected Failed==============", !cb.genStatus.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock BatchRejected Failed==============", !cb.batchStatus.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi RunLock ForwardRejected Failed==============", !cb.forwardStatus.ok());
+
+				delete di;
+				delete info;
+			}
 		}
+
+	// Trainer preflight observability: capture failure context and counters.
+	printf("-----------------------------------\n");
+	printf("Trainer preflight diagnostics\n");
+	printf("-----------------------------------\n");
+	{
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_trainer_preflight_diag", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		const glades::DataInput* noData = NULL;
+		const glades::NNetworkStatus stNull = net.train(noData);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataStatus Failed==============", !stNull.ok());
+
+		glades::NNetwork::TrainerRunDiagnostics diag;
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataGet Failed==============", net.getTrainerRunDiagnostics(diag));
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataCounts Failed==============",
+		         diag.totalRunAttempts == 1ULL &&
+		         diag.totalRunFailures == 1ULL &&
+		         diag.totalPreflightFailures == 1ULL &&
+		         diag.totalNullDataFailures == 1ULL);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataStage Failed==============",
+		         diag.lastFailureStage == "validate_data_input" &&
+		         diag.lastFailureStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT &&
+		         diag.lastRunType == glades::NNetwork::RUN_TRAIN);
+
+		glades::NumberInput emptyDi;
+		const glades::NNetworkStatus stEmpty = net.train(&emptyDi);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataStatus Failed==============", !stEmpty.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataGet Failed==============", net.getTrainerRunDiagnostics(diag));
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataCounts Failed==============",
+		         diag.totalRunAttempts == 2ULL &&
+		         diag.totalRunFailures == 2ULL &&
+		         diag.totalPreflightFailures == 2ULL &&
+		         diag.totalEmptyDataFailures == 1ULL);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataStage Failed==============",
+		         diag.lastFailureStage == "validate_active_split_data" &&
+		         diag.lastFailureStatus.code == glades::NNetworkStatus::EMPTY_DATA &&
+		         !diag.lastFailurePostBuildCheck);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataContext Failed==============",
+		         diag.lastDataSize == 0u &&
+		         diag.lastOutputSize == 1u &&
+		         diag.lastNetType == glades::NNetwork::TYPE_DFF);
+
+		delete info;
 	}
 
 	// TokenInput dataset parsing + sequence semantics (LLM data pipeline).
 	printf("-----------------------------------\n");
-	printf("TokenInput parsing + sequence semantics (train/test + mirroring)\n");
+	printf("TokenInput parsing + explicit split semantics\n");
 	printf("-----------------------------------\n");
 	{
 		mkdir_if_missing("database");
 		mkdir_if_missing("database/tokeninput_ut");
 
-		// Directory semantics: read train.tok and (optional) test.tok.
+		// Directory semantics: require explicit train.tok and test.tok.
 		{
 			{
 				std::ofstream tr("database/tokeninput_ut/train.tok");
@@ -3663,11 +3810,19 @@ void NNTransformerUnitTest()
 
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSize Failed==============", di.getTrainSize() == 5u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSize Failed==============", di.getTestSize() == 4u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TokenInputCapability Failed==============", di.hasTokenIdInput());
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TokenExpectedOutput Failed==============", di.hasTokenIdExpectedOutput());
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir FeatureCount Failed==============", di.getFeatureCount() == 1u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeqCount Failed==============", di.getTrainSequenceCount() == 2u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSeqCount Failed==============", di.getTestSequenceCount() == 1u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq0Len Failed==============", di.getTrainSequenceLength(0u) == 3u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq1Len Failed==============", di.getTrainSequenceLength(1u) == 2u);
+
+			glades::TokenInput diNoSlash;
+			diNoSlash.setPadTokenId(99);
+			diNoSlash.import(shmea::GString("database/tokeninput_ut"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir NoSlash TrainSize Failed==============", diNoSlash.getTrainSize() == 5u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir NoSlash TestSize Failed==============", diNoSlash.getTestSize() == 4u);
 
 			// Verify next-token shift and pad at sequence end.
 			int tok = 0, nxt = 0;
@@ -3679,7 +3834,7 @@ void NNTransformerUnitTest()
 			G_assert(__FILE__, __LINE__, "==============TokenInput NextId4 Pad Failed==============", di.getTrainExpectedTokenId(4u, nxt) && nxt == 99);
 		}
 
-		// File semantics: train only, then mirror train->test.
+		// File semantics: train only by default; test split stays empty unless mirroring is explicitly enabled.
 		{
 			{
 				std::ofstream tr("database/tokeninput_ut/onefile.tok");
@@ -3690,8 +3845,53 @@ void NNTransformerUnitTest()
 			di.import(shmea::GString("database/tokeninput_ut/onefile.tok"), 0);
 			// padTokenId < 0 => do not emit final timestep (avoids negative expected token ids).
 			G_assert(__FILE__, __LINE__, "==============TokenInput File TrainSize Failed==============", di.getTrainSize() == 2u);
-			G_assert(__FILE__, __LINE__, "==============TokenInput File TestMirrored Failed==============", di.getTestSize() == 2u);
-			G_assert(__FILE__, __LINE__, "==============TokenInput File SeqCount Failed==============", di.getTrainSequenceCount() == 1u && di.getTestSequenceCount() == 1u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File TestEmpty Failed==============", di.getTestSize() == 0u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File SeqCount Failed==============", di.getTrainSequenceCount() == 1u && di.getTestSequenceCount() == 0u);
+		}
+
+		// Single-input mirroring is still available, but it must be requested explicitly.
+		{
+			glades::TokenInput di;
+			di.setPadTokenId(-1);
+			di.setMirrorTrainToTestOnImplicitSplit(true);
+			di.import(shmea::GString("database/tokeninput_ut/onefile.tok"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File MirrorOptIn TestSize Failed==============", di.getTestSize() == 2u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File MirrorOptIn SeqCount Failed==============",
+			         di.getTrainSequenceCount() == 1u && di.getTestSequenceCount() == 1u);
+		}
+
+		// Directory mode should fail if the explicit test split is missing.
+		{
+			mkdir_if_missing("database/tokeninput_ut_missing_test");
+			{
+				std::ofstream tr("database/tokeninput_ut_missing_test/train.tok");
+				tr << "1 2 3\n";
+			}
+			glades::TokenInput di;
+			di.import(shmea::GString("database/tokeninput_ut_missing_test/"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput MissingTest Failed==============", di.getTrainSize() == 0u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput MissingTest Status Failed==============", !di.getLastStatus().ok());
+			G_assert(__FILE__, __LINE__, "==============TokenInput MissingTest Message Failed==============",
+			         di.getLastStatus().message.find("unable to open file") != std::string::npos);
+		}
+
+		// Directory mode should also fail if test.tok exists but contains malformed tokens.
+		{
+			mkdir_if_missing("database/tokeninput_ut_bad_test");
+			{
+				std::ofstream tr("database/tokeninput_ut_bad_test/train.tok");
+				tr << "1 2 3\n";
+			}
+			{
+				std::ofstream te("database/tokeninput_ut_bad_test/test.tok");
+				te << "7 nope 9\n";
+			}
+			glades::TokenInput di;
+			di.import(shmea::GString("database/tokeninput_ut_bad_test/"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput BadTest Failed==============", di.getTrainSize() == 0u && di.getTestSize() == 0u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput BadTest Status Failed==============", !di.getLastStatus().ok());
+			G_assert(__FILE__, __LINE__, "==============TokenInput BadTest Message Failed==============",
+			         di.getLastStatus().message.find("invalid token") != std::string::npos);
 		}
 
 		// Invalid token id (does not fit in int) should fail to load (trainSize stays 0).
@@ -3901,49 +4101,89 @@ void NNTransformerUnitTest()
 			}
 		};
 
-		// Case A: ragged prompts + per-request RNG overrides => batch == per-request generate exactly.
+		struct ServeBatchCaseBuilder
 		{
-			glades::NNetwork::TransformerGenerateConfig cfgA;
-			cfgA.includePromptInOutput = true;
-			cfgA.maxNewTokens = 6u;
-			cfgA.maxSeqLen = 0u; // promptLen + maxNewTokens
-			cfgA.temperature = 1.0f;
-			cfgA.topK = 0u;
-			cfgA.topP = 1.0f;
-			cfgA.eosTokenId = -1;
-			cfgA.stopOnEos = false;
-
-			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear(); // len 2
-			reqs[0].promptTokens.push_back(0u);
-			reqs[0].promptTokens.push_back(1u);
-			reqs[1].promptTokens.clear(); // len 3
-			reqs[1].promptTokens.push_back(2u);
-			reqs[1].promptTokens.push_back(3u);
-			reqs[1].promptTokens.push_back(4u);
-			reqs[0].cfg = cfgA;
-			reqs[1].cfg = cfgA;
-			reqs[0].cfg.rngSeedOverride = 111ULL;
-			reqs[1].cfg.rngSeedOverride = 222ULL;
-
-			glades::NNetwork::TransformerServeBatchResult outBatch;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchStatus Failed==============",
-			         net.transformerLmServeGenerateBatch(reqs, outBatch, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchSize Failed==============", outBatch.results.size() == reqs.size());
-
-			for (unsigned int r = 0u; r < static_cast<unsigned int>(reqs.size()); ++r)
+			static glades::NNetwork::TransformerGenerateConfig makeCfg(bool includePromptInOutput,
+			                                                          unsigned int maxNewTokens,
+			                                                          float temperature,
+			                                                          unsigned int topK,
+			                                                          float topP,
+			                                                          uint64_t rngSeedOverride)
 			{
-				glades::NNetwork::TransformerGenerateResult outSingle;
-				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA SingleStatus Failed==============",
-				         net.transformerLmGenerate(reqs[r].promptTokens, reqs[r].cfg, outSingle, NULL).ok());
-				AssertSameGenerateResult::run(outBatch.results[r], outSingle, "==============NN::ServeBatch CaseA BatchVsSingleMismatch Failed==============");
+				glades::NNetwork::TransformerGenerateConfig cfg;
+				cfg.includePromptInOutput = includePromptInOutput;
+				cfg.maxNewTokens = maxNewTokens;
+				cfg.maxSeqLen = 0u;
+				cfg.temperature = temperature;
+				cfg.topK = topK;
+				cfg.topP = topP;
+				cfg.eosTokenId = -1;
+				cfg.stopOnEos = false;
+				cfg.rngSeedOverride = rngSeedOverride;
+				return cfg;
 			}
 
-			// Determinism: same requests twice => identical outputs (since per-request overrides are fixed).
-			glades::NNetwork::TransformerServeBatchResult outBatch2;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA Batch2Status Failed==============",
-			         net.transformerLmServeGenerateBatch(reqs, outBatch2, NULL).ok());
+			static glades::NNetwork::TransformerServeRequest makeRequest(const std::vector<unsigned int>& prompt,
+			                                                           const glades::NNetwork::TransformerGenerateConfig& cfg)
+			{
+				glades::NNetwork::TransformerServeRequest req;
+				req.promptTokens = prompt;
+				req.cfg = cfg;
+				return req;
+			}
+		};
+
+			// Case A: ragged prompts + per-request RNG overrides => batch == per-request generate exactly.
+			{
+				const glades::TransformerPublicAPI::Runtime api = glades::TransformerPublicAPI::runtime(net);
+				glades::NNetwork::TransformerGenerateConfig cfgA =
+				    ServeBatchCaseBuilder::makeCfg(true, 6u, 1.0f, 0u, 1.0f, 111ULL);
+				glades::NNetwork::TransformerGenerateConfig cfgA2 = cfgA;
+				cfgA2.rngSeedOverride = 222ULL;
+
+				std::vector<unsigned int> prompt0;
+				prompt0.push_back(0u);
+				prompt0.push_back(1u);
+				std::vector<unsigned int> prompt1;
+				prompt1.push_back(2u);
+				prompt1.push_back(3u);
+				prompt1.push_back(4u);
+
+				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfgA));
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfgA2));
+
+			glades::NNetwork::TransformerServeBatchResult outBatch;
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchStatus Failed==============",
+				         glades::TransformerPublicAPI::generateBatch(net, reqs, outBatch, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchSize Failed==============", outBatch.results.size() == reqs.size());
+
+				for (unsigned int r = 0u; r < static_cast<unsigned int>(reqs.size()); ++r)
+				{
+					glades::NNetwork::TransformerGenerateResult outSingle;
+					G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA SingleStatus Failed==============",
+					         api.generate(reqs[r].promptTokens, reqs[r].cfg, outSingle, NULL).ok());
+					AssertSameGenerateResult::run(outBatch.results[r], outSingle, "==============NN::ServeBatch CaseA BatchVsSingleMismatch Failed==============");
+				}
+
+				std::vector<float> logitsDirect;
+				std::vector<float> logitsFacade;
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA DirectForwardStatus Failed==============",
+				         net.transformerLmForwardLastLogits(reqs[0].promptTokens, logitsDirect).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA FacadeForwardStatus Failed==============",
+				         api.forwardLastLogits(reqs[0].promptTokens, logitsFacade).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA ForwardSize Failed==============",
+				         logitsDirect.size() == logitsFacade.size());
+				for (size_t i = 0u; i < logitsDirect.size(); ++i)
+				{
+					G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA ForwardParity Failed==============",
+					         std::fabs(logitsDirect[i] - logitsFacade[i]) < 1e-6f);
+				}
+
+				// Determinism: same requests twice => identical outputs (since per-request overrides are fixed).
+				glades::NNetwork::TransformerServeBatchResult outBatch2;
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA Batch2Status Failed==============",
+				         api.generateBatch(reqs, outBatch2, NULL).ok());
 			for (unsigned int r = 0u; r < static_cast<unsigned int>(reqs.size()); ++r)
 				AssertSameGenerateResult::run(outBatch.results[r], outBatch2.results[r], "==============NN::ServeBatch CaseA DeterminismMismatch Failed==============");
 
@@ -3959,33 +4199,25 @@ void NNTransformerUnitTest()
 
 		// Case B: stop tokens work per-request and do not affect other requests.
 		{
-			glades::NNetwork::TransformerGenerateConfig cfgB;
-			cfgB.includePromptInOutput = true;
-			cfgB.maxNewTokens = 10u;
-			cfgB.temperature = 0.0f; // greedy => always emits stopTok
-			cfgB.topK = 0u;
-			cfgB.topP = 1.0f;
-			cfgB.eosTokenId = -1;
-			cfgB.stopOnEos = false;
-			cfgB.rngSeedOverride = 999ULL; // irrelevant for greedy, but keep explicit
+			glades::NNetwork::TransformerGenerateConfig cfgB =
+			    ServeBatchCaseBuilder::makeCfg(true, 10u, 0.0f, 0u, 1.0f, 999ULL);
 
 			glades::NNetwork::TransformerGenerateConfig cfgC = cfgB;
 			cfgC.maxNewTokens = 3u;   // short request to ensure it runs past genIdx=0
 			cfgC.temperature = 1.0f; // stochastic (still deterministic via override)
 			cfgC.rngSeedOverride = 1234ULL;
 
+			std::vector<unsigned int> prompt0;
+			prompt0.push_back(1u);
+			std::vector<unsigned int> prompt1;
+			prompt1.push_back(2u);
+			prompt1.push_back(3u);
+
 			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear();
-			reqs[0].promptTokens.push_back(1u);
-			reqs[0].cfg = cfgB;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfgB));
 			reqs[0].stopTokenIds.clear();
 			reqs[0].stopTokenIds.push_back(stopTok);
-
-			reqs[1].promptTokens.clear();
-			reqs[1].promptTokens.push_back(2u);
-			reqs[1].promptTokens.push_back(3u);
-			reqs[1].cfg = cfgC;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfgC));
 
 			glades::NNetwork::TransformerServeBatchResult outBatch;
 			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB BatchStatus Failed==============",
@@ -4009,9 +4241,9 @@ void NNTransformerUnitTest()
 			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB OtherReqTokenCount Failed==============", r1.tokens.size() == (reqs[1].promptTokens.size() + cfgC.maxNewTokens));
 		}
 
-		// Case C: per-request callback early stop.
-		{
-			struct StopAfterOneCb : public glades::NNetwork::ITransformerServeCallbacks
+			// Case C: per-request callback early stop.
+			{
+			struct StopAfterOneCb : public glades::ITransformerServeCallbacks
 			{
 				virtual bool onToken(const glades::NNetwork& /*net*/, unsigned int requestIndex, unsigned int /*tokenId*/, unsigned int generatedIndex)
 				{
@@ -4020,25 +4252,19 @@ void NNTransformerUnitTest()
 				}
 			};
 
-			glades::NNetwork::TransformerGenerateConfig cfg;
-			cfg.includePromptInOutput = true;
-			cfg.maxNewTokens = 5u;
-			cfg.temperature = 1.0f;
-			cfg.topK = 0u;
-			cfg.topP = 1.0f;
-			cfg.eosTokenId = -1;
-			cfg.stopOnEos = false;
-			cfg.rngSeedOverride = 2026ULL;
+			glades::NNetwork::TransformerGenerateConfig cfg =
+			    ServeBatchCaseBuilder::makeCfg(true, 5u, 1.0f, 0u, 1.0f, 2026ULL);
+			glades::NNetwork::TransformerGenerateConfig cfg2 = cfg;
+			cfg2.rngSeedOverride = 2027ULL;
+
+			std::vector<unsigned int> prompt0;
+			prompt0.push_back(0u);
+			std::vector<unsigned int> prompt1;
+			prompt1.push_back(1u);
 
 			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear();
-			reqs[0].promptTokens.push_back(0u);
-			reqs[1].promptTokens.clear();
-			reqs[1].promptTokens.push_back(1u);
-			reqs[0].cfg = cfg;
-			reqs[1].cfg = cfg;
-			reqs[1].cfg.rngSeedOverride = 2027ULL;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfg));
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfg2));
 
 			glades::NNetwork::TransformerServeBatchResult outBatch;
 			StopAfterOneCb cb;
@@ -4053,13 +4279,42 @@ void NNTransformerUnitTest()
 
 			// Request1 should run to limit.
 			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req1 Limit Failed==============", outBatch.results[1].stoppedByLimit);
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req1 TokenCount Failed==============",
-			         outBatch.results[1].tokens.size() == (reqs[1].promptTokens.size() + cfg.maxNewTokens));
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req1 TokenCount Failed==============",
+				         outBatch.results[1].tokens.size() == (reqs[1].promptTokens.size() + cfg.maxNewTokens));
+			}
 
-		// Case D: single-call generation is deterministic even without rngSeedOverride.
-		// Policy: seed is derived from (network rngSeed ^ prompt hash) when rngSeedOverride==0.
-		{
+			// Case D: serving logits storage cap is enforced for one-shot batch generation and persistent batcher reset.
+			{
+				EnvVarGuard cap("GLADES_TRANSFORMER_SERVE_MAX_BYTES");
+				cap.set("1");
+
+				glades::NNetwork::TransformerGenerateConfig cfg =
+				    ServeBatchCaseBuilder::makeCfg(false, 1u, 1.0f, 1u, 1.0f, 7ULL);
+
+				std::vector<unsigned int> prompt;
+				prompt.push_back(1u);
+				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt, cfg));
+
+				glades::NNetwork::TransformerServeBatchResult outBatch;
+				const glades::NNetworkStatus stBatch = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD BatchCapFail Failed==============", !stBatch.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD BatchCapMessage Failed==============",
+				         stBatch.message.find("serving logits buffers require") != std::string::npos);
+
+				glades::NNetwork::TransformerServeBatcher batcher;
+				glades::NNetwork::TransformerServeBatcherConfig bcfg;
+				bcfg.maxBatchSize = 1u;
+				bcfg.maxSeqLen = 4u;
+				const glades::NNetworkStatus stReset = net.transformerLmServeBatcherReset(batcher, bcfg);
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD BatcherCapFail Failed==============", !stReset.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD BatcherCapMessage Failed==============",
+				         stReset.message.find("serving logits buffers require") != std::string::npos);
+			}
+
+			// Case E: single-call generation is deterministic even without rngSeedOverride.
+			// Policy: seed is derived from (network rngSeed ^ prompt hash) when rngSeedOverride==0.
+			{
 			glades::NNetwork::TransformerGenerateConfig cfg;
 			cfg.includePromptInOutput = true;
 			cfg.maxNewTokens = 8u;
@@ -4077,16 +4332,16 @@ void NNTransformerUnitTest()
 			prompt.push_back(1u);
 
 			glades::NNetwork::TransformerGenerateResult a, b;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD GenAStatus Failed==============",
-			         net.transformerLmGenerate(prompt, cfg, a, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD GenBStatus Failed==============",
-			         net.transformerLmGenerate(prompt, cfg, b, NULL).ok());
-			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseD DeterminismNoOverrideMismatch Failed==============");
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenAStatus Failed==============",
+				         net.transformerLmGenerate(prompt, cfg, a, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenBStatus Failed==============",
+				         net.transformerLmGenerate(prompt, cfg, b, NULL).ok());
+				AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseE DeterminismNoOverrideMismatch Failed==============");
+			}
 
-		// Case E: fast-by-design top-p cap semantics are explicit and equivalent:
-		//   (topP<1, topK==0, topPTopKCap=C) must behave identically to (topP<1, topK=C).
-		{
+			// Case F: fast-by-design top-p cap semantics are explicit and equivalent:
+			//   (topP<1, topK==0, topPTopKCap=C) must behave identically to (topP<1, topK=C).
+			{
 			const unsigned int cap = 7u;
 			glades::NNetwork::TransformerGenerateConfig cfgCap;
 			cfgCap.includePromptInOutput = true;
@@ -4111,16 +4366,16 @@ void NNTransformerUnitTest()
 			prompt.push_back(3u);
 
 			glades::NNetwork::TransformerGenerateResult a, b;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenCapStatus Failed==============",
-			         net.transformerLmGenerate(prompt, cfgCap, a, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenExplicitStatus Failed==============",
-			         net.transformerLmGenerate(prompt, cfgExplicit, b, NULL).ok());
-			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseE TopPCapSemanticsMismatch Failed==============");
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF GenCapStatus Failed==============",
+				         net.transformerLmGenerate(prompt, cfgCap, a, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF GenExplicitStatus Failed==============",
+				         net.transformerLmGenerate(prompt, cfgExplicit, b, NULL).ok());
+				AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseF TopPCapSemanticsMismatch Failed==============");
+			}
 
-		// Case F: greedy semantics equivalence:
-		//   temperature<=0 (greedy) must equal temperature>0 with topK=1 (deterministic argmax).
-		{
+			// Case G: greedy semantics equivalence:
+			//   temperature<=0 (greedy) must equal temperature>0 with topK=1 (deterministic argmax).
+			{
 			glades::NNetwork::TransformerGenerateConfig greedy;
 			greedy.includePromptInOutput = true;
 			greedy.maxNewTokens = 6u;
@@ -4142,16 +4397,16 @@ void NNTransformerUnitTest()
 			prompt.push_back(5u);
 
 			glades::NNetwork::TransformerGenerateResult a, b;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF GreedyStatus Failed==============",
-			         net.transformerLmGenerate(prompt, greedy, a, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF Top1Status Failed==============",
-			         net.transformerLmGenerate(prompt, top1, b, NULL).ok());
-			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseF GreedyVsTop1Mismatch Failed==============");
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG GreedyStatus Failed==============",
+				         net.transformerLmGenerate(prompt, greedy, a, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG Top1Status Failed==============",
+				         net.transformerLmGenerate(prompt, top1, b, NULL).ok());
+				AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseG GreedyVsTop1Mismatch Failed==============");
+			}
 
-		// Case G: full-vocab sampling parity:
-		//   topK==0 with topP==1 uses a specialized fast path; it must match explicit topK==vocab.
-		{
+			// Case H: full-vocab sampling parity:
+			//   topK==0 with topP==1 uses a specialized fast path; it must match explicit topK==vocab.
+			{
 			glades::NNetwork::TransformerGenerateConfig fast;
 			fast.includePromptInOutput = true;
 			fast.maxNewTokens = 10u;
@@ -4173,15 +4428,15 @@ void NNTransformerUnitTest()
 			prompt.push_back(3u);
 
 			glades::NNetwork::TransformerGenerateResult a, b;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG FastStatus Failed==============",
-			         net.transformerLmGenerate(prompt, fast, a, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG ExplicitStatus Failed==============",
-			         net.transformerLmGenerate(prompt, explicitK, b, NULL).ok());
-			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseG FullVocabParityMismatch Failed==============");
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH FastStatus Failed==============",
+				         net.transformerLmGenerate(prompt, fast, a, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH ExplicitStatus Failed==============",
+				         net.transformerLmGenerate(prompt, explicitK, b, NULL).ok());
+				AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseH FullVocabParityMismatch Failed==============");
+			}
 
-		// Case H: greedy sampling must ignore rngSeedOverride.
-		{
+			// Case I: greedy sampling must ignore rngSeedOverride.
+			{
 			glades::NNetwork::TransformerGenerateConfig g0;
 			g0.includePromptInOutput = true;
 			g0.maxNewTokens = 5u;
@@ -4201,12 +4456,12 @@ void NNTransformerUnitTest()
 			prompt.push_back(4u);
 
 			glades::NNetwork::TransformerGenerateResult a, b;
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH GreedyAStatus Failed==============",
-			         net.transformerLmGenerate(prompt, g0, a, NULL).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH GreedyBStatus Failed==============",
-			         net.transformerLmGenerate(prompt, g1, b, NULL).ok());
-			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseH GreedySeedAffectsOutput Failed==============");
-		}
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseI GreedyAStatus Failed==============",
+				         net.transformerLmGenerate(prompt, g0, a, NULL).ok());
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseI GreedyBStatus Failed==============",
+				         net.transformerLmGenerate(prompt, g1, b, NULL).ok());
+				AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseI GreedySeedAffectsOutput Failed==============");
+			}
 
 		delete di;
 		delete info;
@@ -4292,6 +4547,65 @@ void NNTransformerUnitTest()
 			net.getTrainingConfigMutable().transformer.tieEmbeddings = false;
 			const glades::NNetworkStatus st = net.test(di);
 			G_assert(__FILE__, __LINE__, "==============NN::BadTieEmbeddings ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		// setTrainingConfig should reject invalid runtime config before execution starts.
+		{
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_config_boundary", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::TrainingConfig cfg = net.getTrainingConfig();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = 8;
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+			const glades::NNetworkStatus st = net.setTrainingConfig(cfg);
+			G_assert(__FILE__, __LINE__, "==============NN::SetTrainingConfig InvalidPosEnc Failed==============", !st.ok());
+			delete info;
+		}
+
+		{
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_gpu_metrics_cfg", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::NNetwork::TransformerMetricsConfig metricsCfg = net.getTransformerMetricsConfig();
+			metricsCfg.enable = true;
+			metricsCfg.enableGpuPerf = true;
+			metricsCfg.logGpuTrainSummary = true;
+			metricsCfg.logGpuInferSummary = true;
+			net.setTransformerMetricsConfig(metricsCfg);
+			const glades::NNetwork::TransformerMetricsConfig appliedCfg = net.getTransformerMetricsConfig();
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg EnableGpuPerf Failed==============",
+			         appliedCfg.enableGpuPerf && appliedCfg.logGpuTrainSummary && appliedCfg.logGpuInferSummary);
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg TrainSnapshotZero Failed==============",
+			         net.getLastTransformerTrainGpuPerf().counters.kernelLaunches == 0ULL);
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg InferSnapshotZero Failed==============",
+			         net.getLastTransformerInferGpuPerf().counters.bytesH2D == 0ULL);
+			delete info;
+		}
+
+		{
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_sampled_softmax", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::TrainingConfig cfg = net.getTrainingConfig();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = 8;
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX;
+			cfg.transformer.tokenLmSampledNegatives = 0;
+			const glades::NNetworkStatus st = net.setTrainingConfig(cfg);
+			G_assert(__FILE__, __LINE__, "==============NN::SetTrainingConfig InvalidSampledSoftmax Failed==============", !st.ok());
 			delete info;
 		}
 

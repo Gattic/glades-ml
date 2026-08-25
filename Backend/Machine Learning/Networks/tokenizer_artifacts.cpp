@@ -18,6 +18,11 @@ extern "C" void glades_link_anchor_tokenizer_artifacts()
 
 namespace {
 
+static glades::NNetworkStatus invalid_tokenizer_artifacts(const std::string& message)
+{
+	return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, message);
+}
+
 static bool contains_newline(const std::string& s)
 {
 	for (size_t i = 0; i < s.size(); ++i)
@@ -55,23 +60,18 @@ static bool validate_special_id(const char* name, int id, size_t vocabSize, std:
 
 namespace glades {
 
-NNetworkStatus NNetwork::setTokenizerArtifacts(const TokenizerArtifacts& a)
+NNetworkStatus NNetwork::validateTokenizerArtifacts(const TokenizerArtifacts& a)
 {
-	// Enforce the same concurrency policy as other mutable config surfaces.
-	RunLockGuard guard(*this);
-	if (!guard.ok())
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "setTokenizerArtifacts: network is already running");
-
 	// Basic validation (strict but dependency-free).
 	// Type is optional but if set it must be safe for key/value manifests.
 	if (a.type.size() > 64u)
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: tokenizer type too long (max 64)");
+		return invalid_tokenizer_artifacts("setTokenizerArtifacts: tokenizer type too long (max 64)");
 	if (contains_newline(a.type))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: tokenizer type contains newline");
+		return invalid_tokenizer_artifacts("setTokenizerArtifacts: tokenizer type contains newline");
 
 	// Vocab is required to make the artifact meaningful.
-	if (a.vocab.empty())
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: vocab is empty");
+	if (!a.hasVocab())
+		return invalid_tokenizer_artifacts("setTokenizerArtifacts: vocab is empty");
 
 	// Hard caps for hostile environments (avoid pathological allocations).
 	// These are generous for modern LLMs while still bounding memory use.
@@ -79,8 +79,8 @@ NNetworkStatus NNetwork::setTokenizerArtifacts(const TokenizerArtifacts& a)
 	static const size_t kMaxTokenBytes = static_cast<size_t>(1024u * 1024u);     // 1 MiB per token
 	static const size_t kMaxTotalBytes = static_cast<size_t>(1024ull * 1024ull * 1024ull); // 1 GiB total token bytes
 
-	if (a.vocab.size() > kMaxVocabSize)
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: vocab too large");
+	if (a.vocabSize() > kMaxVocabSize)
+		return invalid_tokenizer_artifacts("setTokenizerArtifacts: vocab too large");
 
 	// Duplicate detection + size accounting.
 	// Avoid unordered_set to preserve compatibility with older toolchains.
@@ -90,30 +90,44 @@ NNetworkStatus NNetwork::setTokenizerArtifacts(const TokenizerArtifacts& a)
 	{
 		const std::string& tok = a.vocab[i];
 		if (tok.size() > kMaxTokenBytes)
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: vocab token too large");
+			return invalid_tokenizer_artifacts("setTokenizerArtifacts: vocab token too large");
 		totalBytes += tok.size();
 		if (totalBytes > kMaxTotalBytes)
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "setTokenizerArtifacts: vocab total bytes too large");
+			return invalid_tokenizer_artifacts("setTokenizerArtifacts: vocab total bytes too large");
 
 		std::pair<std::map<std::string, int>::iterator, bool> ins = seen.insert(std::make_pair(tok, static_cast<int>(i)));
 		if (!ins.second)
 		{
 			std::ostringstream oss;
 			oss << "setTokenizerArtifacts: duplicate token detected at id " << i << " (also at id " << ins.first->second << ")";
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
+			return invalid_tokenizer_artifacts(oss.str());
 		}
 	}
 
 	std::string err;
-	const size_t vocabSize = a.vocab.size();
+	const size_t vocabSize = a.vocabSize();
 	if (!validate_special_id("padTokenId", a.padTokenId, vocabSize, err))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, err);
+		return invalid_tokenizer_artifacts(err);
 	if (!validate_special_id("bosTokenId", a.bosTokenId, vocabSize, err))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, err);
+		return invalid_tokenizer_artifacts(err);
 	if (!validate_special_id("eosTokenId", a.eosTokenId, vocabSize, err))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, err);
+		return invalid_tokenizer_artifacts(err);
 	if (!validate_special_id("unkTokenId", a.unkTokenId, vocabSize, err))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, err);
+		return invalid_tokenizer_artifacts(err);
+
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+NNetworkStatus NNetwork::setTokenizerArtifacts(const TokenizerArtifacts& a)
+{
+	// Enforce the same concurrency policy as other mutable config surfaces.
+	RunLockGuard guard(*this);
+	if (!guard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "setTokenizerArtifacts: network is already running");
+
+	const NNetworkStatus validation = validateTokenizerArtifacts(a);
+	if (!validation.ok())
+		return validation;
 
 	tokenizerArtifacts = a;
 	tokenizerArtifactsPresent = true;
@@ -130,4 +144,3 @@ void NNetwork::clearTokenizerArtifacts()
 }
 
 } // namespace glades
-

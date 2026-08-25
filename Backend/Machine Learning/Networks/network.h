@@ -27,11 +27,15 @@
 #include "training_callbacks.h"
 #include "training_config.h"
 #include "atlas_optimizer.h"
+#include "vesta_optimizer.h"
+#include "helios_optimizer.h"
 #include "../nnetwork_status.h"
 #include "bayes.h"
 #include "bayes-optimizer.h"
 #include "transformer_ops.h"
+#include "transformer_types.h"
 #include "aligned_allocator.h"
+#include "cuda/gpu_dispatch.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -46,12 +50,13 @@
 
 #ifdef GLADES_HAVE_CUDA
 #include "cuda/gpu_device.h"
-#include "cuda/gpu_dispatch.h"
 #include "cuda/gpu_blas.h"
 #include "cuda/gpu_transformer_state.h"
 #include "cuda/gpu_dff_state.h"
 #include "cuda/gpu_rnn_state.h"
 #include "cuda/gpu_cnn_state.h"
+#include "cuda/gpu_init.h"
+#include "cuda/gpu_face.h"
 #endif
 
 // Concurrency primitives:
@@ -79,6 +84,8 @@ void GANUnitTest();
 
 namespace glades {
 
+class TransformerServingLayer;
+
 class DataInput;
 class CMatrix;
 class MetaNetwork;
@@ -99,12 +106,696 @@ private:
 	friend DeconvScratchArena;
 	friend void ::GANUnitTest();
 
+public:
+	struct TrainerRunDiagnostics
+	{
+		uint64_t totalRunAttempts;
+		uint64_t totalRunSuccesses;
+		uint64_t totalRunFailures;
+		uint64_t totalPreflightFailures;
+		uint64_t totalNullSkeletonFailures;
+		uint64_t totalNullDataFailures;
+		uint64_t totalUnknownRunTypeFailures;
+		uint64_t totalEmptyDataFailures;
+		uint64_t totalPostBuildEmptyDataFailures;
+		uint64_t totalContractFailures;
+		uint64_t totalTensorInitFailures;
+		int lastRunType;
+		int lastNetType;
+		bool lastTrainRun;
+		bool lastEvalRun;
+		bool lastTokenLM;
+		bool lastTokenLMInput;
+		bool lastSequenceModel;
+		bool lastFailureDuringPreflight;
+		bool lastFailurePostBuildCheck;
+		unsigned int lastDataSize;
+		unsigned int lastFeatureCount;
+		unsigned int lastOutputSize;
+		unsigned int lastExpectedFeatureCount;
+		unsigned int lastExpectedOutputSize;
+		std::string lastFailureStage;
+		NNetworkStatus lastRunStatus;
+		NNetworkStatus lastFailureStatus;
+		NNetworkStatus lastDataInputStatus;
+
+		TrainerRunDiagnostics()
+		    : totalRunAttempts(0ULL),
+		      totalRunSuccesses(0ULL),
+		      totalRunFailures(0ULL),
+		      totalPreflightFailures(0ULL),
+		      totalNullSkeletonFailures(0ULL),
+		      totalNullDataFailures(0ULL),
+		      totalUnknownRunTypeFailures(0ULL),
+		      totalEmptyDataFailures(0ULL),
+		      totalPostBuildEmptyDataFailures(0ULL),
+		      totalContractFailures(0ULL),
+		      totalTensorInitFailures(0ULL),
+		      lastRunType(-1),
+		      lastNetType(-1),
+		      lastTrainRun(false),
+		      lastEvalRun(false),
+		      lastTokenLM(false),
+		      lastTokenLMInput(false),
+		      lastSequenceModel(false),
+		      lastFailureDuringPreflight(false),
+		      lastFailurePostBuildCheck(false),
+		      lastDataSize(0u),
+		      lastFeatureCount(0u),
+		      lastOutputSize(0u),
+		      lastExpectedFeatureCount(0u),
+		      lastExpectedOutputSize(0u),
+		      lastFailureStage(),
+		      lastRunStatus(NNetworkStatus::OK, std::string()),
+		      lastFailureStatus(NNetworkStatus::OK, std::string()),
+		      lastDataInputStatus(NNetworkStatus::OK, std::string())
+		{
+		}
+	};
+
+	struct PersistenceDiagnostics
+	{
+		uint64_t totalPersistenceOps;
+		uint64_t totalPersistenceSuccesses;
+		uint64_t totalPersistenceFailures;
+		uint64_t totalRejectedInputs;
+		uint64_t totalPublishFailures;
+		uint64_t totalModelSaveAttempts;
+		uint64_t totalModelSaveSuccesses;
+		uint64_t totalModelSaveFailures;
+		uint64_t totalModelPublishFailures;
+		uint64_t totalCheckpointSaveAttempts;
+		uint64_t totalCheckpointSaveSuccesses;
+		uint64_t totalCheckpointSaveFailures;
+		uint64_t totalCheckpointPublishFailures;
+		uint64_t totalRotateFailures;
+		uint64_t totalPublishRenameFailures;
+		uint64_t totalManifestWriteFailures;
+		uint64_t totalNninfoWriteFailures;
+		uint64_t totalWeightsWriteFailures;
+		uint64_t totalCheckpointTensorCollectionFailures;
+		uint64_t totalCheckpointShardWriteFailures;
+		uint64_t totalIntegrityFailures;
+		int lastNetType;
+		bool lastOperationWasCheckpoint;
+		bool lastOperationSucceeded;
+		bool lastOperationRejected;
+		bool lastRotatedPrevious;
+		bool lastTokenizerPresent;
+		bool lastIncludeOptimizerState;
+		uint64_t lastShardCount;
+		uint64_t lastTensorCount;
+		uint64_t lastWeightsBytes;
+		uint64_t lastMaxShardBytes;
+		std::string lastOperation;
+		std::string lastName;
+		std::string lastStage;
+		NNetworkStatus lastStatus;
+
+		PersistenceDiagnostics()
+		    : totalPersistenceOps(0ULL),
+		      totalPersistenceSuccesses(0ULL),
+		      totalPersistenceFailures(0ULL),
+		      totalRejectedInputs(0ULL),
+		      totalPublishFailures(0ULL),
+		      totalModelSaveAttempts(0ULL),
+		      totalModelSaveSuccesses(0ULL),
+		      totalModelSaveFailures(0ULL),
+		      totalModelPublishFailures(0ULL),
+		      totalCheckpointSaveAttempts(0ULL),
+		      totalCheckpointSaveSuccesses(0ULL),
+		      totalCheckpointSaveFailures(0ULL),
+		      totalCheckpointPublishFailures(0ULL),
+		      totalRotateFailures(0ULL),
+		      totalPublishRenameFailures(0ULL),
+		      totalManifestWriteFailures(0ULL),
+		      totalNninfoWriteFailures(0ULL),
+		      totalWeightsWriteFailures(0ULL),
+		      totalCheckpointTensorCollectionFailures(0ULL),
+		      totalCheckpointShardWriteFailures(0ULL),
+		      totalIntegrityFailures(0ULL),
+		      lastNetType(-1),
+		      lastOperationWasCheckpoint(false),
+		      lastOperationSucceeded(false),
+		      lastOperationRejected(false),
+		      lastRotatedPrevious(false),
+		      lastTokenizerPresent(false),
+		      lastIncludeOptimizerState(false),
+		      lastShardCount(0ULL),
+		      lastTensorCount(0ULL),
+		      lastWeightsBytes(0ULL),
+		      lastMaxShardBytes(0ULL),
+		      lastOperation(),
+		      lastName(),
+		      lastStage(),
+		      lastStatus(NNetworkStatus::OK, std::string())
+		{
+		}
+	};
+
+	struct AtlasRuntimeDiagnostics
+	{
+		unsigned int atlasMatrices;
+		unsigned int sparrowMatrices;
+		unsigned int sparrowMode2Matrices;
+		double sparrowMeanActiveModes;
+		double sparrowMode2Fraction;
+		double sparrowMeanEdge;
+		double sparrowMeanSecondEdge;
+		double sparrowMeanSecondEdgeRatio;
+		double sparrowMeanMemoryGain;
+		double sparrowMeanHorizontalRatio;
+		unsigned int helmMatrices;
+		unsigned int helmMode2Matrices;
+		double helmMeanActiveModes;
+		double helmMode2Fraction;
+		double helmMeanEdge;
+		double helmMeanSecondEdge;
+		double helmMeanSecondEdgeRatio;
+		double helmMeanSigma;
+		double helmMeanPredR2;
+		double helmMeanMemoryGain;
+		double helmMeanPole;
+		unsigned int asterMatrices;
+		unsigned int asterMode2Matrices;
+		double asterMeanActiveModes;
+		double asterMode2Fraction;
+		double asterMeanEdge;
+		double asterMeanSecondEdge;
+		double asterMeanSecondEdgeRatio;
+		double asterMeanSigma;
+		double asterMeanPredR2;
+		double asterMeanMemoryGain;
+		double asterMeanPole;
+		double asterMeanBoundaryMs;
+		double asterMeanSetupMs;
+		double asterMeanTransportMs;
+		double asterMeanTransferFitMs;
+		double asterMeanStateFitMs;
+		double asterMeanInnovationFitMs;
+		double asterMeanApplyMs;
+		unsigned int aegisMatrices;
+		double aegisMeanLambdaSpatial;
+		double aegisMeanLambdaPredictive;
+		double aegisMeanLambdaOutput;
+		double aegisMeanPredictivePredicted;
+		double aegisMeanPredictiveRealized;
+		double aegisMeanOutputPredicted;
+		double aegisMeanOutputRealized;
+		double aegisMeanPredictiveError;
+		double aegisMeanOutputError;
+		double aegisMeanChannelDisagreement;
+		unsigned int citadelMatrices;
+		double citadelMeanAnchor;
+		double citadelMeanHardRegimeMass;
+		double citadelMeanSparrowTrust;
+		unsigned int rampartMatrices;
+		double rampartMeanTau;
+		double rampartMeanBudget;
+		double rampartMeanCovariance;
+		double rampartMeanSparrowTrust;
+		unsigned int meritMatrices;
+		double meritMeanTau;
+		double meritMeanBudget;
+		double meritMeanCovariance;
+		double meritMeanSparrowTrust;
+		double meritMeanGeometryTrust;
+		unsigned int strataMatrices;
+		double strataMeanNullMode;
+		double strataMeanPredictiveMode;
+		double strataMeanOutputMode;
+		double strataMeanCoupledMode;
+		double strataMeanBudget;
+		double strataMeanNullBenefit;
+		double strataMeanPredictiveBenefit;
+		double strataMeanOutputBenefit;
+		double strataMeanCoupledBenefit;
+		double strataMeanSelectedExcess;
+		double strataMeanSwitchRate;
+		unsigned int transformerGapBatches;
+		double transformerMeanInputUpdateNorm;
+		std::vector<double> transformerMeanBlockUpdateNorms;
+		double transformerMeanFinalNormUpdateNorm;
+		double transformerMeanHeadUpdateNorm;
+		double transformerMeanHeadShare;
+		double transformerMeanNonHeadShare;
+		double transformerMeanApplyMs;
+		unsigned int transformerMarginSnapshots;
+		double transformerMeanTargetMargin;
+		double transformerMeanHardNegativeLogit;
+
+		AtlasRuntimeDiagnostics()
+		    : atlasMatrices(0u),
+		      sparrowMatrices(0u),
+		      sparrowMode2Matrices(0u),
+		      sparrowMeanActiveModes(0.0),
+		      sparrowMode2Fraction(0.0),
+		      sparrowMeanEdge(0.0),
+		      sparrowMeanSecondEdge(0.0),
+		      sparrowMeanSecondEdgeRatio(0.0),
+		      sparrowMeanMemoryGain(0.0),
+		      sparrowMeanHorizontalRatio(0.0),
+		      helmMatrices(0u),
+		      helmMode2Matrices(0u),
+		      helmMeanActiveModes(0.0),
+		      helmMode2Fraction(0.0),
+		      helmMeanEdge(0.0),
+		      helmMeanSecondEdge(0.0),
+		      helmMeanSecondEdgeRatio(0.0),
+		      helmMeanSigma(0.0),
+		      helmMeanPredR2(0.0),
+		      helmMeanMemoryGain(0.0),
+		      helmMeanPole(0.0),
+		      asterMatrices(0u),
+		      asterMode2Matrices(0u),
+		      asterMeanActiveModes(0.0),
+		      asterMode2Fraction(0.0),
+		      asterMeanEdge(0.0),
+		      asterMeanSecondEdge(0.0),
+		      asterMeanSecondEdgeRatio(0.0),
+		      asterMeanSigma(0.0),
+		      asterMeanPredR2(0.0),
+		      asterMeanMemoryGain(0.0),
+		      asterMeanPole(0.0),
+		      asterMeanBoundaryMs(0.0),
+		      asterMeanSetupMs(0.0),
+		      asterMeanTransportMs(0.0),
+		      asterMeanTransferFitMs(0.0),
+		      asterMeanStateFitMs(0.0),
+		      asterMeanInnovationFitMs(0.0),
+		      asterMeanApplyMs(0.0),
+		      aegisMatrices(0u),
+		      aegisMeanLambdaSpatial(0.0),
+		      aegisMeanLambdaPredictive(0.0),
+		      aegisMeanLambdaOutput(0.0),
+		      aegisMeanPredictivePredicted(0.0),
+		      aegisMeanPredictiveRealized(0.0),
+		      aegisMeanOutputPredicted(0.0),
+		      aegisMeanOutputRealized(0.0),
+		      aegisMeanPredictiveError(0.0),
+		      aegisMeanOutputError(0.0),
+		      aegisMeanChannelDisagreement(0.0),
+		      citadelMatrices(0u),
+		      citadelMeanAnchor(0.0),
+		      citadelMeanHardRegimeMass(0.0),
+		      citadelMeanSparrowTrust(0.0),
+		      rampartMatrices(0u),
+		      rampartMeanTau(0.0),
+		      rampartMeanBudget(0.0),
+		      rampartMeanCovariance(0.0),
+		      rampartMeanSparrowTrust(0.0),
+		      meritMatrices(0u),
+		      meritMeanTau(0.0),
+		      meritMeanBudget(0.0),
+		      meritMeanCovariance(0.0),
+		      meritMeanSparrowTrust(0.0),
+		      meritMeanGeometryTrust(0.0),
+		      strataMatrices(0u),
+		      strataMeanNullMode(0.0),
+		      strataMeanPredictiveMode(0.0),
+		      strataMeanOutputMode(0.0),
+		      strataMeanCoupledMode(0.0),
+		      strataMeanBudget(0.0),
+		      strataMeanNullBenefit(0.0),
+		      strataMeanPredictiveBenefit(0.0),
+		      strataMeanOutputBenefit(0.0),
+		      strataMeanCoupledBenefit(0.0),
+		      strataMeanSelectedExcess(0.0),
+		      strataMeanSwitchRate(0.0),
+		      transformerGapBatches(0u),
+		      transformerMeanInputUpdateNorm(0.0),
+		      transformerMeanBlockUpdateNorms(),
+		      transformerMeanFinalNormUpdateNorm(0.0),
+		      transformerMeanHeadUpdateNorm(0.0),
+		      transformerMeanHeadShare(0.0),
+		      transformerMeanNonHeadShare(0.0),
+		      transformerMeanApplyMs(0.0),
+		      transformerMarginSnapshots(0u),
+		      transformerMeanTargetMargin(0.0),
+		      transformerMeanHardNegativeLogit(0.0)
+		{
+		}
+	};
+
+	struct TransformerGroupedParameterSnapshot
+	{
+		bool valid;
+		std::vector<float> inputGroup;
+		std::vector< std::vector<float> > blockGroups;
+		std::vector<float> finalNormGroup;
+		std::vector<float> headGroup;
+
+		TransformerGroupedParameterSnapshot()
+		    : valid(false)
+		{
+		}
+	};
+
+private:
+
 	// Tensor-based DFF training state.
 	//
 	// This is a contiguous-buffer rewrite of the historical (graph-based) training core,
 	// but implemented purely in packed vectors/matrices for cache-friendly execution.
 	struct TensorDFFState
 	{
+		struct HelmState
+		{
+			bool initialized;
+			unsigned int rawHiddenDim;
+			unsigned int hiddenDim;
+			unsigned int outputDim;
+			unsigned int hiddenStackDepth;
+			unsigned int modeRank;
+			std::vector<unsigned int> hiddenLayerActivationIndices;
+			std::vector<unsigned int> hiddenLayerOffsets;
+			std::vector<unsigned int> hiddenLayerSizes;
+			std::vector<float> prevHiddenMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> hiddenVar;
+			std::vector<float> residualVar;
+			std::vector<float> crossCov;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchHiddenSum;
+			std::vector<float> batchHiddenSqSum;
+			std::vector<float> batchResidualSum;
+			std::vector<float> batchResidualSqSum;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+
+			HelmState()
+			    : initialized(false),
+			      rawHiddenDim(0u),
+			      hiddenDim(0u),
+			      outputDim(0u),
+			      hiddenStackDepth(0u),
+			      modeRank(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				rawHiddenDim = 0u;
+				hiddenDim = 0u;
+				outputDim = 0u;
+				hiddenStackDepth = 0u;
+				modeRank = 0u;
+				hiddenLayerActivationIndices.clear();
+				hiddenLayerOffsets.clear();
+				hiddenLayerSizes.clear();
+				prevHiddenMean.clear();
+				prevResidualMean.clear();
+				hiddenVar.clear();
+				residualVar.clear();
+				crossCov.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchHiddenSum.clear();
+				batchHiddenSqSum.clear();
+				batchResidualSum.clear();
+				batchResidualSqSum.clear();
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+			}
+		};
+
+		struct AsterState
+		{
+			bool initialized;
+			unsigned int rawHiddenDim;
+			unsigned int controlDim;
+			unsigned int outputDim;
+			unsigned int hiddenStackDepth;
+			unsigned int stateRank;
+			std::vector<unsigned int> hiddenLayerActivationIndices;
+			std::vector<unsigned int> hiddenLayerOffsets;
+			std::vector<unsigned int> hiddenLayerSizes;
+			std::vector<float> prevControlMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> controlVar;
+			std::vector<float> residualVar;
+			std::vector<float> pastCov;
+			std::vector<float> crossCov;
+			std::vector<float> theta;
+			std::vector<float> statePastCov;
+			std::vector<float> stateCrossCov;
+			std::vector<float> innovationCov;
+			std::vector<float> innovationCross;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchHiddenSum;
+			std::vector<float> batchHiddenSqSum;
+			std::vector<float> batchResidualSum;
+			std::vector<float> batchResidualSqSum;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+			float aegisPredictiveErrorEma;
+			float aegisOutputErrorEma;
+			float aegisPrevPredictiveScore;
+			float aegisPrevOutputScore;
+			float aegisLastLambdaSpatial;
+			float aegisLastLambdaPredictive;
+			float aegisLastLambdaOutput;
+			float aegisLastPredictivePredicted;
+			float aegisLastPredictiveRealized;
+			float aegisLastOutputPredicted;
+			float aegisLastOutputRealized;
+			float aegisLastChannelDisagreement;
+			float citadelPredictiveTrustEma;
+			float citadelOutputTrustEma;
+			float citadelLastAnchor;
+			float citadelLastHardRegimeMass;
+			float citadelLastSparrowTrust;
+			float rampartLastTau;
+			float rampartLastBudget;
+			float rampartLastCovariance;
+			float rampartLastSparrowTrust;
+			float meritLastTau;
+			float meritLastBudget;
+			float meritLastCovariance;
+			float meritLastSparrowTrust;
+			float meritLastGeometryTrust;
+			float strataLastNullMode;
+			float strataLastPredictiveMode;
+			float strataLastOutputMode;
+			float strataLastCoupledMode;
+			float strataLastBudget;
+			float strataNullBenefitEma;
+			float strataPredictiveBenefitEma;
+			float strataOutputBenefitEma;
+			float strataCoupledBenefitEma;
+			float strataLastNullBenefit;
+			float strataLastPredictiveBenefit;
+			float strataLastOutputBenefit;
+			float strataLastCoupledBenefit;
+			float strataLastSelectedExcess;
+			float strataLastSwitchRate;
+			unsigned long long timingBoundaryCount;
+			double totalBoundaryNs;
+			double totalSetupNs;
+			double totalTransportNs;
+			double totalTransferFitNs;
+			double totalStateFitNs;
+			double totalInnovationFitNs;
+			double totalApplyNs;
+
+			AsterState()
+			    : initialized(false),
+			      rawHiddenDim(0u),
+			      controlDim(0u),
+			      outputDim(0u),
+			      hiddenStackDepth(0u),
+			      stateRank(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f),
+			      aegisPredictiveErrorEma(0.0f),
+			      aegisOutputErrorEma(0.0f),
+			      aegisPrevPredictiveScore(0.0f),
+			      aegisPrevOutputScore(0.0f),
+			      aegisLastLambdaSpatial(0.0f),
+			      aegisLastLambdaPredictive(0.0f),
+			      aegisLastLambdaOutput(0.0f),
+			      aegisLastPredictivePredicted(0.0f),
+			      aegisLastPredictiveRealized(0.0f),
+			      aegisLastOutputPredicted(0.0f),
+			      aegisLastOutputRealized(0.0f),
+			      aegisLastChannelDisagreement(0.0f),
+			      citadelPredictiveTrustEma(0.0f),
+			      citadelOutputTrustEma(0.0f),
+			      citadelLastAnchor(0.0f),
+			      citadelLastHardRegimeMass(0.0f),
+			      citadelLastSparrowTrust(1.0f),
+			      rampartLastTau(0.0f),
+			      rampartLastBudget(0.0f),
+			      rampartLastCovariance(0.0f),
+			      rampartLastSparrowTrust(1.0f),
+			      meritLastTau(0.0f),
+			      meritLastBudget(0.0f),
+			      meritLastCovariance(0.0f),
+			      meritLastSparrowTrust(1.0f),
+			      meritLastGeometryTrust(0.0f),
+			      strataLastNullMode(1.0f),
+			      strataLastPredictiveMode(0.0f),
+			      strataLastOutputMode(0.0f),
+			      strataLastCoupledMode(0.0f),
+			      strataLastBudget(0.0f),
+			      strataNullBenefitEma(0.0f),
+			      strataPredictiveBenefitEma(0.0f),
+			      strataOutputBenefitEma(0.0f),
+			      strataCoupledBenefitEma(0.0f),
+			      strataLastNullBenefit(0.0f),
+			      strataLastPredictiveBenefit(0.0f),
+			      strataLastOutputBenefit(0.0f),
+			      strataLastCoupledBenefit(0.0f),
+			      strataLastSelectedExcess(0.0f),
+			      strataLastSwitchRate(0.0f),
+			      timingBoundaryCount(0ULL),
+			      totalBoundaryNs(0.0),
+			      totalSetupNs(0.0),
+			      totalTransportNs(0.0),
+			      totalTransferFitNs(0.0),
+			      totalStateFitNs(0.0),
+			      totalInnovationFitNs(0.0),
+			      totalApplyNs(0.0)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				rawHiddenDim = 0u;
+				controlDim = 0u;
+				outputDim = 0u;
+				hiddenStackDepth = 0u;
+				stateRank = 0u;
+				hiddenLayerActivationIndices.clear();
+				hiddenLayerOffsets.clear();
+				hiddenLayerSizes.clear();
+				prevControlMean.clear();
+				prevResidualMean.clear();
+				controlVar.clear();
+				residualVar.clear();
+				pastCov.clear();
+				crossCov.clear();
+				theta.clear();
+				statePastCov.clear();
+				stateCrossCov.clear();
+				innovationCov.clear();
+				innovationCross.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchHiddenSum.clear();
+				batchHiddenSqSum.clear();
+				batchResidualSum.clear();
+				batchResidualSqSum.clear();
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+				aegisPredictiveErrorEma = 0.0f;
+				aegisOutputErrorEma = 0.0f;
+				aegisPrevPredictiveScore = 0.0f;
+				aegisPrevOutputScore = 0.0f;
+				aegisLastLambdaSpatial = 0.0f;
+				aegisLastLambdaPredictive = 0.0f;
+				aegisLastLambdaOutput = 0.0f;
+				aegisLastPredictivePredicted = 0.0f;
+				aegisLastPredictiveRealized = 0.0f;
+				aegisLastOutputPredicted = 0.0f;
+				aegisLastOutputRealized = 0.0f;
+				aegisLastChannelDisagreement = 0.0f;
+				citadelPredictiveTrustEma = 0.0f;
+				citadelOutputTrustEma = 0.0f;
+				citadelLastAnchor = 0.0f;
+				citadelLastHardRegimeMass = 0.0f;
+				citadelLastSparrowTrust = 1.0f;
+				rampartLastTau = 0.0f;
+				rampartLastBudget = 0.0f;
+				rampartLastCovariance = 0.0f;
+				rampartLastSparrowTrust = 1.0f;
+				meritLastTau = 0.0f;
+				meritLastBudget = 0.0f;
+				meritLastCovariance = 0.0f;
+				meritLastSparrowTrust = 1.0f;
+				meritLastGeometryTrust = 0.0f;
+				strataLastNullMode = 1.0f;
+				strataLastPredictiveMode = 0.0f;
+				strataLastOutputMode = 0.0f;
+				strataLastCoupledMode = 0.0f;
+				strataLastBudget = 0.0f;
+				strataNullBenefitEma = 0.0f;
+				strataPredictiveBenefitEma = 0.0f;
+				strataOutputBenefitEma = 0.0f;
+				strataCoupledBenefitEma = 0.0f;
+				strataLastNullBenefit = 0.0f;
+				strataLastPredictiveBenefit = 0.0f;
+				strataLastOutputBenefit = 0.0f;
+				strataLastCoupledBenefit = 0.0f;
+				strataLastSelectedExcess = 0.0f;
+				strataLastSwitchRate = 0.0f;
+				timingBoundaryCount = 0ULL;
+				totalBoundaryNs = 0.0;
+				totalSetupNs = 0.0;
+				totalTransportNs = 0.0;
+				totalTransferFitNs = 0.0;
+				totalStateFitNs = 0.0;
+				totalInnovationFitNs = 0.0;
+				totalApplyNs = 0.0;
+			}
+		};
+
 		bool initialized;
 		// Layer sizes including input and output: [in, h1, ..., hH, out]
 		std::vector<unsigned int> sizes;
@@ -139,6 +830,8 @@ private:
 
 		// ATLAS optimizer state (one per Transition; used when optimizer.type==ATLAS).
 		std::vector<atlas::WeightState> atlasState;
+		HelmState helm;
+		AsterState aster;
 
 		TensorDFFState() : initialized(false), batchCount(0) {}
 
@@ -150,6 +843,8 @@ private:
 			a.clear();
 			delta.clear();
 			batchCount = 0;
+			helm.reset();
+			aster.reset();
 		}
 	};
 
@@ -615,7 +1310,7 @@ private:
 	shmea::GLogger* loggerOverride;
 	glades::NaiveBayes bModel;
 
-	volatile bool running;
+	volatile int running;
 	int netType;
 	int epochs;
 	bool saveInstance;
@@ -653,6 +1348,35 @@ private:
 	// Low-level lock primitives (implemented in network.cpp; GCC/Clang use atomic builtins).
 	bool tryAcquireRunLock();
 	void releaseRunLock();
+	bool loadRunningFlag() const;
+	void storeRunningFlag(bool value);
+	static void resetPersistenceDiagnosticsAttempt(PersistenceDiagnostics& d,
+	                                               const char* operation,
+	                                               const std::string& name,
+	                                               int netType,
+	                                               bool isCheckpoint,
+	                                               bool tokenizerPresent,
+	                                               bool includeOptimizerState,
+	                                               uint64_t maxShardBytes);
+	static void notePersistenceDiagnosticsFailure(PersistenceDiagnostics& d,
+	                                              const char* stage,
+	                                              bool rejectedInput,
+	                                              bool rotatedPrevious,
+	                                              const NNetworkStatus& st,
+	                                              uint64_t shardCount,
+	                                              uint64_t tensorCount,
+	                                              uint64_t weightsBytes);
+	static void notePersistenceDiagnosticsSuccess(PersistenceDiagnostics& d,
+	                                              const char* stage,
+	                                              bool rotatedPrevious,
+	                                              const NNetworkStatus& st,
+	                                              uint64_t shardCount,
+	                                              uint64_t tensorCount,
+	                                              uint64_t weightsBytes);
+	uint64_t loadConfiguredSeed() const;
+	void storeConfiguredSeed(uint64_t seed);
+	shmea::GLogger* loadLoggerOverride() const;
+	void storeLoggerOverride(shmea::GLogger* logger);
 
 	// Epoch-scoped metric accumulators (reset at the start of each epoch).
 	// Regression:
@@ -670,227 +1394,12 @@ private:
 
 	bool firstRunActivation;
 	NNetworkStatus lastStatus;
+	TrainerRunDiagnostics trainerRunDiagnostics;
+	mutable PersistenceDiagnostics persistenceDiagnostics;
 	TensorDFFState tensorDff;
 	RecurrentScratch recScratch;
 
-	// === Transformer (encoder/decoder) packed parameters ===
-	//
-	// Transformer models are sequence models, like recurrent nets, but without recurrence.
-	// We store all parameters in packed vectors and run explicit forward/backward kernels.
-	struct TensorTransformerState
-	{
-		bool initialized;
-		// Dataset shapes
-		unsigned int inputSize; // featureCount per timestep
-		unsigned int outSize;   // expected output size per timestep
-
-		// Model config
-		unsigned int dModel;
-		unsigned int dFF;
-		unsigned int nHeads;
-		// Grouped-query attention: number of KV heads (<= nHeads).
-		// If equal to nHeads, this is standard multi-head attention.
-		unsigned int nKVHeads;
-		unsigned int nLayers;
-		// If true, use causal self-attention (decoder-only / autoregressive).
-		bool causal;
-		// FFN kind (see TransformerRunConfig::FFNKind). Stored for shape consistency.
-		unsigned int ffnKind;
-
-		// Language-model (token) mode: embedding + vocab head.
-		bool tokenModel;
-		unsigned int vocabSize;
-		int padTokenId;
-		bool tieEmbeddings;
-		// Optimizer update step (used for Adam bias correction).
-		unsigned long long optimizerStep;
-		// Token embedding table E: [vocabSize, dModel]
-		std::vector<float> tokE;
-		// Low-precision weight copy of tokE used by mixed-precision training (optional).
-		std::vector<uint16_t> tokELowp;
-		std::vector<float> vTokE;
-		std::vector<float> v2TokE;
-		std::vector<float> gTokE;
-		// LM head bias: [vocabSize]
-		std::vector<float> lmBias;
-		std::vector<float> mLmBias;
-		std::vector<float> v2LmBias;
-		std::vector<float> gLmBias;
-
-		// Input projection: x[t,inputSize] -> h[t,dModel]
-		// WIn: [dModel, inputSize]
-		std::vector<float> WIn;
-		// Low-precision weight copy of WIn used by mixed-precision training (optional).
-		std::vector<uint16_t> WInLowp;
-		std::vector<float> vWIn;
-		std::vector<float> v2WIn;
-		std::vector<float> gWIn;
-		std::vector<float> bIn;   // [dModel]
-		std::vector<float> mBIn;
-		std::vector<float> v2BIn;
-		std::vector<float> gBIn;
-
-		// Output projection: h[t,dModel] -> y[t,outSize]
-		// WOut: [outSize, dModel]
-		std::vector<float> WOut;
-		// Low-precision weight copy of WOut used by mixed-precision training (optional).
-		std::vector<uint16_t> WOutLowp;
-		std::vector<float> vWOut;
-		std::vector<float> v2WOut;
-		std::vector<float> gWOut;
-		std::vector<float> bOut;  // [outSize]
-		std::vector<float> mBOut;
-		std::vector<float> v2BOut;
-		std::vector<float> gBOut;
-
-		struct Block
-		{
-			// Pre-LN 1
-			std::vector<float> ln1Gamma; // [dModel]
-			std::vector<float> ln1Beta;  // [dModel]
-			std::vector<float> mLn1Gamma;
-			std::vector<float> v2Ln1Gamma;
-			std::vector<float> mLn1Beta;
-			std::vector<float> v2Ln1Beta;
-			std::vector<float> gLn1Gamma;
-			std::vector<float> gLn1Beta;
-
-			// Self-attention linear projections (packed as [dModel, dModel])
-			std::vector<float> Wq, Wk, Wv, Wo;
-			// Low-precision copies (optional; used when TrainingConfig::mixedPrecision.enable).
-			std::vector<uint16_t> WqLowp, WkLowp, WvLowp, WoLowp;
-			std::vector<float> vWq, vWk, vWv, vWo;
-			std::vector<float> v2Wq, v2Wk, v2Wv, v2Wo;
-			std::vector<float> gWq, gWk, gWv, gWo;
-			std::vector<float> bq, bk, bv, bo; // [dModel]
-			std::vector<float> mBq, mBk, mBv, mBo;
-			std::vector<float> v2Bq, v2Bk, v2Bv, v2Bo;
-			std::vector<float> gBq, gBk, gBv, gBo;
-
-			// Pre-LN 2
-			std::vector<float> ln2Gamma; // [dModel]
-			std::vector<float> ln2Beta;  // [dModel]
-			std::vector<float> mLn2Gamma;
-			std::vector<float> v2Ln2Gamma;
-			std::vector<float> mLn2Beta;
-			std::vector<float> v2Ln2Beta;
-			std::vector<float> gLn2Gamma;
-			std::vector<float> gLn2Beta;
-
-			// Feed-forward network
-			// W1: [dFF, dModel], b1: [dFF]
-			// W2: [dModel, dFF], b2: [dModel]
-			std::vector<float> W1, W2;
-			// Low-precision copies (optional; used when TrainingConfig::mixedPrecision.enable).
-			std::vector<uint16_t> W1Lowp, W2Lowp;
-			std::vector<float> vW1, vW2;
-			std::vector<float> v2W1, v2W2;
-			std::vector<float> gW1, gW2;
-			std::vector<float> b1, b2;
-			std::vector<float> mB1, mB2;
-			std::vector<float> v2B1, v2B2;
-			std::vector<float> gB1, gB2;
-
-			// ATLAS optimizer state per weight matrix in this block.
-			atlas::WeightState atlasWq, atlasWk, atlasWv, atlasWo;
-			atlas::WeightState atlasW1, atlasW2;
-		};
-
-		std::vector<Block> blocks;
-
-		// ATLAS optimizer state for non-block weight matrices.
-		atlas::WeightState atlasWIn;
-		atlas::WeightState atlasWOut;
-		atlas::WeightState atlasTokE;
-
-		// Final LayerNorm (applied after the last block, before the output head).
-		std::vector<float> lnFinalGamma; // [dModel]
-		std::vector<float> lnFinalBeta;  // [dModel]
-		std::vector<float> mLnFinalGamma; // Adam 1st moment
-		std::vector<float> v2LnFinalGamma; // Adam 2nd moment
-		std::vector<float> mLnFinalBeta;
-		std::vector<float> v2LnFinalBeta;
-		std::vector<float> gLnFinalGamma; // gradients
-		std::vector<float> gLnFinalBeta;
-		// Running accumulators for Adam bias correction (avoids pow(beta,t) each step).
-		double adamBeta1Power;
-		double adamBeta2Power;
-
-		// === Mixed precision runtime state (Transformer training) ===
-		//
-		// Master weights remain the FP32 vectors above.
-		// If mixed precision is enabled, the training path uses the low-precision weight copies
-		// (tokELowp/WInLowp/WOutLowp + per-block lowp matrices) for forward/backward GEMMs/GEMVs.
-		bool mpLowpReady;
-		// Low-precision dtype selector (transformer_kernels::LOWP_F16 or transformer_kernels::LOWP_BF16).
-		int mpLowpDType;
-		// Dynamic loss scaling state.
-		float mpLossScale;
-		int mpLossScaleGoodSteps;
-
-		TensorTransformerState()
-		    : initialized(false),
-		      inputSize(0u),
-		      outSize(0u),
-		      dModel(0u),
-		      dFF(0u),
-		      nHeads(0u),
-		      nKVHeads(0u),
-		      nLayers(0u),
-		      causal(false)
-		      ,
-		      ffnKind(0u)
-		      ,
-		      tokenModel(false),
-		      vocabSize(0u),
-		      padTokenId(-1),
-		      tieEmbeddings(true),
-		      optimizerStep(0ULL),
-		      adamBeta1Power(1.0),
-		      adamBeta2Power(1.0),
-		      mpLowpReady(false),
-		      mpLowpDType(0),
-		      mpLossScale(1.0f),
-		      mpLossScaleGoodSteps(0)
-		{
-		}
-
-		void reset()
-		{
-			initialized = false;
-			inputSize = 0u;
-			outSize = 0u;
-			dModel = 0u;
-			dFF = 0u;
-			nHeads = 0u;
-			nKVHeads = 0u;
-			nLayers = 0u;
-			causal = false;
-			ffnKind = 0u;
-			tokenModel = false;
-			vocabSize = 0u;
-			padTokenId = -1;
-			tieEmbeddings = true;
-			optimizerStep = 0ULL;
-			adamBeta1Power = 1.0;
-			adamBeta2Power = 1.0;
-			mpLowpReady = false;
-			mpLowpDType = 0;
-			mpLossScale = 1.0f;
-			mpLossScaleGoodSteps = 0;
-			lnFinalGamma.clear(); lnFinalBeta.clear();
-			mLnFinalGamma.clear(); v2LnFinalGamma.clear();
-			mLnFinalBeta.clear(); v2LnFinalBeta.clear();
-			gLnFinalGamma.clear(); gLnFinalBeta.clear();
-			tokE.clear(); tokELowp.clear(); vTokE.clear(); v2TokE.clear(); gTokE.clear();
-			lmBias.clear(); mLmBias.clear(); v2LmBias.clear(); gLmBias.clear();
-			WIn.clear(); WInLowp.clear(); vWIn.clear(); v2WIn.clear(); gWIn.clear();
-			bIn.clear(); mBIn.clear(); v2BIn.clear(); gBIn.clear();
-			WOut.clear(); WOutLowp.clear(); vWOut.clear(); v2WOut.clear(); gWOut.clear();
-			bOut.clear(); mBOut.clear(); v2BOut.clear(); gBOut.clear();
-			blocks.clear();
-		}
-	};
+	#include "transformer_model_state.inc"
 
 	struct TransformerScratch
 	{
@@ -946,6 +1455,11 @@ private:
 		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResAttn;  // [nLayers*T*dModel]
 		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResFF;    // [nLayers*T*dModel]
 
+		// LayerDrop per-step per-layer keep mask. Indexed by `li` (layer index).
+		// Value 1 = block kept (executed); 0 = block dropped (skipped fwd+bwd).
+		// Sized to nLayers when layerDropPMax > 0, empty otherwise.
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > layerDropKept;
+
 		// Gradient checkpointing recompute buffers (only allocated when enabled)
 		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_x1;        // [T, dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_Q;         // [T, dModel]
@@ -963,6 +1477,16 @@ private:
 		// When sampled-softmax is enabled, logits/probs are sized [T, (1+K)] and tokenLmSampleIds
 		// holds the vocabulary indices for each sampled column (col 0 is always the target id).
 		std::vector<int> tokenLmSampleIds; // [T, outSize] (only used for token LM sampled-softmax)
+		// Z-loss scratch: per-position logsumexp(logits) over full vocab.
+		// Populated by transformerCpuForwardPass (full-softmax tokenLM path) and read by the
+		// backward pass (Task 1.4 GPU kernel). Sized [T]. Always populated regardless of
+		// zlossCoef so the backward kernel has access when coef > 0 at inference time.
+		std::vector<float> logZ; // [T]
+
+		// MTP (Multi-Token Prediction) scratch — allocated only when mtpDepth > 0.
+		std::vector<int>   targetsMtp;  // [T] — +2-offset targets for MTP head
+		std::vector<float> hMtp;        // [T * dModel] — Wmtp @ hPostFinalLN
+		std::vector<float> logitsMtp;   // [T * vocabSize] — readout from hMtp
 
 		// === Backward scratch (reused across sequences/layers; aligned) ===
 		// These buffers eliminate per-sequence/per-layer allocations in transformer backward.
@@ -983,6 +1507,10 @@ private:
 		std::vector<float, glades::AlignedAllocator<float, 64> > dXtmp;       // [T, dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > dHInFromLN;  // [T, dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > dInput;      // [T, inputSize]
+
+		// Attention backward chunked dK/dV scratch (reused across layers).
+		// Sized lazily on first use based on nChunksPerHead; persists across layers/sequences.
+		std::vector<float, glades::AlignedAllocator<float, 64> > dKVscratch;
 
 		TransformerScratch()
 		    : T(0u),
@@ -1024,7 +1552,10 @@ private:
 		            unsigned int newFF1Width,
 		            float embDropRate = 0.0f,
 		            float resDropRate = 0.0f,
-		            bool gradCheckpoint = false)
+		            bool gradCheckpoint = false,
+		            int mtpDepth = 0,
+		            unsigned int vocabSize = 0u,
+		            float layerDropPMax = 0.0f)
 		{
 			T = newT;
 			inputSize = newInputSize;
@@ -1084,6 +1615,17 @@ private:
 				dropoutMaskResFF.clear();
 			}
 
+			// LayerDrop per-layer keep mask (only allocated if layerDropPMax > 0)
+			if (layerDropPMax > 0.0f)
+			{
+				if (layerDropKept.size() != static_cast<size_t>(nLayers))
+					layerDropKept.assign(static_cast<size_t>(nLayers), 1u);  // default kept
+				else
+					std::fill(layerDropKept.begin(), layerDropKept.end(), 1u);  // reset to kept
+			}
+			else if (!layerDropKept.empty())
+				layerDropKept.clear();
+
 			// Gradient checkpointing recompute buffers
 			if (gradCheckpoint)
 			{
@@ -1107,6 +1649,35 @@ private:
 			if (tokenLmSampleIds.size() != static_cast<size_t>(T) * static_cast<size_t>(outSize))
 				tokenLmSampleIds.resize(static_cast<size_t>(T) * static_cast<size_t>(outSize));
 			std::fill(tokenLmSampleIds.begin(), tokenLmSampleIds.end(), 0);
+			// logZ: one logsumexp per position; always allocated for the backward kernel.
+			if (logZ.size() != static_cast<size_t>(T))
+				logZ.resize(static_cast<size_t>(T), 0.0f);
+			// Zero logZ each step so the GPU backward kernel reads clean data even on
+			// paths (sampled-softmax, padded positions) that don't write per-position
+			// (code-review issue 3 fix).
+			std::fill(logZ.begin(), logZ.end(), 0.0f);
+
+			// MTP scratch: only allocate when mtpDepth > 0 (empty = disabled).
+			if (mtpDepth > 0)
+			{
+				if (targetsMtp.size() != static_cast<size_t>(T))
+					targetsMtp.assign(static_cast<size_t>(T), 0);
+				const size_t hMtpSz = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				if (hMtp.size() != hMtpSz)
+					hMtp.resize(hMtpSz, 0.0f);
+				if (vocabSize > 0u)
+				{
+					const size_t logitsMtpSz = static_cast<size_t>(T) * static_cast<size_t>(vocabSize);
+					if (logitsMtp.size() != logitsMtpSz)
+						logitsMtp.resize(logitsMtpSz, 0.0f);
+				}
+			}
+			else
+			{
+				targetsMtp.clear();
+				hMtp.clear();
+				logitsMtp.clear();
+			}
 
 			// Backward scratch (not per-layer; reused across the backward pass)
 			// Note: we do not rely on these being zeroed except where explicitly filled in the hot path.
@@ -1252,6 +1823,104 @@ private:
 	};
 	mutable TransformerPosEncCache transformerPosEncCache;
 
+	struct TransformerTokenStepCore
+	{
+		TransformerTokenStepCore()
+		    : where(NULL),
+		      tokenId(0u),
+		      pos(0u),
+		      maxLen(0u),
+		      keyValid(NULL),
+		      kSeq(NULL),
+		      vSeq(NULL),
+		      kSeq16(NULL),
+		      vSeq16(NULL),
+		      outLogits(NULL),
+		      outHidden(NULL),
+		      dModel(0u),
+		      dFF(0u),
+		      nHeads(0u),
+		      nKVHeads(0u),
+		      nLayers(0u),
+		      dHead(0u),
+		      dModelKV(0u),
+		      ffnKind(0u),
+		      ff1Width(0u),
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDim(0u),
+		      ffnActivation(0u),
+		      lowpDType(0),
+		      metricsEnabled(false),
+		      metricsBreakdownEnabled(false),
+		      posEncCache(NULL),
+		      perf(NULL),
+		      h(NULL),
+		      x1(NULL),
+		      x2(NULL),
+		      q(NULL),
+		      kvec(NULL),
+		      vvec(NULL),
+		      attnConcat(NULL),
+		      attnOut(NULL),
+		      ffPre(NULL),
+		      ffAct(NULL),
+		      ffOut(NULL),
+		      scores(NULL)
+		{
+		}
+
+		bool usesLowPrecisionKvCache() const { return kSeq16 != NULL && vSeq16 != NULL; }
+
+		const char* where;
+		unsigned int tokenId;
+		unsigned int pos;
+		unsigned int maxLen;
+		unsigned char* keyValid;
+		float* kSeq;
+		float* vSeq;
+		uint16_t* kSeq16;
+		uint16_t* vSeq16;
+		float* outLogits;
+		float* outHidden;
+
+		unsigned int dModel;
+		unsigned int dFF;
+		unsigned int nHeads;
+		unsigned int nKVHeads;
+		unsigned int nLayers;
+		unsigned int dHead;
+		unsigned int dModelKV;
+		unsigned int ffnKind;
+		unsigned int ff1Width;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		unsigned int ropeDim;
+		unsigned int ffnActivation;
+		int lowpDType;
+		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+
+		TransformerPosEncCache* posEncCache;
+		void* perf;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* h;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* x1;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* x2;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* q;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* kvec;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* vvec;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* attnConcat;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* attnOut;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffPre;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffAct;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffOut;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* scores;
+	};
+
+	NNetworkStatus transformerLmAppendCpuTokenCore(TransformerTokenStepCore& core) const;
+
 	// Ensure packed tensor parameters are initialized from the attached DataInput shape.
 	// Returns false and sets lastStatus on failure.
 	bool ensureTensorParametersInitialized();
@@ -1276,6 +1945,13 @@ private:
 	float lrScheduleMultiplier; // computed each epoch by the scheduler; starts at 1
 	int lrScheduleEpochOffset;  // added to epochFromStart in Trainer::run(); caller sets this
 	                            // when train() is called once per epoch in a loop
+	int runStartingEpochs;      // 2026-05-13 task #29 fix: Trainer::run sets this at run
+	                            // start so per-step LR computations in SGDHelper can
+	                            // subtract it (mirrors Trainer::run's starting_epochs
+	                            // local).  Without this subtraction, callers that set
+	                            // lrScheduleEpochOffset + iterate per-chunk see
+	                            // epochIdx + offset double-counted by 2× (epochIdx is
+	                            // cumulative net.epochs which already equals offset).
 	float lastGradNorm;
 	float lastGradNormScale;
 	int64_t lastStepLogTime;
@@ -1320,6 +1996,15 @@ public:
 		{
 		}
 
+		bool hasType() const { return !type.empty(); }
+		bool hasVocab() const { return !vocab.empty(); }
+		size_t vocabSize() const { return vocab.size(); }
+		bool hasAnySpecialTokenId() const
+		{
+			return padTokenId >= 0 || bosTokenId >= 0 || eosTokenId >= 0 || unkTokenId >= 0;
+		}
+		static bool isSpecialTokenIdSet(int id) { return id >= 0; }
+
 		void reset() { *this = TokenizerArtifacts(); }
 	};
 
@@ -1349,6 +2034,101 @@ private:
 	void SGDHelper_LSTM(unsigned int inputRowCounter, int runType);
 	void SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int runType);
 	void SGDHelper_CNN(unsigned int inputRowCounter, int runType);
+
+	// Transformer SGD sub-functions (split from SGDHelper_TRANSFORMER for readability).
+	// The config struct bundles per-epoch derived values so the extracted methods
+	// share state without passing dozens of individual parameters.
+	struct TransformerEpochCfg
+	{
+		unsigned int inputSize, outSize, dModel, dFF, nHeads, nKVHeads, nLayers;
+		unsigned int vocabSize, dHead, dModelKV, ff1Width;
+		int padTokenId;
+		bool causal, tokenLM, tieEmb, isTrain;
+		float gradClip, lnEps, ropeTheta;
+		int costFx, posEnc, normType, ffnKind, ffnAct, ropeDimOverride;
+		int tokenLmNegK;
+		bool ddpEnabled;
+		bool useLowpWeights;
+		int lowpDType;
+		bool mpEnable, mpUseLossScaling, mpDynamicLossScaling;
+		unsigned int seqBatchMax;
+		glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind;
+		bool tokenLmAllowHuge;
+		float lrScheduleMultiplier;
+	};
+#ifdef GLADES_HAVE_CUDA
+	bool tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+	                               int epochIdx, int64_t epochStartMs,
+	                               unsigned long long& tokensProcessed,
+	                               unsigned long long& targetsProcessed,
+	                               double& tokenLmNllSum,
+	                               unsigned long long& tokenLmTokenCount,
+	                               unsigned long long& clsCorrect,
+	                               unsigned long long& clsTotal,
+	                               shmea::GLogger* logger);
+	bool ensureTransformerGpuTrainingScratch(const TransformerEpochCfg& cfg, unsigned int T);
+	bool syncTransformerGpuTrainingWeightsToCpu();
+	void transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+	                              int epochIdx, int64_t epochStartMs,
+	                              unsigned long long& tokensProcessed,
+	                              unsigned long long& targetsProcessed,
+	                              double& tokenLmNllSum,
+	                              unsigned long long& tokenLmTokenCount,
+	                              unsigned long long& clsCorrect,
+	                              unsigned long long& clsTotal,
+	                              shmea::GLogger* logger);
+#endif
+	void transformerCpuForwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+	                               const std::vector<int>& tokenIds,
+	                               const std::vector<int>& targetIds,
+	                               const std::vector<unsigned char>& keyAllowed,
+	                               unsigned int scratchOutSize, unsigned int sampleCount);
+	void transformerCpuBackwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+	                                const std::vector<int>& tokenIds,
+	                                const std::vector<int>& targetIds,
+	                                unsigned int scratchOutSize,
+	                                unsigned int& seqInBatch,
+	                                unsigned int& timeStepsInBatch);
+
+#ifdef GLADES_HAVE_CUDA
+	// Runs the GPU forward pass (embedding → per-layer blocks → final LN →
+	// output head → softmax) for ONE sequence. Token IDs must already be
+	// uploaded to gpuTransformerScratch->tokenIds (tokenLM mode) by the
+	// caller. Does NOT compute loss/metrics and does NOT run backward.
+	// Writes logits/probs to scratch buffers. Used for both the normal
+	// training forward and the HELIOS FD-HVP probe's perturbed re-forward.
+	//
+	// gpuPerfOpaque: nullable pointer to TransformerGpuPerfBreakdown (cast
+	// internally to avoid exposing the perf struct in this header).
+	bool transformerGpuRunForwardOnly(const TransformerEpochCfg& cfg,
+	                                  unsigned int T,
+	                                  bool useBf16, bool useRope,
+	                                  bool bf16WIn, bool bf16Wq, bool bf16Wk,
+	                                  bool bf16Wv, bool bf16Wo, bool bf16W1,
+	                                  bool bf16W2, bool bf16Head,
+	                                  int ropeDimOverride,
+	                                  void* gpuPerfOpaque);
+
+	// Activation-checkpoint helper.  Re-runs the per-layer forward body for
+	// layers in [segStart, segEnd) (exclusive end), populating the cyclic
+	// activation slots so the backward path can read them.  When
+	// segmentInputOverride is non-NULL it is used as the input to layer
+	// segStart (e.g. a checkpoint hAfterFF copy); otherwise the standard
+	// layerIn formula `(li == 0) ? h : hAfterFF[prevSlot]` is used.  Same
+	// kernel sequence as transformerGpuRunForwardOnly's layer loop, minus
+	// embedding/final-LN/output-head — those are handled once per step in
+	// the train epoch and don't need recomputing.
+	bool transformerGpuLayerRangeForward(
+	    const TransformerEpochCfg& cfg,
+	    unsigned int T,
+	    unsigned int segStart, unsigned int segEnd,
+	    const float* segmentInputOverride,
+	    bool useBf16, bool useRope,
+	    bool bf16Wq, bool bf16Wk, bool bf16Wv,
+	    bool bf16Wo, bool bf16W1, bool bf16W2,
+	    int ropeDimOverride);
+#endif
+
 
 	// Owned resources (used only in some construction paths)
 	shmea::GPointer<NNInfo> ownedSkeleton;
@@ -1404,7 +2184,15 @@ public:
 		// Transformer decoder-only: causal self-attention over sequences.
 		TYPE_TRANSFORMER_DECODER = 5,
 		// Convolutional neural network: im2col+SGEMM convolution, pooling, FC head.
-		TYPE_CNN = 6
+		TYPE_CNN = 6,
+		// CHIRON reversible-flow transformer: bijective symplectic blocks,
+		// O(1)-in-depth activation memory (research/CHIRON_framework.md).
+		// When enabled via cfg.chiron.enable, the training loop routes
+		// forward/backward through CHIRON primitives (chiron_attention_shear,
+		// chiron_reln_forward/inverse/backward, chiron_attention_shear_backward)
+		// instead of storing activations. Phase A: dispatch enum + feature
+		// flag. Phase B: full forward/backward orchestration.
+		TYPE_TRANSFORMER_CHIRON = 7
 	};
 
 	enum
@@ -1419,7 +2207,7 @@ public:
 	explicit NNetwork(const NNInfo* newNNInfo, int newNetType=TYPE_DFF);
 	virtual ~NNetwork();
 	void setSeed(uint64_t seed);
-	uint64_t getSeed() const { return rngSeed; }
+	uint64_t getSeed() const { return loadConfiguredSeed(); }
 	// Create a fresh NNetwork from the same skeleton/type/config for hyperparameter tuning.
 	// Caller owns the returned pointer and must delete it.
 	NNetwork* cloneForTrial() const;
@@ -1448,6 +2236,7 @@ public:
 	// - Not safe to mutate while the network is running (same as trainingConfig/terminator).
 	bool hasTokenizerArtifacts() const { return tokenizerArtifactsPresent; }
 	const TokenizerArtifacts& getTokenizerArtifacts() const { return tokenizerArtifacts; }
+	static NNetworkStatus validateTokenizerArtifacts(const TokenizerArtifacts& a);
 	NNetworkStatus setTokenizerArtifacts(const TokenizerArtifacts& a);
 	void clearTokenizerArtifacts();
 
@@ -1492,6 +2281,8 @@ public:
 	NNetworkStatus train(const DataInput*, ITrainingCallbacks*);
 	NNetworkStatus test(const DataInput*, ITrainingCallbacks*);
 	const NNetworkStatus& getLastStatus() const { return lastStatus; }
+	bool getTrainerRunDiagnostics(TrainerRunDiagnostics& out) const;
+	bool getPersistenceDiagnostics(PersistenceDiagnostics& out) const;
 
 	// Training loop controls (optional).
 	// These are intentionally simple knobs that do not require modifying NNInfo persistence.
@@ -1501,6 +2292,26 @@ public:
 	void setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier);
 	float getLearningRateMultiplier() const { return lrScheduleMultiplier; }
 	void setLrScheduleEpochOffset(int offset) { lrScheduleEpochOffset = offset; }
+
+	// Read-only accessor for the transformer's optimizer step count.
+	// Used by trainers driving paradigm-#38 SLC mini-warmup to mark the
+	// current step as the "last transition" right before a chunk that
+	// changes T.  Returns 0 if the network is not a transformer or hasn't
+	// trained yet.
+	unsigned long long getTransformerOptimizerStep() const
+	{
+		return tensorTransformer.optimizerStep;
+	}
+
+	// Paradigm shift #39 RLG (Reversible Layer Growth) — scheduled
+	// re-zeroing.  Trainer drives this at each --l-schedule transition:
+	// zeros Wo + W2 (and Adam M/V state where present) of transformer
+	// blocks [activeLayers, nLayers), making those blocks bit-exact
+	// identity to the residual.  Stale optimizer state is cleared so
+	// the regrown layers start fresh at every transition.  No-op when
+	// activeLayers >= nLayers or not a transformer network.  Operates
+	// on the GPU mirrors when GPU is enabled.
+	void rlgRezeroDeepLayers(unsigned int activeLayers);
 	void setGlobalGradClipNorm(float clipNorm);
 	float getGlobalGradClipNorm() const { return trainingConfig.globalGradClipNorm; }
 	void setPerElementGradClip(float clipLimit);
@@ -1547,6 +2358,8 @@ public:
 	float getMCC() const;
 	const CMatrix& getConfusionMatrix() const;
 	const shmea::GList& getNodeActivations() const;
+	bool getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) const;
+	bool getTransformerGroupedParameterSnapshot(TransformerGroupedParameterSnapshot& out) const;
 
 	// graphing
 	shmea::GList getResults() const;
@@ -1568,87 +2381,13 @@ public:
 	// - The session objects are owned by the caller and are not shared unless you share them.
 	// - The NNetwork must not be mutated concurrently with session inference (i.e., do not train while serving).
 	//
-	// === Transformer structured metrics (serving/inference) ===
-	//
-	// This is a lightweight, dependency-free metrics surface intended for production serving.
-	// It is disabled by default. When enabled, KV-cache session Reset/Append will accumulate
-	// timing/counter data and the generation APIs will emit structured log lines via the network logger.
-	struct TransformerMetricsConfig
-	{
-		// Master switch. When false, no extra timing/counters are collected.
-		bool enable;
-		// If true, collect coarse per-kernel timing breakdowns inside KV append.
-		// This adds overhead and should only be enabled when diagnosing performance.
-		bool enableKvKernelBreakdown;
-		// Emit one log line per request result in batched serving APIs.
-		bool logPerRequest;
-		// Emit one log line per KV append (very noisy; intended for debugging only).
-		bool logPerKvAppend;
-
-		TransformerMetricsConfig()
-		    : enable(false),
-		      enableKvKernelBreakdown(true),
-		      logPerRequest(true),
-		      logPerKvAppend(false)
-		{
-		}
-	};
-
-	struct TransformerKvPerfBreakdown
-	{
-		unsigned long long kvAppends;
-		// Cache effectiveness (positional encoding caches owned by sessions).
-		unsigned long long sinCacheHits;
-		unsigned long long sinCacheMisses;
-		unsigned long long ropeCacheHits;
-		unsigned long long ropeCacheMisses;
-		// NaN/Inf detection
-		unsigned long long nonFiniteHiddenState;
-		unsigned int lastNonFiniteLayer;
-		unsigned int lastNonFinitePos;
-
-		// Wall time (ms) across KV appends (and optionally per-kernel breakdown).
-		double msTotal;
-		double msEmbed;
-		double msPosEnc;
-		double msNorm;
-		double msProjQKV;
-		double msRoPE;
-		double msKVStore;
-		double msAttention;
-		double msWo;
-		double msFFN;
-		double msLogits;
-
-		TransformerKvPerfBreakdown()
-		    : kvAppends(0ULL),
-		      sinCacheHits(0ULL),
-		      sinCacheMisses(0ULL),
-		      ropeCacheHits(0ULL),
-		      ropeCacheMisses(0ULL),
-		      nonFiniteHiddenState(0ULL),
-		      lastNonFiniteLayer(0u),
-		      lastNonFinitePos(0u),
-		      msTotal(0.0),
-		      msEmbed(0.0),
-		      msPosEnc(0.0),
-		      msNorm(0.0),
-		      msProjQKV(0.0),
-		      msRoPE(0.0),
-		      msKVStore(0.0),
-		      msAttention(0.0),
-		      msWo(0.0),
-		      msFFN(0.0),
-		      msLogits(0.0)
-		{
-		}
-
-		void reset() { *this = TransformerKvPerfBreakdown(); }
-	};
+	#include "transformer_metrics_state.inc"
 
 private:
 	// Transformer serving/inference metrics configuration (default: disabled).
 	TransformerMetricsConfig transformerMetricsCfg;
+	mutable TransformerGpuPerfBreakdown lastTransformerTrainGpuPerf;
+	mutable TransformerGpuPerfBreakdown lastTransformerInferGpuPerf;
 
 public:
 	// Configure structured transformer metrics/logging.
@@ -1656,6 +2395,8 @@ public:
 	//   APIs will emit structured log lines through getLogger().
 	void setTransformerMetricsConfig(const TransformerMetricsConfig& cfg) { transformerMetricsCfg = cfg; }
 	const TransformerMetricsConfig& getTransformerMetricsConfig() const { return transformerMetricsCfg; }
+	const TransformerGpuPerfBreakdown& getLastTransformerTrainGpuPerf() const { return lastTransformerTrainGpuPerf; }
+	const TransformerGpuPerfBreakdown& getLastTransformerInferGpuPerf() const { return lastTransformerInferGpuPerf; }
 
 	struct TransformerLmSession
 	{
@@ -1665,6 +2406,164 @@ public:
 			KV_CACHE_F16 = 1,
 			KV_CACHE_BF16 = 2
 		};
+
+		bool isInitialized() const { return initialized; }
+		unsigned int getMaxLen() const { return maxLen; }
+		unsigned int getCurrentLength() const { return curLen; }
+
+		TransformerLmSession()
+		    : initialized(false),
+		      maxLen(0u),
+		      curLen(0u),
+		      dModel(0u),
+		      dFF(0u),
+		      nHeads(0u),
+		      nKVHeads(0u),
+		      nLayers(0u),
+		      dHead(0u),
+		      dModelKV(0u),
+		      ffnKind(0u),
+		      ff1Width(0u),
+		      kvCacheDType(KV_CACHE_F32),
+		      k(),
+		      v(),
+		      k16(),
+		      v16(),
+		      keyValid(),
+		      h(),
+		      x1(),
+		      x2(),
+		      q(),
+		      kvec(),
+		      vvec(),
+		      attnConcat(),
+		      attnOut(),
+		      ffPre(),
+		      ffAct(),
+		      ffOut(),
+		      scores(),
+		      posEncCache(),
+		      metricsEnabled(false),
+		      metricsBreakdownEnabled(false),
+		      metricsLogPerKvAppend(false),
+		      metricsGpuPerfEnabled(false),
+		      perf(),
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDimOverride(0),
+		      ropeTheta(0.0f),
+		      ffnActivation(0u),
+		      padTokenId(-1),
+		      logger(NULL),
+		      gpuInferState(0)
+		{
+		}
+
+		// Destructor frees GPU inference state if allocated.
+		// Implemented in transformer_infer.cpp to keep CUDA out of the header.
+		~TransformerLmSession();
+
+		void reset()
+		{
+			initialized = false;
+			maxLen = 0u;
+			curLen = 0u;
+			dModel = dFF = nHeads = nKVHeads = nLayers = dHead = dModelKV = 0u;
+			ffnKind = 0u;
+			ff1Width = 0u;
+			kvCacheDType = KV_CACHE_F32;
+			k.clear();
+			v.clear();
+			k16.clear();
+			v16.clear();
+			keyValid.clear();
+			h.clear();
+			x1.clear();
+			x2.clear();
+			q.clear();
+			kvec.clear();
+			vvec.clear();
+			attnConcat.clear();
+			attnOut.clear();
+			ffPre.clear();
+			ffAct.clear();
+			ffOut.clear();
+			scores.clear();
+			posEncCache.reset();
+			metricsEnabled = false;
+			metricsBreakdownEnabled = false;
+			metricsLogPerKvAppend = false;
+			metricsGpuPerfEnabled = false;
+			perf.reset();
+			layerNormEps = 0.0f;
+			normType = 0u;
+			positionalEncoding = 0u;
+			ropeDimOverride = 0;
+			ropeTheta = 0.0f;
+			ffnActivation = 0u;
+			padTokenId = -1;
+			logger = NULL;
+			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
+			// manages GPU lifecycle to avoid pulling CUDA into the header.
+		}
+
+	private:
+		friend class NNetwork;
+
+		// Initialized-session contract:
+		// - cached dimensions mirror the active transformer tensor layout
+		// - exactly one KV storage pair is active (`k/v` for F32 or `k16/v16` for low-precision)
+		// - scratch buffers are pre-sized so Append stays allocation-free
+		// - `keyValid.size() == maxLen`
+		bool usesLowPrecisionKvCache() const { return kvCacheDType != KV_CACHE_F32; }
+		size_t kvElementsPerSequence() const
+		{
+			return static_cast<size_t>(nLayers) * static_cast<size_t>(maxLen) * static_cast<size_t>(dModelKV);
+		}
+		bool shapeMatches(unsigned int expectedDModel,
+		                 unsigned int expectedDFF,
+		                 unsigned int expectedNHeads,
+		                 unsigned int expectedNKVHeads,
+		                 unsigned int expectedNLayers,
+		                 unsigned int expectedDHead,
+		                 unsigned int expectedDModelKV,
+		                 unsigned int expectedFfnKind,
+		                 unsigned int expectedFf1Width) const
+		{
+			return dModel == expectedDModel &&
+			       dFF == expectedDFF &&
+			       nHeads == expectedNHeads &&
+			       nKVHeads == expectedNKVHeads &&
+			       nLayers == expectedNLayers &&
+			       dHead == expectedDHead &&
+			       dModelKV == expectedDModelKV &&
+			       ffnKind == expectedFfnKind &&
+			       ff1Width == expectedFf1Width;
+		}
+		bool storageInvariantsHold() const
+		{
+			if (curLen > maxLen ||
+			    keyValid.size() != static_cast<size_t>(maxLen) ||
+			    h.size() != static_cast<size_t>(dModel) ||
+			    x1.size() != static_cast<size_t>(dModel) ||
+			    x2.size() != static_cast<size_t>(dModel) ||
+			    q.size() != static_cast<size_t>(dModel) ||
+			    kvec.size() != static_cast<size_t>(dModelKV) ||
+			    vvec.size() != static_cast<size_t>(dModelKV) ||
+			    attnConcat.size() != static_cast<size_t>(dModel) ||
+			    attnOut.size() != static_cast<size_t>(dModel) ||
+			    ffPre.size() != static_cast<size_t>(ff1Width) ||
+			    ffAct.size() != static_cast<size_t>(dFF) ||
+			    ffOut.size() != static_cast<size_t>(dModel) ||
+			    scores.size() != static_cast<size_t>(maxLen))
+				return false;
+
+			const size_t kvElems = kvElementsPerSequence();
+			if (usesLowPrecisionKvCache())
+				return k.empty() && v.empty() && k16.size() == kvElems && v16.size() == kvElems;
+			return k.size() == kvElems && v.size() == kvElems && k16.empty() && v16.empty();
+		}
 
 		bool initialized;
 		unsigned int maxLen;
@@ -1710,24 +2609,52 @@ public:
 		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
 
 		// Positional encoding caches (owned by the session to avoid mutating NNetwork).
-		unsigned int sinDModelCached;
-		std::vector<double> sinInvDenomPair;
-		unsigned int ropeDimCached;
-		float ropeThetaCached;
-		std::vector<double> ropeInvFreq;
+		// Reuses the same struct as the training-side cache to avoid divergent implementations.
+		TransformerPosEncCache posEncCache;
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+		bool metricsLogPerKvAppend;
+		bool metricsGpuPerfEnabled;
 		TransformerKvPerfBreakdown perf;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		int ropeDimOverride;
+		float ropeTheta;
+		unsigned int ffnActivation;
+		int padTokenId;
+		shmea::GLogger* logger;
 
 		// Opaque pointer to GPU inference state (allocated/freed by transformer_infer.cpp).
 		// NULL when GPU inference is not active.
 		void* gpuInferState;
 
-		TransformerLmSession()
+	};
+
+	struct TransformerLmBatchSession
+	{
+		enum KVCacheDType
+		{
+			KV_CACHE_F32 = 0,
+			KV_CACHE_F16 = 1,
+			KV_CACHE_BF16 = 2
+		};
+
+		bool isInitialized() const { return initialized; }
+		unsigned int getBatchSize() const { return batchSize; }
+		unsigned int getMaxLen() const { return maxLen; }
+		unsigned int getCurrentLength(unsigned int index) const
+		{
+			return (index < curLen.size()) ? curLen[index] : 0u;
+		}
+
+		TransformerLmBatchSession()
 		    : initialized(false),
+		      batchSize(0u),
 		      maxLen(0u),
-		      curLen(0u),
+		      curLen(),
 		      dModel(0u),
 		      dFF(0u),
 		      nHeads(0u),
@@ -1755,26 +2682,29 @@ public:
 		      ffAct(),
 		      ffOut(),
 		      scores(),
-		      sinDModelCached(0u),
-		      sinInvDenomPair(),
-		      ropeDimCached(0u),
-		      ropeThetaCached(0.0f),
-		      ropeInvFreq(),
+		      posEncCache(),
 		      metricsEnabled(false),
+		      metricsBreakdownEnabled(false),
+		      metricsLogPerKvAppend(false),
+		      metricsGpuPerfEnabled(false),
 		      perf(),
-		      gpuInferState(0)
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDimOverride(0),
+		      ropeTheta(0.0f),
+		      ffnActivation(0u),
+		      padTokenId(-1),
+		      logger(NULL)
 		{
 		}
-
-		// Destructor frees GPU inference state if allocated.
-		// Implemented in transformer_infer.cpp to keep CUDA out of the header.
-		~TransformerLmSession();
 
 		void reset()
 		{
 			initialized = false;
+			batchSize = 0u;
 			maxLen = 0u;
-			curLen = 0u;
+			curLen.clear();
 			dModel = dFF = nHeads = nKVHeads = nLayers = dHead = dModelKV = 0u;
 			ffnKind = 0u;
 			ff1Width = 0u;
@@ -1796,26 +2726,87 @@ public:
 			ffAct.clear();
 			ffOut.clear();
 			scores.clear();
-			sinDModelCached = 0u;
-			sinInvDenomPair.clear();
-			ropeDimCached = 0u;
-			ropeThetaCached = 0.0f;
-			ropeInvFreq.clear();
+			posEncCache.reset();
 			metricsEnabled = false;
+			metricsBreakdownEnabled = false;
+			metricsLogPerKvAppend = false;
+			metricsGpuPerfEnabled = false;
 			perf.reset();
-			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
-			// manages GPU lifecycle to avoid pulling CUDA into the header.
+			layerNormEps = 0.0f;
+			normType = 0u;
+			positionalEncoding = 0u;
+			ropeDimOverride = 0;
+			ropeTheta = 0.0f;
+			ffnActivation = 0u;
+			padTokenId = -1;
+			logger = NULL;
 		}
-	};
 
-	struct TransformerLmBatchSession
-	{
-		enum KVCacheDType
+	private:
+		friend class NNetwork;
+
+		// Initialized-session contract:
+		// - cached dimensions mirror the active transformer tensor layout
+		// - `curLen.size() == batchSize` and every entry stays <= maxLen
+		// - exactly one KV storage pair is active (`k/v` for F32 or `k16/v16` for low-precision)
+		// - scratch buffers are shared across batch elements and pre-sized so Append stays allocation-free
+		// - `keyValid.size() == batchSize * maxLen`
+		bool usesLowPrecisionKvCache() const { return kvCacheDType != KV_CACHE_F32; }
+		size_t kvElementsPerSequence() const
 		{
-			KV_CACHE_F32 = 0,
-			KV_CACHE_F16 = 1,
-			KV_CACHE_BF16 = 2
-		};
+			return static_cast<size_t>(nLayers) * static_cast<size_t>(maxLen) * static_cast<size_t>(dModelKV);
+		}
+		size_t kvElementsTotal() const
+		{
+			return static_cast<size_t>(batchSize) * kvElementsPerSequence();
+		}
+		bool shapeMatches(unsigned int expectedDModel,
+		                 unsigned int expectedDFF,
+		                 unsigned int expectedNHeads,
+		                 unsigned int expectedNKVHeads,
+		                 unsigned int expectedNLayers,
+		                 unsigned int expectedDHead,
+		                 unsigned int expectedDModelKV,
+		                 unsigned int expectedFfnKind,
+		                 unsigned int expectedFf1Width) const
+		{
+			return dModel == expectedDModel &&
+			       dFF == expectedDFF &&
+			       nHeads == expectedNHeads &&
+			       nKVHeads == expectedNKVHeads &&
+			       nLayers == expectedNLayers &&
+			       dHead == expectedDHead &&
+			       dModelKV == expectedDModelKV &&
+			       ffnKind == expectedFfnKind &&
+			       ff1Width == expectedFf1Width;
+		}
+		bool storageInvariantsHold() const
+		{
+			if (curLen.size() != static_cast<size_t>(batchSize) ||
+			    keyValid.size() != (static_cast<size_t>(batchSize) * static_cast<size_t>(maxLen)) ||
+			    h.size() != static_cast<size_t>(dModel) ||
+			    x1.size() != static_cast<size_t>(dModel) ||
+			    x2.size() != static_cast<size_t>(dModel) ||
+			    q.size() != static_cast<size_t>(dModel) ||
+			    kvec.size() != static_cast<size_t>(dModelKV) ||
+			    vvec.size() != static_cast<size_t>(dModelKV) ||
+			    attnConcat.size() != static_cast<size_t>(dModel) ||
+			    attnOut.size() != static_cast<size_t>(dModel) ||
+			    ffPre.size() != static_cast<size_t>(ff1Width) ||
+			    ffAct.size() != static_cast<size_t>(dFF) ||
+			    ffOut.size() != static_cast<size_t>(dModel) ||
+			    scores.size() != static_cast<size_t>(maxLen))
+				return false;
+
+			for (size_t i = 0u; i < curLen.size(); ++i)
+				if (curLen[i] > maxLen)
+					return false;
+
+			const size_t kvElems = kvElementsTotal();
+			if (usesLowPrecisionKvCache())
+				return k.empty() && v.empty() && k16.size() == kvElems && v16.size() == kvElems;
+			return k.size() == kvElems && v.size() == kvElems && k16.empty() && v16.empty();
+		}
 
 		bool initialized;
 		unsigned int batchSize;
@@ -1863,102 +2854,36 @@ public:
 		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
 
 		// Positional encoding caches (session-owned).
-		unsigned int sinDModelCached;
-		std::vector<double> sinInvDenomPair;
-		unsigned int ropeDimCached;
-		float ropeThetaCached;
-		std::vector<double> ropeInvFreq;
+		// Reuses the same struct as the training-side cache to avoid divergent implementations.
+		TransformerPosEncCache posEncCache;
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+		bool metricsLogPerKvAppend;
+		bool metricsGpuPerfEnabled;
 		TransformerKvPerfBreakdown perf;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		int ropeDimOverride;
+		float ropeTheta;
+		unsigned int ffnActivation;
+		int padTokenId;
+		shmea::GLogger* logger;
 
-		TransformerLmBatchSession()
-		    : initialized(false),
-		      batchSize(0u),
-		      maxLen(0u),
-		      curLen(),
-		      dModel(0u),
-		      dFF(0u),
-		      nHeads(0u),
-		      nKVHeads(0u),
-		      nLayers(0u),
-		      dHead(0u),
-		      dModelKV(0u),
-		      ffnKind(0u),
-		      ff1Width(0u),
-		      kvCacheDType(KV_CACHE_F32),
-		      k(),
-		      v(),
-		      k16(),
-		      v16(),
-		      keyValid(),
-		      h(),
-		      x1(),
-		      x2(),
-		      q(),
-		      kvec(),
-		      vvec(),
-		      attnConcat(),
-		      attnOut(),
-		      ffPre(),
-		      ffAct(),
-		      ffOut(),
-		      scores(),
-		      sinDModelCached(0u),
-		      sinInvDenomPair(),
-		      ropeDimCached(0u),
-		      ropeThetaCached(0.0f),
-		      ropeInvFreq(),
-		      metricsEnabled(false),
-		      perf()
-		{
-		}
-
-		void reset()
-		{
-			initialized = false;
-			batchSize = 0u;
-			maxLen = 0u;
-			curLen.clear();
-			dModel = dFF = nHeads = nKVHeads = nLayers = dHead = dModelKV = 0u;
-			ffnKind = 0u;
-			ff1Width = 0u;
-			kvCacheDType = KV_CACHE_F32;
-			k.clear();
-			v.clear();
-			k16.clear();
-			v16.clear();
-			keyValid.clear();
-			h.clear();
-			x1.clear();
-			x2.clear();
-			q.clear();
-			kvec.clear();
-			vvec.clear();
-			attnConcat.clear();
-			attnOut.clear();
-			ffPre.clear();
-			ffAct.clear();
-			ffOut.clear();
-			scores.clear();
-			sinDModelCached = 0u;
-			sinInvDenomPair.clear();
-			ropeDimCached = 0u;
-			ropeThetaCached = 0.0f;
-			ropeInvFreq.clear();
-			metricsEnabled = false;
-			perf.reset();
-		}
 	};
 
 	// Session APIs (const: do not mutate NNetwork inference state).
 	NNetworkStatus transformerLmSessionReset(TransformerLmSession& session, unsigned int maxSeqLen) const;
-	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session, unsigned int tokenId, std::vector<float>* outLogits /* optional */) const;
+	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session,
+	                                         unsigned int tokenId,
+	                                         std::vector<float>* outLogits /* optional */,
+	                                         std::vector<float>* outHidden /* optional */ = NULL) const;
 
 	NNetworkStatus transformerLmBatchSessionReset(TransformerLmBatchSession& session, unsigned int batchSize, unsigned int maxSeqLen) const;
 	// Append one token for each active batch element (ragged-safe):
-	// - Only active[b]!=0 advances session.curLen[b]
+		// - Only active[b]!=0 advances the current length tracked for that batch element
 	// - If tokenValid is provided and tokenValid[b]==0, the position is treated as padding and masked out of attention
 	// - If outLogitsFlat is provided, it is resized to [batchSize * vocabSize] and filled row-major; inactive rows are zeros
 	NNetworkStatus transformerLmBatchSessionAppendSelective(TransformerLmBatchSession& session,
@@ -1983,108 +2908,14 @@ public:
 	//
 	// IMPORTANT:
 	// - This API allocates and uses a per-call KV session (no internal KV state is retained).
-	// - It is still not safe to call concurrently with training/mutation on the same NNetwork instance.
+	// - It fails fast if the same NNetwork instance is already running training/eval/inference.
 	// - This API requires token LM mode (enableTokenEmbedding==true) and decoder net type.
-	struct TransformerGenerateConfig
-	{
-		// Maximum number of new tokens to generate (excluding the prompt).
-		unsigned int maxNewTokens;
-		// Total KV cache length cap. If 0, defaults to promptLen + maxNewTokens.
-		// If provided, it must be >= promptLen + maxNewTokens.
-		unsigned int maxSeqLen;
-
-		// Sampling controls:
-		// - temperature <= 0 => greedy (argmax)
-		// - topK == 0 => disabled
-		// - topP <= 0 or > 1 => disabled
-		float temperature;
-		unsigned int topK;
-		float topP;
-		// Nucleus (top-p) implementation policy:
-		//
-		// When topP < 1 and topK == 0, a "pure" nucleus implementation would need to:
-		// - sort the full vocabulary by logit each step (O(V log V)), then
-		// - take the smallest prefix whose cumulative probability >= topP.
-		//
-		// That can be prohibitively expensive for large vocabularies on CPU.
-		//
-		// Glades defaults to an explicit approximation:
-		// - if topP < 1 and topK == 0, we first cap candidates to the top-K tokens where
-		//   K = min(vocabSize, topPTopKCap), then apply top-p within those candidates.
-		//
-		// Set topPTopKCap to 0 to disable this approximation (full-vocab nucleus).
-		unsigned int topPTopKCap;
-
-		// Stop controls:
-		// - eosTokenId < 0 => disabled
-		// - if stopOnEos==true and eosTokenId is produced, generation stops after emitting it
-		int eosTokenId;
-		bool stopOnEos;
-
-		// Output formatting:
-		// - includePromptInOutput==true => out.tokens includes prompt first, then generated tokens
-		// - otherwise out.tokens contains only generated tokens
-		bool includePromptInOutput;
-
-		// RNG control:
-		// - rngSeedOverride!=0 => seed the per-call RNG with this value
-		// - rngSeedOverride==0 => derive a deterministic seed from the network seed + prompt tokens
-		//
-		// IMPORTANT:
-		// - Generation does not mutate or depend on the shared `NNetwork::rngEngine`.
-		// - If you want stochastic variation across calls, you must supply different rngSeedOverride values.
-		uint64_t rngSeedOverride;
-
-		TransformerGenerateConfig()
-		    : maxNewTokens(0u),
-		      maxSeqLen(0u),
-		      temperature(1.0f),
-		      topK(0u),
-		      topP(1.0f),
-		      topPTopKCap(256u),
-		      eosTokenId(-1),
-		      stopOnEos(true),
-		      includePromptInOutput(false),
-		      rngSeedOverride(0ULL)
-		{
-		}
-	};
-
-	struct TransformerGenerateResult
-	{
-		// Tokens returned (see includePromptInOutput).
-		std::vector<unsigned int> tokens;
-		// Why generation ended.
-		bool stoppedOnEos;
-		// Stopped because a non-EOS stop token was encountered (TransformerServeRequest::stopTokenIds).
-		// This is distinct from stoppedOnEos so serving telemetry can distinguish these cases.
-		bool stoppedByStopToken;
-		bool stoppedByCallback;
-		bool stoppedByLimit;
-		// Last token emitted (undefined if no tokens were emitted).
-		unsigned int lastToken;
-
-		TransformerGenerateResult()
-		    : tokens(),
-		      stoppedOnEos(false),
-		      stoppedByStopToken(false),
-		      stoppedByCallback(false),
-		      stoppedByLimit(false),
-		      lastToken(0u)
-		{
-		}
-	};
-
-	class ITransformerGenerateCallbacks
-	{
-	public:
-		virtual ~ITransformerGenerateCallbacks() {}
-		// Called after a token is emitted (and appended to the KV cache).
-		// Return true to stop generation early.
-		virtual bool onToken(const NNetwork& /*net*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
-		// Polled once per step; return true to cancel generation.
-		virtual bool shouldStop(const NNetwork& /*net*/) { return false; }
-	};
+	// - For supported transformer-facing callers, prefer TransformerPublicAPI / TransformerPublicAPI::runtime(net).
+	// Legacy compatibility aliases only.
+	// New code should include transformer_types.h and use the freestanding names directly.
+	typedef glades::TransformerGenerateConfig TransformerGenerateConfig;
+	typedef glades::TransformerGenerateResult TransformerGenerateResult;
+	typedef glades::ITransformerGenerateCallbacks ITransformerGenerateCallbacks;
 
 	// Generate tokens given a prompt (token IDs).
 	// - `promptTokens` must be non-empty (callers should include a BOS token if needed).
@@ -2105,33 +2936,9 @@ public:
 	// Implementation notes:
 	// - Uses the internal batched KV cache with selective appends (no fake padding positions).
 	// - Still scalar (loops requests), but allocation-free per decode step.
-	struct TransformerServeRequest
-	{
-		std::vector<unsigned int> promptTokens;
-		TransformerGenerateConfig cfg;
-		// Optional additional stop tokens (besides eosTokenId).
-		// If any token in stopTokenIds is generated, generation stops after emitting it.
-		std::vector<unsigned int> stopTokenIds;
-	};
-
-	struct TransformerServeBatchResult
-	{
-		// One result per request (aligned to input order).
-		std::vector<TransformerGenerateResult> results;
-	};
-
-	class ITransformerServeCallbacks
-	{
-	public:
-		virtual ~ITransformerServeCallbacks() {}
-		// Called after a token is emitted for a request.
-		// Return true to stop that request early.
-		virtual bool onToken(const NNetwork& /*net*/, unsigned int /*requestIndex*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
-		// Polled once per global decode step; return true to cancel all requests.
-		virtual bool shouldStopAll(const NNetwork& /*net*/) { return false; }
-		// Polled before sampling for a request each step; return true to cancel that request.
-		virtual bool shouldStopRequest(const NNetwork& /*net*/, unsigned int /*requestIndex*/) { return false; }
-	};
+	typedef glades::TransformerServeRequest TransformerServeRequest;
+	typedef glades::TransformerServeBatchResult TransformerServeBatchResult;
+	typedef glades::ITransformerServeCallbacks ITransformerServeCallbacks;
 
 	// === Continuous batching scheduler (persistent) ===
 	//
@@ -2149,15 +2956,19 @@ public:
 	// Thread-safety:
 	// - A batcher is not internally synchronized; do not call Step/Submit/Remove concurrently
 	//   on the same batcher from multiple threads.
-	// - Multiple batchers may be used concurrently with the same NNetwork as long as the network
-	//   is not being mutated (trained) concurrently.
+	// - Multiple batchers may be used concurrently with the same NNetwork only while the network
+	//   is otherwise idle; public Reset/Step/generate/forward entry points fail fast if the
+	//   network is already running training/eval/inference.
+	// - Prefer TransformerPublicAPI for the supported one-shot runtime surface; these low-level
+	//   batcher/session entry points remain on NNetwork for compatibility and advanced callers.
 	struct TransformerServeBatcherConfig
 	{
 		// Maximum number of concurrent requests (slots) in this batcher.
 		unsigned int maxBatchSize;
 		// Maximum KV cache length per request. Requests with larger maxSeqLen are rejected.
 		unsigned int maxSeqLen;
-		// If true, zero-out the used KV prefix when removing a slot.
+		// If true, zero-out the used KV prefix when removing a slot, including
+		// both FP32 and low-precision KV cache storage.
 		// This is more secure but can be expensive for large models/long sequences.
 		bool wipeKvOnRemove;
 		// Seed for the batcher's shared RNG stream (used when a request does not provide rngSeedOverride).
@@ -2175,44 +2986,61 @@ public:
 
 	struct TransformerServeBatcher
 	{
-		bool initialized;
-		unsigned int vocab;
-		unsigned int maxBatchSize;
-		unsigned int maxSeqLen;
-		bool wipeKvOnRemove;
+	public:
+		enum SlotLifecycle
+		{
+			SLOT_FREE = 0,
+			SLOT_PREFILL,
+			SLOT_DECODE,
+			SLOT_DONE
+		};
 
-		// One KV-cache session sized for [maxBatchSize, maxSeqLen].
-		TransformerLmBatchSession session;
-
-		// Per-slot state (size maxBatchSize).
-		std::vector<unsigned char> inUse;
-		std::vector<unsigned char> done;
-		std::vector<unsigned int> promptPos;
-		std::vector<unsigned int> promptLen;
-		std::vector<unsigned int> generated;
-		std::vector<unsigned int> reqMaxNew;
-		std::vector<unsigned int> reqMaxLen;
-
-		// Request payload per slot (owned).
-		std::vector<TransformerServeRequest> req;
-		// Results per slot (owned).
-		std::vector<TransformerGenerateResult> results;
-
-		// RNG: one shared stream for non-overridden requests, and optional per-slot overrides.
-		glades::rng::Engine batchEngine;
-		std::vector<glades::rng::Engine> overrideEngines;
-		std::vector<unsigned char> hasOverride;
-
-		// Hot-loop buffers (no per-step allocations after Reset).
-		std::vector<unsigned int> tokenIds;
-		std::vector<unsigned char> active;
-		std::vector<unsigned int> sampledTok;     // only meaningful for decode slots in the current step
-		std::vector<unsigned char> sampledIsValid;
-		std::vector<float> prevLogitsFlat; // [B, vocab]
-		std::vector<float> logitsFlat;     // [B, vocab]
-		// Sampling scratch (reused across slots; Step processes slots sequentially for sampling).
-		std::vector<unsigned int> idxScratch;
-		std::vector<float> weightScratch;
+		bool isInitialized() const { return initialized; }
+		unsigned int capacity() const { return maxBatchSize; }
+		bool slotFree(unsigned int slot) const
+		{
+			return slot < inUse.size() && inUse[slot] == 0u;
+		}
+		bool slotInUse(unsigned int slot) const
+		{
+			return !slotFree(slot);
+		}
+		bool slotDone(unsigned int slot) const
+		{
+			return slot < done.size() && done[slot] != 0u;
+		}
+		bool slotInPrefill(unsigned int slot) const
+		{
+			return slot < promptPos.size() && slot < promptLen.size() && promptPos[slot] < promptLen[slot];
+		}
+		bool slotCanDecode(unsigned int slot) const
+		{
+			return slotInUse(slot) && !slotDone(slot) &&
+			       !slotInPrefill(slot) &&
+			       slot < generated.size() &&
+			       slot < reqMaxNew.size() &&
+			       generated[slot] < reqMaxNew[slot];
+		}
+		unsigned int slotCurrentLen(unsigned int slot) const
+		{
+			return slot < session.curLen.size() ? session.curLen[slot] : 0u;
+		}
+		bool slotReachedMaxLen(unsigned int slot) const
+		{
+			return slot < reqMaxLen.size() && slotCurrentLen(slot) >= reqMaxLen[slot];
+		}
+		SlotLifecycle slotLifecycle(unsigned int slot) const
+		{
+			if (slotFree(slot))
+				return SLOT_FREE;
+			if (slotDone(slot))
+				return SLOT_DONE;
+			return slotInPrefill(slot) ? SLOT_PREFILL : SLOT_DECODE;
+		}
+		const TransformerGenerateResult* slotResult(unsigned int slot) const
+		{
+			return slot < results.size() ? &results[slot] : NULL;
+		}
 
 		TransformerServeBatcher()
 		    : initialized(false),
@@ -2275,6 +3103,148 @@ public:
 			idxScratch.clear();
 			weightScratch.clear();
 		}
+
+	private:
+		friend class NNetwork;
+
+		void zeroLogitsRow(unsigned int slot)
+		{
+			if (slot >= maxBatchSize || vocab == 0u)
+				return;
+			const size_t offset = static_cast<size_t>(slot) * static_cast<size_t>(vocab);
+			if (!prevLogitsFlat.empty())
+			{
+				float* row = &prevLogitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+			if (!logitsFlat.empty())
+			{
+				float* row = &logitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+		}
+
+		void installSlotRequest(unsigned int slot,
+		                       const TransformerServeRequest& newReq,
+		                       unsigned int newPromptLen,
+		                       unsigned int newMaxNew,
+		                       unsigned int newMaxLen)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			req[slot] = newReq;
+			results[slot] = TransformerGenerateResult();
+			if (newReq.cfg.includePromptInOutput)
+				results[slot].tokens = newReq.promptTokens;
+			inUse[slot] = 1u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = newPromptLen;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = newMaxNew;
+			reqMaxLen[slot] = newMaxLen;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void clearSlotState(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			inUse[slot] = 0u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = 0u;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = 0u;
+			reqMaxLen[slot] = 0u;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			req[slot] = TransformerServeRequest();
+			results[slot] = TransformerGenerateResult();
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void markSlotStoppedByLimit(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = false;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = true;
+			done[slot] = 1u;
+		}
+
+		void markSlotStoppedByCallback(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = true;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = false;
+			done[slot] = 1u;
+		}
+
+		bool initialized;
+		unsigned int vocab;
+		unsigned int maxBatchSize;
+		unsigned int maxSeqLen;
+		bool wipeKvOnRemove;
+
+		// One KV-cache session sized for [maxBatchSize, maxSeqLen].
+		TransformerLmBatchSession session;
+
+		// Per-slot state (size maxBatchSize).
+		std::vector<unsigned char> inUse;
+		std::vector<unsigned char> done;
+		std::vector<unsigned int> promptPos;
+		std::vector<unsigned int> promptLen;
+		std::vector<unsigned int> generated;
+		std::vector<unsigned int> reqMaxNew;
+		std::vector<unsigned int> reqMaxLen;
+
+		// Request payload per slot (owned).
+		std::vector<TransformerServeRequest> req;
+		// Results per slot (owned).
+		std::vector<TransformerGenerateResult> results;
+
+		// RNG: one shared stream for non-overridden requests, and optional per-slot overrides.
+		glades::rng::Engine batchEngine;
+		std::vector<glades::rng::Engine> overrideEngines;
+		std::vector<unsigned char> hasOverride;
+
+		// Hot-loop buffers (no per-step allocations after Reset).
+		std::vector<unsigned int> tokenIds;
+		std::vector<unsigned char> active;
+		std::vector<unsigned int> sampledTok;     // only meaningful for decode slots in the current step
+		std::vector<unsigned char> sampledIsValid;
+		std::vector<float> prevLogitsFlat; // [B, vocab]
+		std::vector<float> logitsFlat;     // [B, vocab]
+		// Sampling scratch (reused across slots; Step processes slots sequentially for sampling).
+		std::vector<unsigned int> idxScratch;
+		std::vector<float> weightScratch;
+
 	};
 
 	// Initialize/reset a persistent continuous batcher.
@@ -2292,6 +3262,9 @@ public:
 	// - Does not allocate on the hot path after Reset (subject to request submission copying).
 	NNetworkStatus transformerLmServeBatcherStep(TransformerServeBatcher& batcher,
 	                                            ITransformerServeCallbacks* cb /* optional */) const;
+	// Mark an in-use slot as callback-stopped without removing it from the batcher.
+	// Intended for serving runtimes that need to defer terminalization until after user callbacks return.
+	NNetworkStatus transformerLmServeBatcherCancelSlot(TransformerServeBatcher& batcher, unsigned int slot) const;
 
 	// Batched generation entrypoint.
 	// - Requests must be non-empty; each request must have a non-empty promptTokens.
@@ -2314,6 +3287,45 @@ public:
 	// - outLogits is resized to vocabSize and filled with unnormalized logits.
 	NNetworkStatus transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
 	                                             std::vector<float>& outLogits) const;
+
+	// GPU counterpart used by checkpoint evaluators. Runs the same full
+	// sequence GPU forward as training and returns only the last logits row.
+	NNetworkStatus transformerLmForwardLastLogitsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits) const;
+
+	// GPU full-sequence next-token metrics. Inputs and targets are position-
+	// aligned; negative targets and the configured pad token are ignored.
+	NNetworkStatus transformerLmEvaluateTokenMetricsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                    const std::vector<int>& targetIds,
+	                                                    TransformerTokenMetrics& outMetrics) const;
+
+	// Diagnostic canonical full-sequence final hidden rows and logits.
+	NNetworkStatus transformerLmForwardFeaturesGpu(const std::vector<unsigned int>& tokenIds,
+	                                              TransformerFullSequenceFeatures& out) const;
+	NNetworkStatus transformerLmReadoutParameters(TransformerReadoutParameters& out) const;
+
+	// Diagnostic variant that also captures the last-position hidden row at
+	// input and after every block. The implementation shares the exact full
+	// forward above; normal inference remains uninstrumented.
+	NNetworkStatus transformerLmForwardLastTrace(const std::vector<unsigned int>& tokenIds,
+	                                            std::vector<float>& outLogits,
+	                                            TransformerForwardTrace& outTrace) const;
+
+private:
+	// Shared full-sequence GPU implementation for last-logit downloads,
+	// aggregate token metrics, and bounded diagnostic feature extraction.
+	// Exactly one output pointer must be non-NULL.
+	NNetworkStatus transformerLmRunFullSequenceGpu(const char* where,
+	                                              const std::vector<unsigned int>& tokenIds,
+	                                              const std::vector<int>* targetIds,
+	                                              std::vector<float>* outLastLogits,
+	                                              TransformerTokenMetrics* outMetrics,
+	                                              TransformerFullSequenceFeatures* outFeatures) const;
+
+	// Shared implementation for the public logits-only and diagnostic variants.
+	NNetworkStatus transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits,
+	                                                TransformerForwardTrace* outTrace) const;
 };
 };
 

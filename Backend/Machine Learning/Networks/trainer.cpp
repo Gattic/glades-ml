@@ -28,6 +28,376 @@
 
 using namespace glades;
 
+namespace {
+
+static bool is_transformer_token_lm_type(int netType)
+{
+	return (netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) ||
+	       (netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+}
+
+static bool is_sequence_model_type(int netType)
+{
+	return (netType == glades::NNetwork::TYPE_RNN) ||
+	       (netType == glades::NNetwork::TYPE_GRU) ||
+	       (netType == glades::NNetwork::TYPE_LSTM) ||
+	       (netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER) ||
+	       (netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+}
+
+struct TrainerRunPreflight
+{
+	TrainerRunPreflight()
+	    : dataSize(0u),
+	      featureCount(0u),
+	      outputSize(0u),
+	      expectedFeatureCount(0u),
+	      expectedOutputSize(0u),
+	      tokenLM(false),
+	      tokenLMInput(false),
+	      useConfusionMatrix(false),
+	      isSequenceModel(false)
+	{
+	}
+
+	unsigned int dataSize;
+	unsigned int featureCount;
+	unsigned int outputSize;
+	unsigned int expectedFeatureCount;
+	unsigned int expectedOutputSize;
+	bool tokenLM;
+	bool tokenLMInput;
+	bool useConfusionMatrix;
+	bool isSequenceModel;
+};
+
+static void reset_trainer_run_diagnostics(glades::NNetwork::TrainerRunDiagnostics& d,
+                                          int runType,
+                                          int netType)
+{
+	d.totalRunAttempts += 1ULL;
+	d.lastRunType = runType;
+	d.lastNetType = netType;
+	d.lastTrainRun = false;
+	d.lastEvalRun = false;
+	d.lastTokenLM = false;
+	d.lastTokenLMInput = false;
+	d.lastSequenceModel = false;
+	d.lastFailureDuringPreflight = false;
+	d.lastFailurePostBuildCheck = false;
+	d.lastDataSize = 0u;
+	d.lastFeatureCount = 0u;
+	d.lastOutputSize = 0u;
+	d.lastExpectedFeatureCount = 0u;
+	d.lastExpectedOutputSize = 0u;
+	d.lastFailureStage.clear();
+	d.lastRunStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	d.lastFailureStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	d.lastDataInputStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static void record_trainer_run_context(glades::NNetwork::TrainerRunDiagnostics& d,
+                                       const glades::DataInput* di,
+                                       bool isTrainRun,
+                                       bool isEvalRun,
+                                       const TrainerRunPreflight* preflight)
+{
+	d.lastTrainRun = isTrainRun;
+	d.lastEvalRun = isEvalRun;
+	if (di)
+		d.lastDataInputStatus = di->getLastStatus();
+	if (!preflight)
+		return;
+	d.lastDataSize = preflight->dataSize;
+	d.lastFeatureCount = preflight->featureCount;
+	d.lastOutputSize = preflight->outputSize;
+	d.lastExpectedFeatureCount = preflight->expectedFeatureCount;
+	d.lastExpectedOutputSize = preflight->expectedOutputSize;
+	d.lastTokenLM = preflight->tokenLM;
+	d.lastTokenLMInput = preflight->tokenLMInput;
+	d.lastSequenceModel = preflight->isSequenceModel;
+}
+
+static void note_trainer_run_failure(glades::NNetwork::TrainerRunDiagnostics& d,
+                                     const glades::NNetworkStatus& st)
+{
+	d.totalRunFailures += 1ULL;
+	d.lastRunStatus = st;
+}
+
+static void note_trainer_preflight_failure(glades::NNetwork::TrainerRunDiagnostics& d,
+                                           const glades::DataInput* di,
+                                           bool isTrainRun,
+                                           bool isEvalRun,
+                                           const TrainerRunPreflight* preflight,
+                                           const char* stage,
+                                           bool postBuildCheck,
+                                           const glades::NNetworkStatus& st)
+{
+	record_trainer_run_context(d, di, isTrainRun, isEvalRun, preflight);
+	note_trainer_run_failure(d, st);
+	d.totalPreflightFailures += 1ULL;
+	d.lastFailureDuringPreflight = true;
+	d.lastFailurePostBuildCheck = postBuildCheck;
+	d.lastFailureStage = stage ? stage : std::string();
+	d.lastFailureStatus = st;
+
+	if (d.lastFailureStage == "validate_skeleton")
+		d.totalNullSkeletonFailures += 1ULL;
+	else if (d.lastFailureStage == "validate_data_input")
+		d.totalNullDataFailures += 1ULL;
+	else if (d.lastFailureStage == "validate_run_type")
+		d.totalUnknownRunTypeFailures += 1ULL;
+	else if (st.code == glades::NNetworkStatus::EMPTY_DATA)
+	{
+		d.totalEmptyDataFailures += 1ULL;
+		if (postBuildCheck)
+			d.totalPostBuildEmptyDataFailures += 1ULL;
+	}
+	else if (d.lastFailureStage == "initialize_tensors")
+		d.totalTensorInitFailures += 1ULL;
+	else
+		d.totalContractFailures += 1ULL;
+}
+
+static void note_trainer_run_success(glades::NNetwork::TrainerRunDiagnostics& d)
+{
+	d.totalRunSuccesses += 1ULL;
+	d.lastRunStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	d.lastFailureDuringPreflight = false;
+	d.lastFailurePostBuildCheck = false;
+	d.lastFailureStage.clear();
+	d.lastFailureStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus build_empty_data_status(const glades::DataInput& di,
+                                                      bool isTrainRun,
+                                                      bool postBuildCheck)
+{
+	std::string extra;
+	{
+		const glades::NNetworkStatus diSt = di.getLastStatus();
+		if (!diSt.ok() && !diSt.message.empty())
+			extra = std::string(" (DataInput: ") + diSt.message + ")";
+	}
+
+	glades::NNetworkStatus st(
+	    glades::NNetworkStatus::EMPTY_DATA,
+	    isTrainRun
+	        ? (postBuildCheck ? "Trainer::run: empty training data or feature count is zero (post-build check)"
+	                          : "Trainer::run: empty training data or feature count is zero")
+	        : (postBuildCheck ? "Trainer::run: empty test data or feature count is zero (post-build check)"
+	                          : "Trainer::run: empty test data or feature count is zero"));
+	if (!extra.empty())
+		st.message += extra;
+	return st;
+}
+
+static glades::NNetworkStatus validate_active_split_data(const glades::DataInput& di,
+                                                         bool isTrainRun,
+                                                         unsigned int dataSize,
+                                                         bool tokenLMInput,
+                                                         bool postBuildCheck)
+{
+	if ((dataSize > 0u) && (tokenLMInput || (di.getFeatureCount() > 0u)))
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	return build_empty_data_status(di, isTrainRun, postBuildCheck);
+}
+
+static glades::NNetworkStatus validate_sequence_contracts(const glades::DataInput& di,
+                                                          const glades::NNInfo& skeleton,
+                                                          bool isTrainRun,
+                                                          bool isSequenceModel)
+{
+	if (!isSequenceModel)
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+
+	// Recurrent paths require at least one hidden layer (state lives there).
+	if (skeleton.numHiddenLayers() <= 0)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+		                              "Trainer::run: sequence net type requires at least one hidden layer");
+	}
+
+	// Recurrent paths require a valid sequence model (even if it is just the default single sequence).
+	std::string seqErr;
+	if (isTrainRun)
+	{
+		if (!di.validateTrainSequences(&seqErr))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              std::string("Trainer::run: invalid train sequences: ") + seqErr);
+		}
+		if (di.getTrainSequenceCount() == 0)
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              "Trainer::run: sequence net type requires at least one non-empty train sequence");
+		}
+	}
+	else
+	{
+		if (!di.validateTestSequences(&seqErr))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              std::string("Trainer::run: invalid test sequences: ") + seqErr);
+		}
+		if (di.getTestSequenceCount() == 0)
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              "Trainer::run: sequence net type requires at least one non-empty test sequence");
+		}
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus validate_row_shape_contracts(const glades::DataInput& di,
+                                                           bool isTrainRun,
+                                                           unsigned int expectedFeatureCount,
+                                                           unsigned int expectedOutputSize)
+{
+	// Validate that every row has the expected dimensionality.
+	// IMPORTANT:
+	// Do NOT materialize every row to validate shapes. For streaming inputs (e.g. ImageInput),
+	// getTrainRow() can decode images from disk; scanning the whole dataset is prohibitive.
+	//
+	// Instead, use DataInput's shape contract. Implementations with fixed shapes validate
+	// in O(1); others do a bounded spot-check.
+	std::string shapeErr;
+	if (isTrainRun)
+	{
+		if (!di.validateTrainRowShapes(expectedFeatureCount, expectedOutputSize, &shapeErr))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              std::string("Trainer::run: invalid training row shapes: ") + shapeErr);
+		}
+	}
+	else
+	{
+		if (!di.validateTestRowShapes(expectedFeatureCount, expectedOutputSize, &shapeErr))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT,
+			                              std::string("Trainer::run: invalid test row shapes: ") + shapeErr);
+		}
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus build_run_preflight(const glades::DataInput& di,
+                                                  const glades::NNInfo& skeleton,
+                                                  int netType,
+                                                  const glades::TrainingConfig& trainingConfig,
+                                                  bool isTrainRun,
+                                                  TrainerRunPreflight& out,
+                                                  const char*& outFailureStage)
+{
+	outFailureStage = NULL;
+	out.dataSize = isTrainRun ? di.getTrainSize() : di.getTestSize();
+	out.featureCount = di.getFeatureCount();
+	out.outputSize = skeleton.getOutputLayerSize();
+	out.tokenLM = is_transformer_token_lm_type(netType) && trainingConfig.transformer.enableTokenEmbedding;
+	out.tokenLMInput = out.tokenLM && di.hasTokenIdInput();
+	out.useConfusionMatrix =
+	    !out.tokenLM && ((skeleton.getOutputType() == glades::GMath::CLASSIFICATION) ||
+	                     (skeleton.getOutputType() == glades::GMath::KL));
+	out.isSequenceModel = is_sequence_model_type(netType);
+
+	glades::NNetworkStatus st = validate_active_split_data(di, isTrainRun, out.dataSize, out.tokenLMInput, false);
+	if (!st.ok())
+	{
+		outFailureStage = "validate_active_split_data";
+		return st;
+	}
+
+	if (out.outputSize == 0u)
+	{
+		outFailureStage = "validate_output_size";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "Trainer::run: output layer size is zero");
+	}
+
+	st = validate_sequence_contracts(di, skeleton, isTrainRun, out.isSequenceModel);
+	if (!st.ok())
+	{
+		outFailureStage = "validate_sequence_contracts";
+		return st;
+	}
+
+	out.expectedFeatureCount = out.tokenLMInput ? 0u : (out.tokenLM ? 1u : out.featureCount);
+	// Token LM expected rows are a single token id, not a dense one-hot of size outputSize.
+	out.expectedOutputSize = out.tokenLM ? 1u : out.outputSize;
+	st = validate_row_shape_contracts(di, isTrainRun, out.expectedFeatureCount, out.expectedOutputSize);
+	if (!st.ok())
+		outFailureStage = "validate_row_shapes";
+	return st;
+}
+
+struct TrainerCallbackLifecycle
+{
+	TrainerCallbackLifecycle(glades::NNetwork& n,
+	                         int run,
+	                         glades::ITrainingCallbacks* callbacks)
+	    : net(n),
+	      runType(run),
+	      cb(callbacks),
+	      runStarted(false),
+	      runEnded(false)
+	{
+	}
+
+	void beginRun()
+	{
+		if (runStarted)
+			return;
+		runStarted = true;
+		if (cb)
+			cb->onRunStart(net, runType);
+	}
+
+	bool finishEpoch(const glades::TrainingConfig& trainingConfig,
+	                 const glades::NNetworkEpochMetrics& metrics)
+	{
+		bool callbackStop = false;
+		if (cb)
+			callbackStop = cb->onEpochEnd(net, metrics);
+
+		// DDP: consensus on early-stop so all workers stop together.
+		if (trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
+		{
+			unsigned int stopFlag = callbackStop ? 1u : 0u;
+			glades::ddp::allReduceSumInPlace(&stopFlag, 1);
+			callbackStop = (stopFlag > 0u);
+		}
+		return callbackStop;
+	}
+
+	void finishRun()
+	{
+		if (!runStarted || runEnded)
+			return;
+		runEnded = true;
+		if (cb)
+			cb->onRunEnd(net, runType);
+	}
+
+	~TrainerCallbackLifecycle()
+	{
+		finishRun();
+	}
+
+private:
+	glades::NNetwork& net;
+	int runType;
+	glades::ITrainingCallbacks* cb;
+	bool runStarted;
+	bool runEnded;
+
+	TrainerCallbackLifecycle(const TrainerCallbackLifecycle&);
+	TrainerCallbackLifecycle& operator=(const TrainerCallbackLifecycle&);
+};
+
+} // namespace
+
 glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
                                            const glades::DataInput* newDataInput,
                                            int runType,
@@ -49,6 +419,9 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		                             "Trainer::run: NNetwork is already running (not re-entrant/thread-safe). "
 		                             "Create separate NNetwork instances per thread.");
 	}
+
+	glades::NNetwork::TrainerRunDiagnostics& diag = net.trainerRunDiagnostics;
+	reset_trainer_run_diagnostics(diag, runType, net.netType);
 
 	// Lifetime safety:
 	// DataInput is owned by the caller and may be deleted immediately after this function returns.
@@ -73,6 +446,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	{
 		net.running = false;
 		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: skeleton is NULL (load/build a network first)");
+		note_trainer_preflight_failure(diag, NULL, false, false, NULL, "validate_skeleton", false, net.lastStatus);
 		return net.lastStatus;
 	}
 
@@ -80,6 +454,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	{
 		net.running = false;
 		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "Trainer::run: DataInput is NULL");
+		note_trainer_preflight_failure(diag, NULL, false, false, NULL, "validate_data_input", false, net.lastStatus);
 		return net.lastStatus;
 	}
 
@@ -90,136 +465,36 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	RunDataAttachmentGuard dataGuard(net, newDataInput);
 	const bool isTrainRun = (runType == glades::NNetwork::RUN_TRAIN);
 	const bool isEvalRun = (runType == glades::NNetwork::RUN_TEST) || (runType == glades::NNetwork::RUN_VALIDATE);
+	record_trainer_run_context(diag, newDataInput, isTrainRun, isEvalRun, NULL);
 	if (!isTrainRun && !isEvalRun)
 	{
 		net.running = false;
 		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "Trainer::run: unknown runType");
+		note_trainer_preflight_failure(diag, newDataInput, isTrainRun, isEvalRun, NULL, "validate_run_type", false, net.lastStatus);
 		return net.lastStatus;
 	}
 
-	const unsigned int dataSize = isTrainRun ? net.di->getTrainSize() : net.di->getTestSize();
-	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
+	TrainerRunPreflight preflight;
+	const char* preflightFailureStage = NULL;
+	net.lastStatus = build_run_preflight(*net.di, *net.skeleton, net.netType, net.trainingConfig, isTrainRun, preflight, preflightFailureStage);
+	if (!net.lastStatus.ok())
 	{
-		// If the DataInput tracks a concrete import/load error, surface it here so callers
-		// don't have to debug a generic EMPTY_DATA later.
-		std::string extra;
-		{
-			const glades::NNetworkStatus diSt = net.di->getLastStatus();
-			if (!diSt.ok() && !diSt.message.empty())
-				extra = std::string(" (DataInput: ") + diSt.message + ")";
-		}
 		net.running = false;
-		net.lastStatus = NNetworkStatus(
-		    NNetworkStatus::EMPTY_DATA,
-		    isTrainRun ? "Trainer::run: empty training data or feature count is zero"
-		               : "Trainer::run: empty test data or feature count is zero");
-		if (!extra.empty())
-			net.lastStatus.message += extra;
+		note_trainer_preflight_failure(diag, net.di, isTrainRun, isEvalRun, &preflight, preflightFailureStage, false, net.lastStatus);
 		return net.lastStatus;
 	}
-
-	// === Core invariants (fail fast, with explicit status) ===
-	{
-		const unsigned int featureCount = net.di->getFeatureCount();
-		const unsigned int outSize = net.skeleton->getOutputLayerSize();
-		const bool tokenLM =
-		    ((net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) || (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER)) &&
-		    net.trainingConfig.transformer.enableTokenEmbedding;
-
-		if (outSize == 0)
-		{
-			net.running = false;
-			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: output layer size is zero");
-			return net.lastStatus;
-		}
-
-		// Recurrent paths require at least one hidden layer (state lives there).
-		if ((net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM ||
-		     net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER || net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) &&
-		    net.skeleton->numHiddenLayers() <= 0)
-		{
-			net.running = false;
-			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "Trainer::run: sequence net type requires at least one hidden layer");
-			return net.lastStatus;
-		}
-
-		// Recurrent paths require a valid sequence model (even if it is just the default single sequence).
-		if (net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM ||
-		    net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER || net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER)
-		{
-			std::string seqErr;
-			if (isTrainRun)
-			{
-				if (!net.di->validateTrainSequences(&seqErr))
-				{
-					net.running = false;
-					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                std::string("Trainer::run: invalid train sequences: ") + seqErr);
-					return net.lastStatus;
-				}
-				if (net.di->getTrainSequenceCount() == 0)
-				{
-					net.running = false;
-					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                "Trainer::run: sequence net type requires at least one non-empty train sequence");
-					return net.lastStatus;
-				}
-			}
-			else
-			{
-				if (!net.di->validateTestSequences(&seqErr))
-				{
-					net.running = false;
-					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                std::string("Trainer::run: invalid test sequences: ") + seqErr);
-					return net.lastStatus;
-				}
-				if (net.di->getTestSequenceCount() == 0)
-				{
-					net.running = false;
-					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                "Trainer::run: sequence net type requires at least one non-empty test sequence");
-					return net.lastStatus;
-				}
-			}
-		}
-
-		// Validate that every row has the expected dimensionality.
-		// IMPORTANT:
-		// Do NOT materialize every row to validate shapes. For streaming inputs (e.g. ImageInput),
-		// getTrainRow() can decode images from disk; scanning the whole dataset is prohibitive.
-		//
-		// Instead, use DataInput's shape contract. Implementations with fixed shapes validate
-		// in O(1); others do a bounded spot-check.
-		std::string shapeErr;
-		const unsigned int expectedFeatureCount = tokenLM ? 1u : featureCount;
-		// Token LM expected rows are a single token id, not a dense one-hot of size outSize.
-		const unsigned int expectedOutSize = tokenLM ? 1u : outSize;
-		if (isTrainRun)
-		{
-			if (!net.di->validateTrainRowShapes(expectedFeatureCount, expectedOutSize, &shapeErr))
-			{
-				net.running = false;
-				net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                                std::string("Trainer::run: invalid training row shapes: ") + shapeErr);
-				return net.lastStatus;
-			}
-		}
-		else
-		{
-			if (!net.di->validateTestRowShapes(expectedFeatureCount, expectedOutSize, &shapeErr))
-			{
-				net.running = false;
-				net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                                std::string("Trainer::run: invalid test row shapes: ") + shapeErr);
-				return net.lastStatus;
-			}
-		}
-	}
+	record_trainer_run_context(diag, net.di, isTrainRun, isEvalRun, &preflight);
 
 	// For learning-rate schedules, treat this run's start epoch as the baseline.
 	// This makes schedules work sensibly for resumed training.
 	int starting_epochs = isTrainRun ? net.epochs : 0;
+	// 2026-05-13 task #29 fix: expose starting_epochs to SGDHelper_TRANSFORMER
+	// per-step LR computation so it can subtract this from cumulative epochIdx
+	// to get local epoch (matches the subtraction in line 546 below).  Without
+	// this, callers that set lrScheduleEpochOffset + call train()-per-chunk hit
+	// double-counting in the per-step LR override (flagship's --t-schedule
+	// pattern).
+	net.runStartingEpochs = starting_epochs;
 
 	// Ensure weights/parameters exist for this shape before any SGD steps run.
 	if (!net.ensureTensorParametersInitialized())
@@ -227,16 +502,13 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		net.running = false;
 		if (net.lastStatus.ok())
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: failed to initialize tensor parameters");
+		note_trainer_preflight_failure(diag, net.di, isTrainRun, isEvalRun, &preflight, "initialize_tensors", false, net.lastStatus);
 		return net.lastStatus;
 	}
 
 	// Clean confusion matrix
-	const bool tokenLM =
-	    ((net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) || (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER)) &&
-	    net.trainingConfig.transformer.enableTokenEmbedding;
-	const bool useConfusionMatrix =
-	    !tokenLM && ((net.skeleton->getOutputType() == glades::GMath::CLASSIFICATION) ||
-	                 (net.skeleton->getOutputType() == glades::GMath::KL));
+	const bool tokenLM = preflight.tokenLM;
+	const bool useConfusionMatrix = preflight.useConfusionMatrix;
 	if (useConfusionMatrix)
 		net.confusionMatrix.clean();
 
@@ -247,21 +519,11 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	}
 
 	// Re-check the active split is non-empty post-build (build can succeed for featureCount-only cases).
-	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
+	net.lastStatus = validate_active_split_data(*net.di, isTrainRun, preflight.dataSize, preflight.tokenLMInput, true);
+	if (!net.lastStatus.ok())
 	{
-		std::string extra;
-		{
-			const glades::NNetworkStatus diSt = net.di->getLastStatus();
-			if (!diSt.ok() && !diSt.message.empty())
-				extra = std::string(" (DataInput: ") + diSt.message + ")";
-		}
 		net.running = false;
-		net.lastStatus = NNetworkStatus(
-		    NNetworkStatus::EMPTY_DATA,
-		    isTrainRun ? "Trainer::run: empty training data or feature count is zero (post-build check)"
-		               : "Trainer::run: empty test data or feature count is zero (post-build check)");
-		if (!extra.empty())
-			net.lastStatus.message += extra;
+		note_trainer_preflight_failure(diag, net.di, isTrainRun, isEvalRun, &preflight, "validate_active_split_data_post_build", true, net.lastStatus);
 		return net.lastStatus;
 	}
 
@@ -278,8 +540,8 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	net.running = true;
 	net.firstRunActivation = false;
 
-	if (cb)
-		cb->onRunStart(net, runType);
+	TrainerCallbackLifecycle callbackLifecycle(net, runType, cb);
+	callbackLifecycle.beginRun();
 
 	while (net.running)
 	{
@@ -315,26 +577,19 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.confusionMatrix.reset();
 
 		// Forward/backprop/update
-		const bool isSequenceModel =
-		    (net.netType == glades::NNetwork::TYPE_RNN) ||
-		    (net.netType == glades::NNetwork::TYPE_GRU) ||
-		    (net.netType == glades::NNetwork::TYPE_LSTM) ||
-		    (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER) ||
-		    (net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER);
-
 		// DFF paths step over individual rows. Recurrent paths run as a single "step" per epoch
 		// (the helper iterates sequences/timesteps internally).
-		const unsigned int steps = isSequenceModel ? 1u : (isTrainRun ? net.di->getTrainSize() : net.di->getTestSize());
+		const unsigned int steps = preflight.isSequenceModel ? 1u : preflight.dataSize;
 		for (unsigned int step = 0; step < steps; ++step)
 		{
-			const unsigned int r = isSequenceModel ? 0u : step;
+			const unsigned int r = preflight.isSequenceModel ? 0u : step;
 			const glades::NNetworkStatus stStep = net.SGDHelper(r, runType);
 			if (!stStep.ok())
 			{
 				// Stop immediately on internal failures: continuing would produce silent corruption.
 				net.running = false;
-				if (cb)
-					cb->onRunEnd(net, runType);
+				note_trainer_run_failure(diag, stStep);
+				callbackLifecycle.finishRun();
 				return stStep;
 			}
 		}
@@ -350,8 +605,8 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite training aggregates detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			note_trainer_run_failure(diag, net.lastStatus);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -430,8 +685,8 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite metrics detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			note_trainer_run_failure(diag, net.lastStatus);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -497,8 +752,8 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite schedule/gradient metadata detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			note_trainer_run_failure(diag, net.lastStatus);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -545,17 +800,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			}
 		}
 
-		bool callbackStop = false;
-		if (cb)
-			callbackStop = cb->onEpochEnd(net, metrics);
-
-		// DDP: consensus on early-stop so all workers stop together.
-		if (net.trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
-		{
-			unsigned int stopFlag = callbackStop ? 1u : 0u;
-			glades::ddp::allReduceSumInPlace(&stopFlag, 1);
-			callbackStop = (stopFlag > 0u);
-		}
+		const bool callbackStop = callbackLifecycle.finishEpoch(net.trainingConfig, metrics);
 
 		net.cNodeActivations.clear();
 
@@ -571,13 +816,12 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			break;
 	}
 
-	if (cb)
-		cb->onRunEnd(net, runType);
+	callbackLifecycle.finishRun();
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	net.running = false;
 
 	net.lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
+	note_trainer_run_success(diag);
 	return net.lastStatus;
 }
-

@@ -1,0 +1,21 @@
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+============================================================
+ATLAS Alternate Benchmark Harness
+============================================================
+------------------------------------------------------------
+Case: token-lm-document
+Description: larger pseudo-document autoregressive next-token prediction with article-style sections, cross-paragraph entity recall, and mixed topical/detail token populations.
+Config: vocab=257 dModel=48 dFF=192 layers=3 heads=6 seqLen=96 trainSeqs=48 testSeqs=12 epochs=3 repeats=5
+Optimizers: AdamW(lr=0.0010) ATLAS-BSRP(lr=0.0200 cRank=0) ATLAS-SPARROW(lr=0.0200 cRank=4 modeRankCap=1 autoGate=0) ATLAS-HELM(lr=0.0200 modeRank=2 hiddenStack=2) ATLAS-ASTER(lr=0.0200 stateRank=2 hiddenStack=2) ATLAS-AEGIS(lr=0.0200 cRank=4) ATLAS-CITADEL(lr=0.0200 cRank=4) ATLAS-RAMPART(lr=0.0200 cRank=4) ATLAS-MERIT(lr=0.0200 cRank=4) ATLAS-STRATA(lr=0.0200 cRank=4) ATLAS-AURORA(lr=0.0010 cRank=4) ATLAS-SEAM(lr=0.0200 cRank=4) ATLAS-QUASAR(lr=0.0200 cRank=4) ATLAS-GEODE(lr=0.0010 cRank=4)
+ATLAS: rank=16 tSub=64 kappaMax=10.000 sparrow(modeRankCap=1 autoGate=0 memoryScale=0.050 edge=0.100 secondEdge=0.100 secondFrac=0.500 poleMax=0.950) helm(modeRank=2 hiddenStack=2 memoryScale=0.050 edge=0.100 poleMax=0.950) aster(stateRank=2 hiddenStack=2 memoryScale=0.050 edge=0.100 poleMax=0.950) kappa(enabled=0 heads=1 lags=4 rank=2) aurora(adamwBackbone=1 headGain=3.000 bodyTrust=0.600) geode(geom=1.000 pred=0.250)
+
+Optimizer        Train(s)               Tok/s             TrainNLL            TrainPPL             TestNLL             TestPPL         Status
+AdamW               0.16 +/- 0.06        98140.7 +/- 24902.5       4.47091 +/- 0.11728       88.014 +/- 9.660        4.70233 +/- 0.04246      110.301 +/- 4.581      ok
+  XFORM proxy:  in=0.000 +/- 0.000  blk=[3.683 3.949 3.786]  final=0.927 +/- 0.059  head=3.178 +/- 0.101  hShare=0.186 +/- 0.010  applyMs=0.000 +/- 0.000
+                trainMargin=0.000 +/- 0.000  trainHardNeg=0.000 +/- 0.000  testMargin=-1.948 +/- 0.092  testHardNeg=2.941 +/- 0.149
+
+============================================================
+========================
+| Unit Tests Completed |
+========================

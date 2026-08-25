@@ -1,0 +1,20 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+
+============================================================
+VESTA ultra-scale sweep at dModel=4096, 50 epochs (GPU)
+============================================================
+[i]2026-04-18 11:36:45 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=181.528 token_lm_loss_kind=full_softmax nll=3.74239 perplexity=42.1988 acc_top1=3.5225 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-18 11:42:43 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=203.911 token_lm_loss_kind=full_softmax nll=3.23344 perplexity=25.3667 acc_top1=17.2211 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+AdamW reference: testNLL = 3.4879 +/- 0.3599  wall 355.0 s
+
+rank        n     trainNLL              testNLL               wall(s)     opt MiB   
+----        ---   --------------------  --------------------  ----------  -------   
+[i]2026-04-18 11:54:03 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=206.298 token_lm_loss_kind=full_softmax nll=1.73816 perplexity=5.68686 acc_top1=69.6673 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-18 12:05:27 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=206.048 token_lm_loss_kind=full_softmax nll=1.70655 perplexity=5.50991 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=8         2      1.1981 +/- 0.0231     1.7224 +/- 0.0224     678.8 +/- 2.0    7.00      
+[i]2026-04-18 12:20:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=203.1 token_lm_loss_kind=full_softmax nll=1.73905 perplexity=5.69191 acc_top1=69.6673 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-18 12:34:25 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=202.537 token_lm_loss_kind=full_softmax nll=1.70763 perplexity=5.51588 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+r=16        2      1.1892 +/- 0.0230     1.7233 +/- 0.0222     865.5 +/- 22.2   14.00     
+========================
+| Unit Tests Completed |
+========================

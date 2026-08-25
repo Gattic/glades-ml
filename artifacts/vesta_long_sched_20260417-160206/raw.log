@@ -1,0 +1,51 @@
+
+============================================================
+VESTA long-horizon (100 epochs) + cosine LR schedule (GPU)
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=100 seq=512 LR=1.0e-02 r=8 GPU=1
+Schedule: WARMUP_LINEAR(10 steps) + COSINE(T_max=100, min=0.01)
+
+--- dModel=1024 ---
+config                          n     trainNLL              testNLL               wall(s)   
+------                          ---   --------------------  --------------------  ----------
+[i]2026-04-17 20:04:29 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1885.61 token_lm_loss_kind=full_softmax nll=2.08233 perplexity=8.02317 acc_top1=68.2975 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:05:32 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1786.71 token_lm_loss_kind=full_softmax nll=1.94849 perplexity=7.01809 acc_top1=70.8415 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:06:35 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1838.13 token_lm_loss_kind=full_softmax nll=1.96256 perplexity=7.11751 acc_top1=72.9941 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+AdamW fixed LR                  3      1.3418 +/- 0.1113     1.9978 +/- 0.0736     62.5 +/- 0.1  
+[i]2026-04-17 20:07:37 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1768.17 token_lm_loss_kind=full_softmax nll=1.92424 perplexity=6.84993 acc_top1=68.6888 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:08:40 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2052.21 token_lm_loss_kind=full_softmax nll=1.93578 perplexity=6.92946 acc_top1=71.4286 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:09:42 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1812.06 token_lm_loss_kind=full_softmax nll=1.92213 perplexity=6.8355 acc_top1=72.0157 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+AdamW cosine+warmup             3      1.1960 +/- 0.1227     1.9274 +/- 0.0073     62.2 +/- 0.0  
+[i]2026-04-17 20:11:40 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1851.45 token_lm_loss_kind=full_softmax nll=1.77442 perplexity=5.89688 acc_top1=70.8415 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:13:36 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1988.33 token_lm_loss_kind=full_softmax nll=1.79656 perplexity=6.02888 acc_top1=69.6673 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:15:33 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1750 token_lm_loss_kind=full_softmax nll=1.72959 perplexity=5.63833 acc_top1=72.6027 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+VESTA-plain-raw fixed           3      0.9625 +/- 0.0251     1.7669 +/- 0.0341    116.5 +/- 0.6  
+[i]2026-04-17 20:17:32 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1675.41 token_lm_loss_kind=full_softmax nll=1.73589 perplexity=5.67397 acc_top1=71.0372 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:19:28 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1762.07 token_lm_loss_kind=full_softmax nll=1.7461 perplexity=5.7322 acc_top1=70.4501 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:21:25 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=1709.03 token_lm_loss_kind=full_softmax nll=1.71229 perplexity=5.54162 acc_top1=72.2114 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+VESTA-plain-raw cos             3      1.0869 +/- 0.0159     1.7314 +/- 0.0173    117.1 +/- 1.4  
+
+--- dModel=2048 ---
+config                          n     trainNLL              testNLL               wall(s)   
+------                          ---   --------------------  --------------------  ----------
+[i]2026-04-17 20:24:45 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=725.852 token_lm_loss_kind=full_softmax nll=1.95549 perplexity=7.06737 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:28:04 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=736.311 token_lm_loss_kind=full_softmax nll=2.03191 perplexity=7.62867 acc_top1=63.9922 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:31:23 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=761.55 token_lm_loss_kind=full_softmax nll=1.81909 perplexity=6.16622 acc_top1=71.6243 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+AdamW fixed LR                  3      1.5773 +/- 0.2671     1.9355 +/- 0.1078    198.5 +/- 0.2  
+[i]2026-04-17 20:34:43 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=764.97 token_lm_loss_kind=full_softmax nll=1.92942 perplexity=6.88549 acc_top1=64.775 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:38:02 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=753.687 token_lm_loss_kind=full_softmax nll=1.89798 perplexity=6.67238 acc_top1=70.4501 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 20:41:21 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=752.577 token_lm_loss_kind=full_softmax nll=1.74154 perplexity=5.70612 acc_top1=72.0157 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+AdamW cosine+warmup             3      1.5086 +/- 0.2073     1.8563 +/- 0.1006    198.3 +/- 0.3  
+[i]2026-04-17 20:51:38 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=782.542 token_lm_loss_kind=full_softmax nll=1.77215 perplexity=5.88349 acc_top1=69.4716 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 21:02:12 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=793.478 token_lm_loss_kind=full_softmax nll=1.76876 perplexity=5.86356 acc_top1=70.2544 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 21:12:02 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=778.963 token_lm_loss_kind=full_softmax nll=1.65528 perplexity=5.23456 acc_top1=70.8415 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=100
+VESTA-plain-raw fixed           3      1.2524 +/- 0.0177     1.7321 +/- 0.0665    613.0 +/- 22.4 
+[i]2026-04-17 21:22:19 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=794.712 token_lm_loss_kind=full_softmax nll=1.88066 perplexity=6.5578 acc_top1=69.2759 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 21:32:49 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=797.192 token_lm_loss_kind=full_softmax nll=1.96865 perplexity=7.16101 acc_top1=69.6673 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+[i]2026-04-17 21:43:28 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=100 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=784.946 token_lm_loss_kind=full_softmax nll=1.88154 perplexity=6.56362 acc_top1=70.4501 lr_mult=0.01 grad_norm=na grad_norm_scale=na optimizer_step=100
+VESTA-plain-raw cos             3      1.6010 +/- 0.0622     1.9103 +/- 0.0506    627.8 +/- 11.3 
+
+========================
+| Unit Tests Completed |
+========================

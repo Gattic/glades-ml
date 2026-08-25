@@ -19,6 +19,8 @@
 #include "Backend/Database/GList.h"
 #include "../../../Backend/Machine Learning/main.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../include/Backend/Database/GLogger.h"
+
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
@@ -109,6 +111,41 @@ static bool replace_line_prefix_in_file(const std::string& path, const std::stri
 	return replaced && write_text_file(path, out);
 }
 
+static bool remove_lines_with_prefixes_in_file(const std::string& path, const std::vector<std::string>& prefixes)
+{
+	std::string s;
+	if (!read_file_to_string(path, s))
+		return false;
+	std::string out;
+	out.reserve(s.size());
+	size_t pos = 0;
+	bool removedAny = false;
+	while (pos < s.size())
+	{
+		const size_t nl = s.find('\n', pos);
+		const size_t end = (nl == std::string::npos) ? s.size() : nl;
+		const std::string line = s.substr(pos, end - pos);
+		bool removeLine = false;
+		for (size_t i = 0; i < prefixes.size(); ++i)
+		{
+			if (line.find(prefixes[i]) == 0)
+			{
+				removeLine = true;
+				removedAny = true;
+				break;
+			}
+		}
+		if (!removeLine)
+		{
+			out += line;
+			if (nl != std::string::npos)
+				out += "\n";
+		}
+		pos = (nl == std::string::npos) ? s.size() : (nl + 1);
+	}
+	return removedAny && write_text_file(path, out);
+}
+
 static bool parse_kv_manifest(const std::string& path, std::map<std::string, std::string>& outKv)
 {
 	outKv.clear();
@@ -191,6 +228,65 @@ static bool flip_one_byte_in_file(const std::string& path, unsigned long long of
 	io.write(&c, 1);
 	return static_cast<bool>(io);
 }
+
+struct EnvVarGuard
+{
+	std::string name;
+	bool hadOld;
+	std::string oldValue;
+
+	explicit EnvVarGuard(const char* n)
+	    : name(n ? n : ""),
+	      hadOld(false),
+	      oldValue()
+	{
+		if (!name.empty())
+		{
+			const char* v = ::getenv(name.c_str());
+			if (v)
+			{
+				hadOld = true;
+				oldValue = v;
+			}
+		}
+	}
+
+	void set(const char* v)
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		(void)::_putenv_s(name.c_str(), v ? v : "");
+#else
+		(void)::setenv(name.c_str(), v ? v : "", 1);
+#endif
+	}
+
+	void unset()
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		(void)::_putenv_s(name.c_str(), "");
+#else
+		(void)::unsetenv(name.c_str());
+#endif
+	}
+
+	~EnvVarGuard()
+	{
+		if (name.empty())
+			return;
+		if (hadOld)
+			set(oldValue.c_str());
+		else
+			unset();
+	}
+
+private:
+	EnvVarGuard(const EnvVarGuard&);
+	EnvVarGuard& operator=(const EnvVarGuard&);
+};
 
 struct CheckpointTensorLoc
 {
@@ -367,6 +463,9 @@ public:
 		return true;
 	}
 
+	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
+
 	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
 	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
 	virtual unsigned int getFeatureCount() const { return 1u; }
@@ -396,6 +495,129 @@ private:
 	mutable float scratchNext;
 	mutable shmea::GVector<float> one;
 	shmea::GVector<float> empty;
+};
+
+struct OwnedNumberPersistenceFixture
+{
+	glades::NumberInput* di;
+	glades::NNInfo* info;
+
+	OwnedNumberPersistenceFixture(const std::string& name,
+	                              unsigned int rowCount,
+	                              int outputSize,
+	                              int outputType,
+	                              int hiddenSize = -1,
+	                              int hiddenActivationType = glades::GMath::LINEAR)
+	    : di(new glades::NumberInput()),
+	      info(NULL)
+	{
+		di->trainMatrix = shmea::GMatrix(static_cast<int>(rowCount), shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(static_cast<int>(rowCount), shmea::GVector<float>(1, 0.0f));
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f
+		);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		if (hiddenSize > 0)
+		{
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
+			    hiddenSize,
+			    /*learningRate*/ 0.0f,
+			    /*momentumFactor*/ 0.0f,
+			    /*weightDecay1*/ 0.0f,
+			    /*weightDecay2*/ 0.0f,
+			    /*pDropout*/ 0.0f,
+			    /*activationType*/ hiddenActivationType,
+			    /*activationParam*/ 1.0f
+			));
+		}
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(outputSize, outputType);
+		info = new glades::NNInfo(name.c_str(), in, hidden, out);
+	}
+
+	~OwnedNumberPersistenceFixture()
+	{
+		delete di;
+		delete info;
+	}
+
+	void setTrainPair(unsigned int rowIndex, float inputValue, float expectedValue)
+	{
+		if (rowIndex >= static_cast<unsigned int>(di->trainMatrix.size()))
+			return;
+		di->trainMatrix[rowIndex][0] = inputValue;
+		di->trainExpectedMatrix[rowIndex][0] = expectedValue;
+		di->testMatrix[rowIndex][0] = inputValue;
+		di->testExpectedMatrix[rowIndex][0] = expectedValue;
+	}
+
+private:
+	OwnedNumberPersistenceFixture(const OwnedNumberPersistenceFixture&);
+	OwnedNumberPersistenceFixture& operator=(const OwnedNumberPersistenceFixture&);
+};
+
+struct OwnedTokenLmTransformerFixture
+{
+	InMemoryTokenIdInput di;
+	glades::NNInfo* info;
+
+	OwnedTokenLmTransformerFixture(const std::string& name,
+	                               unsigned int vocab,
+	                               unsigned int dModel)
+	    : di(),
+	      info(NULL)
+	{
+		const int padTokenId = static_cast<int>(vocab - 1u);
+		std::vector<unsigned int> toks;
+		toks.push_back(1u);
+		toks.push_back(2u);
+		toks.push_back(3u);
+		toks.push_back(4u);
+		di.setTrainTokens(toks, padTokenId);
+		di.mirrorTrainToTest();
+
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f
+		);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
+		    static_cast<int>(dModel),
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f
+		));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		info = new glades::NNInfo(name.c_str(), in, hidden, out);
+	}
+
+	~OwnedTokenLmTransformerFixture()
+	{
+		delete info;
+	}
+
+private:
+	OwnedTokenLmTransformerFixture(const OwnedTokenLmTransformerFixture&);
+	OwnedTokenLmTransformerFixture& operator=(const OwnedTokenLmTransformerFixture&);
 };
 
 static std::string checkpoint_shard_path(const std::string& checkpointName, unsigned int shardIdx)
@@ -946,45 +1168,20 @@ void NNSaveLoadUnitTest()
     // ============================
     // Case E: Transformer round-trip (weights only; no training)
     // ============================
-    {
-        printf("[UT-NN] Transformer save/load round-trip (no training)\n");
-        glades::NumberInput* di = new glades::NumberInput();
-        di->trainMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
-        di->trainExpectedMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
-        for (int t = 0; t < 3; ++t)
-        {
-            di->trainMatrix[t][0] = static_cast<float>(t);
-            di->trainExpectedMatrix[t][0] = static_cast<float>(t);
-        }
-        di->testMatrix = di->trainMatrix;
-        di->testExpectedMatrix = di->trainExpectedMatrix;
+	{
+		printf("[UT-NN] Transformer save/load round-trip (no training)\n");
+		OwnedNumberPersistenceFixture fixture("ut_save_load_transformer",
+		                                     3u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     8);
+		for (unsigned int t = 0; t < 3u; ++t)
+			fixture.setTrainPair(t, static_cast<float>(t), static_cast<float>(t));
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
 
-        auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-        hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
-            /*size*/ 8,                 // dModel
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f));
-
-        auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info = new glades::NNInfo("ut_save_load_transformer", in, hidden, out);
-
-        glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
-        net.setSeed(2026u);
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		net.setSeed(2026u);
         net.getTerminatorMutable().setEpoch(1);
         net.getTerminatorMutable().setAccuracy(0);
 		{
@@ -1017,20 +1214,17 @@ void NNSaveLoadUnitTest()
         G_assert(__FILE__, __LINE__,
                  "==============NNSaveLoad::TR_SaveModelRoundTrip() Failed==============",
                  net2.saveModel(modelName2).ok());
-        {
-            std::string w1, w2;
-            G_assert(__FILE__, __LINE__,
-                     "==============NNSaveLoad::TR_ReadWeightsFiles() Failed==============",
+		{
+			std::string w1, w2;
+			G_assert(__FILE__, __LINE__,
+			         "==============NNSaveLoad::TR_ReadWeightsFiles() Failed==============",
                      read_file_to_string("database/models/" + modelName + "/weights.bin", w1) &&
                      read_file_to_string("database/models/" + modelName2 + "/weights.bin", w2));
-            G_assert(__FILE__, __LINE__,
-                     "==============NNSaveLoad::TR_WeightsRoundTrip() Failed==============",
-                     w1 == w2);
-        }
-
-        delete di;
-        delete info;
-    }
+			G_assert(__FILE__, __LINE__,
+			         "==============NNSaveLoad::TR_WeightsRoundTrip() Failed==============",
+			         w1 == w2);
+		}
+	}
 
     // ============================
     // Case F: Manifest netType corruption + override rescue
@@ -1463,26 +1657,12 @@ void NNSaveLoadUnitTest()
 	// ============================
 	{
 		printf("[UT-NN] Tokenizer artifacts save/load round-trip\n");
-
-		glades::NumberInput* di = new glades::NumberInput();
-		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-		di->testMatrix = di->trainMatrix;
-		di->testExpectedMatrix = di->trainExpectedMatrix;
-
-		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-		    /*batchSize*/ 1,
-		    /*learningRate*/ 0.0f,
-		    /*momentumFactor*/ 0.0f,
-		    /*weightDecay1*/ 0.0f,
-		    /*weightDecay2*/ 0.0f,
-		    /*pDropout*/ 0.0f,
-		    /*activationType*/ glades::GMath::LINEAR,
-		    /*activationParam*/ 1.0f
-		);
-		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-		glades::NNInfo* info = new glades::NNInfo("ut_tokenizer_artifacts", in, hidden, out);
+		OwnedNumberPersistenceFixture fixture("ut_tokenizer_artifacts",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
 		net.setSeed(13579u);
@@ -1547,9 +1727,216 @@ void NNSaveLoadUnitTest()
 		G_assert(__FILE__, __LINE__,
 		         "==============NNSaveLoad::TokArtifacts_TokenContentRoundTrip() Failed==============",
 		         tb.vocab.size() >= 5u && tb.vocab[4] == "hello world");
+	}
 
-		delete di;
-		delete info;
+	// ============================
+	// Case M: saveModel emits structured publish logs for success and rejected input
+	// ============================
+	{
+		printf("[UT-NN] Model package publish structured logging\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_publish_logs",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_Init() Failed==============",
+		         net.test(di).ok());
+
+		glades::NNetwork::TokenizerArtifacts ta;
+		ta.type = "custom";
+		ta.vocab.push_back("<pad>");
+		ta.vocab.push_back("hello");
+		ta.padTokenId = 0;
+		ta.bosTokenId = -1;
+		ta.eosTokenId = -1;
+		ta.unkTokenId = -1;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_SetTokenizer() Failed==============",
+		         net.setTokenizerArtifacts(ta).ok());
+
+		shmea::GLogger logger;
+		logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+		logger.unsurpress(shmea::GLogger::LOG_INFO);
+		logger.unsurpress(shmea::GLogger::LOG_WARNING);
+		logger.unsurpress(shmea::GLogger::LOG_ERROR);
+		logger.setPrintToConsole(false);
+		net.setLogger(&logger);
+
+		const std::string modelName = "ut_model_pkg_obs_logging";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_Save() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		logger.clear();
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_RejectedStatus() Failed==============",
+		         !net.saveModel("bad/name").ok());
+
+		net.setLogger(NULL);
+	}
+
+	// ============================
+	// Case N: persistence diagnostics expose model/checkpoint publish state and failure buckets
+	// ============================
+	{
+		printf("[UT-NN] Persistence diagnostics for model/checkpoint publish\n");
+		OwnedNumberPersistenceFixture fixture("ut_persistence_diag",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_Init() Failed==============",
+		         net.test(di).ok());
+
+		shmea::GLogger logger;
+		logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+		logger.unsurpress(shmea::GLogger::LOG_INFO);
+		logger.unsurpress(shmea::GLogger::LOG_WARNING);
+		logger.unsurpress(shmea::GLogger::LOG_ERROR);
+		logger.setPrintToConsole(false);
+		net.setLogger(&logger);
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		const std::string modelName = "ut_model_pkg_persist_diag";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterModelSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelSuccessCounts() Failed==============",
+		         diag.totalPersistenceOps == 1ULL &&
+		         diag.totalPersistenceSuccesses == 1ULL &&
+		         diag.totalPersistenceFailures == 0ULL &&
+		         diag.totalModelSaveAttempts == 1ULL &&
+		         diag.totalModelSaveSuccesses == 1ULL &&
+		         diag.totalCheckpointSaveAttempts == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelSuccessState() Failed==============",
+		         !diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_model" &&
+		         diag.lastName == modelName &&
+		         diag.lastStage == "publish_complete" &&
+		         diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastStatus.ok() &&
+		         diag.lastWeightsBytes > 0ULL);
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_RejectedModelSave() Failed==============",
+		         !net.saveModel("bad/name").ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterRejectedModelSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelRejectCounts() Failed==============",
+		         diag.totalPersistenceOps == 2ULL &&
+		         diag.totalPersistenceSuccesses == 1ULL &&
+		         diag.totalPersistenceFailures == 1ULL &&
+		         diag.totalRejectedInputs == 1ULL &&
+		         diag.totalPublishFailures == 0ULL &&
+		         diag.totalModelSaveFailures == 1ULL &&
+		         diag.totalModelPublishFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelRejectState() Failed==============",
+		         !diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_model" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+
+		glades::NNetwork::CheckpointConfig ckptCfg;
+		ckptCfg.includeOptimizerState = true;
+		ckptCfg.maxShardBytes = 4096u;
+		const std::string ckptName = "ut_checkpoint_publish_diag";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_SaveCheckpoint() Failed==============",
+		         net.saveCheckpoint(ckptName, ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterCheckpointSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointSuccessCounts() Failed==============",
+		         diag.totalPersistenceOps == 3ULL &&
+		         diag.totalPersistenceSuccesses == 2ULL &&
+		         diag.totalCheckpointSaveAttempts == 1ULL &&
+		         diag.totalCheckpointSaveSuccesses == 1ULL &&
+		         diag.totalCheckpointSaveFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointSuccessState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastName == ckptName &&
+		         diag.lastStage == "publish_complete" &&
+		         diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastIncludeOptimizerState &&
+		         diag.lastMaxShardBytes == static_cast<uint64_t>(ckptCfg.maxShardBytes) &&
+		         diag.lastShardCount >= 1ULL &&
+		         diag.lastTensorCount >= 1ULL &&
+		         diag.lastStatus.ok());
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_RejectedCheckpointSave() Failed==============",
+		         !net.saveCheckpoint("bad/name", ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterRejectedCheckpointSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointRejectCounts() Failed==============",
+		         diag.totalPersistenceOps == 4ULL &&
+		         diag.totalPersistenceFailures == 2ULL &&
+		         diag.totalRejectedInputs == 2ULL &&
+		         diag.totalCheckpointSaveFailures == 1ULL &&
+		         diag.totalCheckpointPublishFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointRejectState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+
+		glades::NNetwork invalidNet(glades::NNetwork::TYPE_DFF);
+		invalidNet.setLogger(&logger);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointSave() Failed==============",
+		         !invalidNet.saveCheckpoint("ut_checkpoint_publish_invalid_state", ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterInvalidCheckpointSave() Failed==============",
+		         invalidNet.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointCounts() Failed==============",
+		         diag.totalPersistenceOps == 1ULL &&
+		         diag.totalPersistenceFailures == 1ULL &&
+		         diag.totalRejectedInputs == 0ULL &&
+		         diag.totalPublishFailures == 1ULL &&
+		         diag.totalCheckpointSaveAttempts == 1ULL &&
+		         diag.totalCheckpointSaveFailures == 1ULL &&
+		         diag.totalCheckpointPublishFailures == 1ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastName == "ut_checkpoint_publish_invalid_state" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_STATE);
+
+		invalidNet.setLogger(NULL);
+		net.setLogger(NULL);
 	}
 
 	// ============================
@@ -1557,26 +1944,12 @@ void NNSaveLoadUnitTest()
 	// ============================
 	{
 		printf("[UT-NN] Tokenizer vocab corruption detection (checksum)\n");
-
-		glades::NumberInput* di = new glades::NumberInput();
-		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-		di->testMatrix = di->trainMatrix;
-		di->testExpectedMatrix = di->trainExpectedMatrix;
-
-		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-		    /*batchSize*/ 1,
-		    /*learningRate*/ 0.0f,
-		    /*momentumFactor*/ 0.0f,
-		    /*weightDecay1*/ 0.0f,
-		    /*weightDecay2*/ 0.0f,
-		    /*pDropout*/ 0.0f,
-		    /*activationType*/ glades::GMath::LINEAR,
-		    /*activationParam*/ 1.0f
-		);
-		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-		glades::NNInfo* info = new glades::NNInfo("ut_tokenizer_corrupt", in, hidden, out);
+		OwnedNumberPersistenceFixture fixture("ut_tokenizer_corrupt",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
 		G_assert(__FILE__, __LINE__,
@@ -1616,9 +1989,6 @@ void NNSaveLoadUnitTest()
 		G_assert(__FILE__, __LINE__,
 		         "==============NNSaveLoad::TokCorrupt_MessageMentionsChecksum() Failed==============",
 		         st.message.find("checksum") != std::string::npos || st.message.find("fnv1a64") != std::string::npos);
-
-		delete di;
-		delete info;
 	}
 
 	// ============================
@@ -1626,36 +1996,14 @@ void NNSaveLoadUnitTest()
 	// ============================
 	{
 		printf("[UT-NN] Checkpoint manifest strict metadata validation\n");
-
-		glades::NumberInput* di = new glades::NumberInput();
-		di->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-		di->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-		di->testMatrix = di->trainMatrix;
-		di->testExpectedMatrix = di->trainExpectedMatrix;
-
-		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-		    /*batchSize*/ 1,
-		    /*learningRate*/ 0.0f,
-		    /*momentumFactor*/ 0.0f,
-		    /*weightDecay1*/ 0.0f,
-		    /*weightDecay2*/ 0.0f,
-		    /*pDropout*/ 0.0f,
-		    /*activationType*/ glades::GMath::LINEAR,
-		    /*activationParam*/ 1.0f
-		);
-		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
-		    /*size*/ 4,
-		    /*learningRate*/ 0.0f,
-		    /*momentumFactor*/ 0.0f,
-		    /*weightDecay1*/ 0.0f,
-		    /*weightDecay2*/ 0.0f,
-		    /*pDropout*/ 0.0f,
-		    /*activationType*/ glades::GMath::TANH,
-		    /*activationParam*/ 1.0f
-		));
-		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-		glades::NNInfo* info = new glades::NNInfo("ut_ckpt_manifest_strict", in, hidden, out);
+		OwnedNumberPersistenceFixture fixture("ut_ckpt_manifest_strict",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     4,
+		                                     glades::GMath::TANH);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
 		G_assert(__FILE__, __LINE__,
@@ -1766,13 +2114,10 @@ void NNSaveLoadUnitTest()
 			G_assert(__FILE__, __LINE__,
 			         "==============NNSaveLoad::CKPT_Strict_LoadShouldFailShape() Failed==============",
 			         !st.ok());
-			G_assert(__FILE__, __LINE__,
-			         "==============NNSaveLoad::CKPT_Strict_MessageMentionsShape() Failed==============",
-			         st.message.find("shape") != std::string::npos || st.message.find("rank") != std::string::npos);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CKPT_Strict_MessageMentionsShape() Failed==============",
+		         st.message.find("shape") != std::string::npos || st.message.find("rank") != std::string::npos);
 		}
-
-		delete di;
-		delete info;
 	}
 
 	// ============================
@@ -1783,35 +2128,13 @@ void NNSaveLoadUnitTest()
 
 		// --- Regression transformer: must NOT persist token-LM tensors.
 		{
-			glades::NumberInput di;
-			di.trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-			di.trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-			di.testMatrix = di.trainMatrix;
-			di.testExpectedMatrix = di.trainExpectedMatrix;
-
-			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-			    /*batchSize*/ 1,
-			    /*learningRate*/ 0.0f,
-			    /*momentumFactor*/ 0.0f,
-			    /*weightDecay1*/ 0.0f,
-			    /*weightDecay2*/ 0.0f,
-			    /*pDropout*/ 0.0f,
-			    /*activationType*/ glades::GMath::LINEAR,
-			    /*activationParam*/ 1.0f
-			);
-			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
-			    /*size*/ 16, // dModel
-			    /*learningRate*/ 0.0f,
-			    /*momentumFactor*/ 0.0f,
-			    /*weightDecay1*/ 0.0f,
-			    /*weightDecay2*/ 0.0f,
-			    /*pDropout*/ 0.0f,
-			    /*activationType*/ glades::GMath::LINEAR,
-			    /*activationParam*/ 1.0f
-			));
-			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
-			glades::NNInfo* info = new glades::NNInfo("ut_tr_ckpt_reg", in, hidden, out);
+			OwnedNumberPersistenceFixture fixture("ut_tr_ckpt_reg",
+			                                     2u,
+			                                     1,
+			                                     glades::OutputLayerInfo::REGRESSION,
+			                                     16);
+			glades::NumberInput* di = fixture.di;
+			glades::NNInfo* info = fixture.info;
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
 			{
@@ -1826,7 +2149,7 @@ void NNSaveLoadUnitTest()
 			}
 			G_assert(__FILE__, __LINE__,
 			         "==============NNSaveLoad::TrReg_InitTestStatus() Failed==============",
-			         net.test(&di).ok());
+			         net.test(di).ok());
 
 			const std::string ckpt = "ut_checkpoint_tr_regression";
 			glades::NNetwork::CheckpointConfig ccfg;
@@ -1856,47 +2179,16 @@ void NNSaveLoadUnitTest()
 			glades::NNetwork net2(glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
 			G_assert(__FILE__, __LINE__,
 			         "==============NNSaveLoad::TrReg_LoadCheckpoint() Failed==============",
-			         net2.loadCheckpoint(ckpt, &di).ok());
-
-			delete info;
+			         net2.loadCheckpoint(ckpt, di).ok());
 		}
 
 		// --- Token LM transformer: must persist token-LM tensors with correct shapes.
 		{
-			InMemoryTokenIdInput di;
 			const unsigned int vocab = 16u;
 			const int pad = static_cast<int>(vocab - 1u);
-			std::vector<unsigned int> toks;
-			toks.push_back(1u);
-			toks.push_back(2u);
-			toks.push_back(3u);
-			toks.push_back(4u);
-			di.setTrainTokens(toks, pad);
-			di.mirrorTrainToTest();
-
-			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
-			    /*batchSize*/ 1,
-			    /*learningRate*/ 0.0f,
-			    /*momentumFactor*/ 0.0f,
-			    /*weightDecay1*/ 0.0f,
-			    /*weightDecay2*/ 0.0f,
-			    /*pDropout*/ 0.0f,
-			    /*activationType*/ glades::GMath::LINEAR,
-			    /*activationParam*/ 1.0f
-			);
-			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
-			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
-			    /*size*/ 16, // dModel
-			    /*learningRate*/ 0.0f,
-			    /*momentumFactor*/ 0.0f,
-			    /*weightDecay1*/ 0.0f,
-			    /*weightDecay2*/ 0.0f,
-			    /*pDropout*/ 0.0f,
-			    /*activationType*/ glades::GMath::LINEAR,
-			    /*activationParam*/ 1.0f
-			));
-			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(vocab, glades::OutputLayerInfo::CLASSIFICATION);
-			glades::NNInfo* info = new glades::NNInfo("ut_tr_ckpt_tokenlm", in, hidden, out);
+			OwnedTokenLmTransformerFixture fixture("ut_tr_ckpt_tokenlm", vocab, 16u);
+			InMemoryTokenIdInput* di = &fixture.di;
+			glades::NNInfo* info = fixture.info;
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			{
@@ -1911,7 +2203,7 @@ void NNSaveLoadUnitTest()
 			}
 			G_assert(__FILE__, __LINE__,
 			         "==============NNSaveLoad::TrTokLM_InitTestStatus() Failed==============",
-			         net.test(&di).ok());
+			         net.test(di).ok());
 
 			const std::string ckpt = "ut_checkpoint_tr_tokenlm";
 			glades::NNetwork::CheckpointConfig ccfg;
@@ -1953,9 +2245,7 @@ void NNSaveLoadUnitTest()
 			glades::NNetwork net2(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			G_assert(__FILE__, __LINE__,
 			         "==============NNSaveLoad::TrTokLM_LoadCheckpoint() Failed==============",
-			         net2.loadCheckpoint(ckpt, &di).ok());
-
-			delete info;
+			         net2.loadCheckpoint(ckpt, di).ok());
 		}
 	}
 
@@ -2001,6 +2291,236 @@ void NNSaveLoadUnitTest()
 			         "==============NNSaveLoad::TokValidate_SpecialIdRangeShouldFail() Failed==============",
 			         !st.ok());
 		}
+	}
+
+	// ============================
+	// Case P: saveModel can bootstrap uninitialized tensors via externalDI
+	// ============================
+	{
+		printf("[UT-NN] saveModel bootstraps uninitialized tensors via externalDI\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_external_di_bootstrap",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     3,
+		                                     glades::GMath::TANH);
+		fixture.setTrainPair(0u, 1.0f, 0.0f);
+		fixture.setTrainPair(1u, 2.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		net.setSeed(2468u);
+
+		const std::string modelName = "ut_model_pkg_external_di_bootstrap";
+		const glades::NNetworkStatus stSave = net.saveModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_SaveModel() Failed==============",
+		         stSave.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_WeightsHeader() Failed==============",
+		         weights_bin_header_ok("database/models/" + modelName + "/weights.bin", /*netType*/ 0u));
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus stLoad = net2.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_LoadModel() Failed==============",
+		         stLoad.ok());
+	}
+
+	// ============================
+	// Case Q: tokenizer presence mismatch between manifest and package should fail load
+	// ============================
+	{
+		printf("[UT-NN] loadModel rejects tokenizer presence mismatch\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_tok_presence_mismatch",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_Init() Failed==============",
+		         net.test(di).ok());
+
+		glades::NNetwork::TokenizerArtifacts ta;
+		ta.type = "custom";
+		ta.vocab.push_back("<pad>");
+		ta.vocab.push_back("hello");
+		ta.padTokenId = 0;
+		ta.bosTokenId = -1;
+		ta.eosTokenId = -1;
+		ta.unkTokenId = -1;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_SetTokenizer() Failed==============",
+		         net.setTokenizerArtifacts(ta).ok());
+
+		const std::string modelName = "ut_model_pkg_tok_presence_mismatch";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_CorruptManifest() Failed==============",
+		         replace_line_prefix_in_file("database/models/" + modelName + "/manifest.txt",
+		                                     "tokenizer.present=",
+		                                     "tokenizer.present=0"));
+
+		glades::NNetwork netBad(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus st = netBad.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_LoadShouldFail() Failed==============",
+		         !st.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_Message() Failed==============",
+		         st.message.find("tokenizer.present=0") != std::string::npos);
+	}
+
+	// ============================
+	// Case R: transformer model packages require TrainingConfig on load
+	// ============================
+	{
+		printf("[UT-NN] Transformer model load requires persisted TrainingConfig\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_tr_missing_training_cfg",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     16,
+		                                     glades::GMath::LINEAR);
+		fixture.setTrainPair(0u, 1.0f, 0.0f);
+		fixture.setTrainPair(1u, 2.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_Init() Failed==============",
+		         net.test(di).ok());
+
+		const std::string modelName = "ut_model_pkg_tr_missing_training_cfg";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		std::vector<std::string> prefixes;
+		prefixes.push_back("training.");
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_RemoveTrainingLines() Failed==============",
+		         remove_lines_with_prefixes_in_file("database/models/" + modelName + "/manifest.txt", prefixes));
+
+		glades::NNetwork netBad(glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		const glades::NNetworkStatus st = netBad.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_LoadShouldFail() Failed==============",
+		         !st.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_Message() Failed==============",
+		         st.message.find("missing TrainingConfig") != std::string::npos);
+	}
+
+	// ============================
+	// Case S: checkpoint root override and default maxShardBytes contract
+	// ============================
+	{
+		printf("[UT-NN] Checkpoint root override + default maxShardBytes\n");
+		OwnedNumberPersistenceFixture fixture("ut_ckpt_env_root_default_max",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     4,
+		                                     glades::GMath::TANH);
+		fixture.setTrainPair(0u, 0.0f, 0.0f);
+		fixture.setTrainPair(1u, 1.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_Init() Failed==============",
+		         net.test(di).ok());
+
+		std::ostringstream root;
+		root << "/tmp/glades_ut_checkpoint_root_" << static_cast<unsigned long long>(::getpid());
+		EnvVarGuard rootGuard("GLADES_CHECKPOINT_ROOT");
+		rootGuard.set(root.str().c_str());
+
+		glades::NNetwork::CheckpointConfig ccfg;
+		ccfg.includeOptimizerState = false;
+		ccfg.maxShardBytes = 0u;
+		const std::string ckptName = "ut_checkpoint_env_root_default_max";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_SaveCheckpoint() Failed==============",
+		         net.saveCheckpoint(ckptName, ccfg).ok());
+
+		const std::string manifestPath = root.str() + "/" + ckptName + "/manifest.txt";
+		std::map<std::string, std::string> kv;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_ReadManifest() Failed==============",
+		         parse_kv_manifest(manifestPath, kv));
+		unsigned long long maxShardBytes = 0ull;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_MaxShardBytesPresent() Failed==============",
+		         kv_get_u64(kv, "maxShardBytes", maxShardBytes));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_MaxShardBytesDefaulted() Failed==============",
+		         maxShardBytes == (1024ull * 1024ull * 1024ull));
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_GetDiag() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_DiagMaxShardBytes() Failed==============",
+		         diag.lastMaxShardBytes == (1024ull * 1024ull * 1024ull));
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_LoadCheckpoint() Failed==============",
+		         net2.loadCheckpoint(ckptName, di).ok());
+	}
+
+	// ============================
+	// Case T: load operations do not mutate persistence diagnostics
+	// ============================
+	{
+		printf("[UT-NN] loadModel leaves persistence diagnostics unchanged\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_load_diag_stability",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_Init() Failed==============",
+		         net.test(di).ok());
+
+		const std::string modelName = "ut_model_pkg_load_diag_stability";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_LoadModel() Failed==============",
+		         net2.loadModel(modelName, di).ok());
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_GetDiagnostics() Failed==============",
+		         net2.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_CountersUnchanged() Failed==============",
+		         diag.totalPersistenceOps == 0ULL &&
+		         diag.totalPersistenceSuccesses == 0ULL &&
+		         diag.totalPersistenceFailures == 0ULL &&
+		         diag.lastOperation.empty());
 	}
 
     printf("\n============================================================\n");

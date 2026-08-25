@@ -11,10 +11,35 @@ set(GLADES_CUDA_SOURCES
 	gpu_blas.cu
 	gpu_kernels.cu
 	gpu_atlas.cu
+	gpu_vesta.cu
+	gpu_helios.cu
+	gpu_chiron.cu
+	gpu_sfa.cu
+	gpu_igaa.cu
+	gpu_medal.cu
+	gpu_graph.cu
+	gpu_blas_fp8.cu
+	gpu_stiefel.cu
+	gpu_hrtc.cu
+	gpu_ovfg.cu
+	gpu_mpot.cu
+	gpu_mfio.cu
+	gpu_orbit.cu
+	gpu_dfa.cu
+	gpu_trcd.cu
+	gpu_lcp.cu
+	gpu_ibgrad.cu
+	gpu_atcd.cu
+	gpu_csp.cu
+	gpu_face.cu
+	gpu_sparec.cu
+	gpu_kvface_probe.cu
+	gpu_nesr.cu
 	gpu_transformer_state.cu
 	gpu_dff_state.cu
 	gpu_rnn_state.cu
 	gpu_cnn_kernels.cu
+	gpu_init.cu
 )
 
 add_library(GladesCUDA STATIC ${GLADES_CUDA_SOURCES})
@@ -40,6 +65,22 @@ else()
 	target_link_libraries(GladesCUDA cublas)
 endif()
 
+# Link cuBLASLt (FP8 GEMM path, paradigm #50 HELIUM).
+find_library(CUBLASLT_LIB cublasLt HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+if(CUBLASLT_LIB)
+	target_link_libraries(GladesCUDA ${CUBLASLT_LIB})
+else()
+	target_link_libraries(GladesCUDA cublasLt)
+endif()
+
+# Link cuSOLVER for batched factorizations.
+find_library(CUSOLVER_LIB cusolver HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+if(CUSOLVER_LIB)
+	target_link_libraries(GladesCUDA ${CUSOLVER_LIB})
+else()
+	target_link_libraries(GladesCUDA cusolver)
+endif()
+
 # Link CUDA runtime so downstream consumers (unit tests, etc.) get it transitively.
 find_library(CUDART_LIB cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
 if(CUDART_LIB)
@@ -51,7 +92,7 @@ endif()
 # Generate code for common architectures.
 # Users can override via CMAKE_CUDA_ARCHITECTURES.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "60;70;75;80;86;89;90")
+	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
 endif()
 
 install(TARGETS GladesCUDA EXPORT gladesConfig
