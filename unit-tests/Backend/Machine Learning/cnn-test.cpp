@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -104,7 +105,7 @@ static glades::NumberInput* make_synthetic_image_data(
 }
 
 // Create a CNN NNetwork with a given config and return it.
-static glades::NNetwork make_cnn(
+static std::unique_ptr<glades::NNetwork> make_cnn(
     const char* name,
     unsigned int inputC, unsigned int inputH, unsigned int inputW,
     unsigned int numClasses,
@@ -114,7 +115,7 @@ static glades::NNetwork make_cnn(
     int batchSize,
     unsigned int seed)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ batchSize,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -124,10 +125,10 @@ static glades::NNetwork make_cnn(
 	    /*activationType*/ glades::GMath::RELU,
 	    /*activationParam*/ 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (size_t i = 0; i < fcHiddenSizes.size(); ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(fcHiddenSizes[i]),
 		    lr,
 		    0.0f, 0.0f, 0.0f, 0.0f,
@@ -135,16 +136,16 @@ static glades::NNetwork make_cnn(
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(numClasses),
 	    glades::OutputLayerInfo::CLASSIFICATION);
 
 	glades::NNInfo* info = new glades::NNInfo(name, in, hidden, out);
-	glades::NNetwork net(info, glades::NNetwork::TYPE_CNN);
-	net.setSeed(seed);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_CNN);
+	net->setSeed(seed);
 
 	// Configure CNN layers.
-	glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+	glades::TrainingConfig& cfg = net->getTrainingConfigMutable();
 	cfg.cnn.inputH = inputH;
 	cfg.cnn.inputW = inputW;
 	cfg.cnn.inputC = inputC;
@@ -195,8 +196,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_smoke", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_smoke", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 123u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -237,8 +239,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_pool", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_pool", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 456u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -277,8 +280,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_bn", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_bn", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 789u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -319,8 +323,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_full_layer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_full_layer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 111u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -374,8 +379,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_2layer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_2layer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 333u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -416,8 +422,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_rgb", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_rgb", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 555u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -459,8 +466,9 @@ void NNCNNUnitTest()
 		fcHidden.push_back(16u);
 
 		// Train for 1 epoch, record loss.
-		glades::NNetwork net = make_cnn("ut_cnn_loss_dec", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_loss_dec", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 5, 777u);
+		glades::NNetwork& net = *netOwner;
 
 		CaptureMetricsCb cb1(1);
 		net.getTerminatorMutable().setEpoch(1000);
@@ -517,8 +525,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_infer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_infer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 999u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -564,8 +573,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net1 = make_cnn("ut_cnn_save", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_save", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.01f, 10, 1111u);
+		glades::NNetwork& net1 = *net1Owner;
 		net1.getTerminatorMutable().setEpoch(3);
 		net1.getTerminatorMutable().setAccuracy(0);
 
@@ -623,8 +633,9 @@ void NNCNNUnitTest()
 		fcHidden.push_back(16u);
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_multifc", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_multifc", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1313u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -665,8 +676,9 @@ void NNCNNUnitTest()
 		// No FC hidden layers - flatten goes directly to output.
 		std::vector<unsigned int> fcHidden;
 
-		glades::NNetwork net = make_cnn("ut_cnn_nofc", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_nofc", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1515u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -707,8 +719,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_3class", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_3class", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1717u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(5);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -747,8 +760,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_stride2", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_stride2", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1919u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -787,8 +801,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_5x5", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_5x5", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 2121u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -829,8 +844,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_adam", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_adam", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.001f, 10, 2323u);
+		glades::NNetwork& net = *netOwner;
 
 		// Enable AdamW.
 		glades::TrainingConfig& tcfg = net.getTrainingConfigMutable();
@@ -903,8 +919,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(32u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_deep", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_deep", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 2525u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -945,8 +962,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net1 = make_cnn("ut_cnn_bn_save", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_bn_save", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.01f, 10, 2727u);
+		glades::NNetwork& net1 = *net1Owner;
 		net1.getTerminatorMutable().setEpoch(5);
 		net1.getTerminatorMutable().setAccuracy(0);
 
@@ -1014,8 +1032,9 @@ void NNCNNUnitTest()
 		fcHidden.push_back(8u);
 
 		// Batch size = 1 (pure stochastic).
-		glades::NNetwork net = make_cnn("ut_cnn_sgd1", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_sgd1", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 1, 2929u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -1056,8 +1075,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_rect", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_rect", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 3131u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -1109,8 +1129,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net = make_cnn("ut_cnn_mixed", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_mixed", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 3333u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -1151,8 +1172,9 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork net1 = make_cnn("ut_cnn_adam_cont", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_adam_cont", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.001f, 10, 3535u);
+		glades::NNetwork& net1 = *net1Owner;
 
 		glades::TrainingConfig& tcfg = net1.getTrainingConfigMutable();
 		tcfg.optimizer.type = glades::OptimizerConfig::ADAMW;
@@ -1213,8 +1235,9 @@ void NNCNNUnitTest()
 		fcHidden.push_back(8u);
 
 		// Batch size = 0 means full batch.
-		glades::NNetwork net = make_cnn("ut_cnn_fullbatch", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_fullbatch", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 0, 3737u);
+		glades::NNetwork& net = *netOwner;
 		net.getTerminatorMutable().setEpoch(3);
 		net.getTerminatorMutable().setAccuracy(0);
 
@@ -1285,8 +1308,9 @@ void NNCNNMNISTUnitTest()
 	std::vector<unsigned int> fcHidden;
 	fcHidden.push_back(128u);
 
-	glades::NNetwork net = make_cnn("ut_cnn_mnist", inputC, inputH, inputW, numClasses,
+	auto netOwner = make_cnn("ut_cnn_mnist", inputC, inputH, inputW, numClasses,
 	                                convSpecs, fcHidden, 0.001f, 64, 42u);
+	glades::NNetwork& net = *netOwner;
 
 	// Configure AdamW + grad clipping.
 	glades::TrainingConfig& tcfg = net.getTrainingConfigMutable();

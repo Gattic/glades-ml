@@ -64,11 +64,11 @@ struct Fixture
 		di.setPadTokenId(static_cast<int>(padTokenId));
 		di.import(tbl);
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(32, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(32, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(32, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(32, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		info = new glades::NNInfo("fuzz_transformer_infer", in, hidden, out);
 
 		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);

@@ -199,11 +199,11 @@ struct SmallTransformerSetup
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 		for (int l = 0; l < nLayers; ++l)
-			hidden.push_back(new glades::HiddenLayerInfo(static_cast<int>(dModel), 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(static_cast<int>(dModel), 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 
 		info = new glades::NNInfo("ut_transformer_improvements", in, hidden, out);
 		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -645,10 +645,10 @@ void TransformerImprovementsUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_finln_kv_parity", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);

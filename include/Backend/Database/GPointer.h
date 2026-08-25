@@ -18,216 +18,84 @@
 #define _GPOINTER
 
 #include "GDeleter.h"
-#include <ctime>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
+
+#include <concepts>
+#include <cstddef>
+#include <memory>
+#include <utility>
 
 namespace shmea {
 
-template <typename T, void(*Deleter)(T*) = default_deleter<T> >
+template <typename T, void(*Deleter)(T*) = default_deleter<T>>
 class GPointer
 {
-protected:
-
-	T* data;
-	unsigned int* refCount;
-	pthread_mutex_t* refMutex;
-
-public:
-
-	// Allow cross-specialization access for aliasing conversions
+private:
 	template <typename U, void(*UDeleter)(U*)>
 	friend class GPointer;
 
-	explicit GPointer(T* newData = NULL) : 
-		data(newData),
-		refCount(newData ? new unsigned int(1) : NULL),
-		refMutex(NULL)
+	std::shared_ptr<T> data;
+
+public:
+	GPointer() = default;
+
+	// Boundary adoption constructor. First-party call sites should prefer
+	// make_gpointer(); foreign APIs may use this to adopt a result immediately.
+	explicit GPointer(T* newData)
+		: data(newData, Deleter)
 	{
-		if (newData)
-		{
-			refMutex = new pthread_mutex_t;
-			pthread_mutex_init(refMutex, NULL);
-		}
 	}
 
-	GPointer(const GPointer<T, Deleter>& g2) :
-		data(NULL),
-		refCount(NULL),
-		refMutex(NULL)
+	explicit GPointer(std::shared_ptr<T> owner)
+		: data(std::move(owner))
 	{
-		copy(g2);
 	}
 
-	// Converting constructor: enable GPointer<Derived> -> GPointer<Base>
-	// Shares ownership (same refCount) and performs pointer upcast
+	GPointer(const GPointer&) = default;
+	GPointer(GPointer&&) noexcept = default;
+	GPointer& operator=(const GPointer&) = default;
+	GPointer& operator=(GPointer&&) noexcept = default;
+	~GPointer() = default;
+
 	template <typename U, void(*UDeleter)(U*)>
-	GPointer(const GPointer<U, UDeleter>& g2) :
-		data(NULL),
-		refCount(NULL),
-		refMutex(NULL)
+	requires std::convertible_to<U*, T*>
+	GPointer(const GPointer<U, UDeleter>& other)
+		: data(other.data)
 	{
-		reset();
-		data = static_cast<T*>(g2.data);
-		refCount = g2.refCount;
-		refMutex = g2.refMutex;
-		increment();
 	}
 
-	virtual ~GPointer()
+	template <typename U, void(*UDeleter)(U*)>
+	requires std::convertible_to<U*, T*>
+	GPointer& operator=(const GPointer<U, UDeleter>& other)
 	{
-		reset();
-	}
-
-	void reset()
-	{
-		if (!refCount)
-		{
-			return;
-		}
-		
-		unsigned int count = decrement();
-		if (count == 0)
-		{
-			// Store local copies before nulling members
-			T* dataToDelete = data;
-			unsigned int* countToDelete = refCount;
-			pthread_mutex_t* mutexToDelete = refMutex;
-			
-			// Null members first
-			data = NULL;
-			refCount = NULL;
-			refMutex = NULL;
-			
-			// Delete after members are nulled
-			if (dataToDelete)
-			{
-				Deleter(dataToDelete);
-			}
-			delete countToDelete;
-			if (mutexToDelete)
-			{
-				pthread_mutex_destroy(mutexToDelete);
-				delete mutexToDelete;
-			}
-		} else {
-			// Just null our references
-			data = NULL;
-			refCount = NULL;
-			refMutex = NULL;
-		}
-	}
-
-	T* get() const
-	{
-		return data;
-	}
-
-	unsigned int increment()
-	{
-		if (refCount)
-		{
-			if (refMutex)
-				pthread_mutex_lock(refMutex);
-			++(*refCount);
-			unsigned int v = *refCount;
-			if (refMutex)
-				pthread_mutex_unlock(refMutex);
-			return v;
-		}
-		return 0;
-	}
-
-	unsigned int decrement()
-	{
-		if (refCount)
-		{
-			if (refMutex)
-				pthread_mutex_lock(refMutex);
-			--(*refCount);
-			unsigned int v = *refCount;
-			if (refMutex)
-				pthread_mutex_unlock(refMutex);
-			return v;
-		}
-		return 0;
-	}
-
-	T& operator*()
-	{
-		return *data;
-	}
-
-	T* operator->()
-	{
-		return data;
-	}
-
-	T* operator->() const
-	{
-		return data;
-	}
-
-	operator T*() const
-	{
-		return data;
-	}
-
-	operator bool() const
-	{
-		return (data!=NULL);
-	}
-
-	bool operator==(const GPointer<T, Deleter>& other) const
-	{
-		return data == other.data;
-	}
-
-	bool operator!=(const GPointer<T, Deleter>& other) const
-	{
-		return data != other.data;
-	}
-
-	GPointer<T, Deleter>& copy(const GPointer<T, Deleter>& g2)
-	{
-		if(this != &g2)
-		{
-			reset();
-			
-			data = g2.data;
-			refCount = g2.refCount;
-			refMutex = g2.refMutex;
-			
-			increment();
-		}
-
+		data = other.data;
 		return *this;
 	}
 
-	GPointer<T, Deleter>& operator=(const GPointer<T, Deleter>& g2)
-	{
-		return copy(g2);
-	}
+	void reset() noexcept { data.reset(); }
+	T* get() const noexcept { return data.get(); }
+	long use_count() const noexcept { return data.use_count(); }
 
-	// Converting assignment: enable GPointer<Derived> -> GPointer<Base>
-	template <typename U, void(*UDeleter)(U*)>
-	GPointer<T, Deleter>& operator=(const GPointer<U, UDeleter>& g2)
+	T& operator*() const { return *data; }
+	T* operator->() const noexcept { return data.get(); }
+	T& operator[](std::size_t index) const { return data.get()[index]; }
+	explicit operator bool() const noexcept { return static_cast<bool>(data); }
+
+	bool operator==(const GPointer& other) const noexcept { return data == other.data; }
+	bool operator!=(const GPointer& other) const noexcept { return data != other.data; }
+
+	GPointer& copy(const GPointer& other)
 	{
-		if ((void*)this == (const void*)&g2)
-		{
-			return *this;
-		}
-		reset();
-		data = static_cast<T*>(g2.data);
-		refCount = g2.refCount;
-		refMutex = g2.refMutex;
-		increment();
+		data = other.data;
 		return *this;
 	}
 };
-};
+
+template <typename T, typename... Args>
+GPointer<T> make_gpointer(Args&&... args)
+{
+	return GPointer<T>(std::make_shared<T>(std::forward<Args>(args)...));
+}
+
+} // namespace shmea
 
 #endif

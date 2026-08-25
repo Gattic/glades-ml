@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <algorithm>
 #include <vector>
+#include <memory>
 
 // ============================================================
 // File-static DDP state
@@ -30,7 +31,7 @@ namespace {
 static bool ddpInitialized = false;
 static int ddpRank = 0;
 static int ddpWorldSize = 1;
-static GNet::GServer* ddpServer = NULL;
+static std::unique_ptr<GNet::GServer> ddpServer;
 
 // Synchronization for blocking allreduce/barrier/broadcast.
 static pthread_mutex_t ddpMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -134,7 +135,8 @@ class DDPReduceService : public GNet::Service
 public:
 	DDPReduceService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		const shmea::GString& payload = cData->getBinaryPayload();
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
@@ -203,11 +205,13 @@ public:
 		++reduceWorkersArrived;
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPReduce"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPReduceService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPReduceService>(s);
+	}
 };
 
 // --- DDPResultService (runs on non-root) ---
@@ -218,7 +222,8 @@ class DDPResultService : public GNet::Service
 public:
 	DDPResultService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		const shmea::GString& payload = cData->getBinaryPayload();
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
@@ -260,11 +265,13 @@ public:
 		reduceResultReady = true;
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPResult"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPResultService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPResultService>(s);
+	}
 };
 
 // --- DDPBarrierService (runs on root) ---
@@ -275,18 +282,21 @@ class DDPBarrierService : public GNet::Service
 public:
 	DDPBarrierService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		pthread_mutex_lock(&ddpMutex);
 		workerConnections.push_back(cData->getConnection());
 		++barrierWorkersArrived;
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPBarrier"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPBarrierService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPBarrierService>(s);
+	}
 };
 
 // --- DDPBarrierReleaseService (runs on non-root) ---
@@ -297,18 +307,21 @@ class DDPBarrierReleaseService : public GNet::Service
 public:
 	DDPBarrierReleaseService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		(void)cData;
 		pthread_mutex_lock(&ddpMutex);
 		barrierReleased = true;
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPBarrierRelease"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPBarrierReleaseService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPBarrierReleaseService>(s);
+	}
 };
 
 // --- DDPBroadcastService (runs on non-root) ---
@@ -319,7 +332,8 @@ class DDPBroadcastService : public GNet::Service
 public:
 	DDPBroadcastService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		const shmea::GString& payload = cData->getBinaryPayload();
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
@@ -332,11 +346,13 @@ public:
 		broadcastReady = true;
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPBroadcast"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPBroadcastService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPBroadcastService>(s);
+	}
 };
 
 // --- DDPBroadcastReadyService (runs on root) ---
@@ -347,18 +363,21 @@ class DDPBroadcastReadyService : public GNet::Service
 public:
 	DDPBroadcastReadyService(GNet::GServer* s) : srv(s) {}
 
-	shmea::ServiceData* execute(const shmea::ServiceData* cData)
+	shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData* cData)
 	{
 		pthread_mutex_lock(&ddpMutex);
 		workerConnections.push_back(cData->getConnection());
 		++barrierWorkersArrived; // reuse barrier counter for broadcast sync
 		pthread_cond_broadcast(&ddpCond);
 		pthread_mutex_unlock(&ddpMutex);
-		return NULL;
+		return {};
 	}
 
 	shmea::GString getName() const { return "DDPBroadcastReady"; }
-	GNet::Service* MakeService(GNet::GServer* s) const { return new DDPBroadcastReadyService(s); }
+	shmea::GPointer<GNet::Service> MakeService(GNet::GServer* s) const {
+		return shmea::make_gpointer<DDPBroadcastReadyService>(s);
+	}
 };
 
 // --- Login listener for root to track connecting workers ---
@@ -398,15 +417,15 @@ static void initInternal(const char* rootHost, int rootPort,
 	ddpRank = rank;
 	ddpWorldSize = worldSize;
 
-	ddpServer = new GNet::GServer();
+	ddpServer = std::make_unique<GNet::GServer>();
 
 	// Register services on all workers.
-	ddpServer->addService(new DDPReduceService(ddpServer));
-	ddpServer->addService(new DDPResultService(ddpServer));
-	ddpServer->addService(new DDPBarrierService(ddpServer));
-	ddpServer->addService(new DDPBarrierReleaseService(ddpServer));
-	ddpServer->addService(new DDPBroadcastService(ddpServer));
-	ddpServer->addService(new DDPBroadcastReadyService(ddpServer));
+	ddpServer->addService(shmea::make_gpointer<DDPReduceService>(ddpServer.get()));
+	ddpServer->addService(shmea::make_gpointer<DDPResultService>(ddpServer.get()));
+	ddpServer->addService(shmea::make_gpointer<DDPBarrierService>(ddpServer.get()));
+	ddpServer->addService(shmea::make_gpointer<DDPBarrierReleaseService>(ddpServer.get()));
+	ddpServer->addService(shmea::make_gpointer<DDPBroadcastService>(ddpServer.get()));
+	ddpServer->addService(shmea::make_gpointer<DDPBroadcastReadyService>(ddpServer.get()));
 
 	char rootPortBuf[32];
 	sprintf(rootPortBuf, "%d", rootPort);
@@ -414,7 +433,7 @@ static void initInternal(const char* rootHost, int rootPort,
 	if (rank == 0)
 	{
 		// Root: set up login listener and start listening.
-		ddpServer->setLoginListener(shmea::GPointer<GNet::LoginListener>(new DDPLoginListener()));
+		ddpServer->setLoginListener(shmea::make_gpointer<DDPLoginListener>());
 		char listenBuf[32];
 		sprintf(listenBuf, "%d", myListenPort);
 		ddpServer->run(shmea::GString(listenBuf), false);
@@ -481,8 +500,7 @@ void glades::ddp::finalize()
 	if (ddpServer)
 	{
 		ddpServer->stop();
-		delete ddpServer;
-		ddpServer = NULL;
+		ddpServer.reset();
 	}
 	ddpRank = 0;
 	ddpWorldSize = 1;
@@ -541,13 +559,13 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 		// Send result to each non-root worker.
 		for (size_t i = 0; i < workerConnections.size(); ++i)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(workerConnections[i], "DDPResult");
 			unsigned int resultSize = 4 + byteSize;
 			std::vector<unsigned char> resultBuf(resultSize);
 			resultBuf[0] = 0; resultBuf[1] = 0; resultBuf[2] = 0; resultBuf[3] = 0;
 			memcpy(&resultBuf[4], &reduceAccumF[0], byteSize);
 			sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 
 		workerConnections.clear();
@@ -573,13 +591,13 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 
 		if (rootConn)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPReduce");
 			unsigned int sendSize = 4 + byteSize;
 			std::vector<unsigned char> sendBuf(sendSize);
 			sendBuf[0] = 0; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
 			memcpy(&sendBuf[4], data, byteSize);
 			sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 
 		// Wait for result from root.
@@ -674,9 +692,9 @@ void glades::ddp::barrier()
 		// Release all workers.
 		for (size_t i = 0; i < workerConnections.size(); ++i)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPBarrierRelease");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(workerConnections[i], "DDPBarrierRelease");
 			sd->set(shmea::GString("DDPBarrierRelease"));
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 		workerConnections.clear();
 		barrierWorkersArrived = 0;
@@ -699,9 +717,9 @@ void glades::ddp::barrier()
 
 		if (rootConn)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPBarrier");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPBarrier");
 			sd->set(shmea::GString("DDPBarrier"));
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 
 		// Wait for release.
@@ -737,9 +755,9 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 
 		for (size_t i = 0; i < workerConnections.size(); ++i)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPBroadcast");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(workerConnections[i], "DDPBroadcast");
 			sd->setBinaryPayload(reinterpret_cast<const char*>(data), byteSize);
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 		workerConnections.clear();
 		barrierWorkersArrived = 0;
@@ -762,9 +780,9 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 
 		if (rootConn)
 		{
-			shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPBroadcastReady");
+			auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPBroadcastReady");
 			sd->set(shmea::GString("DDPBroadcastReady"));
-			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			ddpServer->send(sd);
 		}
 
 		// Wait for broadcast data.
@@ -859,9 +877,9 @@ static void allReduceCompressed(float* data, size_t count, int effectiveMode)
 
 			for (size_t i = 0; i < workerConnections.size(); ++i)
 			{
-				shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
+				auto sd = shmea::make_gpointer<shmea::ServiceData>(workerConnections[i], "DDPResult");
 				sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
-				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+				ddpServer->send(sd);
 			}
 		}
 		else
@@ -874,9 +892,9 @@ static void allReduceCompressed(float* data, size_t count, int effectiveMode)
 
 			for (size_t i = 0; i < workerConnections.size(); ++i)
 			{
-				shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
+				auto sd = shmea::make_gpointer<shmea::ServiceData>(workerConnections[i], "DDPResult");
 				sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
-				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+				ddpServer->send(sd);
 			}
 		}
 
@@ -951,9 +969,9 @@ static void allReduceCompressed(float* data, size_t count, int effectiveMode)
 					memcpy(&sendBuf[8 + nnz * 4], &values[0], nnz * 2);
 				}
 
-				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPReduce");
 				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
-				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+				ddpServer->send(sd);
 			}
 			else if (effectiveMode == 1)
 			{
@@ -965,9 +983,9 @@ static void allReduceCompressed(float* data, size_t count, int effectiveMode)
 				for (size_t i = 0; i < count; ++i)
 					dst[i] = float_to_fp16(data[i]);
 
-				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPReduce");
 				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
-				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+				ddpServer->send(sd);
 			}
 			else
 			{
@@ -977,9 +995,9 @@ static void allReduceCompressed(float* data, size_t count, int effectiveMode)
 				sendBuf[0] = 0; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
 				memcpy(&sendBuf[4], data, count * sizeof(float));
 
-				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				auto sd = shmea::make_gpointer<shmea::ServiceData>(rootConn, "DDPReduce");
 				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
-				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+				ddpServer->send(sd);
 			}
 		}
 

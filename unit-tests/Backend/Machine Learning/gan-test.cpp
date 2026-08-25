@@ -129,7 +129,7 @@ static glades::NNInfo* make_gen_info(const char* name,
                                      float lr,
                                      int activationType)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -139,10 +139,10 @@ static glades::NNInfo* make_gen_info(const char* name,
 	    /*activationType*/ activationType,
 	    /*activationParam*/ 0.01f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (size_t i = 0; i < hiddenSizes.size(); ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(hiddenSizes[i]),
 		    lr,
 		    0.0f, 0.0f, 0.0f, 0.0f,
@@ -151,7 +151,7 @@ static glades::NNInfo* make_gen_info(const char* name,
 	}
 
 	// Output layer size will be overridden by GAN based on data
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 
 	return new glades::NNInfo(name, in, hidden, out);
 }
@@ -162,7 +162,7 @@ static glades::NNInfo* make_disc_info(const char* name,
                                       float lr,
                                       int activationType)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -172,10 +172,10 @@ static glades::NNInfo* make_disc_info(const char* name,
 	    /*activationType*/ activationType,
 	    /*activationParam*/ 0.01f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (size_t i = 0; i < hiddenSizes.size(); ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(hiddenSizes[i]),
 		    lr,
 		    0.0f, 0.0f, 0.0f, 0.0f,
@@ -183,7 +183,7 @@ static glades::NNInfo* make_disc_info(const char* name,
 		    0.01f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 
 	return new glades::NNInfo(name, in, hidden, out);
 }

@@ -21,11 +21,13 @@
 #include "../Database/GPointer.h"
 #include "../Database/GLogger.h"
 #include "socket.h"
+#include "service.h"
 #include "udp_channel.h"
 #include <errno.h>
 #include <iostream>
 #include <map>
 #include <pthread.h>
+#include <memory>
 #include <queue>
 #include <set>
 #include <stdio.h>
@@ -99,7 +101,7 @@ class GServer
 	// Bounded worker pool for executing Services (replaces thread-per-request)
 	pthread_mutex_t* serviceMutex;
 	pthread_cond_t* serviceCond;
-	std::queue<newServiceArgs*> serviceQueue;
+	std::queue<std::unique_ptr<newServiceArgs>> serviceQueue;
 	std::vector<pthread_t> serviceWorkers;
 	unsigned int serviceQueueMax;
 	bool serviceStopRequested;
@@ -150,8 +152,8 @@ class GServer
 	pthread_mutex_t* servicesMutex;
 	std::map<shmea::GString, pthread_mutex_t*> runningServiceLocks;
 
-	std::map<shmea::GString, Service*> service_depot;
-	std::map<shmea::GString, Service*> running_services;
+	std::map<shmea::GString, shmea::GPointer<Service>> service_depot;
+	std::map<shmea::GString, shmea::GPointer<Service>> running_services;
 
 	// Logout listener (supports class member functions)
 	shmea::GPointer<LogoutListener> logoutListener;
@@ -201,8 +203,8 @@ public:
 
 	void send(shmea::GPointer<shmea::ServiceData>);
 
-	unsigned int addService(Service*);
-	Service* DoService(shmea::GString, shmea::GString = "");
+	unsigned int addService(shmea::GPointer<Service>);
+	shmea::GPointer<Service> DoService(shmea::GString, shmea::GString = "");
 	// Set the getConnection port to socks if not specified
 	Connection* getConnection(shmea::GString, shmea::GString = "admin", shmea::GString = "-1");
 	Connection* getConnectionFromName(shmea::GString);

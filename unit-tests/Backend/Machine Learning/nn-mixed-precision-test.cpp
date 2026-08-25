@@ -112,7 +112,7 @@ static glades::NNInfo* make_tiny_transformer_regression_info(const std::string& 
                                                             unsigned int outSize,
                                                             float learningRate)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ learningRate,
 	    /*momentumFactor*/ 0.0f,
@@ -122,8 +122,8 @@ static glades::NNInfo* make_tiny_transformer_regression_info(const std::string& 
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    /*size*/ static_cast<int>(dModel),
 	    /*learningRate*/ learningRate,
 	    /*momentumFactor*/ 0.0f,
@@ -133,7 +133,7 @@ static glades::NNInfo* make_tiny_transformer_regression_info(const std::string& 
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(outSize), glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(outSize), glades::OutputLayerInfo::REGRESSION);
 	return new glades::NNInfo(name.c_str(), in, hidden, out);
 }
 

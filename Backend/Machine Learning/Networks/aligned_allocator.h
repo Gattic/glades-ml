@@ -61,17 +61,6 @@ public:
 		::free(static_cast<void*>(p));
 	}
 
-	// C++03 construct/destroy (no-op for trivials but required by some libstdc++ modes).
-	void construct(pointer p, const_reference v)
-	{
-		::new (static_cast<void*>(p)) value_type(v);
-	}
-
-	void destroy(pointer p)
-	{
-		p->~value_type();
-	}
-
 	size_type max_size() const
 	{
 		return static_cast<size_type>(-1) / sizeof(value_type);

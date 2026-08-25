@@ -152,7 +152,7 @@ static BenchResult run_one(const glades::NumberInput& data,
 	// - input features: 2 (x,y)
 	// - hidden: hiddenSize
 	// - output: 1 regression (z)
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -162,8 +162,8 @@ static BenchResult run_one(const glades::NumberInput& data,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    /*size*/ hiddenSize,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -173,7 +173,7 @@ static BenchResult run_one(const glades::NumberInput& data,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 	glades::NNInfo* info = new glades::NNInfo((std::string("bench_") + r.name).c_str(), in, hidden, out);
 
 	glades::NNetwork net(info, netType);

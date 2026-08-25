@@ -75,14 +75,14 @@ static BenchResult runBench(int netType, bool useAtlas,
 	di.testMatrix = di.trainMatrix;
 	di.testExpectedMatrix = di.trainExpectedMatrix;
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    hiddenSize, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 	std::string name = std::string("bench_atlas_") + r.netType + "_" + r.optimizer;
 	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
 

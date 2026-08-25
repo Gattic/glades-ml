@@ -50,7 +50,8 @@ protected:
 	bool running;
 
 	static void* launchService(void* y);
-	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
+	virtual shmea::GPointer<shmea::ServiceData> execute(
+		const shmea::ServiceData*) = 0;
 	void StartService(newServiceArgs*);
 	void ExitService(newServiceArgs*);
 
@@ -62,7 +63,7 @@ public:
 
 	bool getRunning() const;
 
-	virtual Service* MakeService(GServer*) const = 0;
+	virtual shmea::GPointer<Service> MakeService(GServer*) const = 0;
 	virtual shmea::GString getName() const = 0;
 };
 };

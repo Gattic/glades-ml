@@ -51,33 +51,35 @@ void init();
 RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
 
-// Machine Learning Functions
-//
-// Legacy API: these return raw pointers that the caller must delete.
-MetaNetwork* train(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* train(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* train(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+// Machine-learning operations return explicit shared ownership. Input pointers
+// are non-owning borrows; existing MetaNetwork operations retain ownership by
+// accepting and returning GPointer.
+shmea::GPointer<MetaNetwork> train(
+	NNInfo*, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> train(
+	NNetwork*, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> train(
+	shmea::GPointer<MetaNetwork>, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> test(
+	NNInfo*, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> test(
+	NNetwork*, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> test(
+	shmea::GPointer<MetaNetwork>, DataInput*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
 
-// Callback-aware API: pass an ITrainingCallbacks* to receive epoch metrics.
-// When callbacks != NULL, training uses the provided callbacks instead of the built-in
-// default (logger + GUI adapter). The server/connection parameters are still used for
-// setServer() so the network can be saved/loaded remotely if needed.
-MetaNetwork* train(NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-
-// Safer ownership API: returns RAII pointer (ref-counted).
-//
-// These wrap the legacy functions but transfer ownership into a `GPointer` so callers
-// don't need to remember to `delete` returned MetaNetwork instances.
-shmea::GPointer<MetaNetwork> trainOwned(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-shmea::GPointer<MetaNetwork> trainOwned(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-shmea::GPointer<MetaNetwork> trainOwned(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-shmea::GPointer<MetaNetwork> testOwned(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-shmea::GPointer<MetaNetwork> testOwned(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-shmea::GPointer<MetaNetwork> testOwned(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+// Callback-aware API.
+shmea::GPointer<MetaNetwork> train(
+	NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
+shmea::GPointer<MetaNetwork> test(
+	NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = nullptr,
+	GNet::Connection* = nullptr);
 
 // Database Setup
 bool doesDatabaseExist();

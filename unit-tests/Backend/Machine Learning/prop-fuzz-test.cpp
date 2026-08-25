@@ -214,7 +214,7 @@ struct SmallDecoderLmFixture
 		di.import(tbl);
 		PROP_REQUIRE("==============PropFuzz: fixture TokenInput import failed==============", di.loadedOk());
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -224,8 +224,8 @@ struct SmallDecoderLmFixture
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 32, // dModel
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -234,7 +234,7 @@ struct SmallDecoderLmFixture
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 32,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -244,7 +244,7 @@ struct SmallDecoderLmFixture
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		info = new glades::NNInfo("ut_prop_fuzz_decoder_lm", in, hidden, out);
 
 		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);

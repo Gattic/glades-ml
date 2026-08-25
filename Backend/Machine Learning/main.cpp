@@ -25,6 +25,8 @@
 #include "Networks/training_callbacks.h"
 #include "DataObjects/ImageInput.h"
 
+#include <utility>
+
 using namespace glades;
 
 bool glades::doesDatabaseExist()
@@ -42,13 +44,8 @@ void glades::createDatabase()
 #endif
 }
 
-/*!
- * @brief initialize glades
- * @details initialize the neural network mutex
- */
 void glades::init()
 {
-	// initialize the mutex
 	if (!doesDatabaseExist())
 		createDatabase();
 }
@@ -58,330 +55,132 @@ bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
 	if (!newNet)
 		return false;
 
-	// Save the neural network
-	const glades::NNetworkStatus st = newNet->saveModel(std::string(newNet->getName().c_str()));
-	if (!st.ok())
+	const glades::NNetworkStatus status =
+		newNet->saveModel(std::string(newNet->getName().c_str()));
+	if (!status.ok())
 	{
 		char buffer[256];
 		sprintf(buffer, "Unable to save \"%s\"", newNet->getName().c_str());
 		puts(buffer);
 		return false;
 	}
-
 	return true;
 }
 
-/*!
- * @brief train network
- * @details train a neural network
- * @param networkInfo the incoming or desired neural net info
- * @param newDataInput the data to use in training
- * @return the trained MetaNetwork object
- */
-glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+namespace {
+
+shmea::GPointer<glades::MetaNetwork> RunMetaNetwork(
+	shmea::GPointer<glades::MetaNetwork> network,
+	glades::DataInput* input,
+	glades::ITrainingCallbacks* callbacks,
+	GNet::GServer* server,
+	GNet::Connection* connection,
+	bool training)
 {
-	if (!networkInfo)
-		return NULL;
+	if (!network || !input)
+		return {};
 
-	// metanetwork for aggregation
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networkInfo->getName());
-
-	// Add the Neural Network
-	cMetaNetwork->addSubnet(networkInfo);
-
-	// Train the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
+	const auto subnets = network->getSubnets();
+	for (glades::NNetwork* subnet : subnets)
 	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
-		if (!st.ok())
+		if (!subnet)
+			return {};
+		if (server && connection)
+			subnet->setServer(server, connection);
+		const glades::NNetworkStatus status = callbacks
+			? (training ? subnet->train(input, callbacks)
+			            : subnet->test(input, callbacks))
+			: (training ? subnet->train(input) : subnet->test(input));
+		if (!status.ok())
 		{
-			printf("[NN] Train failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
+			printf("[NN] %s failed: %s\n",
+			       training ? "Train" : "Test", status.message.c_str());
+			return {};
 		}
 	}
-
-	return cMetaNetwork;
+	return network;
 }
 
-/*!
- * @brief train network
- * @details train a neural network
- * @param networkInfo the incoming or desired neural net info
- * @param newDataInput the data to use in training
- * @return the trained MetaNetwork object
- */
-glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDataInput,
-    GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> MakeMetaNetwork(glades::NNInfo* info)
 {
-	if (!cNetwork)
-		return NULL;
-
-	// metanetwork for aggregation
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(cNetwork->getName());
-
-	// Add the Neural Network
-	cMetaNetwork->addSubnet(cNetwork);
-
-	// Train the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
-		if (!st.ok())
-		{
-			printf("[NN] Train failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	if (!info)
+		return {};
+	auto network = shmea::make_gpointer<glades::MetaNetwork>(info->getName());
+	network->addSubnet(info);
+	return network;
 }
 
-/*!
- * @brief train a metanetwork
- * @details train a set of neural networks
- * @param networkInfo the incoming or desired neural net info
- * @param newDataInput the data to use in training
- * @return the trained MetaNetwork object
- */
-glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
-    DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> MakeMetaNetwork(glades::NNetwork* subnet)
 {
-	if (!cMetaNetwork)
-		return NULL;
-
-	// Train the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
-		if (!st.ok())
-		{
-			printf("[NN] Train failed: %s\n", st.message.c_str());
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	if (!subnet)
+		return {};
+	auto network = shmea::make_gpointer<glades::MetaNetwork>(subnet->getName());
+	network->addSubnet(subnet);
+	return network;
 }
 
-/*!
- * @brief test network
- * @details test a network
- * @param networkInfo the incoming network's relevant information
- * @param newDataInput the data to use in testing
- * @return the tested MetaNetwork object
- */
-glades::MetaNetwork* glades::test(NNInfo* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+} // namespace
+
+shmea::GPointer<glades::MetaNetwork> glades::train(
+	NNInfo* info, DataInput* input, GNet::GServer* server,
+	GNet::Connection* connection)
 {
-	if (!networkInfo)
-		return NULL;
-
-	// metanetwork for aggregation
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networkInfo->getName());
-
-	// Add the Neural Network
-	cMetaNetwork->addSubnet(networkInfo);
-
-	// Test the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
-		if (!st.ok())
-		{
-			printf("[NN] Test failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	return RunMetaNetwork(
+		MakeMetaNetwork(info), input, nullptr, server, connection, true);
 }
 
-/*!
- * @brief test network
- * @details test a network
- * @param networkInfo the incoming network's relevant information
- * @param newDataInput the data to use in testing
- * @return the tested MetaNetwork object
- */
-glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::train(
+	NNetwork* subnet, DataInput* input, GNet::GServer* server,
+	GNet::Connection* connection)
 {
-	if (!networkInfo)
-		return NULL;
-
-	// metanetwork for aggregation
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networkInfo->getName());
-
-	// Add the Neural Network
-	cMetaNetwork->addSubnet(networkInfo);
-
-	// Test the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
-		if (!st.ok())
-		{
-			printf("[NN] Test failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	return RunMetaNetwork(
+		MakeMetaNetwork(subnet), input, nullptr, server, connection, true);
 }
 
-/*!
- * @brief test a metanetwork
- * @details test a set of neural networks
- * @param networkInfo the incoming or desired neural net info
- * @param newDataInput the data to use in testing
- * @return the tested MetaNetwork object
- */
-glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::train(
+	shmea::GPointer<MetaNetwork> network, DataInput* input,
+	GNet::GServer* server, GNet::Connection* connection)
 {
-	if (!cMetaNetwork)
-		return NULL;
-
-	// Test the Neural Network
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
-		if (!st.ok())
-		{
-			printf("[NN] Test failed: %s\n", st.message.c_str());
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	return RunMetaNetwork(
+		std::move(network), input, nullptr, server, connection, true);
 }
 
-// ===== Callback-aware wrappers =====
-//
-// These pass an explicit ITrainingCallbacks* to the network, bypassing the built-in
-// default callbacks. Useful when the caller provides its own GUI/logging adapter.
-
-glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDataInput,
-    ITrainingCallbacks* callbacks, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::test(
+	NNInfo* info, DataInput* input, GNet::GServer* server,
+	GNet::Connection* connection)
 {
-	if (!cNetwork)
-		return NULL;
-
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(cNetwork->getName());
-	cMetaNetwork->addSubnet(cNetwork);
-
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->train(newDataInput, callbacks);
-		if (!st.ok())
-		{
-			printf("[NN] Train failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	return RunMetaNetwork(
+		MakeMetaNetwork(info), input, nullptr, server, connection, false);
 }
 
-glades::MetaNetwork* glades::test(glades::NNetwork* cNetwork, DataInput* newDataInput,
-    ITrainingCallbacks* callbacks, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::test(
+	NNetwork* subnet, DataInput* input, GNet::GServer* server,
+	GNet::Connection* connection)
 {
-	if (!cNetwork)
-		return NULL;
-
-	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(cNetwork->getName());
-	cMetaNetwork->addSubnet(cNetwork);
-
-	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
-	for (unsigned int i = 0; i < subnets.size(); ++i)
-	{
-		if (serverInstance && cConnection)
-			subnets[i]->setServer(serverInstance, cConnection);
-		const glades::NNetworkStatus st = subnets[i]->test(newDataInput, callbacks);
-		if (!st.ok())
-		{
-			printf("[NN] Test failed: %s\n", st.message.c_str());
-			delete cMetaNetwork;
-			return NULL;
-		}
-	}
-
-	return cMetaNetwork;
+	return RunMetaNetwork(
+		MakeMetaNetwork(subnet), input, nullptr, server, connection, false);
 }
 
-// ===== Safer ownership wrappers (RAII) =====
-//
-// These functions wrap the legacy raw-pointer API and return a ref-counted `GPointer`.
-// This avoids forcing callers to remember to `delete` the returned MetaNetwork.
-
-shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::NNInfo* networkInfo,
-                                                       glades::DataInput* newDataInput,
-                                                       GNet::GServer* serverInstance,
-                                                       GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::test(
+	shmea::GPointer<MetaNetwork> network, DataInput* input,
+	GNet::GServer* server, GNet::Connection* connection)
 {
-	return shmea::GPointer<glades::MetaNetwork>(glades::train(networkInfo, newDataInput, serverInstance, cConnection));
+	return RunMetaNetwork(
+		std::move(network), input, nullptr, server, connection, false);
 }
 
-shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::NNetwork* cNetwork,
-                                                       glades::DataInput* newDataInput,
-                                                       GNet::GServer* serverInstance,
-                                                       GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::train(
+	NNetwork* subnet, DataInput* input, ITrainingCallbacks* callbacks,
+	GNet::GServer* server, GNet::Connection* connection)
 {
-	return shmea::GPointer<glades::MetaNetwork>(glades::train(cNetwork, newDataInput, serverInstance, cConnection));
+	return RunMetaNetwork(
+		MakeMetaNetwork(subnet), input, callbacks, server, connection, true);
 }
 
-shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::MetaNetwork* cMetaNetwork,
-                                                       glades::DataInput* newDataInput,
-                                                       GNet::GServer* serverInstance,
-                                                       GNet::Connection* cConnection)
+shmea::GPointer<glades::MetaNetwork> glades::test(
+	NNetwork* subnet, DataInput* input, ITrainingCallbacks* callbacks,
+	GNet::GServer* server, GNet::Connection* connection)
 {
-	return shmea::GPointer<glades::MetaNetwork>(glades::train(cMetaNetwork, newDataInput, serverInstance, cConnection));
+	return RunMetaNetwork(
+		MakeMetaNetwork(subnet), input, callbacks, server, connection, false);
 }
-
-shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::NNInfo* networkInfo,
-                                                      glades::DataInput* newDataInput,
-                                                      GNet::GServer* serverInstance,
-                                                      GNet::Connection* cConnection)
-{
-	return shmea::GPointer<glades::MetaNetwork>(glades::test(networkInfo, newDataInput, serverInstance, cConnection));
-}
-
-shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::NNetwork* networkInfo,
-                                                      glades::DataInput* newDataInput,
-                                                      GNet::GServer* serverInstance,
-                                                      GNet::Connection* cConnection)
-{
-	return shmea::GPointer<glades::MetaNetwork>(glades::test(networkInfo, newDataInput, serverInstance, cConnection));
-}
-
-shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::MetaNetwork* cMetaNetwork,
-                                                      glades::DataInput* newDataInput,
-                                                      GNet::GServer* serverInstance,
-                                                      GNet::Connection* cConnection)
-{
-	return shmea::GPointer<glades::MetaNetwork>(glades::test(cMetaNetwork, newDataInput, serverInstance, cConnection));
-}
-
