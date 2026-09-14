@@ -813,32 +813,57 @@ void glades::NNetwork::stop()
 
 bool glades::NNetwork::loadRunningFlag() const
 {
+#ifdef _MSC_VER
+	return InterlockedCompareExchange(reinterpret_cast<volatile long*>(&const_cast<NNetwork*>(this)->running), 0, 0) != 0;
+#else
 	return (__atomic_load_n(&running, __ATOMIC_SEQ_CST) != 0);
+#endif
 }
 
 void glades::NNetwork::storeRunningFlag(bool value)
 {
+#ifdef _MSC_VER
+	InterlockedExchange(reinterpret_cast<volatile long*>(&running), value ? 1 : 0);
+#else
 	__atomic_store_n(&running, value ? 1 : 0, __ATOMIC_SEQ_CST);
+#endif
 }
 
 uint64_t glades::NNetwork::loadConfiguredSeed() const
 {
+#ifdef _MSC_VER
+	return static_cast<uint64_t>(InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&const_cast<NNetwork*>(this)->rngSeed), 0, 0));
+#else
 	return __atomic_load_n(&rngSeed, __ATOMIC_SEQ_CST);
+#endif
 }
 
 void glades::NNetwork::storeConfiguredSeed(uint64_t seed)
 {
+#ifdef _MSC_VER
+	InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&rngSeed), static_cast<LONG64>(seed));
+#else
 	__atomic_store_n(&rngSeed, seed, __ATOMIC_SEQ_CST);
+#endif
 }
 
 shmea::GLogger* glades::NNetwork::loadLoggerOverride() const
 {
+#ifdef _MSC_VER
+	return static_cast<shmea::GLogger*>(InterlockedCompareExchangePointer(
+	    reinterpret_cast<void* volatile*>(&const_cast<NNetwork*>(this)->loggerOverride), NULL, NULL));
+#else
 	return __atomic_load_n(&loggerOverride, __ATOMIC_SEQ_CST);
+#endif
 }
 
 void glades::NNetwork::storeLoggerOverride(shmea::GLogger* logger)
 {
+#ifdef _MSC_VER
+	InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&loggerOverride), logger);
+#else
 	__atomic_store_n(&loggerOverride, logger, __ATOMIC_SEQ_CST);
+#endif
 }
 
 void glades::NNetwork::setSeed(uint64_t seed)

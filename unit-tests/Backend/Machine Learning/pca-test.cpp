@@ -21,6 +21,7 @@
 #include "../../../Backend/Machine Learning/GMath/pca.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "Backend/Plotter/Plotter.h"
+#include <cstdint>
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
@@ -358,7 +359,7 @@ void PCAUnitTest(bool saveImages)
     std::vector<std::vector<double> > hd_data(hd_samples, std::vector<double>(hd_features, 0.0));
 
     // Deterministic pseudo-random number generator (LCG)
-    unsigned long lcg_state = 42;
+    uint64_t lcg_state = 42;
     for (unsigned int i = 0; i < hd_samples; ++i)
     {
 	// Generate base values with correlation
@@ -472,7 +473,7 @@ void PCAUnitTest(bool saveImages)
 
     {
 	// Two features with nearly equal variance
-	unsigned long lcg2 = 123;
+	uint64_t lcg2 = 123;
 	std::vector<std::vector<double> > degen_data;
 	for (int i = 0; i < 200; ++i)
 	{
@@ -523,7 +524,7 @@ void PCAUnitTest(bool saveImages)
 
     {
 	// One feature with huge variance, another with tiny variance
-	unsigned long lcg3 = 456;
+	uint64_t lcg3 = 456;
 	std::vector<std::vector<double> > cond_data;
 	for (int i = 0; i < 200; ++i)
 	{
@@ -671,7 +672,7 @@ void PCAUnitTest(bool saveImages)
     {
 	// Generate data
 	std::vector<std::vector<double> > full_data;
-	unsigned long lcg4 = 789;
+	uint64_t lcg4 = 789;
 	for (int i = 0; i < 200; ++i)
 	{
 	    double x = static_cast<double>(i) / 200.0 * 10.0 - 5.0;

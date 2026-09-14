@@ -33,6 +33,9 @@
 #include <sstream>
 #include <time.h>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "logfmt_utils.h"
 
@@ -47,7 +50,19 @@ static timespec monotonic_now()
 	timespec ts;
 	ts.tv_sec = 0;
 	ts.tv_nsec = 0;
+#ifdef _WIN32
+	LARGE_INTEGER freq;
+	LARGE_INTEGER counter;
+	if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter) && freq.QuadPart > 0)
+	{
+		const long long sec = counter.QuadPart / freq.QuadPart;
+		const long long rem = counter.QuadPart % freq.QuadPart;
+		ts.tv_sec = static_cast<time_t>(sec);
+		ts.tv_nsec = static_cast<long>((rem * 1000000000LL) / freq.QuadPart);
+	}
+#else
 	clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
 	return ts;
 }
 
@@ -212,6 +227,20 @@ static bool echo_scope_uses_decoder_matrix(const glades::ATLASConfig& ac,
 	}
 }
 
+static unsigned int argos_role_flags_for_head()
+{
+	return glades::atlas::ARGOS_ROLE_HEAD;
+}
+
+static unsigned int argos_role_flags_for_block(unsigned int blockIndex,
+                                               unsigned int nLayers)
+{
+	unsigned int flags = glades::atlas::ARGOS_ROLE_NONE;
+	if ((blockIndex + 1u) == nLayers)
+		flags |= glades::atlas::ARGOS_ROLE_LATE;
+	return flags;
+}
+
 static bool observe_echo_cpu(glades::atlas::EchoWeightState& state,
                              const float* rowObs,
                              const float* colObs,
@@ -264,20 +293,6 @@ struct MatraBatchGroup
 	{
 	}
 };
-
-static unsigned int argos_role_flags_for_head()
-{
-	return glades::atlas::ARGOS_ROLE_HEAD;
-}
-
-static unsigned int argos_role_flags_for_block(unsigned int blockIndex,
-                                               unsigned int nLayers)
-{
-	unsigned int flags = glades::atlas::ARGOS_ROLE_NONE;
-	if ((blockIndex + 1u) == nLayers)
-		flags |= glades::atlas::ARGOS_ROLE_LATE;
-	return flags;
-}
 
 static bool run_argos_gpu(glades::gpu::GpuArgosWeightState& state,
                           glades::gpu::GpuBuffer<float>& param,

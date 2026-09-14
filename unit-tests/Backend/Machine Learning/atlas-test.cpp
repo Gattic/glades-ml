@@ -45,7 +45,9 @@
 #include <sstream>
 #include <string>
 #include <sys/time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace {

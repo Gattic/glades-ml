@@ -19,7 +19,7 @@
 #include "Backend/Database/GList.h"
 #include "../../../Backend/Machine Learning/main.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
-#include "../../../include/Backend/Database/GLogger.h"
+#include "Backend/Database/GLogger.h"
 
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"

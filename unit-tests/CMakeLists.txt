@@ -31,9 +31,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 #Project
 project(glades-unit-tests)
 
+if(WIN32)
+    include_directories(BEFORE "${CMAKE_SOURCE_DIR}/compat")
+endif()
+
 #Compiler Flags
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:CXX>:/wd4101> $<$<COMPILE_LANGUAGE:CXX>:/wd4100>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_SOURCE_DIR}/compat/unistd.h>)
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
     set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
@@ -102,6 +107,10 @@ set(MAIN_src_files
 	unit-test.h
 )
 add_executable(${PROJECT_NAME} ${MAIN_src_files})
+
+if(MSVC)
+	target_link_options(${PROJECT_NAME} PRIVATE /STACK:16777216)
+endif()
 
 #Link libraries
 target_link_libraries(${PROJECT_NAME}

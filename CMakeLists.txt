@@ -234,7 +234,9 @@ install(TARGETS ${PROJECT_NAME} EXPORT gladesConfig
     RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Install headers
-install(DIRECTORY "Backend/Machine Learning/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning" FILES_MATCHING PATTERN "*.h")
+install(DIRECTORY "Backend/Machine Learning/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning" FILES_MATCHING
+    PATTERN "*.h"
+    PATTERN "*.inc")
 install(FILES main.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # ---- Package config / exports ----

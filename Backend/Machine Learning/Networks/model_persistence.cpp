@@ -1176,10 +1176,17 @@ static glades::NNetworkStatus compute_model_package_integrity(const ModelPackage
 {
 	outIntegrity = ModelPackageIntegrity();
 	struct stat st;
+#ifdef _WIN32
+	if (::stat(paths.nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		outIntegrity.nninfoBytes = static_cast<uint64_t>(st.st_size);
+	if (::stat(paths.weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		outIntegrity.weightsBytes = static_cast<uint64_t>(st.st_size);
+#else
 	if (::lstat(paths.nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
 		outIntegrity.nninfoBytes = static_cast<uint64_t>(st.st_size);
 	if (::lstat(paths.weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
 		outIntegrity.weightsBytes = static_cast<uint64_t>(st.st_size);
+#endif
 	if (outIntegrity.weightsBytes > 0ULL)
 	{
 		if (!fnv1a64_hash_file_prefix(paths.weightsPath, outIntegrity.weightsBytes, outIntegrity.weightsHash))
@@ -1361,7 +1368,11 @@ static glades::NNetworkStatus verify_loaded_model_package_files(const ModelPacka
 	if (mf.hasWeightsBytes && mf.hasWeightsFNV)
 	{
 		struct stat st;
+#ifdef _WIN32
+		if (::stat(paths.weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 		if (::lstat(paths.weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#endif
 			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: weights.bin missing or not a regular file");
 		const uint64_t bytes = static_cast<uint64_t>(st.st_size);
 		if (bytes != mf.weightsBytes)
@@ -1374,7 +1385,11 @@ static glades::NNetworkStatus verify_loaded_model_package_files(const ModelPacka
 	if (mf.hasNninfoBytes)
 	{
 		struct stat st;
+#ifdef _WIN32
+		if (::stat(paths.nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 		if (::lstat(paths.nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#endif
 			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv missing or not a regular file");
 		const uint64_t bytes = static_cast<uint64_t>(st.st_size);
 		if (bytes != mf.nninfoBytes)

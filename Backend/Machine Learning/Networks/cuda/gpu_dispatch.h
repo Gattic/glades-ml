@@ -7,7 +7,11 @@
 #include "gpu_device.h"
 
 #include <cstddef>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
 
 namespace glades {
 namespace gpu {
@@ -88,9 +92,18 @@ public:
 private:
 	static double nowMs()
 	{
+#ifdef _WIN32
+		FILETIME ft;
+		ULARGE_INTEGER uli;
+		GetSystemTimeAsFileTime(&ft);
+		uli.LowPart = ft.dwLowDateTime;
+		uli.HighPart = ft.dwHighDateTime;
+		return static_cast<double>(uli.QuadPart - 116444736000000000ULL) / 10000.0;
+#else
 		struct timeval tv;
 		gettimeofday(&tv, NULL);
 		return static_cast<double>(tv.tv_sec) * 1000.0 + static_cast<double>(tv.tv_usec) / 1000.0;
+#endif
 	}
 
 	double* accumulator;

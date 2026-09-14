@@ -10,9 +10,9 @@
 #include "Backend/Core/platform.h"
 #else
 #include <pthread.h>
+#include <sys/time.h>
 #endif
 #include <sstream>
-#include <sys/time.h>
 
 #include "logfmt_utils.h"
 
@@ -76,11 +76,20 @@ static void append_token_delta(std::vector<unsigned int>& dst, const std::vector
 
 static uint64_t now_micros()
 {
+#ifdef _WIN32
+	FILETIME ft;
+	ULARGE_INTEGER uli;
+	GetSystemTimeAsFileTime(&ft);
+	uli.LowPart = ft.dwLowDateTime;
+	uli.HighPart = ft.dwHighDateTime;
+	return static_cast<uint64_t>((uli.QuadPart - 116444736000000000ULL) / 10ULL);
+#else
 	struct timeval tv;
 	tv.tv_sec = 0;
 	tv.tv_usec = 0;
 	gettimeofday(&tv, NULL);
 	return static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
+#endif
 }
 
 static uint64_t elapsed_micros(uint64_t startedAtUs)

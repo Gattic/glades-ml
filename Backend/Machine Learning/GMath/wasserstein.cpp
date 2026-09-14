@@ -19,6 +19,10 @@
 #include <algorithm>
 #include <cstdlib>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 using namespace glades;
 
 double Wasserstein::distance1D(const std::vector<double>& a, const std::vector<double>& b)

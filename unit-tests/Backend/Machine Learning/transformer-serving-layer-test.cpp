@@ -22,7 +22,7 @@
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_serving_layer.h"
 
-#include "../../../include/Backend/Database/GLogger.h"
+#include "Backend/Database/GLogger.h"
 
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"

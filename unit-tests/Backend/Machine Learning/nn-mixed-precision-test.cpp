@@ -75,6 +75,8 @@ static bool parse_kv_manifest(const std::string& path, std::map<std::string, std
 	bool firstLine = true;
 	while (std::getline(in, line))
 	{
+		if (!line.empty() && line[line.size() - 1u] == '\r')
+			line.erase(line.size() - 1u);
 		if (firstLine)
 		{
 			outKv["__magic__"] = line;

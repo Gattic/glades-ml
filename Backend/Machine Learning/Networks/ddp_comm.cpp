@@ -808,24 +808,6 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 	}
 }
 
-// ============================================================
-// Compression configuration
-// ============================================================
-void glades::ddp::setCompression(int mode)
-{
-	ddpCompressionMode = mode;
-}
-
-void glades::ddp::setTopKRatio(float ratio)
-{
-	if (ratio > 0.0f && ratio <= 1.0f)
-		ddpTopKRatio = ratio;
-}
-
-void glades::ddp::setTopKWarmupSteps(int steps)
-{
-	ddpTopKWarmupSteps = steps;
-}
 
 // ============================================================
 // Compressed AllReduce (modes 0, 1, 2)

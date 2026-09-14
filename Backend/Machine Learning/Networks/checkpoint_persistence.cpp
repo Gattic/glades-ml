@@ -3612,7 +3612,11 @@ static glades::NNetworkStatus open_checkpoint_shards(const std::string& dir,
 
 		const std::string shardPath = dir + shardFile;
 		struct stat st;
+#ifdef _WIN32
+		if (::stat(shardPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 		if (::lstat(shardPath.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode))
+#endif
 		{
 			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
 			                              "loadCheckpoint: shard file missing or not a regular file");

@@ -1488,6 +1488,26 @@ void VESTAGpuBf16CastTest()
 	printf("[vesta] GpuBf16CastTest: CUDA not compiled; skipping\n");
 }
 
+void VESTAGpuBf16GemmTest()
+{
+	printf("[vesta] GpuBf16GemmTest: CUDA not compiled; skipping\n");
+}
+
+void VESTAGpuBf16TrainShapeReproTest()
+{
+	printf("[vesta] GpuBf16TrainShapeReproTest: CUDA not compiled; skipping\n");
+}
+
+void VESTAGpuBf16FlashAttentionTest()
+{
+	printf("[vesta] GpuBf16FlashAttentionTest: CUDA not compiled; skipping\n");
+}
+
+void VESTATransformerBf16ParityTest()
+{
+	printf("[vesta] TransformerBf16ParityTest: CUDA not compiled; skipping\n");
+}
+
 void VESTAGpuRefreshBenchmark()
 {
 	printf("[vesta] GpuRefreshBenchmark: CUDA not compiled; skipping\n");

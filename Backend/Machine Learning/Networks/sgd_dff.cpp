@@ -13,6 +13,9 @@
 #include <sstream>
 #include <time.h>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "logfmt_utils.h"
 
@@ -25,7 +28,19 @@ static timespec monotonic_now()
 	timespec ts;
 	ts.tv_sec = 0;
 	ts.tv_nsec = 0;
+#ifdef _WIN32
+	LARGE_INTEGER freq;
+	LARGE_INTEGER counter;
+	if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&counter) && freq.QuadPart > 0)
+	{
+		const long long sec = counter.QuadPart / freq.QuadPart;
+		const long long rem = counter.QuadPart % freq.QuadPart;
+		ts.tv_sec = static_cast<time_t>(sec);
+		ts.tv_nsec = static_cast<long>((rem * 1000000000LL) / freq.QuadPart);
+	}
+#else
 	clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
 	return ts;
 }
 

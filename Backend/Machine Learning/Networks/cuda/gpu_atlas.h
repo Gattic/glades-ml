@@ -1150,6 +1150,9 @@ struct GpuMuonWeightState
 	      lastOrthError(0.0f), lastEligible(false), step(0ULL), initialized(false) {}
 };
 
+struct GpuMatraBatchItem {};
+struct GpuMuonBatchItem {};
+
 inline bool atlas_gpu_init(GpuAtlasWeightState&, unsigned int, unsigned int,
                            unsigned int, float, glades::rng::Engine&) { return false; }
 inline bool atlas_gpu_step(GpuAtlasWeightState&, float*, float*,
