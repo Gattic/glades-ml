@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <stdexcept>
 
@@ -31,8 +33,27 @@ static float predict(glades::NNetwork& net, glades::NumberInput& data)
 }
 int main(int argc, char** argv) try
 {
-    require(argc == 3, "create NAME | read DIRECTORY | reject DIRECTORY | wrong-shape DIRECTORY");
+    require(argc >= 3, "create NAME | read DIRECTORY | reject DIRECTORY | wrong-shape DIRECTORY | corrupt CASE FILE");
     const std::string mode = argv[1];
+    if (mode == "corrupt")
+    {
+        require(argc == 4, "corrupt checksum|truncated FILE");
+        std::ifstream input(argv[3], std::ios::binary);
+        require(bool(input), "Cannot read corruption fixture");
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        require(!input.bad() && bytes.size() > 20u, "Incomplete corruption fixture");
+        input.close();
+        const std::string which = argv[2];
+        if (which == "checksum") bytes[bytes.size() - 1u] ^= 1;
+        else if (which == "truncated") bytes.resize(20u);
+        else throw std::runtime_error("Unknown corruption case");
+        std::ofstream output(argv[3], std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), bytes.size());
+        output.close();
+        require(bool(output), "Cannot write corruption fixture");
+        return 0;
+    }
+    require(argc == 3, "Unexpected consumer arguments");
     glades::NumberInput data;
     data.trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.25f));
     data.trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.75f));

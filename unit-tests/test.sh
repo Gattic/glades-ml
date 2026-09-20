@@ -5,6 +5,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [[ "${1:-}" == "package-consumer" ]]; then
-    exec python3 ../tests/package-consumer/run.py
+    exec cmake -P ../tests/package-consumer/run.cmake
 fi
 exec "./build/glades-unit-tests" "$@"

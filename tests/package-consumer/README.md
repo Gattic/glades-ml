@@ -10,7 +10,12 @@ The consumer uses only `find_package(glades CONFIG REQUIRED)` and the public
 `glades` target: no source include patches. It compiles/links against the build
 export and a relocated install export (`cmake --install --prefix` into an isolated
 build-owned prefix; the user's installed library and trainer are not changed).
-Evidence, models and logs stay in `build/package-consumer-*`.
+Evidence, models and logs stay in `build/package-consumer-*`. The wrapper invokes
+`cmake -P tests/package-consumer/run.cmake`; process/file/hash orchestration uses
+CMake 3.20+ and binary corruption fixtures use the C++ consumer. No Python is
+needed for the library or this regression. `commands.log` and `results.txt` retain
+command outcomes; models and the reader CWD are checked unchanged after both
+successful and negative reads.
 
 `NNetwork::loadModelDirectory(absoluteDirectory, forShape)` reads a v3 model
 package at an explicit location, independent of its directory basename. No
