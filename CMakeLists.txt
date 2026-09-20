@@ -211,6 +211,7 @@ target_link_libraries(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 install(TARGETS ${PROJECT_NAME} EXPORT gladesConfig
@@ -254,10 +255,15 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/gladesConfigVersion.cmake"
     DESTINATION "${glades_INSTALL_CMAKEDIR}")
 
+# Public ML headers refer to the dependency prefix headers shipped under include/.
+install(DIRECTORY "include/Backend/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend"
+    FILES_MATCHING PATTERN "*.h")
+
 # Install the complete public machine-learning header tree for consumers.
 install(DIRECTORY "Backend/Machine Learning/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning"
-    FILES_MATCHING PATTERN "*.h")
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.inc")
 
 # Install the full ML public header tree (namespaced under include/glades/) so
 # downstream consumers (glades-trainer) compile against the installed headers

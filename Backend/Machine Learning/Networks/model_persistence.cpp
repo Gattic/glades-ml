@@ -9,6 +9,7 @@
 // behind a single API. Legacy graph-based formats are not supported.
 
 #include "network.h"
+#include "../DataObjects/DataInput.h"
 #include "logfmt_utils.h"
 #include "Backend/Database/GLogger.h"
 
@@ -1591,7 +1592,27 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	if (!forShape)
 		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "loadModel: forShape is null (required to rebuild input layer)");
 
-	const ModelPackagePaths paths = build_model_package_paths(model_dir_no_slash(modelName));
+	return loadModelPackage(model_dir_no_slash(modelName), modelName, forShape, netTypeOverride, false);
+}
+
+NNetworkStatus NNetwork::loadModelDirectory(const std::string& directory, const DataInput* forShape)
+{
+	if (!forShape)
+		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "loadModelDirectory: forShape is null");
+	if (directory.empty() || directory[0] != '/' || directory.find('\0') != std::string::npos)
+		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "loadModelDirectory: expected an absolute directory path");
+	std::string path = directory;
+	while (path.size() > 1u && path[path.size() - 1u] == '/')
+		path.erase(path.size() - 1u);
+	if (!stat_is_dir(path))
+		return failStatus(NNetworkStatus::INVALID_STATE, "loadModelDirectory: package directory missing or not a directory (symlinks unsupported)");
+	return loadModelPackage(path, std::string(), forShape, -1, true);
+}
+
+NNetworkStatus NNetwork::loadModelPackage(const std::string& directory, const std::string& expectedName,
+                                        const DataInput* forShape, int netTypeOverride, bool requireIntegrity)
+{
+	const ModelPackagePaths paths = build_model_package_paths(directory);
 
 	// Modern-only: unified model package must exist.
 	{
@@ -1618,8 +1639,11 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 		return failStatus(NNetworkStatus::INVALID_STATE, oss.str());
 	}
 	// Best-effort consistency check: if manifest name exists it must match the directory component.
-	if (!mf.name.empty() && mf.name != modelName)
+	if (!expectedName.empty() && !mf.name.empty() && mf.name != expectedName)
 		return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: manifest name mismatch vs requested modelName");
+	if (requireIntegrity && (mf.version != kModelFormatVersionLatest || !mf.hasWeightsBytes ||
+	                        !mf.hasWeightsFNV || !mf.hasNninfoBytes || !is_safe_path_component(mf.name) || mf.netType < 0))
+		return failStatus(NNetworkStatus::INVALID_STATE, "loadModelDirectory: v3 package integrity metadata required");
 
 	int savedNetType = mf.netType;
 	if (savedNetType < 0)
@@ -1633,7 +1657,7 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	// Load architecture from nninfo.csv (self-contained, file-based).
 	{
 		const shmea::GTable t(shmea::GString(paths.nninfoPath.c_str()), ',', shmea::GTable::TYPE_FILE);
-		ownedSkeleton = shmea::GPointer<NNInfo>(new NNInfo(shmea::GString(modelName.c_str()), t));
+		ownedSkeleton = shmea::GPointer<NNInfo>(new NNInfo(shmea::GString((expectedName.empty() ? mf.name : expectedName).c_str()), t));
 		skeleton = ownedSkeleton.get();
 	}
 
@@ -1644,6 +1668,18 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	const NNetworkStatus stW = loadTensorWeightsFromFile(paths.weightsPath);
 	if (!stW.ok())
 		return stW;
+	if (requireIntegrity && netType == TYPE_DFF)
+	{
+		// Evaluation can initialize tensors for a new geometry. Reject inconsistent
+		// deployment packages here instead of later silently replacing trained weights.
+		std::vector<unsigned int> expectedSizes;
+		expectedSizes.push_back(forShape->getFeatureCount());
+		for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
+			expectedSizes.push_back(skeleton->getHiddenLayerSize(static_cast<unsigned int>(i)));
+		expectedSizes.push_back(skeleton->getOutputLayerSize());
+		if (!tensorDff.initialized || tensorDff.sizes != expectedSizes)
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadModelDirectory: DFF input/architecture shape mismatch");
+	}
 
 	// Restore metadata/config from manifest (best-effort; missing keys keep defaults).
 	if (mf.hasEpochs)
@@ -1711,7 +1747,8 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 		}
 	}
 
-	// Optional file-integrity verification when the manifest provides checksums/sizes.
+	// Directory deployment reads always verify integrity. Named-package reads retain
+	// optional file-integrity verification when the manifest provides checksums/sizes.
 	// This is intentionally opt-in so unit tests and power users can patch weights on disk
 	// (for deterministic override scenarios) without having to rewrite the manifest.
 	//
@@ -1719,7 +1756,7 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	//   GLADES_MODEL_VERIFY_FILES=1
 	{
 		const char* v = ::getenv("GLADES_MODEL_VERIFY_FILES");
-		const bool verify = (v && std::strcmp(v, "1") == 0);
+		const bool verify = requireIntegrity || (v && std::strcmp(v, "1") == 0);
 		if (verify)
 		{
 			const NNetworkStatus stVerifyFiles =

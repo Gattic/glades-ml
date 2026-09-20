@@ -636,6 +636,8 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 
 	// Progress logs for long DFF epochs (bounded to ~20 messages per epoch,
 	// and at most once per second wall-clock to avoid flooding on fast small datasets).
+	// Evaluation uses callbacks; it must not write relative training logs during serving.
+	if (isTrain)
 	{
 		shmea::GLogger* logger = getLogger();
 		if (logger && dataSize > 0u)
@@ -655,7 +657,7 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					std::ostringstream oss;
 					oss << "event=nn_step_progress";
 					append_logfmt_kv(oss, "net_type", netType);
-					append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+					append_logfmt_kv(oss, "run_type", std::string("train"));
 					append_logfmt_kv(oss, "epoch", epochs);
 					append_logfmt_kv(oss, "step", done);
 					append_logfmt_kv(oss, "steps_total", dataSize);
