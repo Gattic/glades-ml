@@ -4277,8 +4277,10 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 					const NNetwork::TensorDFFState& dff = self.discriminator.tensorDff;
 					const NNInfo* skel = self.discriminator.skeleton;
 					ctx.qDelta.resize(numDiscLayers);
+					// Fresh thread contexts have no per-layer storage yet. Size and clear
+					// every layer before writing the Q-path deltas.
 					for (unsigned int li = 0; li < numDiscLayers; ++li)
-						std::memset(&ctx.qDelta[li][0], 0, ctx.qDelta[li].size() * sizeof(float));
+						ctx.qDelta[li].assign(dff.sizes[li], 0.0f);
 					for (unsigned int i = 0; i < d.penultDim && i < ctx.sharedGrad.size(); ++i)
 					{
 						if (numDiscLayers >= 3u)
@@ -4473,8 +4475,10 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 					const NNetwork::TensorDFFState& dff = self.discriminator.tensorDff;
 					const NNInfo* skel = self.discriminator.skeleton;
 					ctx.qDelta.resize(numDiscLayers);
+					// Fresh thread contexts have no per-layer storage yet. Size and clear
+					// every layer before writing the Q-path deltas.
 					for (unsigned int li = 0; li < numDiscLayers; ++li)
-						std::memset(&ctx.qDelta[li][0], 0, ctx.qDelta[li].size() * sizeof(float));
+						ctx.qDelta[li].assign(dff.sizes[li], 0.0f);
 
 					// Penultimate layer: apply activation derivative
 					for (unsigned int i = 0; i < d.penultDim && i < ctx.sharedGrad.size(); ++i)

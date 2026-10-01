@@ -657,6 +657,71 @@ void GANUnitTest()
 		delete di;
 	}
 
+	// Each training body must initialize its own Q-gradient scratch. In particular,
+	// generator-only training must not depend on a preceding discriminator step.
+	printf("GAN Test 7b: InfoGAN Q-gradient scratch regression\n");
+	{
+		const std::vector<std::vector<unsigned int> > discShapes = {{5u}, {7u, 3u, 6u}};
+		for (const std::vector<unsigned int>& discHidden : discShapes)
+		{
+			for (unsigned int phase = 0; phase < 2u; ++phase)
+			{
+				glades::NumberInput* di = make_gaussian_mixture(11u, 42u);
+				glades::NNInfo* genInfo = make_gen_info("ut_info_scratch_gen", {9u, 4u}, 0.0002f, glades::GMath::LEAKY);
+				glades::NNInfo* discInfo = make_disc_info("ut_info_scratch_disc", discHidden, 0.0002f, glades::GMath::LEAKY);
+
+				glades::GANConfig cfg;
+				cfg.variantType = glades::GANConfig::GAN_INFO;
+				cfg.noiseDim = 3u;
+				cfg.epochs = 2;
+				cfg.batchSize = 5; // Reuse scratch across batches, including a partial batch.
+				cfg.nCriticPerGenerator = (phase == 0u) ? 1 : 0;
+				cfg.nGenPerCritic = (phase == 0u) ? 0 : 1;
+				cfg.infoConfig.numCategorical = 3u;
+				cfg.infoConfig.numContinuous = 1u;
+
+				// Compare identical seeds with and without the MI contribution. Only one
+				// network trains, so differences cannot come through the other network.
+				std::vector<float> trainedParams[2], frozenParams[2];
+				for (unsigned int withInfo = 0; withInfo < 2u; ++withInfo)
+				{
+					cfg.infoConfig.infoLambda = static_cast<float>(withInfo);
+					glades::GAN gan(cfg, genInfo, discInfo);
+					gan.setSeed(1729u);
+					GANCaptureMetrics metrics;
+					const glades::NNetworkStatus st = gan.train(di, &metrics);
+					ASSERT("InfoGAN Q scratch: training failed", st.ok());
+					ASSERT("InfoGAN Q scratch: missing or non-finite metrics",
+					       metrics.saw && is_finite(metrics.last.infoLoss) &&
+					       is_finite(metrics.last.dLossReal) && is_finite(metrics.last.gLoss));
+
+					const glades::NNetwork* nets[] = {&gan.getDiscriminator(), &gan.getGenerator()};
+					for (unsigned int n = 0; n < 2u; ++n)
+					{
+						std::vector<float>& params = (n == phase) ? trainedParams[withInfo] : frozenParams[withInfo];
+						for (const glades::NNetwork::TensorDFFState::Transition& tr : nets[n]->tensorDff.T)
+						{
+							params.insert(params.end(), tr.W.begin(), tr.W.end());
+							params.insert(params.end(), tr.bias.begin(), tr.bias.end());
+						}
+						bool allFinite = !params.empty();
+						for (float value : params)
+							allFinite = allFinite && is_finite(value);
+						ASSERT("InfoGAN Q scratch: missing or non-finite parameters", allFinite);
+					}
+				}
+				ASSERT("InfoGAN Q scratch: MI gradient did not affect the trained network",
+				       trainedParams[0] != trainedParams[1]);
+				ASSERT("InfoGAN Q scratch: inactive network was changed",
+				       frozenParams[0] == frozenParams[1]);
+
+				delete genInfo;
+				delete discInfo;
+				delete di;
+			}
+		}
+	}
+
 	// ------------------------------------------------------------------
 	// Test 8: InfoGAN controlled generation
 	// ------------------------------------------------------------------
