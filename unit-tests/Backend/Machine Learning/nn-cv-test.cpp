@@ -125,6 +125,17 @@ void NNCVUnitTestValidation()
 	printf("CV Test B (walk-forward folds skip empty-train)\n");
 	printf("-----------------------------------\n");
 	{
+		// A valid two-output walk-forward fixture must contain both labels in
+		// every usable training prefix. Interleave the original class blocks so
+		// the first nonempty prefix (two rows) already contains A and B.
+		shmea::GTable walkForwardTbl(',', headers);
+		walkForwardTbl.toggleOutput(2u);
+		for (unsigned int i = 0; i < 5u; ++i)
+		{
+			walkForwardTbl.addRow(tbl.getRow(i));
+			walkForwardTbl.addRow(tbl.getRow(i + 5u));
+		}
+
 		glades::CrossValidationConfig cfg;
 		cfg.kFolds = 5u;
 		cfg.timeSeries = true;
@@ -134,10 +145,39 @@ void NNCVUnitTestValidation()
 		cfg.standardizeFlag = glades::GMath::NONE;
 
 		glades::CrossValidationResults r;
-		const glades::NNetworkStatus st = glades::crossValidateTableCSV(tbl, models, cfg, &r);
+		const glades::NNetworkStatus st = glades::crossValidateTableCSV(walkForwardTbl, models, cfg, &r);
 		G_assert(__FILE__, __LINE__, "==============NNCV::B Status Failed==============", st.ok());
 		// For N=10, k=5, the first fold has empty train (start=0) and is skipped -> 4 usable folds.
 		G_assert(__FILE__, __LINE__, "==============NNCV::B FoldsUsed Failed==============", r.foldsUsed == 4u);
+		G_assert(__FILE__, __LINE__, "==============NNCV::B TotalRows Failed==============", r.totalRows == 10u);
+		G_assert(__FILE__, __LINE__, "==============NNCV::B MeanSize Failed==============", r.meanTestAccuracy.size() == models.size());
+		G_assert(__FILE__, __LINE__, "==============NNCV::B FoldOuterSize Failed==============", r.foldTestAccuracy.size() == models.size());
+		for (unsigned int m = 0; m < models.size(); ++m)
+		{
+			G_assert(__FILE__, __LINE__, "==============NNCV::B FoldCount Failed==============", r.foldTestAccuracy[m].size() == r.foldsUsed);
+			for (unsigned int f = 0; f < r.foldsUsed; ++f)
+			{
+				const float a = r.foldTestAccuracy[m][f];
+				G_assert(__FILE__, __LINE__, "==============NNCV::B Accuracy Failed==============",
+				         std::isfinite(a) && a >= 0.0f && a <= 100.0f);
+			}
+		}
+
+		// Keep the original, class-blocked fixture as a negative regression.
+		// Its first nonempty training prefix contains only A, so fitting on
+		// TRAIN alone yields one output, incompatible with the two-output model.
+		// Learning B from later/test rows to make this succeed would leak labels.
+		printf("-----------------------------------\n");
+		printf("CV Test C (walk-forward rejects missing training classes)\n");
+		printf("-----------------------------------\n");
+		const glades::NNetworkStatus missingClass = glades::crossValidateTableCSV(tbl, models, cfg, &r);
+		G_assert(__FILE__, __LINE__, "==============NNCV::C Status Failed==============",
+		         missingClass.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+		G_assert(__FILE__, __LINE__, "==============NNCV::C DimensionDiagnostic Failed==============",
+		         missingClass.message.find("output dims do not match model output layer size") != std::string::npos);
+		// Failed validation must not expose the successful call's old results.
+		G_assert(__FILE__, __LINE__, "==============NNCV::C ResultsReset Failed==============",
+		         r.foldsUsed == 0u && r.totalRows == 0u && r.meanTestAccuracy.empty() && r.foldTestAccuracy.empty());
 	}
 
 	delete info;

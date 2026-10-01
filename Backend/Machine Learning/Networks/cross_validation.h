@@ -67,6 +67,9 @@ struct CrossValidationResults
 //
 // Each element in `modelTemplates` serves only as an architectural+hyperparameter template.
 // The runner trains and evaluates *fresh clones* per fold; the passed templates are NOT mutated.
+// Each usable training fold must encode exactly the output dimensionality of every template.
+// In particular, a missing training class may cause INVALID_ARGUMENT; the runner never learns
+// additional output labels from the test split to make the dimensions match.
 //
 // Returns status.OK on success, otherwise an error code with message.
 NNetworkStatus crossValidateTableCSV(const shmea::GTable& input,
