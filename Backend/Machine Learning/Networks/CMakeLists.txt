@@ -10,6 +10,14 @@ set(Networks_src_files
 	model_persistence.cpp
 	tokenizer_artifacts.cpp
 	checkpoint_persistence.cpp
+	chiron_checkpoint.cpp
+	chiron_serving.cpp
+	chiron_decode_cache.cpp
+	chiron_generate.cpp
+	chiron_orbit.cpp
+	chiron_orbit.h
+	chiron_vitals.cpp
+	chiron_vitals.h
 	sgd_dff.cpp
 	sgd_rnn.cpp
 	sgd_gru.cpp

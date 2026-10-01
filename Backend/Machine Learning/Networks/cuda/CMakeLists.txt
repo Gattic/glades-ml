@@ -24,6 +24,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_ovfg.cu
 	gpu_mpot.cu
 	gpu_mfio.cu
+	gpu_orbit.cu
 	gpu_dfa.cu
 	gpu_trcd.cu
 	gpu_lcp.cu

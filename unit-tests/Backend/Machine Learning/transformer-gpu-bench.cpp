@@ -389,7 +389,7 @@ static void build_dataset(const BenchConfig& cfg, DatasetBundle& out)
 
 static glades::NNInfo* build_info(const BenchConfig& cfg, const char* name)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1,
 	    cfg.learningRate,
 	    0.0f,
@@ -399,10 +399,10 @@ static glades::NNInfo* build_info(const BenchConfig& cfg, const char* name)
 	    glades::GMath::LINEAR,
 	    1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (unsigned int i = 0u; i < cfg.layers; ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(cfg.dModel),
 		    cfg.learningRate,
 		    0.0f,
@@ -413,7 +413,7 @@ static glades::NNInfo* build_info(const BenchConfig& cfg, const char* name)
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(cfg.vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(cfg.vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	return new glades::NNInfo(name, in, hidden, out);
 }
 

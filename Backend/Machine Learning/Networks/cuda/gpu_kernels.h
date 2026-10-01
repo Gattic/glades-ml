@@ -30,6 +30,16 @@ bool layernorm_backward(const float* dout, const float* x,
                         const float* invStd, int rows, int cols,
                         float* dx, float* dgamma, float* dbeta);
 
+// Phase 3 (q-side source cure): layernorm backward with xhat=(x-mean)*invStd
+// clamped to [-xhatMax, xhatMax] in the dgamma/dbeta reduction — bounds the
+// drift-driven dgamma overflow at its source.  xhatMax<=0 = plain backward.
+// See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+bool layernorm_backward_bounded(const float* dout, const float* x,
+                                const float* gamma, const float* mean,
+                                const float* invStd, int rows, int cols,
+                                float* dx, float* dgamma, float* dbeta,
+                                float xhatMax);
+
 // ---------------------------------------------------------------------------
 // RMSNorm (LLaMA-style)
 // ---------------------------------------------------------------------------
@@ -92,7 +102,108 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
                                            float zlossCoef,
                                            int rows, int cols,
                                            unsigned short* dlogits);
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
+// Semantics contract + bit-exact CPU references: chiron_echo_*_cpu in
+// transformer_chiron_ops.h.  Training-only readout regularizer; the trainer
+// dispatches none of these at --echo-coef 0 (E0 discipline).
+// Per-row excess-copy stats over the trailing w-token window: PA[T] (dense
+// gradient mass), Rrow[T] (hinge loss terms), activeBits[T*ceil(w/32)] (owner
+// window-slot bitmap), activeCount[T].  Keeping owner slots rather than copied
+// vocabulary ids cuts hard-mode scratch from O(T*w) ints to O(T*w/32) words;
+// scatter recovers each id from tokens.  blockDim == w; w in [1, 1024].  The
+// legacy entry point is the exact hard hinge.  The Huber entry point implements
+// h_delta(x)=x^2/(2delta) for 0<x<delta and x-delta/2 for x>=delta;
+// activeWeights[T*w] stores h'_delta(x) at the original owner slot (only bits
+// marked active are valid), PA=sum(p*h'), and maxActiveProb is an optional
+// per-row diagnostic.
+bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
+                       const int* targets, int T, int V, int w,
+                       float kappa, float tau0,
+                       float* PA, float* Rrow, uint32_t* activeBits,
+                       int* activeCount);
+bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
+                             const int* targets, int T, int V, int w,
+                             float kappa, float tau0, float huberDelta,
+                             float* PA, float* Rrow, uint32_t* activeBits,
+                             float* activeWeights, int* activeCount,
+                             float* maxActiveProb);
+// Compact GPU telemetry summary, avoiding four O(T) device-to-host copies per
+// training step.  All fields are floats; count fields are exact for supported
+// T/w.  maxActiveProb uses max reduction while all other fields use sum.
+enum EchoSummaryIndex
+{
+	ECHO_SUM_R = 0,
+	ECHO_SUM_PA,
+	ECHO_SUM_PMAX,
+	ECHO_MAX_P,
+	ECHO_ACTIVE_ROWS,
+	ECHO_ACTIVE_IDS,
+	ECHO_HIST_0,
+	ECHO_HIST_1,
+	ECHO_HIST_2,
+	ECHO_HIST_3,
+	ECHO_HIST_4,
+	ECHO_SUMMARY_SIZE
+};
+bool echo_summarize_stats(const float* Rrow, const float* PA,
+                          const float* maxActiveProb, const int* activeCount,
+                          int T, float* summary);
+// Shipped zloss CE backward + the dense ECHO term (-echoCoef*PA[t])*probs;
+// bit-identical to softmax_cross_entropy_bwd_bf16_zloss at echoCoef == 0.
+bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
+                                                const int* targets,
+                                                const float* logZ,
+                                                float zlossCoef,
+                                                float echoCoef,
+                                                const float* PA,
+                                                int rows, int cols,
+                                                unsigned short* dlogits);
+// Dense term of the standalone ECHO-only backward used by detached gradient
+// attribution probes: dlogits[t,v] = -echoCoef*PA[t]*probs[t,v].  Follow with
+// echo_scatter_bf16[_weighted] to complete the exact ECHO field.
+bool echo_dense_bwd_bf16(const unsigned short* probs, float echoCoef,
+                          const float* PA, int rows, int cols,
+                          unsigned short* dlogits);
+// Sparse ECHO scatter.  Hard hinge adds echoCoef*probs[t,id]; the weighted
+// form additionally multiplies by activeWeights[t,ownerSlot]=h'_delta(p-margin).
+// tokens + the owner-slot bitmap recover ids without a dense active-id buffer.
+bool echo_scatter_bf16(const unsigned short* probs, const int* tokens,
+                       const uint32_t* activeBits, float echoCoef,
+                       int rows, int cols, int w, unsigned short* dlogits);
+bool echo_scatter_bf16_weighted(const unsigned short* probs,
+                                const int* tokens,
+                                const uint32_t* activeBits,
+                                const float* activeWeights, float echoCoef,
+                                int rows, int cols, int w,
+                                unsigned short* dlogits);
 bool scale_array_bf16(unsigned short* x, float scale, int n);
+
+// Contextual Rank Margin (CRM), training-only and additive. Both entry points
+// add the weighted, unnormalized CRM field to caller-owned dlogits and emit
+// row-major stats matching glades::chiron::ChironCrmRowStatIndex. A zero
+// coefficient is a host-side no-op: no kernel launch and no output mutation.
+bool chiron_crm_forward_backward(const float* logits, const int* targets,
+                                 float coefficient, float margin,
+                                 float temperature, int rows, int cols,
+                                 float* dlogits, float* rowStats);
+bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
+                                      const int* targets,
+                                      float coefficient, float margin,
+                                      float temperature, int rows, int cols,
+                                      unsigned short* dlogits, float* rowStats);
+// Frozen-step diagnostic variant. probs supplies the exact stored CE field;
+// hardNegativeMass, when non-null and pre-zeroed, receives unit mass per row
+// shared uniformly over the exact maximum set. No second optimizer pass runs.
+bool chiron_crm_forward_backward_bf16_observed(const unsigned short* logits,
+                                               const unsigned short* probs,
+                                               const int* targets,
+                                               float coefficient, float margin,
+                                               float temperature, int rows, int cols,
+                                               unsigned short* dlogits,
+                                               float* rowStats,
+                                               float* hardNegativeMass);
+
 bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
                                   const int* targets,
                                   int T, int vocabSize, int padToken,
@@ -101,6 +212,14 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
                                 const int* targets,
                                 int T, int vocabSize, int padToken,
                                 int* correct_count, int* valid_count);
+// V10/V16 read-only output vectors, fused into the existing CE/argmax scans.
+bool chiron_vitals_output_vectors_bf16(const unsigned short* probs,
+                                        const int* targets,
+                                        int T, int vocabSize, int padToken,
+                                        float* loss_sum, int* loss_count,
+                                        int* correct_count, int* valid_count,
+                                        float* perTokenNll,
+                                        unsigned char* perTokenTop1);
 
 // 2026-05-14 live-eval suite — position-bucketed NLL + top-k accuracy.
 // Both operate on BF16 probs (the storage type used at runtime when
@@ -234,9 +353,46 @@ bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
 
 // ---------------------------------------------------------------------------
 // Paradigm shift #42 SCFA — Spectral Compressed Flow Attention primitives.
-// Compression/lift use existing sgemm_rowmajor (q_compr = B^T q  and
-// y_∥ = B y_compr).  These kernels supply the SCFA-specific operations.
+//
+// The original global DCT projection B B^T was not token-causal: an output at
+// position t changed when tokens after t changed.  The causal path partitions
+// T positions into k contiguous blocks.  `block_compress` summarizes each
+// block; `causal_lag_lift` exposes summary b only to block b+1.  The matching
+// transpose operators keep trainer backward exact while preserving O(T*m)
+// outer work and exact prefix invariance.
 // ---------------------------------------------------------------------------
+
+// out[b,c] = alpha * sum_{t in block(b)} x[t,c] / sqrt(|block(b)|)
+//          + beta * out[b,c].
+bool scfa_block_compress(const float* x, int T, int m, int k,
+                         float alpha, float beta, float* out,
+                         cudaStream_t stream = 0);
+
+// out[t,c] = alpha * x[block(t)-1,c] / sqrt(|block(t)-1|)
+//          + beta * out[t,c], or beta*out for the first block.
+bool scfa_causal_lag_lift(const float* x, int T, int m, int k,
+                          float alpha, float beta, float* out,
+                          cudaStream_t stream = 0);
+
+// Transpose of scfa_causal_lag_lift:
+// out[b,c] = alpha * sum_{t in block(b+1)} x[t,c] / sqrt(|block(b)|)
+//          + beta * out[b,c].
+bool scfa_causal_lag_reduce(const float* x, int T, int m, int k,
+                            float alpha, float beta, float* out,
+                            cudaStream_t stream = 0);
+
+// Transpose of scfa_block_compress:
+// out[t,c] = alpha * x[block(t),c] / sqrt(|block(t)|)
+//          + beta * out[t,c].
+bool scfa_block_expand(const float* x, int T, int m, int k,
+                       float alpha, float beta, float* out,
+                       cudaStream_t stream = 0);
+
+// Decode helper for the lag lift of one completed block. Uses device rsqrtf,
+// matching scfa_causal_lag_lift rather than a host-rounded scale constant:
+// out[c] = summary[c] / sqrt(blockWidth).
+bool scfa_lag_row(const float* summary, int m, int blockWidth, float* out,
+                  cudaStream_t stream = 0);
 
 // y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]    (causal depthwise 1-D conv).
 // One filter per channel; m channels, T positions, half-width w (kernel size
@@ -325,8 +481,24 @@ bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
                                               float* dK,
                                               cudaStream_t stream = 0);
 
-// Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
-// to k columns.  Used as the sequence-spectral basis in SCFA.
+// Cast-elim Port B (2026-06-12): dual_out variant that also side-writes the
+// BF16 RNE mirror of dx_secondary (bit-identical to a subsequent
+// cast_f32_to_bf16), so the downstream B^T·dq_perp FAST_16BF GEMM can
+// consume the mirror via the fast16bf constant table.  NULL mirror falls
+// back to scfa_depthwise_causal_conv_bwd_dual_out; supports w ∈ {4, 8}
+// only (the production iter-99 dispatch gate).
+bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+    const float* x, const float* K,
+    const float* dy,
+    int T, int m, int w,
+    float* dx_primary,
+    float* dx_secondary,
+    unsigned short* dx_secondary_bf16,
+    float* dK,
+    cudaStream_t stream = 0);
+
+// Legacy research helper: fill B[T × k] with a truncated orthonormal DCT-II
+// basis. Causal CHIRON SCFA does not use this globally noncausal basis.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
 
 // ---------------------------------------------------------------------------
@@ -416,6 +588,74 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
                                 const float* dout,
                                 int T, int vocabSize, int dModel);
+// V15 read-only row-coverage tap: rowMass[token[t]] += sum_d |dout[t,d]|.
+bool embedding_coverage_accumulate(const int* tokenIds, const float* dout,
+                                   int T, int vocabSize, int dModel,
+                                   float* rowMass);
+
+// Per-row RMS clamp with non-finite sanitization, in place on x [rows×cols].
+//  - any non-finite element in a row → entire row zeroed, ++*d_nonfiniteCount
+//  - else row RMS > tauRms           → row scaled by tauRms/rms, ++*d_clampedCount
+//  - else                            → row untouched (no write; bit-identical)
+// Row sum-of-squares accumulates in double so huge-but-finite rows rescale
+// correctly instead of overflowing FP32 to inf.  Deterministic.  Count
+// pointers are device ints and may be NULL.  Returns false on invalid args
+// or tauRms <= 0 (the disabled path must not call).  Used by the CHIRON
+// trainer to bound dq_0 rows before embedding_scatter_add (SIRA stability
+// mitigation, 2026-06-11 — see SIRA_TERMINAL_30K_RESULT_2026_05_27.md).
+bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
+                   int* d_clampedCount, int* d_nonfiniteCount);
+// V1 fused form. d_preClampSumSq is ADDITIVE and records the raw sum of
+// squares before any sanitization/rescale; caller controls reset/cadence.
+bool row_rms_clamp_vitals(float* x, int rows, int cols, float tauRms,
+                          int* d_clampedCount, int* d_nonfiniteCount,
+                          float* d_preClampSumSq,
+                          int* d_boundaryClamped = NULL,
+                          int* d_boundaryNonfinite = NULL);
+
+// Per-vector L2-norm clamp, in place on x[n].  Non-finite vector → zeroed;
+// else ‖x‖₂ > maxNorm → scaled by maxNorm/‖x‖; else untouched (bit-identical).
+// Sum-of-squares accumulates in double so huge-but-finite gradients rescale
+// instead of overflowing.  d_clampedCount may be NULL.  Returns false on
+// invalid args or maxNorm <= 0.  Used by the per-group gradient clamp
+// (q-side instability mitigation 1): bound each layer's dgamma/dbeta L2 norm
+// before the global-norm sum.  See research/QSIDE_INSTABILITY_INVESTIGATION_2026_06_14.md.
+bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount);
+
+// Elementwise hard cap: clamp each element of x to [-cap, +cap].  No-op (returns
+// true) on n<=0 or cap<=0.  Used by the OBSD a_drift gate cap (--drift-gate-cap,
+// bounded-gate salvage for the un-capped gate that grew to maxA ~1.8).
+bool clamp_abs(float* x, int n, float cap);
+
+// Adaptive Gradient Clipping (AGC, Phase 1): clip g to lambda*max(‖w‖, eps),
+// auto-scaled to the parameter norm.  d_count may be NULL.  Returns false on
+// invalid args / lambda<=0.  See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, int* d_count);
+
+// Gradient Centralization (Phase 2): subtract each row's mean from a
+// [rows, cols] gradient in place. See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+bool gradient_centralize(float* g, int rows, int cols);
+// BF16-in/BF16-out variant for the bf16Grads weight-grad path (dWq/k/v/o_bf).
+bool gradient_centralize_bf16(uint16_t* g, int rows, int cols);
+
+// Spectral norm via power iteration (Phase 4): estimate σ_max(W) for the
+// [rows, cols] row-major FP32 matrix W. u (rows) is the persistent left
+// singular vector (caller inits nonzero; reuse warm across steps); v (cols) is
+// scratch. Returns σ_max in *sigmaOut.
+bool spectral_norm_estimate(const float* W, int rows, int cols,
+                            float* u, float* v, int iters, float* sigmaOut);
+// Per-step spectral normalization (on-device conditional down-scale to maxSigma).
+// FP32 master variant scales W in place; BF16 variant scales the BF16 master Wbf
+// using a caller-materialized FP32 view Wf32. u/v are cold-start scratch (rows/
+// cols). Pass sigmaOut=NULL on the hot path to skip the host σ readback.
+bool spectral_normalize(float* W, int rows, int cols,
+                        float* u, float* v, int iters, float maxSigma, float* sigmaOut);
+bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int cols,
+                             float* u, float* v, int iters, float maxSigma, float* sigmaOut);
+
+// SAM (Phase 5) perturb/restore: W += scale*g (scale = ±rho/‖g‖). FP32 + BF16.
+bool sam_perturb(float* W, const float* g, int n, float scale);
+bool sam_perturb_bf16(uint16_t* W, const uint16_t* g, int n, float scale);
 
 // ---------------------------------------------------------------------------
 // Adam optimizer
@@ -498,7 +738,7 @@ bool adam_update_int8_state(float* param, const float* grad,
                              float* m_scale, float* v_scale,
                              float lr, float beta1, float beta2, float eps,
                              float weightDecay, float gradScale,
-                             int step, int n);
+                             int step, int n, float* vitalsStats = NULL);
 
 // BF16-grad variants of the above two: read gradient from a BF16 buffer
 // instead of FP32.  Used when MixedPrecisionConfig::gradStorageBf16 is
@@ -516,7 +756,7 @@ bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
                                       float* scratch_fp32,
                                       float lr, float beta1, float beta2, float eps,
                                       float weightDecay, float gradScale,
-                                      int step, int n);
+                                      int step, int n, float* vitalsStats = NULL);
 
 // BF16-WEIGHT variants: param is a bf16 buffer (Lowp mirror as canonical
 // weight store, no FP32 master).  Each step: cast bf16 weight → weight_scratch
@@ -552,7 +792,8 @@ bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
                                                float lr, float beta1, float beta2, float eps,
                                                float weightDecay, float gradScale,
                                                int step, int n,
-                                               uint32_t srBaseSeed, uint32_t srStepIdx);
+                                               uint32_t srBaseSeed, uint32_t srStepIdx,
+                                               float* vitalsStats = NULL);
 
 // Returns the number of FP32 scale entries required for int8 Adam state
 // given a parameter count n.
@@ -892,6 +1133,12 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
 bool argmax_count_matches(const float* probs, const int* targets,
                           int T, int vocabSize, int padToken,
                           int* correct_count, int* valid_count);
+bool chiron_vitals_output_vectors(const float* probs, const int* targets,
+                                  int T, int vocabSize, int padToken,
+                                  float* loss_sum, int* loss_count,
+                                  int* correct_count, int* valid_count,
+                                  float* perTokenNll,
+                                  unsigned char* perTokenTop1);
 
 // ---------------------------------------------------------------------------
 // Chunked cross-entropy loss — never materializes the dense T × V logits
@@ -973,6 +1220,39 @@ bool chunked_cross_entropy_backward(const float* X, const float* W_lm,
                                     float* dX, float* dW_lm,
                                     float* scratch);
 
+// Deterministic chunked squared-hinge max-margin objective used by bounded
+// frozen-feature diagnostics. W_aug is [V,dAug], where the final column is bias
+// and X_aug's final feature is 1. Scratch layout (floats): logits[T*chunk],
+// best_logit[T], target_logit[T], hinge[T]; competitor[T] is a separate int
+// buffer. Loss is the SUM of squared hinges; backward scales by 1/valid_count.
+bool chunked_squared_hinge_loss(const float* X_aug, const float* W_aug,
+                                const int* targets,
+                                int T, int V, int dAug, int V_chunk_size,
+                                float margin,
+                                float* loss_sum, int* valid_count,
+                                int* competitor, float* scratch);
+bool chunked_squared_hinge_backward(const float* X_aug,
+                                    const int* targets,
+                                    const int* competitor,
+                                    const float* hinge,
+                                    int T, int V, int dAug, int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dW_aug, float* scratch);
+
+// Fixed-order vector primitives for deterministic L-BFGS. Dot products emit
+// one partial per 256-element block; callers download and sum partials in order
+// using FP64 host accumulation.
+int deterministic_dot_partial_count(int n);
+bool deterministic_dot_partials(const float* a, const float* b, int n,
+                                float* partials, int partial_count);
+bool add_anchor_regularizer(const float* value, const float* anchor,
+                            int rows, int weight_cols, float lambda,
+                            float* gradient, float* partials,
+                            int partial_count);
+bool project_augmented_bias_gauge(float* value, int rows, int stride,
+                                  float* partials, int partial_count);
+
 // ---------------------------------------------------------------------------
 // Batch zero: zero multiple GPU buffers with a single kernel launch
 // ---------------------------------------------------------------------------
@@ -1006,12 +1286,17 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 // Caller must zero d_accumulator before the first call.
 // Multiple calls accumulate across different buffers.
 bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
+// Same read pass, atomically accumulates into global and a VITALS group scalar.
+bool sum_squared_accumulate_dual(const float* data, int n,
+                                 float* d_accumulator, float* d_secondary);
 
 // BF16-input variant of sum_squared_accumulate.  Decodes each element as bf16->f32
 // (zero-extend low 16 bits) and accumulates v*v into d_accumulator.  Used for the
 // global grad-norm pass under BF16-grad Phase-2 where the FP32 grad buffers have
 // been retired and only the BF16 mirrors are live.
 bool sum_squared_accumulate_bf16(const uint16_t* data, int n, float* d_accumulator);
+bool sum_squared_accumulate_bf16_dual(const uint16_t* data, int n,
+                                      float* d_accumulator, float* d_secondary);
 
 // BF16 ↔ FP32 element-wise casts. Operates element-wise on GPU buffers.
 // `n` is the number of elements (not bytes). Designed as primitives for
@@ -1108,6 +1393,7 @@ namespace gpu {
 
 inline bool layernorm_forward(const float*, const float*, const float*, float, int, int, float*, float*, float*) { return false; }
 inline bool layernorm_backward(const float*, const float*, const float*, const float*, const float*, int, int, float*, float*, float*) { return false; }
+inline bool layernorm_backward_bounded(const float*, const float*, const float*, const float*, const float*, int, int, float*, float*, float*, float) { return false; }
 
 inline bool rmsnorm_forward(const float*, const float*, float, int, int, float*, float*) { return false; }
 inline bool rmsnorm_backward(const float*, const float*, const float*, const float*, int, int, float*, float*) { return false; }
@@ -1120,9 +1406,21 @@ inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short
 inline bool softmax_forward_bf16_with_lse(const unsigned short*, int, int, unsigned short*, float*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
 inline bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short*, const int*, const float*, float, int, int, unsigned short*) { return false; }
+inline bool echo_repeat_stats(const unsigned short*, const int*, const int*, int, int, int, float, float, float*, float*, uint32_t*, int*) { return false; }
+inline bool echo_repeat_stats_huber(const unsigned short*, const int*, const int*, int, int, int, float, float, float, float*, float*, uint32_t*, float*, int*, float*) { return false; }
+enum EchoSummaryIndex { ECHO_SUM_R = 0, ECHO_SUM_PA, ECHO_SUM_PMAX, ECHO_MAX_P, ECHO_ACTIVE_ROWS, ECHO_ACTIVE_IDS, ECHO_HIST_0, ECHO_HIST_1, ECHO_HIST_2, ECHO_HIST_3, ECHO_HIST_4, ECHO_SUMMARY_SIZE };
+inline bool echo_summarize_stats(const float*, const float*, const float*, const int*, int, float*) { return false; }
+inline bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short*, const int*, const float*, float, float, const float*, int, int, unsigned short*) { return false; }
+inline bool chiron_crm_forward_backward(const float*, const int*, float coefficient, float, float, int, int, float*, float*) { return coefficient == 0.0f; }
+inline bool chiron_crm_forward_backward_bf16(const unsigned short*, const int*, float coefficient, float, float, int, int, unsigned short*, float*) { return coefficient == 0.0f; }
+inline bool chiron_crm_forward_backward_bf16_observed(const unsigned short*, const unsigned short*, const int*, float coefficient, float, float, int, int, unsigned short*, float*, float*) { return coefficient == 0.0f; }
+inline bool echo_dense_bwd_bf16(const unsigned short*, float, const float*, int, int, unsigned short*) { return false; }
+inline bool echo_scatter_bf16(const unsigned short*, const int*, const uint32_t*, float, int, int, int, unsigned short*) { return false; }
+inline bool echo_scatter_bf16_weighted(const unsigned short*, const int*, const uint32_t*, const float*, float, int, int, int, unsigned short*) { return false; }
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
+inline bool chiron_vitals_output_vectors_bf16(const unsigned short*, const int*, int, int, int, float*, int*, int*, int*, float*, unsigned char*) { return false; }
 inline bool cross_entropy_nll_bucketed_bf16(const unsigned short*, const int*, int, int, int, int, float*, int*) { return false; }
 inline bool topk_accuracy_bf16(const unsigned short*, const int*, int, int, int, int, const int*, int*, int*) { return false; }
 inline bool distill_combined_bwd(const float*, const float*, const int*, int, int, float, float*) { return false; }
@@ -1148,6 +1446,11 @@ inline bool orion_lift_add_int8_bf16w_bf16anchor(void*, const void*, const void*
 inline bool orion_perturb_col_int8(float*, const float*, const void*, const float*, int, int, float) { return false; }
 inline bool orion_perturb_col_int8_bf16w(void*, const float*, const void*, const float*, int, int, float) { return false; }
 inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int, float) { return false; }
+inline bool scfa_block_compress(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_causal_lag_lift(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_causal_lag_reduce(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_block_expand(const float*, int, int, int, float, float, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_lag_row(const float*, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
@@ -1155,6 +1458,7 @@ inline bool scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled(const float*
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_dual_out(const float*, const float*, const float*, int, int, int, float*, float*, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(const float*, const float*, const float*, int, int, int, float*, float*, unsigned short*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
@@ -1183,6 +1487,20 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_gather_bf16(const uint16_t*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
+inline bool embedding_coverage_accumulate(const int*, const float*, int, int, int, float*) { return false; }
+inline bool row_rms_clamp(float*, int, int, float, int*, int*) { return false; }
+inline bool row_rms_clamp_vitals(float*, int, int, float, int*, int*, float*,
+                                  int* = NULL, int* = NULL) { return false; }
+inline bool clamp_vector_l2norm(float*, int, float, int*) { return false; }
+inline bool clamp_abs(float*, int, float) { return false; }
+inline bool agc_clamp_vector(float*, const float*, int, float, float, int*) { return false; }
+inline bool gradient_centralize(float*, int, int) { return false; }
+inline bool gradient_centralize_bf16(uint16_t*, int, int) { return false; }
+inline bool spectral_norm_estimate(const float*, int, int, float*, float*, int, float*) { return false; }
+inline bool spectral_normalize(float*, int, int, float*, float*, int, float, float*) { return false; }
+inline bool spectral_normalize_bf16(uint16_t*, const float*, int, int, float*, float*, int, float, float*) { return false; }
+inline bool sam_perturb(float*, const float*, int, float) { return false; }
+inline bool sam_perturb_bf16(uint16_t*, const uint16_t*, int, float) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }
@@ -1213,6 +1531,7 @@ inline bool softmax_backward_attn(const float*, const float*, int, int, float, f
 inline bool causal_softmax_with_bwd_attn(float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
+inline bool chiron_vitals_output_vectors(const float*, const int*, int, int, int, float*, int*, int*, int*, float*, unsigned char*) { return false; }
 inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,
                                        int, int, int, int, int,
                                        float*, int*, float*) { return false; }
@@ -1220,6 +1539,16 @@ inline bool chunked_cross_entropy_backward(const float*, const float*, const int
                                            const float*, const float*,
                                            int, int, int, int, int, int, bool,
                                            float*, float*, float*) { return false; }
+inline bool chunked_squared_hinge_loss(const float*, const float*, const int*, int, int,
+                                       int, int, float, float*, int*, int*, float*) { return false; }
+inline bool chunked_squared_hinge_backward(const float*, const int*, const int*,
+                                           const float*, int, int, int, int, int,
+                                           bool, float*, float*) { return false; }
+inline int deterministic_dot_partial_count(int) { return 0; }
+inline bool deterministic_dot_partials(const float*, const float*, int, float*, int) { return false; }
+inline bool add_anchor_regularizer(const float*, const float*, int, int, float,
+                                   float*, float*, int) { return false; }
+inline bool project_augmented_bias_gauge(float*, int, int, float*, int) { return false; }
 
 inline bool kv_attention_incremental(const float*, const float*, const float*, float*, const unsigned char*, int, int, int, int, int, int, float, float*) { return false; }
 
@@ -1227,7 +1556,9 @@ inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, int*) { return false; }
 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
+inline bool sum_squared_accumulate_dual(const float*, int, float*, float*) { return false; }
 inline bool sum_squared_accumulate_bf16(const uint16_t*, int, float*) { return false; }
+inline bool sum_squared_accumulate_bf16_dual(const uint16_t*, int, float*, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
 inline bool cast_f32_to_bf16_stochastic(const float*, uint16_t*, size_t, uint32_t, uint32_t) { return false; }
@@ -1235,7 +1566,7 @@ inline bool cast_f32_to_bf16_batched(int, const float* const*, uint16_t* const*,
 inline bool bf16_accum_axpy(uint16_t*, const float*, float, float, size_t) { return false; }
 inline bool adam_update_int8_state(float*, const float*, int8_t*, uint8_t*,
                                     float*, float*, float, float, float, float,
-                                    float, float, int, int) { return false; }
+                                    float, float, int, int, float* = NULL) { return false; }
 inline int adam_int8_scale_count(int n) { return (n + 255) / 256; }
 inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
                                    float, float, float, float, float, float,
@@ -1249,7 +1580,7 @@ inline bool adam_update_bf16_state_bf16grad(float*, const uint16_t*, uint16_t*, 
 inline bool adam_update_int8_state_bf16grad(float*, const uint16_t*, int8_t*, uint8_t*,
                                              float*, float*, float*,
                                              float, float, float, float, float, float,
-                                             int, int) { return false; }
+                                             int, int, float* = NULL) { return false; }
 inline bool adam_update_bf16_state_bf16grad_bf16w(uint16_t*, float*, const uint16_t*,
                                                    uint16_t*, uint16_t*,
                                                    float, float, float, float, float, float,
@@ -1261,7 +1592,8 @@ inline bool adam_update_int8_state_bf16grad_bf16w(uint16_t*, float*, const uint1
 inline bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t*, const uint16_t*,
                                                       int8_t*, uint8_t*, float*, float*,
                                                       float, float, float, float, float, float,
-                                                      int, int, uint32_t, uint32_t) { return false; }
+                                                      int, int, uint32_t, uint32_t,
+                                                      float* = NULL) { return false; }
 inline bool astra_update(float*, const float*, float*,
                           float, float, float, float, float,
                           int, int) { return false; }

@@ -1838,6 +1838,7 @@ private:
 		      kSeq16(NULL),
 		      vSeq16(NULL),
 		      outLogits(NULL),
+		      outHidden(NULL),
 		      dModel(0u),
 		      dFF(0u),
 		      nHeads(0u),
@@ -1884,6 +1885,7 @@ private:
 		uint16_t* kSeq16;
 		uint16_t* vSeq16;
 		float* outLogits;
+		float* outHidden;
 
 		unsigned int dModel;
 		unsigned int dFF;
@@ -1929,6 +1931,8 @@ private:
 	// These write/read packed tensors directly.
 	NNetworkStatus saveTensorWeightsToFile(const std::string& filePath) const;
 	NNetworkStatus loadTensorWeightsFromFile(const std::string& filePath);
+	NNetworkStatus loadModelPackage(const std::string& directory, const std::string& expectedName,
+	                               const DataInput* forShape, int netTypeOverride, bool requireIntegrity);
 
 	// for tables & graphs
 	std::vector<Point2*> rocCurve;
@@ -2226,6 +2230,14 @@ public:
 	// network tensors can be shaped before applying weights.
 	NNetworkStatus saveModel(const std::string& modelName, const DataInput* externalDI = NULL) const;
 	NNetworkStatus loadModel(const std::string& modelName, const DataInput* forShape, int netTypeOverride = -1);
+
+	// Deployment read: absolute package directory, independent of CWD and package basename.
+	// No init(), directory creation, environment mutation or writes. Requires v3 integrity
+	// metadata and verifies files regardless of GLADES_MODEL_VERIFY_FILES. DFF tensors
+	// must match forShape and the saved architecture. Evaluate with the same input shape.
+	// Not concurrent with runs. Use trusted packages; checks are not authentication.
+	// Discard the network on failure. Other network families retain their codec checks.
+	NNetworkStatus loadModelDirectory(const std::string& directory, const DataInput* forShape);
 
 	// === Tokenizer/vocab artifacts (optional) ===
 	//
@@ -2876,7 +2888,10 @@ public:
 
 	// Session APIs (const: do not mutate NNetwork inference state).
 	NNetworkStatus transformerLmSessionReset(TransformerLmSession& session, unsigned int maxSeqLen) const;
-	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session, unsigned int tokenId, std::vector<float>* outLogits /* optional */) const;
+	NNetworkStatus transformerLmSessionAppend(TransformerLmSession& session,
+	                                         unsigned int tokenId,
+	                                         std::vector<float>* outLogits /* optional */,
+	                                         std::vector<float>* outHidden /* optional */ = NULL) const;
 
 	NNetworkStatus transformerLmBatchSessionReset(TransformerLmBatchSession& session, unsigned int batchSize, unsigned int maxSeqLen) const;
 	// Append one token for each active batch element (ragged-safe):
@@ -3284,6 +3299,45 @@ public:
 	// - outLogits is resized to vocabSize and filled with unnormalized logits.
 	NNetworkStatus transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
 	                                             std::vector<float>& outLogits) const;
+
+	// GPU counterpart used by checkpoint evaluators. Runs the same full
+	// sequence GPU forward as training and returns only the last logits row.
+	NNetworkStatus transformerLmForwardLastLogitsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits) const;
+
+	// GPU full-sequence next-token metrics. Inputs and targets are position-
+	// aligned; negative targets and the configured pad token are ignored.
+	NNetworkStatus transformerLmEvaluateTokenMetricsGpu(const std::vector<unsigned int>& tokenIds,
+	                                                    const std::vector<int>& targetIds,
+	                                                    TransformerTokenMetrics& outMetrics) const;
+
+	// Diagnostic canonical full-sequence final hidden rows and logits.
+	NNetworkStatus transformerLmForwardFeaturesGpu(const std::vector<unsigned int>& tokenIds,
+	                                              TransformerFullSequenceFeatures& out) const;
+	NNetworkStatus transformerLmReadoutParameters(TransformerReadoutParameters& out) const;
+
+	// Diagnostic variant that also captures the last-position hidden row at
+	// input and after every block. The implementation shares the exact full
+	// forward above; normal inference remains uninstrumented.
+	NNetworkStatus transformerLmForwardLastTrace(const std::vector<unsigned int>& tokenIds,
+	                                            std::vector<float>& outLogits,
+	                                            TransformerForwardTrace& outTrace) const;
+
+private:
+	// Shared full-sequence GPU implementation for last-logit downloads,
+	// aggregate token metrics, and bounded diagnostic feature extraction.
+	// Exactly one output pointer must be non-NULL.
+	NNetworkStatus transformerLmRunFullSequenceGpu(const char* where,
+	                                              const std::vector<unsigned int>& tokenIds,
+	                                              const std::vector<int>* targetIds,
+	                                              std::vector<float>* outLastLogits,
+	                                              TransformerTokenMetrics* outMetrics,
+	                                              TransformerFullSequenceFeatures* outFeatures) const;
+
+	// Shared implementation for the public logits-only and diagnostic variants.
+	NNetworkStatus transformerLmForwardLastTraceImpl(const std::vector<unsigned int>& tokenIds,
+	                                                std::vector<float>& outLogits,
+	                                                TransformerForwardTrace* outTrace) const;
 };
 };
 

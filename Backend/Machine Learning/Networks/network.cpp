@@ -554,6 +554,45 @@ glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const gla
 	return TransformerPublicAPI::runtime(net).forwardLastLogits(tokenIds, outLogits);
 }
 
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogitsGpu(const glades::NNetwork& net,
+                                                                          const std::vector<glades::TokenId>& tokenIds,
+                                                                          std::vector<float>& outLogits)
+{
+	return TransformerPublicAPI::runtime(net).forwardLastLogitsGpu(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::evaluateTokenMetricsGpu(
+    const glades::NNetwork& net,
+    const std::vector<glades::TokenId>& tokenIds,
+    const std::vector<glades::TokenLabelId>& targetIds,
+    glades::TransformerTokenMetrics& outMetrics)
+{
+	return TransformerPublicAPI::runtime(net).evaluateTokenMetricsGpu(tokenIds, targetIds, outMetrics);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardFeaturesGpu(
+    const glades::NNetwork& net,
+    const std::vector<glades::TokenId>& tokenIds,
+    glades::TransformerFullSequenceFeatures& out)
+{
+	return TransformerPublicAPI::runtime(net).forwardFeaturesGpu(tokenIds, out);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::readoutParameters(
+    const glades::NNetwork& net,
+    glades::TransformerReadoutParameters& out)
+{
+	return TransformerPublicAPI::runtime(net).readoutParameters(out);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastTrace(const glades::NNetwork& net,
+                                                                      const std::vector<glades::TokenId>& tokenIds,
+                                                                      std::vector<float>& outLogits,
+                                                                      glades::TransformerForwardTrace& outTrace)
+{
+	return TransformerPublicAPI::runtime(net).forwardLastTrace(tokenIds, outLogits, outTrace);
+}
+
 glades::TransformerPublicAPI::Runtime glades::TransformerPublicAPI::runtime(const glades::NNetwork& net)
 {
 	return Runtime(net);
@@ -583,6 +622,40 @@ glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(
                                                                                 std::vector<float>& outLogits) const
 {
 	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogitsGpu(const std::vector<glades::TokenId>& tokenIds,
+                                                                                   std::vector<float>& outLogits) const
+{
+	return net.transformerLmForwardLastLogitsGpu(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::evaluateTokenMetricsGpu(
+    const std::vector<glades::TokenId>& tokenIds,
+    const std::vector<glades::TokenLabelId>& targetIds,
+    glades::TransformerTokenMetrics& outMetrics) const
+{
+	return net.transformerLmEvaluateTokenMetricsGpu(tokenIds, targetIds, outMetrics);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardFeaturesGpu(
+    const std::vector<glades::TokenId>& tokenIds,
+    glades::TransformerFullSequenceFeatures& out) const
+{
+	return net.transformerLmForwardFeaturesGpu(tokenIds, out);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::readoutParameters(
+    glades::TransformerReadoutParameters& out) const
+{
+	return net.transformerLmReadoutParameters(out);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastTrace(const std::vector<glades::TokenId>& tokenIds,
+                                                                               std::vector<float>& outLogits,
+                                                                               glades::TransformerForwardTrace& outTrace) const
+{
+	return net.transformerLmForwardLastTrace(tokenIds, outLogits, outTrace);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::resetBatcher(Batcher& batcher, const BatcherConfig& cfg) const

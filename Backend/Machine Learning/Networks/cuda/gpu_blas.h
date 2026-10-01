@@ -140,6 +140,27 @@ bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
                                        float beta,
                                        unsigned short* C, int ldc);
 
+// Cast-elim Port C fwd slice (2026-06-12): NN form of the dst-BF16 variant
+// (C = alpha * A · B + beta * C, C stored BF16, FP32 internal accumulate).
+// Used by the inner-attention forward projections to write sQ/sK/sV
+// directly as BF16.
+bool sgemm_rowmajor_bf16_dst_bf16(int M, int N, int K,
+                                   float alpha,
+                                   const unsigned short* A, int lda,
+                                   const unsigned short* B, int ldb,
+                                   float beta,
+                                   unsigned short* C, int ldc);
+
+// Cast-elim V+O slice (2026-06-12): batched-strided NN form with BF16 D
+// (FP32 internal accumulate, RNE on store).
+bool sgemm_batched_strided_bf16_dst_bf16(int M, int N, int K,
+                                          float alpha,
+                                          const unsigned short* A, int lda, long long strideA,
+                                          const unsigned short* B, int ldb, long long strideB,
+                                          float beta,
+                                          unsigned short* C, int ldc, long long strideC,
+                                          int batchCount);
+
 // === FAST_16BF GEMM wrappers (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same signature as sgemm_rowmajor* (FP32 A, FP32 B, FP32 C) but routes
@@ -259,6 +280,27 @@ bool sgemm_batched_strided_atb_bf16(int M, int N, int K,
                                     float* C, int ldc, long long strideC,
                                     int batchCount);
 
+// Grouped-query variants: A/C advance once per query head while B advances
+// once per groupSize query heads. Device pointer arrays are built internally,
+// allowing one cuBLAS launch without materializing expanded K/V tensors.
+bool sgemm_batched_grouped_bf16(int M, int N, int K, float alpha,
+                                 const unsigned short* A, int lda, long long strideA,
+                                 const unsigned short* B, int ldb, long long strideBGroup,
+                                 int groupSize, float beta,
+                                 float* C, int ldc, long long strideC, int batchCount);
+bool sgemm_batched_grouped_abt_bf16(int M, int N, int K, float alpha,
+                                     const unsigned short* A, int lda, long long strideA,
+                                     const unsigned short* B, int ldb, long long strideBGroup,
+                                     int groupSize, float beta,
+                                     float* C, int ldc, long long strideC, int batchCount);
+
+// Two independent BF16 GEMMs dispatched as one batched cuBLAS call. Used for
+// FFN gate/up projections and their paired weight gradients.
+bool sgemm_pair_bf16_dst_bf16(bool transposeA,int M,int N,int K,float alpha,
+                               const unsigned short* A0,const unsigned short* A1,int lda,
+                               const unsigned short* B0,const unsigned short* B1,int ldb,
+                               float beta,unsigned short* C0,unsigned short* C1,int ldc);
+
 // Row-major right-side upper-triangular solve (in-place):
 // Solves X[M,N] * R[N,N] = alpha * B[M,N]  where R is upper triangular.
 // B is overwritten with the solution X.
@@ -305,6 +347,16 @@ bool sgemm_batched_strided(int M, int N, int K,
                             float* C, int ldc, long long int strideC,
                             int batchCount);
 
+// Exact row-major batched strided SGEMM using default cuBLAS math mode.
+// This avoids TF32 tensor-core contraction on Ampere+ for parity-sensitive paths.
+bool sgemm_batched_strided_exact(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda, long long int strideA,
+                                  const float* B, int ldb, long long int strideB,
+                                  float beta,
+                                  float* C, int ldc, long long int strideC,
+                                  int batchCount);
+
 // Row-major batched strided SGEMM with B transposed:
 // C_i[M,N] = alpha * A_i[M,K] * B_i^T[K,N] + beta * C_i[M,N]
 // where each B_i is stored as [N,K] row-major.
@@ -316,6 +368,22 @@ bool sgemm_batched_strided_abt(int M, int N, int K,
                                 float* C, int ldc, long long int strideC,
                                 int batchCount);
 
+bool sgemm_batched_grouped(int M, int N, int K, float alpha,
+                            const float* A, int lda, long long strideA,
+                            const float* B, int ldb, long long strideBGroup,
+                            int groupSize, float beta,
+                            float* C, int ldc, long long strideC, int batchCount);
+bool sgemm_batched_grouped_exact(int M, int N, int K, float alpha,
+                                  const float* A, int lda, long long strideA,
+                                  const float* B, int ldb, long long strideBGroup,
+                                  int groupSize, float beta,
+                                  float* C, int ldc, long long strideC, int batchCount);
+bool sgemm_batched_grouped_abt(int M, int N, int K, float alpha,
+                                const float* A, int lda, long long strideA,
+                                const float* B, int ldb, long long strideBGroup,
+                                int groupSize, float beta,
+                                float* C, int ldc, long long strideC, int batchCount);
+
 // Row-major batched strided SGEMM with A transposed:
 // C_i[M,N] = alpha * A_i^T[M,K] * B_i[K,N] + beta * C_i[M,N]
 // where each A_i is stored as [K,M] row-major.
@@ -326,6 +394,16 @@ bool sgemm_batched_strided_atb(int M, int N, int K,
                                 float beta,
                                 float* C, int ldc, long long int strideC,
                                 int batchCount);
+
+// Exact row-major batched strided SGEMM with A transposed using default cuBLAS
+// math mode. Avoids TF32 tensor-core contraction on Ampere+.
+bool sgemm_batched_strided_atb_exact(int M, int N, int K,
+                                      float alpha,
+                                      const float* A, int lda, long long int strideA,
+                                      const float* B, int ldb, long long int strideB,
+                                      float beta,
+                                      float* C, int ldc, long long int strideC,
+                                      int batchCount);
 
 // Row-major batched pointer-array SGEMM with A transposed:
 // C_i[M,N] = alpha * A_i^T[M,K] * B_i[K,N] + beta * C_i[M,N]
@@ -412,6 +490,11 @@ inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const fl
 inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_bf16_dst_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, unsigned short*, int) { return false; }
+inline bool sgemm_batched_strided_bf16_dst_bf16(int, int, int, float, const unsigned short*, int, long long, const unsigned short*, int, long long, float, unsigned short*, int, long long, int) { return false; }
+inline bool sgemm_batched_grouped_bf16(int,int,int,float,const unsigned short*,int,long long,const unsigned short*,int,long long,int,float,float*,int,long long,int){return false;}
+inline bool sgemm_batched_grouped_abt_bf16(int,int,int,float,const unsigned short*,int,long long,const unsigned short*,int,long long,int,float,float*,int,long long,int){return false;}
+inline bool sgemm_pair_bf16_dst_bf16(bool,int,int,int,float,const unsigned short*,const unsigned short*,int,const unsigned short*,const unsigned short*,int,float,unsigned short*,unsigned short*,int){return false;}
 inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
@@ -425,8 +508,13 @@ inline void set_tf32_enabled(bool) {}
 inline bool get_tf32_enabled() { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
 inline bool sgemm_batched_strided(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
+inline bool sgemm_batched_strided_exact(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_abt(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
+inline bool sgemm_batched_grouped(int,int,int,float,const float*,int,long long,const float*,int,long long,int,float,float*,int,long long,int){return false;}
+inline bool sgemm_batched_grouped_exact(int,int,int,float,const float*,int,long long,const float*,int,long long,int,float,float*,int,long long,int){return false;}
+inline bool sgemm_batched_grouped_abt(int,int,int,float,const float*,int,long long,const float*,int,long long,int,float,float*,int,long long,int){return false;}
 inline bool sgemm_batched_strided_atb(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
+inline bool sgemm_batched_strided_atb_exact(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_pointer(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
 inline bool sgemm_batched_pointer_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
 inline bool sgemm_batched_pointer_atb(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }

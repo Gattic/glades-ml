@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <cmath>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -847,13 +848,13 @@ static bool warm_image_cache(glades::ImageInput& di, long long& outMs, std::stri
 	return true;
 }
 
-static glades::NNetwork* make_lenet_mnist(const std::string& name,
-                                          float learningRate,
-                                          float momentum,
-                                          int batchSize,
-                                          unsigned int seed)
+static std::unique_ptr<glades::NNetwork> make_lenet_mnist(const std::string& name,
+                                         float learningRate,
+                                         float momentum,
+                                         int batchSize,
+                                         unsigned int seed)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    batchSize,
 	    learningRate,
 	    momentum,
@@ -863,8 +864,8 @@ static glades::NNetwork* make_lenet_mnist(const std::string& name,
 	    glades::GMath::RELU,
 	    1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    128,
 	    learningRate,
 	    momentum,
@@ -874,12 +875,12 @@ static glades::NNetwork* make_lenet_mnist(const std::string& name,
 	    glades::GMath::RELU,
 	    1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    10,
 	    glades::OutputLayerInfo::CLASSIFICATION);
 
 	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
-	glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_CNN);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_CNN);
 	net->setSeed(seed);
 
 	glades::CNNConfig::ConvLayerSpec conv1;
@@ -914,13 +915,13 @@ static glades::NNetwork* make_lenet_mnist(const std::string& name,
 	return net;
 }
 
-static glades::NNetwork* make_mlp_mnist(const std::string& name,
-                                        float learningRate,
-                                        float momentum,
-                                        int batchSize,
-                                        unsigned int seed)
+static std::unique_ptr<glades::NNetwork> make_mlp_mnist(const std::string& name,
+                                       float learningRate,
+                                       float momentum,
+                                       int batchSize,
+                                       unsigned int seed)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    batchSize,
 	    learningRate,
 	    momentum,
@@ -930,8 +931,8 @@ static glades::NNetwork* make_mlp_mnist(const std::string& name,
 	    glades::GMath::LINEAR,
 	    1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    512,
 	    learningRate,
 	    momentum,
@@ -940,7 +941,7 @@ static glades::NNetwork* make_mlp_mnist(const std::string& name,
 	    0.0f,
 	    glades::GMath::RELU,
 	    1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    256,
 	    learningRate,
 	    momentum,
@@ -949,7 +950,7 @@ static glades::NNetwork* make_mlp_mnist(const std::string& name,
 	    0.0f,
 	    glades::GMath::RELU,
 	    1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    128,
 	    learningRate,
 	    momentum,
@@ -959,12 +960,12 @@ static glades::NNetwork* make_mlp_mnist(const std::string& name,
 	    glades::GMath::RELU,
 	    1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    10,
 	    glades::OutputLayerInfo::CLASSIFICATION);
 
 	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
-	glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_DFF);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_DFF);
 	net->setSeed(seed);
 
 	delete info;
@@ -1106,9 +1107,9 @@ static SingleRunResult run_single_benchmark(glades::ImageInput& data,
 	const float momentum = optimizer_momentum(optimizer, cfg);
 	const std::string netName = std::string("atlas_bench_") + out.optimizerLabel;
 
-	glades::NNetwork* net = (cfg.modelKind == BENCH_MODEL_DFF_MLP)
-	                        ? make_mlp_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed)
-	                        : make_lenet_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed);
+	auto net = (cfg.modelKind == BENCH_MODEL_DFF_MLP)
+	               ? make_mlp_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed)
+	               : make_lenet_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed);
 	configure_optimizer(*net, optimizer, cfg);
 	net->getTerminatorMutable().setEpoch(static_cast<int>(cfg.epochs));
 	net->getTerminatorMutable().setAccuracy(0.0f);
@@ -1122,14 +1123,12 @@ static SingleRunResult run_single_benchmark(glades::ImageInput& data,
 	{
 		out.ok = false;
 		out.err = trainStatus.message;
-		delete net;
 		return out;
 	}
 	if (!trainCb.saw)
 	{
 		out.ok = false;
 		out.err = "Training completed without reporting epoch metrics.";
-		delete net;
 		return out;
 	}
 
@@ -1142,14 +1141,12 @@ static SingleRunResult run_single_benchmark(glades::ImageInput& data,
 	{
 		out.ok = false;
 		out.err = testStatus.message;
-		delete net;
 		return out;
 	}
 	if (!testCb.saw)
 	{
 		out.ok = false;
 		out.err = "Evaluation completed without reporting metrics.";
-		delete net;
 		return out;
 	}
 
@@ -1162,14 +1159,12 @@ static SingleRunResult run_single_benchmark(glades::ImageInput& data,
 	{
 		out.ok = false;
 		out.err = "Non-finite loss/accuracy detected.";
-		delete net;
 		return out;
 	}
 
 	const double totalTrainImages = static_cast<double>(cfg.epochs) * static_cast<double>(data.getTrainSize());
 	const double seconds = static_cast<double>(out.trainMs) / 1000.0;
 	out.trainImagesPerSec = (seconds > 0.0) ? (totalTrainImages / seconds) : 0.0;
-	delete net;
 	return out;
 }
 

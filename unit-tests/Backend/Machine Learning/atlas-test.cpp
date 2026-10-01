@@ -1052,7 +1052,7 @@ static glades::NumberInput* make_atlas_transformer_resume_dataset()
 
 static glades::NNInfo* make_atlas_transformer_resume_info(const char* name)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ 0.01f,
 	    /*momentumFactor*/ 0.0f,
@@ -1062,8 +1062,8 @@ static glades::NNInfo* make_atlas_transformer_resume_info(const char* name)
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    /*size*/ 16,
 	    /*learningRate*/ 0.01f,
 	    /*momentumFactor*/ 0.0f,
@@ -1073,7 +1073,7 @@ static glades::NNInfo* make_atlas_transformer_resume_info(const char* name)
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f));
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(4, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(4, glades::OutputLayerInfo::REGRESSION);
 	return new glades::NNInfo(name, in, hidden, out);
 }
 
@@ -1143,17 +1143,16 @@ static glades::NNInfo* make_atlas_transformer_token_info(const char* name,
                                                          unsigned int layers,
                                                          float learningRate)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, learningRate, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (unsigned int i = 0u; i < layers; ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(dModel), learningRate, 0.0f, 0.0f, 0.0f, 0.0f,
 		    glades::GMath::LINEAR, 1.0f));
 	}
-	glades::OutputLayerInfo* out =
-	    new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	return new glades::NNInfo(name, in, hidden, out);
 }
 
@@ -4719,7 +4718,7 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 2,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -4729,8 +4728,8 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::SIGMOID,
 		    /*activationParam*/ 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 4,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -4740,7 +4739,7 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::SIGMOID,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_regression", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -4864,12 +4863,12 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_helm", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -4932,12 +4931,12 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_aster", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -6688,7 +6687,7 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 4,
 		    /*learningRate*/ 0.1f,
 		    /*momentumFactor*/ 0.0f,
@@ -6698,8 +6697,8 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::SIGMOID,
 		    /*activationParam*/ 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 8,
 		    /*learningRate*/ 0.1f,
 		    /*momentumFactor*/ 0.0f,
@@ -6709,7 +6708,7 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::SIGMOID,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_xor", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -6768,7 +6767,7 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -6779,8 +6778,8 @@ void ATLASUnitTest()
 		    /*activationParam*/ 1.0f);
 
 		// Transformer blocks: 1 hidden layer with dModel=16
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 16, // dModel
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -6790,7 +6789,7 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(numOutputs, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(numOutputs, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_transformer", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
@@ -6844,14 +6843,14 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_rnn", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_RNN);
@@ -6902,14 +6901,14 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_gru", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_GRU);
@@ -6960,14 +6959,14 @@ void ATLASUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_lstm", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_LSTM);
@@ -7022,14 +7021,14 @@ void ATLASUnitTest()
 			di->testMatrix = di->trainMatrix;
 			di->testExpectedMatrix = di->trainExpectedMatrix;
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 			    4, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
 
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			    8, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
 
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 			glades::NNInfo* info = new glades::NNInfo("ut_atlas_ckpt", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -7854,12 +7853,12 @@ void ATLASUnitTest()
 		// Run with SGD (momentum)
 		float sgdLoss;
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 			    4, 0.05f, 0.9f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			    8, 0.05f, 0.9f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 			glades::NNInfo* info = new glades::NNInfo("ut_cmp_sgd", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -7879,12 +7878,12 @@ void ATLASUnitTest()
 		// Run with ATLAS
 		float atlasLoss;
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 			    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 			glades::NNInfo* info = new glades::NNInfo("ut_cmp_atlas", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -8626,7 +8625,7 @@ void ATLASUnitTest()
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
 		// Build CNN: 1 conv layer (4 filters, 3x3, pad 1, maxpool 2x2) + 1 FC hidden (16).
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 5,
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -8636,11 +8635,11 @@ void ATLASUnitTest()
 		    /*activationType*/ glades::GMath::RELU,
 		    /*activationParam*/ 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::RELU, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 		    static_cast<int>(numClasses), glades::OutputLayerInfo::CLASSIFICATION);
 
 		glades::NNInfo* info = new glades::NNInfo("ut_atlas_cnn", in, hidden, out);
@@ -8806,12 +8805,12 @@ void ATLASUnitTest()
 			diA->testMatrix = diA->trainMatrix;
 			diA->testExpectedMatrix = diA->trainExpectedMatrix;
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 			    4, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			    8, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 			glades::NNInfo* info = new glades::NNInfo("ut_atlas_st24", in, hidden, out);
 
 			glades::NNetwork netA(info, glades::NNetwork::TYPE_DFF);

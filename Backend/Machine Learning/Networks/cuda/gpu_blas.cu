@@ -40,6 +40,73 @@ static uint16_t* g_fast16bf_scratch_b = 0;
 static size_t    g_fast16bf_scratch_a_n = 0;
 static size_t    g_fast16bf_scratch_b_n = 0;
 
+// GQA pointer-array scratch. A/C advance per query head while B advances
+// once per query-head group. Arrays are populated on the compute stream and
+// reused across calls; no expanded K/V tensor is materialized.
+static float** g_grouped_f_A = 0;
+static float** g_grouped_f_B = 0;
+static float** g_grouped_f_C = 0;
+static unsigned short** g_grouped_bf_A = 0;
+static unsigned short** g_grouped_bf_B = 0;
+static unsigned short** g_grouped_bf_C = 0;
+static int g_grouped_capacity = 0;
+
+__global__ void fill_grouped_f_ptrs(const float* A,long long strideA,
+                                    const float* B,long long strideBGroup,
+                                    int groupSize,float* C,long long strideC,
+                                    float** outA,float** outB,float** outC,int count)
+{
+	const int i=blockIdx.x*blockDim.x+threadIdx.x;
+	if(i<count){outA[i]=const_cast<float*>(A+(long long)i*strideA);outB[i]=const_cast<float*>(B+(long long)(i/groupSize)*strideBGroup);outC[i]=C+(long long)i*strideC;}
+}
+
+__global__ void fill_grouped_bf_ptrs(const unsigned short* A,long long strideA,
+                                     const unsigned short* B,long long strideBGroup,
+                                     int groupSize,float* C,long long strideC,
+                                     unsigned short** outA,unsigned short** outB,
+                                     float** outC,int count)
+{
+	const int i=blockIdx.x*blockDim.x+threadIdx.x;
+	if(i<count){outA[i]=const_cast<unsigned short*>(A+(long long)i*strideA);outB[i]=const_cast<unsigned short*>(B+(long long)(i/groupSize)*strideBGroup);outC[i]=C+(long long)i*strideC;}
+}
+
+__global__ void fill_pair_bf_ptrs(const unsigned short* A0,const unsigned short* A1,
+                                  const unsigned short* B0,const unsigned short* B1,
+                                  unsigned short* C0,unsigned short* C1,
+                                  unsigned short** outA,unsigned short** outB,
+                                  unsigned short** outC)
+{
+	if(threadIdx.x==0){outA[0]=const_cast<unsigned short*>(A0);outA[1]=const_cast<unsigned short*>(A1);outB[0]=const_cast<unsigned short*>(B0);outB[1]=const_cast<unsigned short*>(B1);outC[0]=C0;outC[1]=C1;}
+}
+
+static void releaseGroupedPointerScratch()
+{
+	if(g_grouped_f_A)cudaFree(g_grouped_f_A);if(g_grouped_f_B)cudaFree(g_grouped_f_B);
+	if(g_grouped_f_C)cudaFree(g_grouped_f_C);if(g_grouped_bf_A)cudaFree(g_grouped_bf_A);
+	if(g_grouped_bf_B)cudaFree(g_grouped_bf_B);if(g_grouped_bf_C)cudaFree(g_grouped_bf_C);
+	g_grouped_f_A=g_grouped_f_B=g_grouped_f_C=0;
+	g_grouped_bf_A=g_grouped_bf_B=g_grouped_bf_C=0;
+	g_grouped_capacity=0;
+}
+
+static bool ensureGroupedPointerScratch(int count)
+{
+	if(count<=g_grouped_capacity)return true;
+	releaseGroupedPointerScratch();
+	if(cudaMalloc((void**)&g_grouped_f_A,(size_t)count*sizeof(float*))!=cudaSuccess||
+	   cudaMalloc((void**)&g_grouped_f_B,(size_t)count*sizeof(float*))!=cudaSuccess||
+	   cudaMalloc((void**)&g_grouped_f_C,(size_t)count*sizeof(float*))!=cudaSuccess||
+	   cudaMalloc((void**)&g_grouped_bf_A,(size_t)count*sizeof(unsigned short*))!=cudaSuccess||
+	   cudaMalloc((void**)&g_grouped_bf_B,(size_t)count*sizeof(unsigned short*))!=cudaSuccess||
+	   cudaMalloc((void**)&g_grouped_bf_C,(size_t)count*sizeof(unsigned short*))!=cudaSuccess)
+	{
+		fprintf(stderr,"[glades-cuda] grouped GQA pointer scratch allocation failed (%d heads)\n",count);
+		releaseGroupedPointerScratch();
+		return false;
+	}
+	g_grouped_capacity=count;return true;
+}
+
 static bool ensureFast16bfScratch(uint16_t** scratch, size_t* size_n, size_t needed_n)
 {
 	if (*size_n >= needed_n) return true;
@@ -239,6 +306,12 @@ bool get_tf32_enabled() { return g_tf32_enabled; }
 
 bool blasInit()
 {
+	// Handles must bind to the canonical non-blocking compute stream.  Raw
+	// GPU callers can reach BLAS before higher-level device initialization;
+	// creating a handle then would bind it to stream 0 permanently, while
+	// later custom kernels use computeStream(), causing cross-stream races.
+	if (!isAvailable() && !initDevice())
+		return false;
 	if (g_initialized)
 		return true;
 
@@ -310,6 +383,7 @@ bool blasInit()
 
 void blasDestroy()
 {
+	releaseGroupedPointerScratch();
 	// ralph-loop iter 6: tear down side handle/stream first if initialized.
 	if (g_sideInitialized)
 	{
@@ -708,6 +782,38 @@ bool sgemm_batched_strided(int M, int N, int K,
 	return true;
 }
 
+bool sgemm_batched_strided_exact(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda, long long int strideA,
+                                  const float* B, int ldb, long long int strideB,
+                                  float beta,
+                                  float* C, int ldc, long long int strideC,
+                                  int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	// Same row-major trick as sgemm_batched_strided, but force the strict-FP32
+	// cuBLAS handle (CUBLAS_DEFAULT_MATH) so Ampere+ does not contract via TF32.
+	cublasHandle_t h = pick_handle(CUBLAS_DEFAULT_MATH);
+	cublasStatus_t st = cublasSgemmStridedBatched(h,
+	                                               CUBLAS_OP_N, CUBLAS_OP_N,
+	                                               N, M, K,
+	                                               &alpha,
+	                                               B, ldb, strideB,
+	                                               A, lda, strideA,
+	                                               &beta,
+	                                               C, ldc, strideC,
+	                                               batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(exact) failed: %d\n",
+		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided_abt(int M, int N, int K,
                                 float alpha,
                                 const float* A, int lda, long long int strideA,
@@ -738,6 +844,47 @@ bool sgemm_batched_strided_abt(int M, int N, int K,
 	return true;
 }
 
+static bool sgemm_batched_grouped_fp32_impl(bool abt,bool exact,
+                                             int M,int N,int K,float alpha,
+                                             const float* A,int lda,long long strideA,
+                                             const float* B,int ldb,long long strideBGroup,
+                                             int groupSize,float beta,
+                                             float* C,int ldc,long long strideC,int batchCount)
+{
+	if(!g_initialized&&!blasInit())return false;
+	if(batchCount<=0)return true;
+	if(!A||!B||!C||groupSize<=0||batchCount%groupSize!=0)return false;
+	if(!ensureGroupedPointerScratch(batchCount))return false;
+	fill_grouped_f_ptrs<<<(batchCount+127)/128,128,0,computeStream()>>>(A,strideA,B,strideBGroup,groupSize,C,strideC,g_grouped_f_A,g_grouped_f_B,g_grouped_f_C,batchCount);
+	if(cudaGetLastError()!=cudaSuccess)return false;
+	cublasHandle_t h=exact?pick_handle(CUBLAS_DEFAULT_MATH):g_handle;
+	cublasStatus_t st=cublasSgemmBatched(h,abt?CUBLAS_OP_T:CUBLAS_OP_N,CUBLAS_OP_N,
+	                                    N,M,K,&alpha,
+	                                    reinterpret_cast<const float* const*>(g_grouped_f_B),ldb,
+	                                    reinterpret_cast<const float* const*>(g_grouped_f_A),lda,
+	                                    &beta,g_grouped_f_C,ldc,batchCount);
+	if(st!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"[glades-cuda] grouped GQA cublasSgemmBatched failed: %d\n",(int)st);return false;}
+	return true;
+}
+
+bool sgemm_batched_grouped(int M,int N,int K,float alpha,
+                            const float* A,int lda,long long strideA,
+                            const float* B,int ldb,long long strideBGroup,
+                            int groupSize,float beta,float* C,int ldc,long long strideC,int batchCount)
+{return sgemm_batched_grouped_fp32_impl(false,false,M,N,K,alpha,A,lda,strideA,B,ldb,strideBGroup,groupSize,beta,C,ldc,strideC,batchCount);}
+
+bool sgemm_batched_grouped_exact(int M,int N,int K,float alpha,
+                                  const float* A,int lda,long long strideA,
+                                  const float* B,int ldb,long long strideBGroup,
+                                  int groupSize,float beta,float* C,int ldc,long long strideC,int batchCount)
+{return sgemm_batched_grouped_fp32_impl(false,true,M,N,K,alpha,A,lda,strideA,B,ldb,strideBGroup,groupSize,beta,C,ldc,strideC,batchCount);}
+
+bool sgemm_batched_grouped_abt(int M,int N,int K,float alpha,
+                                const float* A,int lda,long long strideA,
+                                const float* B,int ldb,long long strideBGroup,
+                                int groupSize,float beta,float* C,int ldc,long long strideC,int batchCount)
+{return sgemm_batched_grouped_fp32_impl(true,false,M,N,K,alpha,A,lda,strideA,B,ldb,strideBGroup,groupSize,beta,C,ldc,strideC,batchCount);}
+
 bool sgemm_batched_strided_atb(int M, int N, int K,
                                 float alpha,
                                 const float* A, int lda, long long int strideA,
@@ -762,6 +909,38 @@ bool sgemm_batched_strided_atb(int M, int N, int K,
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
 		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(ATB) failed: %d\n",
+		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_strided_atb_exact(int M, int N, int K,
+                                      float alpha,
+                                      const float* A, int lda, long long int strideA,
+                                      const float* B, int ldb, long long int strideB,
+                                      float beta,
+                                      float* C, int ldc, long long int strideC,
+                                      int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	// Same ATB trick as sgemm_batched_strided_atb, but force the strict-FP32
+	// cuBLAS handle (CUBLAS_DEFAULT_MATH) so Ampere+ does not contract via TF32.
+	cublasHandle_t h = pick_handle(CUBLAS_DEFAULT_MATH);
+	cublasStatus_t st = cublasSgemmStridedBatched(h,
+	                                               CUBLAS_OP_N, CUBLAS_OP_T,
+	                                               N, M, K,
+	                                               &alpha,
+	                                               B, ldb, strideB,
+	                                               A, lda, strideA,
+	                                               &beta,
+	                                               C, ldc, strideC,
+	                                               batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(ATB exact) failed: %d\n",
 		        static_cast<int>(st));
 		return false;
 	}
@@ -1147,6 +1326,22 @@ bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
 	                                  "cublasGemmEx(BF16,ATB,dstBF16)");
 }
 
+// Cast-elim Port C fwd slice (2026-06-12): plain (NN) form of the iter-61
+// dst-BF16 variant.  Used by the inner-attention forward projections to
+// write sQ/sK/sV directly as BF16, eliminating the standalone casts.
+bool sgemm_rowmajor_bf16_dst_bf16(int M, int N, int K,
+                                   float alpha,
+                                   const unsigned short* A, int lda,
+                                   const unsigned short* B, int ldb,
+                                   float beta,
+                                   unsigned short* C, int ldc)
+{
+	return gemmex_bf16_impl_dst_bf16(CUBLAS_OP_N, CUBLAS_OP_N,
+	                                  M, N, K,
+	                                  alpha, A, lda, B, ldb, beta, C, ldc,
+	                                  "cublasGemmEx(BF16,NN,dstBF16)");
+}
+
 // === FAST_16BF GEMM (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same row-major→col-major transpose trick as sgemm_rowmajor.  Routes
@@ -1472,6 +1667,40 @@ bool sgemm_batched_strided_bf16(int M, int N, int K,
 	                            "cublasGemmStridedBatchedEx(BF16)");
 }
 
+// Cast-elim V+O slice (2026-06-12): dst-BF16 variant of the batched strided
+// NN BF16 GEMM.  FP32 internal accumulate; cuBLAS RNE-rounds to BF16 on the
+// D write (same rounding as a standalone cast of the FP32 result).  Used by
+// the inner-attention P·V GEMM to write O directly as BF16.
+bool sgemm_batched_strided_bf16_dst_bf16(int M, int N, int K,
+                                          float alpha,
+                                          const unsigned short* A, int lda, long long strideA,
+                                          const unsigned short* B, int ldb, long long strideB,
+                                          float beta,
+                                          unsigned short* C, int ldc, long long strideC,
+                                          int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	cublasStatus_t st = cublasGemmStridedBatchedEx(g_handle,
+	    CUBLAS_OP_N, CUBLAS_OP_N,
+	    N, M, K,
+	    &alpha,
+	    B, CUDA_R_16BF, ldb, strideB,
+	    A, CUDA_R_16BF, lda, strideA,
+	    &beta,
+	    C, CUDA_R_16BF, ldc, strideC,
+	    batchCount,
+	    CUBLAS_COMPUTE_32F_FAST_16BF,
+	    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasGemmStridedBatchedEx(BF16,dstBF16) failed: %d (M=%d N=%d K=%d bc=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided_abt_bf16(int M, int N, int K,
                                     float alpha,
                                     const unsigned short* A, int lda, long long strideA,
@@ -1486,6 +1715,59 @@ bool sgemm_batched_strided_abt_bf16(int M, int N, int K,
 	                            beta, C, ldc, strideC,
 	                            batchCount,
 	                            "cublasGemmStridedBatchedEx(BF16,ABT)");
+}
+
+static bool sgemm_batched_grouped_bf16_impl(bool abt,int M,int N,int K,float alpha,
+                                              const unsigned short* A,int lda,long long strideA,
+                                              const unsigned short* B,int ldb,long long strideBGroup,
+                                              int groupSize,float beta,float* C,int ldc,
+                                              long long strideC,int batchCount)
+{
+	if(!g_initialized&&!blasInit())return false;
+	if(batchCount<=0)return true;
+	if(!A||!B||!C||groupSize<=0||batchCount%groupSize!=0)return false;
+	if(!ensureGroupedPointerScratch(batchCount))return false;
+	fill_grouped_bf_ptrs<<<(batchCount+127)/128,128,0,computeStream()>>>(A,strideA,B,strideBGroup,groupSize,C,strideC,g_grouped_bf_A,g_grouped_bf_B,g_grouped_f_C,batchCount);
+	if(cudaGetLastError()!=cudaSuccess)return false;
+	cublasStatus_t st=cublasGemmBatchedEx(g_handle,abt?CUBLAS_OP_T:CUBLAS_OP_N,CUBLAS_OP_N,
+	                                    N,M,K,&alpha,
+	                                    reinterpret_cast<const void* const*>(g_grouped_bf_B),CUDA_R_16BF,ldb,
+	                                    reinterpret_cast<const void* const*>(g_grouped_bf_A),CUDA_R_16BF,lda,
+	                                    &beta,reinterpret_cast<void* const*>(g_grouped_f_C),CUDA_R_32F,ldc,
+	                                    batchCount,CUBLAS_COMPUTE_32F_FAST_16BF,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if(st!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"[glades-cuda] grouped GQA cublasGemmBatchedEx(BF16) failed: %d\n",(int)st);return false;}
+	return true;
+}
+
+bool sgemm_batched_grouped_bf16(int M,int N,int K,float alpha,
+                                 const unsigned short* A,int lda,long long strideA,
+                                 const unsigned short* B,int ldb,long long strideBGroup,
+                                 int groupSize,float beta,float* C,int ldc,long long strideC,int batchCount)
+{return sgemm_batched_grouped_bf16_impl(false,M,N,K,alpha,A,lda,strideA,B,ldb,strideBGroup,groupSize,beta,C,ldc,strideC,batchCount);}
+
+bool sgemm_batched_grouped_abt_bf16(int M,int N,int K,float alpha,
+                                     const unsigned short* A,int lda,long long strideA,
+                                     const unsigned short* B,int ldb,long long strideBGroup,
+                                     int groupSize,float beta,float* C,int ldc,long long strideC,int batchCount)
+{return sgemm_batched_grouped_bf16_impl(true,M,N,K,alpha,A,lda,strideA,B,ldb,strideBGroup,groupSize,beta,C,ldc,strideC,batchCount);}
+
+bool sgemm_pair_bf16_dst_bf16(bool transposeA,int M,int N,int K,float alpha,
+                               const unsigned short* A0,const unsigned short* A1,int lda,
+                               const unsigned short* B0,const unsigned short* B1,int ldb,
+                               float beta,unsigned short* C0,unsigned short* C1,int ldc)
+{
+	if(!g_initialized&&!blasInit())return false;
+	if(!ensureGroupedPointerScratch(2))return false;
+	fill_pair_bf_ptrs<<<1,1,0,computeStream()>>>(A0,A1,B0,B1,C0,C1,g_grouped_bf_A,g_grouped_bf_B,g_grouped_bf_C);
+	if(cudaGetLastError()!=cudaSuccess)return false;
+	cublasStatus_t st=cublasGemmBatchedEx(g_handle,CUBLAS_OP_N,transposeA?CUBLAS_OP_T:CUBLAS_OP_N,
+	                                    N,M,K,&alpha,
+	                                    reinterpret_cast<const void* const*>(g_grouped_bf_B),CUDA_R_16BF,ldb,
+	                                    reinterpret_cast<const void* const*>(g_grouped_bf_A),CUDA_R_16BF,lda,
+	                                    &beta,reinterpret_cast<void* const*>(g_grouped_bf_C),CUDA_R_16BF,ldc,
+	                                    2,CUBLAS_COMPUTE_32F_FAST_16BF,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if(st!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"[glades-cuda] paired cublasGemmBatchedEx(BF16,dstBF16) failed: %d\n",(int)st);return false;}
+	return true;
 }
 
 bool sgemm_batched_strided_atb_bf16(int M, int N, int K,

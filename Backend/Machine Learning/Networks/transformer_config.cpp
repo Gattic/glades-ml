@@ -52,6 +52,50 @@ static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where
 	if (runtimeCfg.layerDropPMax < 0.0f || runtimeCfg.layerDropPMax >= 1.0f)
 		return invalid_argument(where, "layerDropPMax must be in [0,1)");
 
+	if (runtimeCfg.siraCoef < 0.0f)
+		return invalid_argument(where, "siraCoef must be >= 0");
+	if (runtimeCfg.siraEnergyWeight < 0.0f || runtimeCfg.siraBalanceWeight < 0.0f || runtimeCfg.siraActionWeight < 0.0f)
+		return invalid_argument(where, "SIRA weights must be >= 0");
+	if (runtimeCfg.siraHuberTau <= 0.0f)
+		return invalid_argument(where, "siraHuberTau must be > 0");
+	if (runtimeCfg.siraWarmupSteps < 0)
+		return invalid_argument(where, "siraWarmupSteps must be >= 0");
+	if (runtimeCfg.siraLogEverySteps < 0)
+		return invalid_argument(where, "siraLogEverySteps must be >= 0");
+	if (runtimeCfg.siraShadowDiagnostics && runtimeCfg.siraLogEverySteps <= 0)
+		return invalid_argument(where, "siraLogEverySteps must be > 0 when SIRA diagnostics are enabled");
+	if (runtimeCfg.siraPositionBuckets <= 0)
+		return invalid_argument(where, "siraPositionBuckets must be > 0");
+	for (size_t i = 0; i < runtimeCfg.siraProbeLayers.size(); ++i)
+	{
+		if (runtimeCfg.siraProbeLayers[i] < 0)
+			return invalid_argument(where, "siraProbeLayers entries must be >= 0");
+	}
+
+	if (runtimeCfg.phsDataGroups <= 0)
+		return invalid_argument(where, "phsDataGroups must be > 0");
+	if (runtimeCfg.phsPositionBuckets <= 0)
+		return invalid_argument(where, "phsPositionBuckets must be > 0");
+	if (runtimeCfg.phsLogEverySteps < 0)
+		return invalid_argument(where, "phsLogEverySteps must be >= 0");
+	if (runtimeCfg.phsShadowDiagnostics && runtimeCfg.phsLogEverySteps <= 0)
+		return invalid_argument(where, "phsLogEverySteps must be > 0 when PHS diagnostics are enabled");
+	if (runtimeCfg.phsEmaDecay < 0.0f || runtimeCfg.phsEmaDecay >= 1.0f)
+		return invalid_argument(where, "phsEmaDecay must be in [0,1)");
+
+	if (runtimeCfg.ptocLogEverySteps < 0)
+		return invalid_argument(where, "ptocLogEverySteps must be >= 0");
+	if (runtimeCfg.ptocShadowDiagnostics && runtimeCfg.ptocLogEverySteps <= 0)
+		return invalid_argument(where, "ptocLogEverySteps must be > 0 when PTOC diagnostics are enabled");
+	if (runtimeCfg.ptocSampleLayers <= 0)
+		return invalid_argument(where, "ptocSampleLayers must be > 0");
+	if (runtimeCfg.ptocSampleTokens <= 0)
+		return invalid_argument(where, "ptocSampleTokens must be > 0");
+	if (runtimeCfg.ptocEps <= 0.0f)
+		return invalid_argument(where, "ptocEps must be > 0");
+	if (runtimeCfg.ptocEta <= 0.0f)
+		return invalid_argument(where, "ptocEta must be > 0");
+
 	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 

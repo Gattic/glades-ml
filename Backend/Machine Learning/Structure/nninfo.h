@@ -82,8 +82,10 @@ public:
 
 	NNInfo(const shmea::GString&);
 	NNInfo(const shmea::GString&, const shmea::GTable&);
-	NNInfo(const shmea::GString&, InputLayerInfo*, const std::vector<HiddenLayerInfo*>&,
-		   OutputLayerInfo*);
+	NNInfo(const shmea::GString&,
+	       shmea::GPointer<InputLayerInfo>,
+	       std::vector<shmea::GPointer<HiddenLayerInfo>>,
+	       shmea::GPointer<OutputLayerInfo>);
 	~NNInfo();
 
 	// gets
@@ -116,7 +118,7 @@ public:
 	void setPInput(float);
 	void setBatchSize(int);
 	void setTBPTTWindow(int);
-	void setLayers(const std::vector<HiddenLayerInfo*>&);
+	void setLayers(std::vector<shmea::GPointer<HiddenLayerInfo>>);
 	void setLearningRate(unsigned int, float);
 	void setMomentumFactor(unsigned int, float);
 	void setWeightDecay1(unsigned int, float);
@@ -124,7 +126,7 @@ public:
 	void setPDropout(unsigned int, float);
 	void setActivationType(unsigned int, int);
 	void setActivationParam(unsigned int, float);
-	void addHiddenLayer(HiddenLayerInfo*);
+	void addHiddenLayer(shmea::GPointer<HiddenLayerInfo>);
 	void copyHiddenLayer(unsigned int, unsigned int);
 	void resizeHiddenLayers(unsigned int);
 	void removeHiddenLayer(unsigned int);

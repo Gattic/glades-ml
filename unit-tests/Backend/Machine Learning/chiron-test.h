@@ -37,6 +37,8 @@ void CHIRONBatchedSketchParityTest();
 void CHIRONGpuEndToEndTest();
 void CHIRONGpuAttentionShearParityTest();
 void CHIRONGpuFullBlockEndToEndTest();
+void CHIRONFfnShearTest();
+void CHIRONGqaTiledTest();
 void CHIRONGpuReLNBackwardTest();
 void CHIRONGpuAttentionShearBackwardTest();
 void CHIRONGpuFullBlockBackwardTest();
@@ -85,6 +87,77 @@ void CHIRONLayerDropDeterministicMasksTest();
 void CHIRONUL2SpanSamplerMeanSpanTest();
 void CHIRONUL2SpanSamplerRateTest();
 void CHIRONUL2DisabledParityTest();
+void CHIRONSiraConfigDefaultsTest();
+void CHIRONSiraDisabledParityTest();
+void CHIRONSiraDiagnosticsTest();
+void CHIRONSiraEnabledMathTest();
+void CHIRONSiraTrainingLossTest();
+void CHIRONPhsConfigDefaultsTest();
+void CHIRONPhsDisabledParityTest();
+void CHIRONPhsDiagnosticsMathTest();
+void CHIRONPhsEmaTest();
+void CHIRONPtocConfigDefaultsTest();
+void CHIRONPtocDisabledParityTest();
+void CHIRONPtocDiagnosticsMathTest();
+void CHIRONQClampMathTest();
+void CHIRONQClampEdgeTest();
+void CHIRONRelnDualMirrorTest();
+void CHIRONDwconvDualMirrorTest();
+void CHIRONInnerVOTest();
+void CHIRONGradGroupClampTest();
+void CHIRONAgcClampTest();
+void CHIRONGradCentralizeTest();
+void CHIRONGradCentralizeBf16Test();
+void CHIRONSpectralNormTest();
+void CHIRONSamTest();
+void CHIRONRelnBackwardBoundedTest();
+void CHIRONRelnReanchorTest();
+void CHIRONDriftGradCheckTest();
+void CHIRONDriftCpuGpuParityTest();
+void CHIRONDriftReversibilityTest();
+void CHIRONDriftBackwardParityTest();
+void CHIRONRotCpuTest();
+void CHIRONRotGpuParityTest();
+void CHIRONRotBackwardParityTest();
+void CHIRONWhiscFuseRelnParityTest();
+
+void WhiSCScaleCpuTest();
+void WhiSCStatsCpuTest();
+void WhiSCGpuParityTest();
+void WhiSCBackwardParityTest();
+void WhiSCFoldBackwardParityTest();
+void WhiSCInvWalkBackwardParityTest();
+
+// PIED increment dropout (2026-07-01,
+// docs/superpowers/specs/2026-07-01-chiron-pied-increment-dropout-design.md).
+void CHIRONPiedMaskCpuTest();
+void CHIRONPiedCommitInverseCpuTest();
+void CHIRONPiedGpuParityTest();
+void CHIRONPiedDualPParityTest();
+void CHIRONPiedDyDualParityTest();
+
+// PACT — Profile Anti-Cancellation Tax (2026-07-04,
+// docs/superpowers/specs/2026-07-04-chiron-pact-anti-cancellation-design.md).
+void CHIRONPactRefMathTest();
+void CHIRONPactDampSigmaParityTest();
+void CHIRONPactCommitParityTest();
+void CHIRONPactFieldParityTest();
+
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md).
+void CHIRONEchoStatsCpuTest();
+void CHIRONEchoGradFDCpuTest();
+void CHIRONEchoE2CpuTest();
+void CHIRONEchoGpuParityTest();
+void CHIRONEchoZlossZeroCoefBitParityTest();
+
+// CRM — Contextual Rank Margin Q0 engineering qualification.
+void CHIRONCrmCpuMathTest();
+void CHIRONCrmGpuParityTest();
+void CHIRONCrmZeroCoefBitParityTest();
+
+// Focused multi-block token-LM accounting regression.
+void CHIRONTokenLmMetricCountTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

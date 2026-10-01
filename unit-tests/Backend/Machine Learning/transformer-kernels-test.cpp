@@ -3,6 +3,11 @@
 #include "../../../Backend/Machine Learning/rng.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_dispatch.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
+#ifdef GLADES_HAVE_CUDA
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -423,6 +428,86 @@ void TransformerKernelsUnitTest()
 		ASSERT("RoPE strided(stride=dHead) matches non-strided", ok);
 		printf("[PASS] F5: RoPEStridedMatchesNonStrided\n");
 	}
+
+#ifdef GLADES_HAVE_CUDA
+	// F6: CUDA forward/fused/inverse paths use the same adjacent-dimension
+	// pairing as the canonical CPU implementation, including partial RoPE.
+	{
+		ASSERT("RoPE CUDA device init", glades::gpu::initDevice());
+		const unsigned int T = 3;
+		const unsigned int qHeads = 2;
+		const unsigned int kvHeads = 1;
+		const unsigned int dHead = 8;
+		const unsigned int ropeDim = 6;
+		const unsigned int halfDim = ropeDim / 2;
+		const unsigned int qStride = qHeads * dHead;
+		const unsigned int kvStride = kvHeads * dHead;
+		std::vector<float> q((size_t)T * qStride);
+		std::vector<float> k((size_t)T * kvStride);
+		unsigned int seedF6 = 222u;
+		fill_random(&q[0], (unsigned int)q.size(), seedF6);
+		fill_random(&k[0], (unsigned int)k.size(), seedF6);
+		const std::vector<float> qOriginal(q), kOriginal(k);
+		std::vector<float> qCpu(q), kCpu(k), qGpu(q), kGpu(k), qSingleGpu(q);
+		std::vector<double> invFreqCpu(halfDim);
+		std::vector<float> invFreqGpu(halfDim);
+		for (unsigned int i = 0; i < halfDim; ++i)
+		{
+			invFreqCpu[i] = pow(10000.0, -(2.0 * (double)i) / (double)ropeDim);
+			invFreqGpu[i] = (float)invFreqCpu[i];
+		}
+		for (unsigned int h = 0; h < qHeads; ++h)
+			rope_apply_inplace_strided(&qCpu[h * dHead], T, qStride, dHead,
+			                           ropeDim, invFreqCpu, false);
+		for (unsigned int h = 0; h < kvHeads; ++h)
+			rope_apply_inplace_strided(&kCpu[h * dHead], T, kvStride, dHead,
+			                           ropeDim, invFreqCpu, false);
+
+		glades::gpu::GpuBuffer<float> dQ, dK, dSingle, dInv;
+		ASSERT("RoPE CUDA q alloc", dQ.allocate(q.size()));
+		ASSERT("RoPE CUDA k alloc", dK.allocate(k.size()));
+		ASSERT("RoPE CUDA single alloc", dSingle.allocate(q.size()));
+		ASSERT("RoPE CUDA invfreq alloc", dInv.allocate(invFreqGpu.size()));
+		ASSERT("RoPE CUDA q upload", dQ.upload(&qGpu[0], qGpu.size()));
+		ASSERT("RoPE CUDA k upload", dK.upload(&kGpu[0], kGpu.size()));
+		ASSERT("RoPE CUDA single upload", dSingle.upload(&qSingleGpu[0], qSingleGpu.size()));
+		ASSERT("RoPE CUDA invfreq upload", dInv.upload(&invFreqGpu[0], invFreqGpu.size()));
+		ASSERT("RoPE CUDA single forward",
+		       glades::gpu::rope_apply(dSingle.data(), dInv.data(), T, qHeads,
+		                               dHead, halfDim, false));
+		ASSERT("RoPE CUDA fused qk forward",
+		       glades::gpu::rope_apply_qk(dQ.data(), dK.data(), dInv.data(), T,
+		                                  qHeads, kvHeads, dHead, halfDim, false));
+		ASSERT("RoPE CUDA q download", dQ.download(&qGpu[0], qGpu.size()));
+		ASSERT("RoPE CUDA k download", dK.download(&kGpu[0], kGpu.size()));
+		ASSERT("RoPE CUDA single download",
+		       dSingle.download(&qSingleGpu[0], qSingleGpu.size()));
+		float qErr = 0.0f, kErr = 0.0f, singleErr = 0.0f;
+		for (size_t i = 0; i < qCpu.size(); ++i)
+		{
+			qErr = std::max(qErr, std::fabs(qCpu[i] - qGpu[i]));
+			singleErr = std::max(singleErr, std::fabs(qCpu[i] - qSingleGpu[i]));
+		}
+		for (size_t i = 0; i < kCpu.size(); ++i)
+			kErr = std::max(kErr, std::fabs(kCpu[i] - kGpu[i]));
+		ASSERT("RoPE CUDA fused Q adjacent-pair parity", qErr < 2e-6f);
+		ASSERT("RoPE CUDA fused K adjacent-pair parity", kErr < 2e-6f);
+		ASSERT("RoPE CUDA single adjacent-pair parity", singleErr < 2e-6f);
+
+		ASSERT("RoPE CUDA inverse",
+		       glades::gpu::rope_apply(dSingle.data(), dInv.data(), T, qHeads,
+		                               dHead, halfDim, true));
+		ASSERT("RoPE CUDA inverse download",
+		       dSingle.download(&qSingleGpu[0], qSingleGpu.size()));
+		float roundTripErr = 0.0f;
+		for (size_t i = 0; i < qOriginal.size(); ++i)
+			roundTripErr = std::max(roundTripErr,
+			                        std::fabs(qOriginal[i] - qSingleGpu[i]));
+		ASSERT("RoPE CUDA adjacent-pair round trip", roundTripErr < 2e-6f);
+		(void)kOriginal;
+		printf("[PASS] F6: RoPECudaAdjacentPairParity\n");
+	}
+#endif
 
 	// ----------------------------------------------------------
 	// Group G: FP16/BF16 Round-Trip

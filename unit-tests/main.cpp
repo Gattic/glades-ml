@@ -47,6 +47,11 @@
 #include "Backend/Machine Learning/vesta-test.h"
 #include "Backend/Machine Learning/helios-test.h"
 #include "Backend/Machine Learning/chiron-test.h"
+#include "Backend/Machine Learning/chiron-rank-cause-test.h"
+#include "Backend/Machine Learning/chiron-orbit-test.h"
+#include "Backend/Machine Learning/chiron-vitals-test.h"
+#include "Backend/Machine Learning/chiron-model-test.h"
+#include "Backend/Machine Learning/chiron-generate-test.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
@@ -209,8 +214,157 @@ int main(int argc, char* argv[])
 		VESTAUnitTest();
 	    else if (strcmp(argv[1], "helios") == 0)
 		HELIOSUnitTest();
+	    else if (strcmp(argv[1], "chiron-token-count") == 0)
+		CHIRONTokenLmMetricCountTest();
 	    else if (strcmp(argv[1], "chiron") == 0)
 		CHIRONUnitTest();
+	    else if (strcmp(argv[1], "chiron-rank-cause") == 0)
+		ChironRankCauseUnitTest();
+	    else if (strcmp(argv[1], "chiron-sira") == 0 || strcmp(argv[1], "sira") == 0)
+	    {
+		CHIRONSiraConfigDefaultsTest();
+		CHIRONSiraDisabledParityTest();
+		CHIRONSiraDiagnosticsTest();
+		CHIRONSiraEnabledMathTest();
+		CHIRONSiraTrainingLossTest();
+		CHIRONPhsConfigDefaultsTest();
+		CHIRONPhsDisabledParityTest();
+		CHIRONPhsDiagnosticsMathTest();
+		CHIRONPhsEmaTest();
+		CHIRONPtocConfigDefaultsTest();
+		CHIRONPtocDisabledParityTest();
+		CHIRONPtocDiagnosticsMathTest();
+		CHIRONQClampMathTest();
+		CHIRONQClampEdgeTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-phs") == 0 || strcmp(argv[1], "phs") == 0)
+	    {
+		CHIRONPhsConfigDefaultsTest();
+		CHIRONPhsDisabledParityTest();
+		CHIRONPhsDiagnosticsMathTest();
+		CHIRONPhsEmaTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-ptoc") == 0 || strcmp(argv[1], "ptoc") == 0)
+	    {
+		CHIRONPtocConfigDefaultsTest();
+		CHIRONPtocDisabledParityTest();
+		CHIRONPtocDiagnosticsMathTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-qclamp") == 0 || strcmp(argv[1], "qclamp") == 0)
+	    {
+		CHIRONQClampMathTest();
+		CHIRONQClampEdgeTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-agc") == 0 || strcmp(argv[1], "agc") == 0)
+	    {
+		CHIRONAgcClampTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-gc") == 0 || strcmp(argv[1], "gc") == 0)
+	    {
+		CHIRONGradCentralizeTest();
+		CHIRONGradCentralizeBf16Test();
+	    }
+	    else if (strcmp(argv[1], "chiron-relnbound") == 0 || strcmp(argv[1], "relnbound") == 0)
+	    {
+		CHIRONRelnBackwardBoundedTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-reanchor") == 0 || strcmp(argv[1], "reanchor") == 0)
+	    {
+		CHIRONRelnReanchorTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-drift") == 0 || strcmp(argv[1], "drift") == 0)
+	    {
+		CHIRONDriftGradCheckTest();
+		CHIRONDriftCpuGpuParityTest();
+		CHIRONDriftReversibilityTest();
+		CHIRONDriftBackwardParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-rot") == 0 || strcmp(argv[1], "rot") == 0)
+	    {
+		CHIRONRotCpuTest();
+		CHIRONRotGpuParityTest();
+		CHIRONRotBackwardParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-whisc") == 0 || strcmp(argv[1], "whisc") == 0)
+	    {
+		WhiSCScaleCpuTest();
+		WhiSCStatsCpuTest();
+		WhiSCGpuParityTest();
+		WhiSCBackwardParityTest();
+		WhiSCFoldBackwardParityTest();
+		WhiSCInvWalkBackwardParityTest();
+		CHIRONWhiscFuseRelnParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-pied") == 0 || strcmp(argv[1], "pied") == 0)
+	    {
+		CHIRONPiedMaskCpuTest();
+		CHIRONPiedCommitInverseCpuTest();
+		CHIRONPiedGpuParityTest();
+		CHIRONPiedDualPParityTest();
+		CHIRONPiedDyDualParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-gqa-ffn") == 0 || strcmp(argv[1], "gqa-ffn") == 0)
+	    {
+		CHIRONGqaTiledTest();
+		CHIRONFfnShearTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-vitals") == 0 || strcmp(argv[1], "vitals") == 0)
+		CHIRONVitalsUnitTest();
+	    else if (strcmp(argv[1], "chiron-orbit") == 0 || strcmp(argv[1], "orbit") == 0)
+		CHIRONOrbitUnitTest();
+	    else if (strcmp(argv[1], "chiron-orbit-bench") == 0 || strcmp(argv[1], "orbit-bench") == 0)
+		CHIRONOrbitBenchmark();
+	    else if (strcmp(argv[1], "chiron-pact") == 0 || strcmp(argv[1], "pact") == 0)
+	    {
+		CHIRONPactRefMathTest();
+		CHIRONPactDampSigmaParityTest();
+		CHIRONPactCommitParityTest();
+		CHIRONPactFieldParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-echo") == 0 || strcmp(argv[1], "echo") == 0)
+	    {
+		CHIRONEchoStatsCpuTest();
+		CHIRONEchoGradFDCpuTest();
+		CHIRONEchoE2CpuTest();
+		CHIRONEchoGpuParityTest();
+		CHIRONEchoZlossZeroCoefBitParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-echo-cpu") == 0)
+	    {
+		// GPU-free subset (run while the GPU is occupied by training).
+		CHIRONEchoStatsCpuTest();
+		CHIRONEchoGradFDCpuTest();
+		CHIRONEchoE2CpuTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-crm") == 0 || strcmp(argv[1], "crm") == 0)
+	    {
+		CHIRONCrmCpuMathTest();
+		CHIRONCrmGpuParityTest();
+		CHIRONCrmZeroCoefBitParityTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-crm-cpu") == 0)
+		CHIRONCrmCpuMathTest();
+	    else if (strcmp(argv[1], "chiron-model") == 0)
+		CHIRONModelUnitTest();
+	    else if (strcmp(argv[1], "chiron-generate-cpu") == 0)
+		CHIRONGenerateCpuUnitTest();
+	    else if (strcmp(argv[1], "chiron-generate") == 0)
+		CHIRONGenerateUnitTest();
+	    else if (strcmp(argv[1], "chiron-spectral") == 0 || strcmp(argv[1], "spectral") == 0)
+	    {
+		CHIRONSpectralNormTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-sam") == 0 || strcmp(argv[1], "sam") == 0)
+	    {
+		CHIRONSamTest();
+	    }
+	    else if (strcmp(argv[1], "chiron-castelim") == 0 || strcmp(argv[1], "castelim") == 0)
+	    {
+		CHIRONRelnDualMirrorTest();
+		CHIRONDwconvDualMirrorTest();
+		CHIRONInnerVOTest();
+		CHIRONGradGroupClampTest();
+	    }
 	    else if (strcmp(argv[1], "chiron-bench") == 0)
 		CHIRONBenchmark();
 	    else if (strcmp(argv[1], "vesta-sweep") == 0)

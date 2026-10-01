@@ -160,14 +160,14 @@ static CmpResult run_one_helios_cmp_cfg(glades::OptimizerConfig::Type optType,
 	di.setTrainTokens(trainToks, -1);
 	di.setTestTokens(testToks, -1);
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (unsigned int i = 0; i < nLayers; ++i)
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(dModel), learningRate, 0.0f, 0.0f, 0.0f, 0.0f,
 		    glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("helios_cmp", in, hidden, out);
 

@@ -5268,7 +5268,7 @@ static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind var
 
 static glades::NNInfo* build_token_info(const BenchConfig& cfg, float learningRate, const char* name)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1,
 	    learningRate,
 	    0.0f,
@@ -5278,10 +5278,10 @@ static glades::NNInfo* build_token_info(const BenchConfig& cfg, float learningRa
 	    glades::GMath::LINEAR,
 	    1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (unsigned int i = 0u; i < cfg.token.layers; ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(cfg.token.dModel),
 		    learningRate,
 		    0.0f,
@@ -5292,7 +5292,7 @@ static glades::NNInfo* build_token_info(const BenchConfig& cfg, float learningRa
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(cfg.token.vocab),
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(cfg.token.vocab),
 	                                                           glades::OutputLayerInfo::CLASSIFICATION);
 	return new glades::NNInfo(name, in, hidden, out);
 }
@@ -5411,7 +5411,7 @@ static bool make_regression_network(const BenchConfig& cfg,
                                     std::string& err)
 {
 	const float lr = (variant == VARIANT_ADAMW) ? spec.adamLR : spec.atlasLR;
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    static_cast<int>(spec.batchSize),
 	    lr,
 	    0.0f,
@@ -5421,10 +5421,10 @@ static bool make_regression_network(const BenchConfig& cfg,
 	    glades::GMath::LINEAR,
 	    1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (size_t i = 0; i < spec.hiddenSizes.size(); ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(spec.hiddenSizes[i]),
 		    lr,
 		    0.0f,
@@ -5435,7 +5435,7 @@ static bool make_regression_network(const BenchConfig& cfg,
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* outLayer = new glades::OutputLayerInfo(static_cast<int>(spec.outputDim),
+	auto outLayer = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(spec.outputDim),
 	                                                                glades::OutputLayerInfo::REGRESSION);
 	out.info = new glades::NNInfo(spec.name, in, hidden, outLayer);
 	out.net = new glades::NNetwork(out.info, glades::NNetwork::TYPE_DFF);

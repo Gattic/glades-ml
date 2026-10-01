@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -103,9 +104,8 @@ static glades::NumberInput* make_synthetic_image_data(
 	return di;
 }
 
-// Create a CNN NNetwork with a given config and return heap-allocated pointer.
-// Caller owns the returned pointer and must delete it.
-static glades::NNetwork* make_cnn(
+// Create a CNN NNetwork with a given config and return it.
+static std::unique_ptr<glades::NNetwork> make_cnn(
     const char* name,
     unsigned int inputC, unsigned int inputH, unsigned int inputW,
     unsigned int numClasses,
@@ -115,7 +115,7 @@ static glades::NNetwork* make_cnn(
     int batchSize,
     unsigned int seed)
 {
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ batchSize,
 	    /*learningRate*/ lr,
 	    /*momentumFactor*/ 0.0f,
@@ -125,10 +125,10 @@ static glades::NNetwork* make_cnn(
 	    /*activationType*/ glades::GMath::RELU,
 	    /*activationParam*/ 1.0f);
 
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (size_t i = 0; i < fcHiddenSizes.size(); ++i)
 	{
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(fcHiddenSizes[i]),
 		    lr,
 		    0.0f, 0.0f, 0.0f, 0.0f,
@@ -136,12 +136,12 @@ static glades::NNetwork* make_cnn(
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(numClasses),
 	    glades::OutputLayerInfo::CLASSIFICATION);
 
 	glades::NNInfo* info = new glades::NNInfo(name, in, hidden, out);
-	glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_CNN);
+	auto net = std::make_unique<glades::NNetwork>(info, glades::NNetwork::TYPE_CNN);
 	net->setSeed(seed);
 
 	// Configure CNN layers.
@@ -196,17 +196,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_smoke", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_smoke", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 123u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN smoke train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Smoke TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -239,17 +239,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_pool", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_pool", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 456u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN pool train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Pool TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -280,17 +280,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_bn", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_bn", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 789u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN BN train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::BN TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -323,17 +323,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_full_layer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_full_layer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 111u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN full-layer train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::FullLayer TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -379,17 +379,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_2layer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_2layer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 333u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN 2-layer train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::2Layer TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -422,17 +422,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_rgb", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_rgb", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 555u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN RGB train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::RGB TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -466,13 +466,14 @@ void NNCNNUnitTest()
 		fcHidden.push_back(16u);
 
 		// Train for 1 epoch, record loss.
-		glades::NNetwork* net = make_cnn("ut_cnn_loss_dec", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_loss_dec", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 5, 777u);
+		glades::NNetwork& net = *netOwner;
 
 		CaptureMetricsCb cb1(1);
-		net->getTerminatorMutable().setEpoch(1000);
-		net->getTerminatorMutable().setAccuracy(0);
-		net->train(di, &cb1);
+		net.getTerminatorMutable().setEpoch(1000);
+		net.getTerminatorMutable().setAccuracy(0);
+		net.train(di, &cb1);
 		G_assert(__FILE__, __LINE__, "==============CNN::LossDec Epoch1 Metrics Not Captured==============", cb1.saw);
 		const float loss1 = cb1.last.totalError;
 		printf("[UT] CNN loss after epoch 1: %f\n", loss1);
@@ -480,7 +481,7 @@ void NNCNNUnitTest()
 
 		// Train for 20 more epochs.
 		CaptureMetricsCb cb2(21);
-		net->train(di, &cb2);
+		net.train(di, &cb2);
 		G_assert(__FILE__, __LINE__, "==============CNN::LossDec Epoch20 Metrics Not Captured==============", cb2.saw);
 		const float loss2 = cb2.last.totalError;
 		printf("[UT] CNN loss after epoch ~20: %f\n", loss2);
@@ -492,7 +493,6 @@ void NNCNNUnitTest()
 		         loss2 < loss1);
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -525,22 +525,22 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_infer", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_infer", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 999u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
 		// Train first.
-		const glades::NNetworkStatus stTrain = net->train(di);
+		const glades::NNetworkStatus stTrain = net.train(di);
 		G_assert(__FILE__, __LINE__, "==============CNN::Infer TrainStatus() Failed==============", stTrain.ok());
 
 		// Now test (inference).
-		const glades::NNetworkStatus stTest = net->test(di);
+		const glades::NNetworkStatus stTest = net.test(di);
 		printf("[UT] CNN test status: %s\n", stTest.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Infer TestStatus() Failed==============", stTest.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -573,16 +573,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net1 = make_cnn("ut_cnn_save", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_save", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.01f, 10, 1111u);
-		net1->getTerminatorMutable().setEpoch(3);
-		net1->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net1 = *net1Owner;
+		net1.getTerminatorMutable().setEpoch(3);
+		net1.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus stTrain = net1->train(di);
+		const glades::NNetworkStatus stTrain = net1.train(di);
 		G_assert(__FILE__, __LINE__, "==============CNN::SaveLoad Train() Failed==============", stTrain.ok());
 
 		// Save the model.
-		const glades::NNetworkStatus stSave = net1->saveModel("ut_cnn_roundtrip");
+		const glades::NNetworkStatus stSave = net1.saveModel("ut_cnn_roundtrip");
 		printf("[UT] CNN save status: %s\n", stSave.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::SaveLoad SaveModel() Failed==============", stSave.ok());
 
@@ -598,7 +599,6 @@ void NNCNNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============CNN::SaveLoad Test() After Load Failed==============", stTest.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net1;
 		delete di;
 	}
 
@@ -633,17 +633,17 @@ void NNCNNUnitTest()
 		fcHidden.push_back(16u);
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_multifc", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_multifc", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1313u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN multi-FC train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::MultiFC TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -676,17 +676,17 @@ void NNCNNUnitTest()
 		// No FC hidden layers - flatten goes directly to output.
 		std::vector<unsigned int> fcHidden;
 
-		glades::NNetwork* net = make_cnn("ut_cnn_nofc", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_nofc", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1515u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN no-FC train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::NoFC TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -719,17 +719,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(16u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_3class", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_3class", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1717u);
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN 3-class train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::3Class TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -760,17 +760,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_stride2", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_stride2", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 1919u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN stride2 train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Stride2 TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -801,17 +801,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_5x5", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_5x5", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 2121u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN 5x5 train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::5x5 TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -844,25 +844,25 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_adam", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_adam", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.001f, 10, 2323u);
+		glades::NNetwork& net = *netOwner;
 
 		// Enable AdamW.
-		glades::TrainingConfig& tcfg = net->getTrainingConfigMutable();
+		glades::TrainingConfig& tcfg = net.getTrainingConfigMutable();
 		tcfg.optimizer.type = glades::OptimizerConfig::ADAMW;
 		tcfg.optimizer.adamBeta1 = 0.9f;
 		tcfg.optimizer.adamBeta2 = 0.999f;
 		tcfg.optimizer.adamEps = 1e-8f;
 
-		net->getTerminatorMutable().setEpoch(5);
-		net->getTerminatorMutable().setAccuracy(0);
+		net.getTerminatorMutable().setEpoch(5);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN AdamW train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::AdamW TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -919,17 +919,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(32u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_deep", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_deep", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 2525u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN deep train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Deep TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -962,23 +962,24 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net1 = make_cnn("ut_cnn_bn_save", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_bn_save", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.01f, 10, 2727u);
-		net1->getTerminatorMutable().setEpoch(5);
-		net1->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net1 = *net1Owner;
+		net1.getTerminatorMutable().setEpoch(5);
+		net1.getTerminatorMutable().setAccuracy(0);
 
-		G_assert(__FILE__, __LINE__, "==============CNN::BNSave Train() Failed==============", net1->train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============CNN::BNSave Train() Failed==============", net1.train(di).ok());
 
 		// Capture inference loss before save.
 		CaptureMetricsCb cb1(1);
-		net1->getTerminatorMutable().setEpoch(1000);
-		net1->test(di, &cb1);
+		net1.getTerminatorMutable().setEpoch(1000);
+		net1.test(di, &cb1);
 		G_assert(__FILE__, __LINE__, "==============CNN::BNSave Test() Failed==============", cb1.saw);
 		const float testLoss1 = cb1.last.totalError;
 		printf("[UT] CNN BN test loss (original): %f\n", testLoss1);
 
 		// Save.
-		G_assert(__FILE__, __LINE__, "==============CNN::BNSave SaveModel() Failed==============", net1->saveModel("ut_cnn_bn_roundtrip").ok());
+		G_assert(__FILE__, __LINE__, "==============CNN::BNSave SaveModel() Failed==============", net1.saveModel("ut_cnn_bn_roundtrip").ok());
 
 		// Load into fresh net.
 		glades::NNetwork net2(glades::NNetwork::TYPE_CNN);
@@ -998,7 +999,6 @@ void NNCNNUnitTest()
 		         fabs(testLoss1 - testLoss2) < tol);
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net1;
 		delete di;
 	}
 
@@ -1032,17 +1032,17 @@ void NNCNNUnitTest()
 		fcHidden.push_back(8u);
 
 		// Batch size = 1 (pure stochastic).
-		glades::NNetwork* net = make_cnn("ut_cnn_sgd1", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_sgd1", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 1, 2929u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN stochastic train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Stochastic TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -1075,17 +1075,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_rect", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_rect", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 10, 3131u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN rect train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Rect TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -1129,17 +1129,17 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net = make_cnn("ut_cnn_mixed", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_mixed", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.005f, 10, 3333u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN mixed train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::Mixed TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -1172,17 +1172,18 @@ void NNCNNUnitTest()
 		std::vector<unsigned int> fcHidden;
 		fcHidden.push_back(8u);
 
-		glades::NNetwork* net1 = make_cnn("ut_cnn_adam_cont", C, H, W, numClasses,
+		auto net1Owner = make_cnn("ut_cnn_adam_cont", C, H, W, numClasses,
 		                                 convSpecs, fcHidden, 0.001f, 10, 3535u);
+		glades::NNetwork& net1 = *net1Owner;
 
-		glades::TrainingConfig& tcfg = net1->getTrainingConfigMutable();
+		glades::TrainingConfig& tcfg = net1.getTrainingConfigMutable();
 		tcfg.optimizer.type = glades::OptimizerConfig::ADAMW;
 
-		net1->getTerminatorMutable().setEpoch(3);
-		net1->getTerminatorMutable().setAccuracy(0);
+		net1.getTerminatorMutable().setEpoch(3);
+		net1.getTerminatorMutable().setAccuracy(0);
 
-		G_assert(__FILE__, __LINE__, "==============CNN::AdamCont Train1() Failed==============", net1->train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============CNN::AdamCont SaveModel() Failed==============", net1->saveModel("ut_cnn_adam_cont").ok());
+		G_assert(__FILE__, __LINE__, "==============CNN::AdamCont Train1() Failed==============", net1.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============CNN::AdamCont SaveModel() Failed==============", net1.saveModel("ut_cnn_adam_cont").ok());
 
 		// Load and continue training.
 		glades::NNetwork net2(glades::NNetwork::TYPE_CNN);
@@ -1201,7 +1202,6 @@ void NNCNNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============CNN::AdamCont Train2() Failed==============", st2.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net1;
 		delete di;
 	}
 
@@ -1235,17 +1235,17 @@ void NNCNNUnitTest()
 		fcHidden.push_back(8u);
 
 		// Batch size = 0 means full batch.
-		glades::NNetwork* net = make_cnn("ut_cnn_fullbatch", C, H, W, numClasses,
+		auto netOwner = make_cnn("ut_cnn_fullbatch", C, H, W, numClasses,
 		                                convSpecs, fcHidden, 0.01f, 0, 3737u);
-		net->getTerminatorMutable().setEpoch(3);
-		net->getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(3);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		printf("[UT] CNN full-batch train status: %s\n", st.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNN::FullBatch TrainStatus() Failed==============", st.ok());
 
 		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
-		delete net;
 		delete di;
 	}
 
@@ -1308,11 +1308,12 @@ void NNCNNMNISTUnitTest()
 	std::vector<unsigned int> fcHidden;
 	fcHidden.push_back(128u);
 
-	glades::NNetwork* net = make_cnn("ut_cnn_mnist", inputC, inputH, inputW, numClasses,
+	auto netOwner = make_cnn("ut_cnn_mnist", inputC, inputH, inputW, numClasses,
 	                                convSpecs, fcHidden, 0.001f, 64, 42u);
+	glades::NNetwork& net = *netOwner;
 
 	// Configure AdamW + grad clipping.
-	glades::TrainingConfig& tcfg = net->getTrainingConfigMutable();
+	glades::TrainingConfig& tcfg = net.getTrainingConfigMutable();
 	tcfg.optimizer.type = glades::OptimizerConfig::ADAMW;
 	tcfg.optimizer.adamBeta1 = 0.9f;
 	tcfg.optimizer.adamBeta2 = 0.999f;
@@ -1328,9 +1329,9 @@ void NNCNNMNISTUnitTest()
 	{
 		// Train 1 epoch, capture loss.
 		CaptureMetricsCb cb1(1);
-		net->getTerminatorMutable().setEpoch(1000);
-		net->getTerminatorMutable().setAccuracy(0);
-		const glades::NNetworkStatus stA1 = net->train(di, &cb1);
+		net.getTerminatorMutable().setEpoch(1000);
+		net.getTerminatorMutable().setAccuracy(0);
+		const glades::NNetworkStatus stA1 = net.train(di, &cb1);
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestA Epoch1 Train Failed==============", stA1.ok());
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestA Epoch1 Metrics==============", cb1.saw);
 		const float loss1 = cb1.last.totalError;
@@ -1339,7 +1340,7 @@ void NNCNNMNISTUnitTest()
 
 		// Train 4 more epochs.
 		CaptureMetricsCb cb2(4);
-		net->train(di, &cb2);
+		net.train(di, &cb2);
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestA Epoch5 Metrics==============", cb2.saw);
 		const float loss2 = cb2.last.totalError;
 		printf("[UT] MNIST loss after epoch 5: %f\n", loss2);
@@ -1360,7 +1361,7 @@ void NNCNNMNISTUnitTest()
 	printf("-----------------------------------\n");
 	{
 		CaptureMetricsCb cbTest(1);
-		net->test(di, &cbTest);
+		net.test(di, &cbTest);
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestB Metrics==============", cbTest.saw);
 		const float acc = cbTest.last.classAccuracy;
 		printf("[UT] MNIST test accuracy: %.2f%%\n", acc);
@@ -1379,7 +1380,7 @@ void NNCNNMNISTUnitTest()
 	printf("-----------------------------------\n");
 	{
 		// Save trained model.
-		const glades::NNetworkStatus stSave = net->saveModel("ut_cnn_mnist_roundtrip");
+		const glades::NNetworkStatus stSave = net.saveModel("ut_cnn_mnist_roundtrip");
 		printf("[UT] MNIST save status: %s\n", stSave.message.c_str());
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestC SaveModel()==============", stSave.ok());
 
@@ -1391,7 +1392,7 @@ void NNCNNMNISTUnitTest()
 
 		// Inference on original.
 		CaptureMetricsCb cbOrig(1);
-		net->test(di, &cbOrig);
+		net.test(di, &cbOrig);
 		G_assert(__FILE__, __LINE__, "==============CNNMNIST::TestC Orig Metrics==============", cbOrig.saw);
 
 		// Inference on loaded.
@@ -1414,6 +1415,5 @@ void NNCNNMNISTUnitTest()
 	printf("CNN MNIST Unit Tests Completed\n");
 	printf("============================================================\n");
 
-	delete net;
 	delete di;
 }

@@ -77,6 +77,22 @@ __device__ __forceinline__ float warpReduceMax(float val)
 	return val;
 }
 
+__device__ __forceinline__ void warpReduceMaxCount(float& maximum, float& count)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+	{
+		const float otherMaximum = __shfl_down_sync(0xFFFFFFFF, maximum, offset);
+		const float otherCount = __shfl_down_sync(0xFFFFFFFF, count, offset);
+		if (otherMaximum > maximum)
+		{
+			maximum = otherMaximum;
+			count = otherCount;
+		}
+		else if (otherMaximum == maximum)
+			count += otherCount;
+	}
+}
+
 // Block-wide sum reduction using shared memory.  Caller must provide
 // smem of size >= (blockDim.x / 32) floats.
 __device__ float blockReduceSum(float val, float* smem)
@@ -92,6 +108,43 @@ __device__ float blockReduceSum(float val, float* smem)
 	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : 0.0f;
 	if (wid == 0) val = warpReduceSum(val);
 	return val;
+}
+
+// Three reductions with one block synchronization. CRM uses this for decoded
+// sum/norm/certificate and observed component triples; it avoids five extra
+// block barriers in the production-sized row kernel.
+__device__ void blockReduceSum3(float& a, float& b, float& c,
+                                float* smemA, float* smemB, float* smemC)
+{
+	const int lane = threadIdx.x & 31;
+	const int wid = threadIdx.x >> 5;
+	a = warpReduceSum(a); b = warpReduceSum(b); c = warpReduceSum(c);
+	if (lane == 0) { smemA[wid] = a; smemB[wid] = b; smemC[wid] = c; }
+	__syncthreads();
+	const int numWarps = (blockDim.x + 31) / 32;
+	a = (threadIdx.x < (unsigned)numWarps) ? smemA[threadIdx.x] : 0.0f;
+	b = (threadIdx.x < (unsigned)numWarps) ? smemB[threadIdx.x] : 0.0f;
+	c = (threadIdx.x < (unsigned)numWarps) ? smemC[threadIdx.x] : 0.0f;
+	if (wid == 0) { a = warpReduceSum(a); b = warpReduceSum(b); c = warpReduceSum(c); }
+}
+
+// Block-wide max/count reduction. Count is the exact multiplicity of maximum.
+__device__ void blockReduceMaxCount(float& maximum, float& count,
+                                    float* maxScratch, float* countScratch)
+{
+	const int lane = threadIdx.x & 31;
+	const int wid = threadIdx.x >> 5;
+	warpReduceMaxCount(maximum, count);
+	if (lane == 0)
+	{
+		maxScratch[wid] = maximum;
+		countScratch[wid] = count;
+	}
+	__syncthreads();
+	const int numWarps = (blockDim.x + 31) / 32;
+	maximum = (threadIdx.x < (unsigned)numWarps) ? maxScratch[threadIdx.x] : -FLT_MAX;
+	count = (threadIdx.x < (unsigned)numWarps) ? countScratch[threadIdx.x] : 0.0f;
+	if (wid == 0) warpReduceMaxCount(maximum, count);
 }
 
 // Block-wide max reduction using shared memory.
@@ -349,6 +402,72 @@ __global__ void layernorm_backward_dgamma_dbeta_partial(
 	}
 }
 
+// Phase 3 (q-side source cure, 2026-06-17): xhat-clamped variant of the
+// dgamma/dbeta partial kernel.  Identical to _partial except xhat is clamped
+// to [-xhatMax, xhatMax] before accumulation.  xhat=(x-mean)*invStd is the
+// layernorm-normalized value (should be O(1)); a huge xhat is BF16-inverse
+// reconstruction drift — clamping it bounds the dgamma overflow at its source
+// (the unbounded factor; dout is already bounded by --dq-layer-clamp).
+// Separate kernel (not a branch in _partial) to keep the default path's
+// codegen untouched (iter-70/73 FMA-drift-class precaution).
+template<int BLOCK_C, int BLOCK_T>
+__global__ void layernorm_backward_dgamma_dbeta_partial_clamped(
+    const float* __restrict__ dout,
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ invStd,
+    int rows, int cols,
+    int rowsPerBlock,
+    float xhatMax,
+    float* __restrict__ partial_dg,
+    float* __restrict__ partial_db)
+{
+	const int col            = blockIdx.x * BLOCK_C + threadIdx.x;
+	const int rowStart       = blockIdx.y * rowsPerBlock;
+	const int rowEnd         = rowStart + rowsPerBlock;
+	const int rowEndClamped  = (rowEnd > rows) ? rows : rowEnd;
+	const int ty             = threadIdx.y;
+
+	float dgAcc = 0.0f;
+	float dbAcc = 0.0f;
+	if (col < cols)
+	{
+		for (int r = rowStart + ty; r < rowEndClamped; r += BLOCK_T)
+		{
+			float mu   = mean[r];
+			float inv  = invStd[r];
+			float xhat = (x[(size_t)r * cols + col] - mu) * inv;
+			xhat = fmaxf(-xhatMax, fminf(xhatMax, xhat));   // <-- the source bound
+			float d    = dout[(size_t)r * cols + col];
+			dgAcc += d * xhat;
+			dbAcc += d;
+		}
+	}
+
+	__shared__ float sDg[BLOCK_T][BLOCK_C];
+	__shared__ float sDb[BLOCK_T][BLOCK_C];
+	sDg[ty][threadIdx.x] = dgAcc;
+	sDb[ty][threadIdx.x] = dbAcc;
+	__syncthreads();
+
+	for (int s = BLOCK_T / 2; s > 0; s >>= 1)
+	{
+		if (ty < s)
+		{
+			sDg[ty][threadIdx.x] += sDg[ty + s][threadIdx.x];
+			sDb[ty][threadIdx.x] += sDb[ty + s][threadIdx.x];
+		}
+		__syncthreads();
+	}
+
+	if (ty == 0 && col < cols)
+	{
+		const size_t base = (size_t)blockIdx.y * (size_t)cols + (size_t)col;
+		partial_dg[base] = sDg[0][threadIdx.x];
+		partial_db[base] = sDb[0][threadIdx.x];
+	}
+}
+
 // Phase 2: deterministic per-col reduce of T_PARTS partials in fixed loop
 // order.  One thread per col; T_PARTS is small (≤8) so loop is cheap.
 __global__ void layernorm_backward_dgamma_dbeta_reduce(
@@ -443,6 +562,51 @@ bool layernorm_backward(const float* dout, const float* x,
 		}
 	}
 
+	return true;
+}
+
+// Phase 3 (q-side source cure): layernorm backward with xhat clamped to
+// [-xhatMax, xhatMax] in the dgamma/dbeta reduction.  dx kernel unchanged
+// (the observed overflow is dgamma; dx feeds the next layer where
+// --dq-layer-clamp bounds it).  xhatMax<=0 delegates to plain
+// layernorm_backward (bit-identical).
+bool layernorm_backward_bounded(const float* dout, const float* x,
+                                const float* gamma, const float* mean,
+                                const float* invStd, int rows, int cols,
+                                float* dx, float* dgamma, float* dbeta,
+                                float xhatMax)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	if (!(xhatMax > 0.0f))
+		return layernorm_backward(dout, x, gamma, mean, invStd, rows, cols, dx, dgamma, dbeta);
+
+	int block1 = rowBlockSize(cols);
+	int smemBytes1 = (block1 / 32 + 2) * 2 * sizeof(float);
+	layernorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
+		dout, x, gamma, mean, invStd, cols, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	const int BLOCK_C = 64;
+	const int BLOCK_T = 8;
+	const int T_PARTS = 4;
+	if (!ensure_ln_partial_scratch(T_PARTS, cols)) return false;
+	int rowsPerBlock = (rows + T_PARTS - 1) / T_PARTS;
+	{
+		dim3 grid((cols + BLOCK_C - 1) / BLOCK_C, T_PARTS);
+		dim3 block(BLOCK_C, BLOCK_T);
+		layernorm_backward_dgamma_dbeta_partial_clamped<64, 8>
+		    <<<grid, block, 0, computeStream()>>>(
+		        dout, x, mean, invStd, rows, cols, rowsPerBlock, xhatMax,
+		        s_ln_partial_dg, s_ln_partial_db);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	{
+		const int RBLOCK = 256;
+		int rgrid = (cols + RBLOCK - 1) / RBLOCK;
+		layernorm_backward_dgamma_dbeta_reduce<<<rgrid, RBLOCK, 0, computeStream()>>>(
+		    s_ln_partial_dg, s_ln_partial_db, T_PARTS, cols, dgamma, dbeta);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
 	return true;
 }
 
@@ -1173,7 +1337,8 @@ __global__ void rope_apply_inplace(float* __restrict__ x,
                                    int T, int nHeads, int dHead,
                                    int halfDim, bool inverse)
 {
-	// Grid: one thread per (t, h, d) triple where d in [0, halfDim).
+	// Grid: one thread per (t, h, pair) triple. Pair adjacent dimensions
+	// (2*d, 2*d+1), matching the canonical CPU training/inference kernels.
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	int total = T * nHeads * halfDim;
 	if (idx >= total) return;
@@ -1189,11 +1354,13 @@ __global__ void rope_apply_inplace(float* __restrict__ x,
 
 	// x layout: [T, nHeads, dHead]
 	size_t base = ((size_t)t * nHeads + h) * dHead;
-	float x0 = x[base + d];
-	float x1 = x[base + d + halfDim];
+	const int i0 = 2 * d;
+	const int i1 = i0 + 1;
+	float x0 = x[base + i0];
+	float x1 = x[base + i1];
 
-	x[base + d]            = x0 * cosT - x1 * sinT;
-	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+	x[base + i0] = x0 * cosT - x1 * sinT;
+	x[base + i1] = x0 * sinT + x1 * cosT;
 }
 
 } // anonymous namespace
@@ -1245,11 +1412,13 @@ __global__ void rope_apply_qk_kernel(float* __restrict__ Q,
 	float sinT  = inverse ? -sinf(theta) : sinf(theta);
 
 	size_t base = ((size_t)t * nHeads + h) * dHead;
-	float x0 = x[base + d];
-	float x1 = x[base + d + halfDim];
+	const int i0 = 2 * d;
+	const int i1 = i0 + 1;
+	float x0 = x[base + i0];
+	float x1 = x[base + i1];
 
-	x[base + d]            = x0 * cosT - x1 * sinT;
-	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+	x[base + i0] = x0 * cosT - x1 * sinT;
+	x[base + i1] = x0 * sinT + x1 * cosT;
 }
 
 } // anonymous namespace
@@ -1467,6 +1636,26 @@ __global__ void embedding_scatter_add_kernel(float* __restrict__ dE,
 // for the embedding-grad scatter-add (gTokE) — directly accumulates each
 // token's dout slice into the persistent BF16 mirror, eliminating both the
 // FP32 grad allocation and the Phase-1 cast pass for gTokE.
+// V15 coverage tap.  One block per token reduces |dq[t,:]| and performs one
+// order-independent atomic add into the token row.  It is deliberately a
+// separate read-only pass: the shipped embedding scatter kernel and its atomic
+// ordering remain untouched, so enabling telemetry cannot perturb dE bits.
+__global__ void embedding_coverage_accumulate_kernel(
+    const int* __restrict__ tokenIds, const float* __restrict__ dout,
+    int T, int vocabSize, int dModel, float* __restrict__ rowMass)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+	const int tok = tokenIds[t];
+	if (tok < 0 || tok >= vocabSize) return;
+	extern __shared__ float smem[];
+	float local = 0.0f;
+	for (int d = threadIdx.x; d < dModel; d += blockDim.x)
+		local += fabsf(dout[(size_t)t * dModel + d]);
+	local = blockReduceSum(local, smem);
+	if (threadIdx.x == 0) atomicAdd(rowMass + tok, local);
+}
+
 __global__ void embedding_scatter_add_bf16_kernel(uint16_t* __restrict__ dE_bf16,
                                                   const int* __restrict__ tokenIds,
                                                   const float* __restrict__ dout,
@@ -1523,6 +1712,189 @@ __global__ void embedding_scatter_add_bf16_kernel(uint16_t* __restrict__ dE_bf16
 	}
 }
 
+// Per-row RMS clamp with non-finite sanitization (in place).  One 256-thread
+// block per row; the row sum-of-squares accumulates in double so huge-but-
+// finite rows (|x| ~ 1e20, whose FP32 square is inf) still compute a correct
+// rescale instead of being misread as overflowed.  Rows that need no change
+// take no write at all — they stay bit-identical.  Deterministic: fixed-order
+// tree reduction, and the count atomics only order independent increments.
+__global__ void row_rms_clamp_kernel(float* __restrict__ x,
+                                     int rows, int cols, float tauRms,
+                                     int* __restrict__ clampedCount,
+                                     int* __restrict__ nonfiniteCount,
+                                     float* __restrict__ preClampSumSq,
+                                     int* __restrict__ boundaryClamped,
+                                     int* __restrict__ boundaryNonfinite)
+{
+	const int row = blockIdx.x;
+	if (row >= rows) return;
+	float* xr = x + (size_t)row * cols;
+
+	__shared__ double s_ss[256];
+	__shared__ int s_bad[256];
+	__shared__ float s_scale;
+
+	double ss = 0.0;
+	int bad = 0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		const float v = xr[i];
+		if (!isfinite(v)) bad = 1;
+		ss += (double)v * (double)v;
+	}
+	s_ss[threadIdx.x] = ss;
+	s_bad[threadIdx.x] = bad;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < (unsigned int)stride)
+		{
+			s_ss[threadIdx.x] += s_ss[threadIdx.x + stride];
+			s_bad[threadIdx.x] |= s_bad[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+	{
+		// V1 tap: one scalar atomic per row, fused with the mandatory clamp
+		// read.  Stats are additive across accumulation micro-steps.
+		if (preClampSumSq)
+			atomicAdd(preClampSumSq, s_bad[0] ? INFINITY : (float)s_ss[0]);
+		float scale = 1.0f;
+		if (s_bad[0])
+		{
+			// Row is poisoned (NaN/Inf): zero it rather than propagate.
+			scale = 0.0f;
+			if (nonfiniteCount) atomicAdd(nonfiniteCount, 1);
+			if (boundaryNonfinite) atomicAdd(boundaryNonfinite, 1);
+		}
+		else
+		{
+			const double rms = sqrt(s_ss[0] / (double)cols);
+			if (rms > (double)tauRms)
+			{
+				scale = (float)((double)tauRms / rms);
+				if (clampedCount) atomicAdd(clampedCount, 1);
+				if (boundaryClamped) atomicAdd(boundaryClamped, 1);
+			}
+		}
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float scale = s_scale;
+	if (scale == 1.0f) return;
+	// scale==0 writes the literal 0.0f (a NaN element times 0 is still NaN).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		xr[i] = (scale == 0.0f) ? 0.0f : xr[i] * scale;
+}
+
+// Per-vector L2-norm clamp (in place).  One block over the whole vector.
+//  - any non-finite element → entire vector zeroed, ++*d_clampedCount
+//  - else ‖x‖₂ > maxNorm     → scaled by maxNorm/‖x‖, ++*d_clampedCount
+//  - else                    → untouched (no write; bit-identical)
+// Sum-of-squares in double so huge-but-finite gradients (|x|~1e19, whose
+// FP32 square overflows) rescale correctly instead of reading as inf.
+// Used by the per-group gradient clamp (q-side instability mitigation 1):
+// bound each layer's dgamma/dbeta L2 norm BEFORE the global-norm sum, which
+// per-row clamping cannot do.  See research/QSIDE_INSTABILITY_INVESTIGATION_2026_06_14.md.
+__global__ void clamp_vector_l2norm_kernel(float* __restrict__ x, int n,
+                                           float maxNorm,
+                                           int* __restrict__ clampedCount)
+{
+	__shared__ double s_ss[256];
+	__shared__ int s_bad[256];
+	__shared__ float s_scale;
+
+	double ss = 0.0;
+	int bad = 0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const float v = x[i];
+		if (!isfinite(v)) bad = 1;
+		ss += (double)v * (double)v;
+	}
+	s_ss[threadIdx.x] = ss;
+	s_bad[threadIdx.x] = bad;
+	__syncthreads();
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (threadIdx.x < (unsigned int)stride) {
+			s_ss[threadIdx.x] += s_ss[threadIdx.x + stride];
+			s_bad[threadIdx.x] |= s_bad[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0) {
+		float scale = 1.0f;
+		if (s_bad[0]) {
+			scale = 0.0f;
+			if (clampedCount) atomicAdd(clampedCount, 1);
+		} else {
+			const double norm = sqrt(s_ss[0]);
+			if (norm > (double)maxNorm) {
+				scale = (float)((double)maxNorm / norm);
+				if (clampedCount) atomicAdd(clampedCount, 1);
+			}
+		}
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float scale = s_scale;
+	if (scale == 1.0f) return;
+	for (int i = threadIdx.x; i < n; i += blockDim.x)
+		x[i] = (scale == 0.0f) ? 0.0f : x[i] * scale;
+}
+
+// Adaptive Gradient Clipping (AGC, NFNets/Brock 2021): clip grad g to
+// lambda*max(‖w‖, eps) — auto-scaled to the parameter's own magnitude rather
+// than a fixed threshold.  One block over the whole vector; both norms in
+// double (huge-but-finite safe).  See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+__global__ void agc_clamp_vector_kernel(float* __restrict__ g,
+                                        const float* __restrict__ w,
+                                        int n, float lambda, float eps,
+                                        int* __restrict__ clampedCount)
+{
+	__shared__ double s_gg[256]; __shared__ double s_ww[256]; __shared__ float s_scale;
+	double gg = 0.0, ww = 0.0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const float gv = g[i], wv = w[i];
+		gg += (double)gv * gv; ww += (double)wv * wv;
+	}
+	s_gg[threadIdx.x] = gg; s_ww[threadIdx.x] = ww; __syncthreads();
+	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+		if (threadIdx.x < (unsigned)s) { s_gg[threadIdx.x] += s_gg[threadIdx.x + s]; s_ww[threadIdx.x] += s_ww[threadIdx.x + s]; }
+		__syncthreads();
+	}
+	if (threadIdx.x == 0) {
+		const double gnorm = sqrt(s_gg[0]);
+		double wnorm = sqrt(s_ww[0]); if (wnorm < (double)eps) wnorm = (double)eps;
+		const double maxg = (double)lambda * wnorm;
+		float scale = 1.0f;
+		if (gnorm > maxg && gnorm > 0.0) { scale = (float)(maxg / gnorm); if (clampedCount) atomicAdd(clampedCount, 1); }
+		s_scale = scale;
+	}
+	__syncthreads();
+	const float sc = s_scale; if (sc == 1.0f) return;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) g[i] *= sc;
+}
+
+// Gradient Centralization (Yong et al. 2020): subtract each row's mean from
+// a [rows, cols] gradient — cheap landscape-flattening regularizer. One block
+// per row; double-accumulated row sum. See docs/superpowers/plans/2026-06-16-chiron-stability-techniques.md.
+__global__ void gradient_centralize_kernel(float* __restrict__ g, int rows, int cols)
+{
+	const int r = blockIdx.x; if (r >= rows) return;
+	float* gr = g + (size_t)r * cols;
+	__shared__ double s[256];
+	double sum = 0.0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += (double)gr[i];
+	s[threadIdx.x] = sum; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	__shared__ float mean;
+	if (threadIdx.x == 0) mean = (float)(s[0] / (double)cols);
+	__syncthreads();
+	const float mu = mean;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) gr[i] -= mu;
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1569,6 +1941,93 @@ bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
 	embedding_scatter_add_bf16_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE_bf16, tokenIds, dout, T, vocabSize, dModel);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool embedding_coverage_accumulate(const int* tokenIds, const float* dout,
+                                   int T, int vocabSize, int dModel,
+                                   float* rowMass)
+{
+	if (!tokenIds || !dout || !rowMass || T <= 0 || vocabSize <= 0 || dModel <= 0)
+		return false;
+	const int block = 256;
+	const int smem = (block / 32 + 2) * (int)sizeof(float);
+	embedding_coverage_accumulate_kernel<<<T, block, smem, computeStream()>>>(
+	    tokenIds, dout, T, vocabSize, dModel, rowMass);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool row_rms_clamp(float* x, int rows, int cols, float tauRms,
+                   int* d_clampedCount, int* d_nonfiniteCount)
+{
+	// Strict argument contract: tauRms <= 0 would zero every row, which is
+	// never what a caller wants — the disabled path must not call at all.
+	if (!x || rows <= 0 || cols <= 0) return false;
+	if (!(tauRms > 0.0f)) return false;
+	row_rms_clamp_kernel<<<rows, 256, 0, computeStream()>>>(
+	    x, rows, cols, tauRms, d_clampedCount, d_nonfiniteCount,
+	    NULL, NULL, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool row_rms_clamp_vitals(float* x, int rows, int cols, float tauRms,
+                          int* d_clampedCount, int* d_nonfiniteCount,
+                          float* d_preClampSumSq,
+                          int* d_boundaryClamped, int* d_boundaryNonfinite)
+{
+	if (!x || !d_preClampSumSq || rows <= 0 || cols <= 0 || !(tauRms > 0.0f))
+		return false;
+	row_rms_clamp_kernel<<<rows, 256, 0, computeStream()>>>(
+	    x, rows, cols, tauRms, d_clampedCount, d_nonfiniteCount,
+	    d_preClampSumSq, d_boundaryClamped, d_boundaryNonfinite);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool clamp_vector_l2norm(float* x, int n, float maxNorm, int* d_clampedCount)
+{
+	if (!x || n <= 0) return false;
+	if (!(maxNorm > 0.0f)) return false;
+	clamp_vector_l2norm_kernel<<<1, 256, 0, computeStream()>>>(
+	    x, n, maxNorm, d_clampedCount);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+__global__ void clamp_abs_kernel(float* x, int n, float cap)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) x[i] = fmaxf(-cap, fminf(cap, x[i]));
+}
+
+// Elementwise hard cap: clamp each element of x to [-cap, +cap].  Returns true
+// (no-op) on n<=0 or cap<=0.  Used by the OBSD a_drift gate cap (bounded-gate
+// salvage: the un-capped gate grew to maxA ~1.8 and regressed val NLL).
+bool clamp_abs(float* x, int n, float cap)
+{
+	if (n <= 0 || cap <= 0.0f) return true;
+	int block = 256; int grid = (n + block - 1) / block;
+	clamp_abs_kernel<<<grid, block, 0, computeStream()>>>(x, n, cap);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool agc_clamp_vector(float* g, const float* w, int n, float lambda, float eps, int* d_count)
+{
+	if (!g || !w || n <= 0) return false;
+	if (!(lambda > 0.0f)) return false;
+	agc_clamp_vector_kernel<<<1, 256, 0, computeStream()>>>(g, w, n, lambda, eps, d_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool gradient_centralize(float* g, int rows, int cols)
+{
+	if (!g || rows <= 0 || cols <= 0) return false;
+	gradient_centralize_kernel<<<rows, 256, 0, computeStream()>>>(g, rows, cols);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1885,7 +2344,238 @@ __global__ void sophia_g_update_bf16_state_kernel(
 	param[idx] -= lr * ratio;
 }
 
+// Gradient Centralization, BF16-in/BF16-out variant (Phase 2).  Reads the
+// uint16_t (BF16) weight gradient, centers each output-row over the fan-in in
+// FP32 (double-accumulated row sum), writes the centered value back as BF16
+// (RNE).  Matches gradient_centralize_kernel but for the bf16Grads path where
+// dWq/dWk/dWv/dWo live as BF16.
+__global__ void gradient_centralize_bf16_kernel(uint16_t* __restrict__ g, int rows, int cols)
+{
+	const int r = blockIdx.x; if (r >= rows) return;
+	uint16_t* gr = g + (size_t)r * cols;
+	__shared__ double s[256];
+	double sum = 0.0;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += (double)bf16_load_as_f32(gr[i]);
+	s[threadIdx.x] = sum; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	__shared__ float mean;
+	if (threadIdx.x == 0) mean = (float)(s[0] / (double)cols);
+	__syncthreads();
+	const float mu = mean;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		gr[i] = bf16_store_from_f32(bf16_load_as_f32(gr[i]) - mu);
+}
+
 } // anonymous namespace
+
+bool gradient_centralize_bf16(uint16_t* g, int rows, int cols)
+{
+	if (!g || rows <= 0 || cols <= 0) return false;
+	gradient_centralize_bf16_kernel<<<rows, 256, 0, computeStream()>>>(g, rows, cols);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// === Phase 4: spectral norm (power iteration) ==============================
+namespace {
+
+// v[j] = sum_i W[i*cols+j] * u[i]   (Wᵀu, one thread per output column j)
+__global__ void k_spec_ATu(const float* __restrict__ W, const float* __restrict__ u,
+                           float* __restrict__ v, int rows, int cols)
+{
+	const int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= cols) return;
+	double acc = 0.0;
+	for (int i = 0; i < rows; ++i) acc += (double)W[(size_t)i * cols + j] * (double)u[i];
+	v[j] = (float)acc;
+}
+
+// u[i] = sum_j W[i*cols+j] * v[j]   (Wv, one thread per output row i)
+__global__ void k_spec_Av(const float* __restrict__ W, const float* __restrict__ v,
+                          float* __restrict__ u, int rows, int cols)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= rows) return;
+	const float* Wi = W + (size_t)i * cols;
+	double acc = 0.0;
+	for (int j = 0; j < cols; ++j) acc += (double)Wi[j] * (double)v[j];
+	u[i] = (float)acc;
+}
+
+// single-block L2 norm → out[0] = sqrt(sum x^2)
+__global__ void k_spec_l2norm(const float* __restrict__ x, int n, float* __restrict__ out)
+{
+	__shared__ double s[256];
+	double a = 0.0;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) a += (double)x[i] * (double)x[i];
+	s[threadIdx.x] = a; __syncthreads();
+	for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (threadIdx.x < (unsigned)st) s[threadIdx.x] += s[threadIdx.x + st]; __syncthreads(); }
+	if (threadIdx.x == 0) out[0] = (float)sqrt(s[0]);
+}
+
+// x /= norm[0]  (zero if norm underflows)
+__global__ void k_spec_scale_inv(float* __restrict__ x, int n, const float* __restrict__ norm)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float nv = norm[0];
+	x[i] = (nv > 1e-30f) ? (x[i] / nv) : 0.0f;
+}
+
+__global__ void k_spec_fill_ones(float* __restrict__ u, int n)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	u[i] = 1.0f;
+}
+
+// W *= min(1, maxSigma/σ)  — conditional spectral down-scaling, fully on-device
+// (no host σ readback). FP32 master.
+__global__ void k_spec_cond_scale(float* __restrict__ W, int n,
+                                  const float* __restrict__ sigma, float maxSigma)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float s = sigma[0];
+	const float f = (s > maxSigma && s > 1e-30f) ? (maxSigma / s) : 1.0f;
+	W[i] = W[i] * f;
+}
+
+// BF16-master variant of the conditional down-scale (read/scale/write BF16).
+__global__ void k_spec_cond_scale_bf16(uint16_t* __restrict__ W, int n,
+                                       const float* __restrict__ sigma, float maxSigma)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	const float s = sigma[0];
+	const float f = (s > maxSigma && s > 1e-30f) ? (maxSigma / s) : 1.0f;
+	W[i] = bf16_store_from_f32(bf16_load_as_f32(W[i]) * f);
+}
+
+} // anonymous namespace
+
+namespace {
+// Shared 1-float device scratch for the power-iteration σ.
+static float* spec_sigma_scratch()
+{
+	static float* p = 0;
+	if (!p) { cudaError_t e = cudaMalloc(&p, sizeof(float)); if (e != cudaSuccess) return 0; }
+	return p;
+}
+
+// Power iteration core: estimate σ_max(Wf32 [rows,cols]) leaving σ in *dSigma
+// (device). initU fills u with ones first (cold start); else u is reused warm.
+static bool spec_power_iterate(const float* Wf32, int rows, int cols,
+                               float* u, float* v, int iters, bool initU, float* dSigma)
+{
+	const int tb = 256;
+	const int gridC = (cols + tb - 1) / tb;
+	const int gridR = (rows + tb - 1) / tb;
+	if (initU) k_spec_fill_ones<<<gridR, tb, 0, computeStream()>>>(u, rows);
+	for (int it = 0; it < iters; ++it)
+	{
+		k_spec_ATu<<<gridC, tb, 0, computeStream()>>>(Wf32, u, v, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(v, cols, dSigma);
+		k_spec_scale_inv<<<gridC, tb, 0, computeStream()>>>(v, cols, dSigma);
+		k_spec_Av<<<gridR, tb, 0, computeStream()>>>(Wf32, v, u, rows, cols);
+		k_spec_l2norm<<<1, tb, 0, computeStream()>>>(u, rows, dSigma);  // dSigma = ‖Wv‖ = σ
+		// leave u un-normalized on the last iter (σ already captured)
+		if (it != iters - 1)
+			k_spec_scale_inv<<<gridR, tb, 0, computeStream()>>>(u, rows, dSigma);
+	}
+	return true;
+}
+} // anonymous namespace
+
+// Estimate σ_max(W) by power iteration.  W is [rows, cols] row-major (FP32).
+// u (rows) initialized nonzero by the caller (cold start) or reused warm.
+// v (cols) is scratch.  Returns σ_max in *sigmaOut (host).
+bool spectral_norm_estimate(const float* W, int rows, int cols,
+                            float* u, float* v, int iters, float* sigmaOut)
+{
+	if (!W || !u || !v || rows <= 0 || cols <= 0 || iters <= 0) return false;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(W, rows, cols, u, v, iters, /*initU=*/false, dSigma)) return false;
+	float sigma = 0.0f;
+	cudaMemcpyAsync(&sigma, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+	if (!synchronizeComputeStream()) return false;
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	if (sigmaOut) *sigmaOut = sigma;
+	return true;
+}
+
+// Per-step spectral normalization (FP32 master): estimate σ_max(W) cold (u/v
+// scratch), then scale W *= min(1, maxSigma/σ) entirely on-device (no host
+// sync).  Optionally returns σ to *sigmaOut if the caller passes a non-null
+// host pointer (adds one D2H — pass null on the hot path).
+bool spectral_normalize(float* W, int rows, int cols,
+                        float* u, float* v, int iters, float maxSigma, float* sigmaOut)
+{
+	if (!W || !u || !v || rows <= 0 || cols <= 0 || iters <= 0 || maxSigma <= 0.0f) return false;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(W, rows, cols, u, v, iters, /*initU=*/true, dSigma)) return false;
+	if (sigmaOut)
+	{
+		cudaMemcpyAsync(sigmaOut, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+		if (!synchronizeComputeStream()) return false;
+	}
+	const int tb = 256, gridN = ((rows * cols) + tb - 1) / tb;
+	k_spec_cond_scale<<<gridN, tb, 0, computeStream()>>>(W, rows * cols, dSigma, maxSigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Per-step spectral normalization (BF16 master): caller materializes the FP32
+// view Wf32 (e.g. via cast_bf16_to_f32 into a scratch); σ is estimated on Wf32
+// and the BF16 master Wbf is scaled in-place on-device.
+bool spectral_normalize_bf16(uint16_t* Wbf, const float* Wf32, int rows, int cols,
+                             float* u, float* v, int iters, float maxSigma, float* sigmaOut)
+{
+	if (!Wbf || !Wf32 || !u || !v || rows <= 0 || cols <= 0 || iters <= 0 || maxSigma <= 0.0f) return false;
+	float* dSigma = spec_sigma_scratch(); if (!dSigma) return false;
+	if (!spec_power_iterate(Wf32, rows, cols, u, v, iters, /*initU=*/true, dSigma)) return false;
+	if (sigmaOut)
+	{
+		cudaMemcpyAsync(sigmaOut, dSigma, sizeof(float), cudaMemcpyDeviceToHost, computeStream());
+		if (!synchronizeComputeStream()) return false;
+	}
+	const int tb = 256, gridN = ((rows * cols) + tb - 1) / tb;
+	k_spec_cond_scale_bf16<<<gridN, tb, 0, computeStream()>>>(Wbf, rows * cols, dSigma, maxSigma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// === Phase 5: SAM weight perturb / restore =================================
+namespace {
+// W[i] += scale * g[i]   (ascent step to the ρ-ball with scale = +ρ/‖g‖;
+// restore with scale = −ρ/‖g‖). FP32 master.
+__global__ void k_sam_perturb(float* __restrict__ W, const float* __restrict__ g,
+                              int n, float scale)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	W[i] = W[i] + scale * g[i];
+}
+// BF16 master + BF16 grad variant (read both as f32, write bf16 RNE).
+__global__ void k_sam_perturb_bf16(uint16_t* __restrict__ W, const uint16_t* __restrict__ g,
+                                   int n, float scale)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+	W[i] = bf16_store_from_f32(bf16_load_as_f32(W[i]) + scale * bf16_load_as_f32(g[i]));
+}
+} // anonymous namespace
+
+// SAM perturb/restore: W += scale*g.  Pass scale = +rho/‖g‖ to ascend to the
+// ρ-ball boundary, scale = −rho/‖g‖ to restore exactly.
+bool sam_perturb(float* W, const float* g, int n, float scale)
+{
+	if (!W || !g || n <= 0) return false;
+	const int tb = 256, grid = (n + tb - 1) / tb;
+	k_sam_perturb<<<grid, tb, 0, computeStream()>>>(W, g, n, scale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+bool sam_perturb_bf16(uint16_t* W, const uint16_t* g, int n, float scale)
+{
+	if (!W || !g || n <= 0) return false;
+	const int tb = 256, grid = (n + tb - 1) / tb;
+	k_sam_perturb_bf16<<<grid, tb, 0, computeStream()>>>(W, g, n, scale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool adam_update_bf16_state(float* param, const float* grad,
                             uint16_t* m_bf16, uint16_t* v_bf16,
@@ -2039,6 +2729,53 @@ namespace {
 
 #define ADAM_INT8_BS 256   // chosen so shmem = 2 * BS * 4 = 2 KB — fits in L1
 
+// V5/V7 additive warp reductions. Slot layout is AdamStatSlot in
+// chiron_vitals.h. All sums are read-only telemetry; REL_UPDATE_MAX uses an
+// integer atomicMax because the value is finite/non-negative.
+__device__ __forceinline__ void adam_vitals_warp_accumulate(
+    float* stats, float count, float mSat, float vSat, float dead,
+    float agree, float signal, float noise, float efficiency,
+    float noiseFit, float updateSq, float weightSq,
+    float relativeSum, float relativeMax)
+{
+	if (!stats) return;
+	float v[12] = {count, mSat, vSat, dead, agree, signal, noise, efficiency,
+	               noiseFit, updateSq, weightSq, relativeSum};
+	for (int off = 16; off > 0; off >>= 1)
+	{
+		for (int j = 0; j < 12; ++j)
+			v[j] += __shfl_down_sync(0xFFFFFFFFu, v[j], off);
+		const float other = __shfl_down_sync(0xFFFFFFFFu, relativeMax, off);
+		if (other > relativeMax) relativeMax = other;
+	}
+	const int lane = threadIdx.x & 31;
+	const int warp = threadIdx.x >> 5;
+	__shared__ float blockStats[13][32];
+	if (lane == 0)
+	{
+		for (int j = 0; j < 12; ++j) blockStats[j][warp] = v[j];
+		blockStats[12][warp] = relativeMax;
+	}
+	__syncthreads();
+	if (warp == 0)
+	{
+		const int nWarp = (blockDim.x + 31) >> 5;
+		for (int j = 0; j < 12; ++j)
+		{
+			float x = lane < nWarp ? blockStats[j][lane] : 0.0f;
+			x = warpReduceSum(x);
+			if (lane == 0) atomicAdd(stats + j, x);
+		}
+		float x = lane < nWarp ? blockStats[12][lane] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			const float other = __shfl_down_sync(0xFFFFFFFFu, x, off);
+			if (other > x) x = other;
+		}
+		if (lane == 0) atomicMax(reinterpret_cast<int*>(stats + 12), __float_as_int(x));
+	}
+}
+
 __global__ void adam_update_int8_state_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
@@ -2049,10 +2786,14 @@ __global__ void adam_update_int8_state_kernel(
     float lr, float beta1, float beta2,
     float eps, float weightDecay,
     float gradScale,
-    int step, int n, int numBlocks)
+    int step, int n, int numBlocks,
+    float* __restrict__ vitalsStats)
 {
 	const int blockId = blockIdx.x;
 	if (blockId >= numBlocks) return;
+	// Deterministic 1/16 block sample at production scale. The estimator only
+	// needs stable group summaries; sampling avoids millions of global atomics.
+	if (vitalsStats && numBlocks > 16 && (blockId & 15) != 0) vitalsStats = NULL;
 
 	const int start = blockId * ADAM_INT8_BS;
 	const int end = min(start + ADAM_INT8_BS, n);
@@ -2157,6 +2898,9 @@ __global__ void adam_update_int8_state_kernel(
 	const float invNewM = 127.0f / newMMax;  // signed int8 spacing
 	const float invNewV = 255.0f / newVMax;  // unsigned uint8 spacing
 
+	float vtCount=0.f, vtMSat=0.f, vtVSat=0.f, vtDead=0.f, vtAgree=0.f;
+	float vtSignal=0.f, vtNoise=0.f, vtEff=0.f, vtNoiseFit=0.f;
+	float vtUpdateSq=0.f, vtWeightSq=0.f, vtRelSum=0.f, vtRelMax=0.f;
 	for (int i = threadIdx.x; i < len; i += blockDim.x)
 	{
 		const int gi = start + i;
@@ -2170,32 +2914,51 @@ __global__ void adam_update_int8_state_kernel(
 		float mq = mNew * invNewM;
 		mq = fmaxf(-127.0f, fminf(127.0f, rintf(mq)));
 		m_int8[gi]  = (int8_t)mq;
+		float vq = 0.0f;
 		if (vNew <= 0.0f)
 		{
 			v_uint8[gi] = 0;
 		}
 		else
 		{
-			float vq = rintf(vNew * invNewV);
+			vq = rintf(vNew * invNewV);
 			if (vq < 1.0f) vq = 1.0f;      // preserve "nonzero" semantics
 			if (vq > 255.0f) vq = 255.0f;
 			v_uint8[gi] = (uint8_t)vq;
 		}
 
+		const float pBefore = param[gi];
 		// AdamW weight decay on the current param (FP32).
 		if (weightDecay != 0.0f)
 			param[gi] -= lr * weightDecay * param[gi];
 
-		// Bias-corrected Adam update on param.  We clamp the denominator
-		// so a bad-luck quantization of vNew down to ~0 can't drive the
-		// step magnitude past a safety threshold.  When vNew was stored
-		// with at least code 1 of the uint8 grid, sqrt(vNew) ≥ √(absmax/255)
-		// which is always well-behaved; but we still floor at eps to stay
-		// symmetric with the FP32 adam_update path.
+		// Bias-corrected Adam update on param.
 		const float mHat = mNew / bc1;
 		const float vHat = vNew / bc2;
-		param[gi] -= lr * mHat / (sqrtf(vHat) + eps);
+		const float denom = sqrtf(vHat) + eps;
+		const float update = lr * mHat / denom;
+		param[gi] -= update;
+		if (vitalsStats)
+		{
+			const float ess = (1.0f + beta1) / fmaxf(1e-6f, 1.0f - beta1);
+			const float mh2 = mHat * mHat;
+			const float noise = fmaxf(0.0f, ess * (vHat - mh2) / fmaxf(1.0f, ess - 1.0f));
+			const float signal = fmaxf(0.0f, (ess * mh2 - vHat) / fmaxf(1.0f, ess - 1.0f));
+			const float rel = fabsf(update) / (fabsf(pBefore) + 1e-12f);
+			const float g = grad[gi] * gradScale;
+			vtCount += 1.0f; vtMSat += fabsf(mq) >= 127.0f; vtVSat += vq >= 255.0f;
+			vtDead += fabsf(update) < eps;
+			vtAgree += ((mHat >= 0.0f) == (g >= 0.0f)) ? 1.0f : 0.0f;
+			vtSignal += signal; vtNoise += noise;
+			vtEff += (signal + noise > 0.0f) ? signal / (signal + noise) : 0.0f;
+			vtNoiseFit += fabsf(lr) * noise / (denom * ess);
+			vtUpdateSq += update * update; vtWeightSq += pBefore * pBefore;
+			vtRelSum += rel; if (rel > vtRelMax) vtRelMax = rel;
+		}
 	}
+	adam_vitals_warp_accumulate(vitalsStats, vtCount, vtMSat, vtVSat, vtDead,
+	    vtAgree, vtSignal, vtNoise, vtEff, vtNoiseFit, vtUpdateSq, vtWeightSq,
+	    vtRelSum, vtRelMax);
 }
 
 // ---------------------------------------------------------------------------
@@ -2232,10 +2995,12 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
     float eps, float weightDecay,
     float gradScale,
     int step, int n, int numBlocks,
-    uint32_t srBaseSeed, uint32_t srStepIdx)
+    uint32_t srBaseSeed, uint32_t srStepIdx,
+    float* __restrict__ vitalsStats)
 {
 	const int blockId = blockIdx.x;
 	if (blockId >= numBlocks) return;
+	if (vitalsStats && numBlocks > 16 && (blockId & 15) != 0) vitalsStats = NULL;
 
 	const int start = blockId * ADAM_INT8_BS;
 	const int end = min(start + ADAM_INT8_BS, n);
@@ -2329,6 +3094,9 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
 	const float invNewV = 255.0f / newVMax;
 
 	// Pass 2: requantize m/v, read bf16 param, update, stochastic encode bf16 param.
+	float vtCount=0.f, vtMSat=0.f, vtVSat=0.f, vtDead=0.f, vtAgree=0.f;
+	float vtSignal=0.f, vtNoise=0.f, vtEff=0.f, vtNoiseFit=0.f;
+	float vtUpdateSq=0.f, vtWeightSq=0.f, vtRelSum=0.f, vtRelMax=0.f;
 	for (int i = threadIdx.x; i < len; i += blockDim.x)
 	{
 		const int gi = start + i;
@@ -2340,13 +3108,14 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
 		mq = fmaxf(-127.0f, fminf(127.0f, rintf(mq)));
 		m_int8[gi]  = (int8_t)mq;
 		// Requantize v → unsigned uint8.
+		float vq = 0.0f;
 		if (vNew <= 0.0f)
 		{
 			v_uint8[gi] = 0;
 		}
 		else
 		{
-			float vq = rintf(vNew * invNewV);
+			vq = rintf(vNew * invNewV);
 			if (vq < 1.0f) vq = 1.0f;
 			if (vq > 255.0f) vq = 255.0f;
 			v_uint8[gi] = (uint8_t)vq;
@@ -2356,6 +3125,7 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
 		union { uint32_t u; float f; } pv;
 		pv.u = (uint32_t)param_bf16[gi] << 16;
 		float pFp = pv.f;
+		const float pBefore = pFp;
 
 		// AdamW weight decay.
 		if (weightDecay != 0.0f)
@@ -2364,7 +3134,27 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
 		// Bias-corrected Adam update.
 		const float mHat = mNew / bc1;
 		const float vHat = vNew / bc2;
-		pFp -= lr * mHat / (sqrtf(vHat) + eps);
+		const float denom = sqrtf(vHat) + eps;
+		const float update = lr * mHat / denom;
+		pFp -= update;
+		if (vitalsStats)
+		{
+			const float ess = (1.0f + beta1) / fmaxf(1e-6f, 1.0f - beta1);
+			const float mh2 = mHat * mHat;
+			const float noise = fmaxf(0.0f, ess * (vHat - mh2) / fmaxf(1.0f, ess - 1.0f));
+			const float signal = fmaxf(0.0f, (ess * mh2 - vHat) / fmaxf(1.0f, ess - 1.0f));
+			const float rel = fabsf(update) / (fabsf(pBefore) + 1e-12f);
+			union { uint32_t u; float f; } gv; gv.u = (uint32_t)grad_bf16[gi] << 16;
+			const float g = gv.f * gradScale;
+			vtCount += 1.0f; vtMSat += fabsf(mq) >= 127.0f; vtVSat += vq >= 255.0f;
+			vtDead += fabsf(update) < eps;
+			vtAgree += ((mHat >= 0.0f) == (g >= 0.0f)) ? 1.0f : 0.0f;
+			vtSignal += signal; vtNoise += noise;
+			vtEff += (signal + noise > 0.0f) ? signal / (signal + noise) : 0.0f;
+			vtNoiseFit += fabsf(lr) * noise / (denom * ess);
+			vtUpdateSq += update * update; vtWeightSq += pBefore * pBefore;
+			vtRelSum += rel; if (rel > vtRelMax) vtRelMax = rel;
+		}
 
 		// Stochastic-rounded fp32 → bf16 encode (same RNG as cast_f32_to_bf16_stochastic).
 		union { float f; uint32_t u; } v;
@@ -2383,6 +3173,9 @@ __global__ void adam_update_int8_state_bf16w_bf16g_kernel(
 			param_bf16[gi] = (uint16_t)(high16 & 0xFFFFu);
 		}
 	}
+	adam_vitals_warp_accumulate(vitalsStats, vtCount, vtMSat, vtVSat, vtDead,
+	    vtAgree, vtSignal, vtNoise, vtEff, vtNoiseFit, vtUpdateSq, vtWeightSq,
+	    vtRelSum, vtRelMax);
 }
 
 } // anonymous namespace
@@ -2392,13 +3185,14 @@ bool adam_update_int8_state(float* param, const float* grad,
                              float* m_scale, float* v_scale,
                              float lr, float beta1, float beta2, float eps,
                              float weightDecay, float gradScale,
-                             int step, int n)
+                             int step, int n, float* vitalsStats)
 {
 	if (n <= 0) return true;
 	const int numBlocks = (n + ADAM_INT8_BS - 1) / ADAM_INT8_BS;
 	adam_update_int8_state_kernel<<<numBlocks, ADAM_INT8_BS, 0, computeStream()>>>(
 	    param, grad, m_int8, v_uint8, m_scale, v_scale,
-	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks);
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks,
+	    vitalsStats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -2414,14 +3208,14 @@ bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
                                       float* scratch_fp32,
                                       float lr, float beta1, float beta2, float eps,
                                       float weightDecay, float gradScale,
-                                      int step, int n)
+                                      int step, int n, float* vitalsStats)
 {
 	if (n <= 0) return true;
 	if (scratch_fp32 == 0 || grad_bf16 == 0) return false;
 	if (!cast_bf16_to_f32(grad_bf16, scratch_fp32, (size_t)n)) return false;
 	return adam_update_int8_state(param, scratch_fp32, m_int8, v_uint8,
 	                              m_scale, v_scale, lr, beta1, beta2, eps,
-	                              weightDecay, gradScale, step, n);
+	                              weightDecay, gradScale, step, n, vitalsStats);
 }
 
 // BF16-WEIGHT variants — wrapper kernels for CHIRON-style --bf16-weights mode.
@@ -2468,7 +3262,8 @@ bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
                                                float lr, float beta1, float beta2, float eps,
                                                float weightDecay, float gradScale,
                                                int step, int n,
-                                               uint32_t srBaseSeed, uint32_t srStepIdx)
+                                               uint32_t srBaseSeed, uint32_t srStepIdx,
+                                               float* vitalsStats)
 {
 	if (n <= 0) return true;
 	if (param_bf16 == 0 || grad_bf16 == 0) return false;
@@ -2476,7 +3271,7 @@ bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
 	adam_update_int8_state_bf16w_bf16g_kernel<<<numBlocks, ADAM_INT8_BS, 0, computeStream()>>>(
 	    param_bf16, grad_bf16, m_int8, v_uint8, m_scale, v_scale,
 	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks,
-	    srBaseSeed, srStepIdx);
+	    srBaseSeed, srStepIdx, vitalsStats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -3242,12 +4037,16 @@ bool causal_softmax_with_bwd_attn(float* S, const float* dP,
 
 namespace {
 
-// One block total (simple reduction).  Each thread handles a subset of rows.
+// One block total (deterministic reduction). Each thread handles a fixed
+// strided subset of rows, then the block writes one ordered FP32 sum. Token
+// NLL only reads the target probability, so a single block keeps this path
+// cheap while avoiding schedule-dependent cross-block atomic accumulation.
 __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
                                          const int* __restrict__ targets,
                                          int T, int vocabSize, int padToken,
                                          float* __restrict__ loss_sum,
-                                         int* __restrict__ valid_count)
+                                         int* __restrict__ valid_count,
+                                         float* __restrict__ perTokenNll)
 {
     extern __shared__ float smem[];
     float* sLoss = smem;
@@ -3261,21 +4060,23 @@ __global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
         if (tgt < 0 || tgt >= vocabSize) continue;
         float p = probs[(size_t)t * vocabSize + tgt];
         if (p < 1e-12f) p = 1e-12f;
-        localLoss += -logf(p);
+        const float nll = -logf(p);
+        if (perTokenNll) perTokenNll[t] = nll;
+        localLoss += nll;
         ++localCount;
     }
 
-    // Reduce loss.
+    // One block gives the reduction a fixed order across every launch.
     localLoss = blockReduceSum(localLoss, sLoss);
     if (threadIdx.x == 0)
-        atomicAdd(loss_sum, localLoss);
+        *loss_sum = localLoss;
 
     // Reduce count (reuse warp reduce as floats, cast back).
     __syncthreads();
     float countF = (float)localCount;
     countF = blockReduceSum(countF, sLoss);
     if (threadIdx.x == 0)
-        atomicAdd(valid_count, (int)countF);
+        *valid_count = (int)countF;
 }
 
 } // anonymous namespace
@@ -3285,14 +4086,12 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
                             float* loss_sum, int* valid_count)
 {
     if (T <= 0 || vocabSize <= 0) return true;
-    GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
-    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
-    int block = 256;
-    int grid = 1;
-    if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
-    int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
-    cross_entropy_nll_kernel<<<grid, block, smemBytes, computeStream()>>>(
-        probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
+    GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
+    const int block = 256;
+    const int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
+    cross_entropy_nll_kernel<<<1, block, smemBytes, computeStream()>>>(
+        probs, targets, T, vocabSize, padToken, loss_sum, valid_count, NULL);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -3307,7 +4106,8 @@ __global__ void argmax_count_kernel(const float* __restrict__ probs,
                                     const int* __restrict__ targets,
                                     int T, int vocabSize, int padToken,
                                     int* __restrict__ correct_count,
-                                    int* __restrict__ valid_count)
+                                    int* __restrict__ valid_count,
+                                    unsigned char* __restrict__ perTokenTop1)
 {
     extern __shared__ float smem[];
 
@@ -3328,7 +4128,9 @@ __global__ void argmax_count_kernel(const float* __restrict__ probs,
         {
             if (row[v] > bestVal) { bestVal = row[v]; bestIdx = v; }
         }
-        if (bestIdx == tgt) ++localCorrect;
+        const bool hit = bestIdx == tgt;
+        if (perTokenTop1) perTokenTop1[t] = hit ? 1u : 0u;
+        if (hit) ++localCorrect;
     }
 
     float correctF = (float)localCorrect;
@@ -3348,17 +4150,46 @@ bool argmax_count_matches(const float* probs, const int* targets,
                           int* correct_count, int* valid_count)
 {
     if (T <= 0 || vocabSize <= 0) return true;
-    GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
-    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+    GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
     // One thread per row for argmax (vocabSize may be large).
     int block = 128;
     int grid = (T + block - 1) / block;
     if (grid > 128) grid = 128;
     int smemBytes = (block / 32 + 1) * sizeof(float);
     argmax_count_kernel<<<grid, block, smemBytes, computeStream()>>>(
-        probs, targets, T, vocabSize, padToken, correct_count, valid_count);
+        probs, targets, T, vocabSize, padToken, correct_count, valid_count, NULL);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+bool chiron_vitals_output_vectors(const float* probs, const int* targets,
+                                  int T, int vocabSize, int padToken,
+                                  float* loss_sum, int* loss_count,
+                                  int* correct_count, int* valid_count,
+                                  float* perTokenNll,
+                                  unsigned char* perTokenTop1)
+{
+	if (!probs || !targets || !loss_sum || !loss_count || !valid_count || !correct_count
+	    || !perTokenNll || !perTokenTop1 || T <= 0 || vocabSize <= 0) return false;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenNll, 0, (size_t)T * sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenTop1, 0, (size_t)T * sizeof(unsigned char), computeStream()));
+	const int blockLoss = 256;
+	const int smemLoss = (blockLoss / 32 + 2) * (int)sizeof(float);
+	cross_entropy_nll_kernel<<<1, blockLoss, smemLoss, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, loss_sum, loss_count, perTokenNll);
+	const int blockArg = 128;
+	int gridArg = (T + blockArg - 1) / blockArg; if (gridArg > 128) gridArg = 128;
+	const int smemArg = (blockArg / 32 + 1) * (int)sizeof(float);
+	argmax_count_kernel<<<gridArg, blockArg, smemArg, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, correct_count, valid_count,
+	    perTokenTop1);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
 }
 
 // ===========================================================================
@@ -3521,6 +4352,436 @@ __global__ void softmax_cross_entropy_backward_bf16_zloss(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// CRM — Contextual Rank Margin. One deterministic block per row finds the
+// exact stored-logit non-target maximum, counts the full tie set, and adds the
+// uniform max subgradient. The disabled path is guarded in the host wrappers.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float crm_softplus(float a)
+{
+	return fmaxf(a, 0.0f) + log1pf(expf(-fabsf(a)));
+}
+
+__device__ __forceinline__ float crm_sigmoid(float a)
+{
+	if (a >= 0.0f) return 1.0f / (1.0f + expf(-a));
+	const float e = expf(a);
+	return e / (1.0f + e);
+}
+
+__device__ __forceinline__ float crm_bf16_half_ulp(float value)
+{
+	const float magnitude = fabsf(value);
+	if (magnitude == 0.0f) return ldexpf(1.0f, -134);
+	int exponent = 0;
+	frexpf(magnitude, &exponent);
+	return ldexpf(1.0f, exponent - 9);
+}
+
+template <bool BF16>
+__global__ void chiron_crm_forward_backward_kernel(
+    const void* __restrict__ logitsRaw,
+    const void* __restrict__ probsRaw,
+    const int* __restrict__ targets,
+    float coefficient, float margin, float temperature,
+    int cols, void* __restrict__ dlogitsRaw,
+    float* __restrict__ rowStats,
+    float* __restrict__ hardNegativeMass)
+{
+	extern __shared__ float reductions[];
+	float* maxScratch = reductions;
+	const int warpCount = (blockDim.x + 31) / 32;
+	float* countScratch = reductions + warpCount;
+	float* thirdScratch = reductions + 2 * warpCount;
+	const int row = blockIdx.x;
+	const int target = targets[row];
+	if (target < 0 || target >= cols) return;
+	const float* logitsF = (const float*)logitsRaw;
+	const unsigned short* logitsB = (const unsigned short*)logitsRaw;
+	const float* probsF = (const float*)probsRaw;
+	const unsigned short* probsB = (const unsigned short*)probsRaw;
+	float localMax = -FLT_MAX;
+	float localCount = 0.0f;
+	for (int v = threadIdx.x; v < cols; v += blockDim.x)
+	{
+		if (v == target) continue;
+		const float q = BF16 ? bf16_load(logitsB[(size_t)row * cols + v])
+		                     : logitsF[(size_t)row * cols + v];
+		if (q > localMax)
+		{
+			localMax = q;
+			localCount = 1.0f;
+		}
+		else if (q == localMax)
+			localCount += 1.0f;
+	}
+	blockReduceMaxCount(localMax, localCount, maxScratch, countScratch);
+	__shared__ float maximum;
+	__shared__ int tieCount;
+	__shared__ float targetAdd, tieAdd;
+	if (threadIdx.x == 0)
+	{
+		maximum = localMax;
+		tieCount = (int)localCount;
+		const float targetQ = BF16 ? bf16_load(logitsB[(size_t)row * cols + target])
+		                           : logitsF[(size_t)row * cols + target];
+		const float a = (margin + maximum - targetQ) / temperature;
+		const float s = crm_sigmoid(a);
+		targetAdd = -coefficient * s;
+		tieAdd = coefficient * s / (float)tieCount;
+		float* st = rowStats + (size_t)row * 12;
+		st[0] = temperature * crm_softplus(a);
+		st[1] = s;
+		st[2] = (float)tieCount;
+		st[3] = (targetQ - maximum < margin) ? 1.0f : 0.0f;
+		st[4] = coefficient * s * sqrtf(1.0f + 1.0f / tieCount);
+		st[5] = targetAdd + tieCount * tieAdd;
+		st[9] = 0.0f;
+		st[10] = 0.0f;
+		st[11] = 0.0f;
+	}
+	__syncthreads();
+	float* dF = (float*)dlogitsRaw;
+	unsigned short* dB = (unsigned short*)dlogitsRaw;
+	float localInjectedSum = 0.0f;
+	float localInjectedSq = 0.0f;
+	float localCertificate = 0.0f;
+	float localCeSq = 0.0f;
+	float localCrmSq = 0.0f;
+	float localCeCrmDot = 0.0f;
+	for (int v = threadIdx.x; v < cols; v += blockDim.x)
+	{
+		const size_t off = (size_t)row * cols + v;
+		const float q = BF16 ? bf16_load(logitsB[off]) : logitsF[off];
+		const float add = (v == target) ? targetAdd
+		                : ((q == maximum) ? tieAdd : 0.0f);
+		if (probsRaw)
+		{
+			const float probability = BF16 ? bf16_load(probsB[off]) : probsF[off];
+			const float ce = probability - (v == target ? 1.0f : 0.0f);
+			localCeSq += ce * ce;
+			localCrmSq += add * add;
+			localCeCrmDot += ce * add;
+		}
+		if (hardNegativeMass && v != target && q == maximum)
+			atomicAdd(hardNegativeMass + v, 1.0f / (float)tieCount);
+		if (add == 0.0f) continue;
+		float delta = 0.0f;
+		if (BF16)
+		{
+			const float before = bf16_load(dB[off]);
+			const float unrounded = before + add;
+			const unsigned short stored = bf16_store(unrounded);
+			const float after = bf16_load(stored);
+			dB[off] = stored;
+			delta = after - before;
+			localCertificate += crm_bf16_half_ulp(unrounded);
+		}
+		else
+		{
+			const float before = dF[off];
+			dF[off] += add;
+			delta = dF[off] - before;
+		}
+		localInjectedSum += delta;
+		localInjectedSq += delta * delta;
+	}
+	blockReduceSum3(localInjectedSum, localInjectedSq, localCertificate,
+	                maxScratch, countScratch, thirdScratch);
+	if (threadIdx.x == 0)
+	{
+		float* st = rowStats + (size_t)row * 12;
+		st[6] = sqrtf(localInjectedSq);
+		st[7] = localInjectedSum;
+		st[8] = localCertificate;
+	}
+	if (probsRaw)
+	{
+		__syncthreads();
+		blockReduceSum3(localCeSq, localCrmSq, localCeCrmDot,
+		                maxScratch, countScratch, thirdScratch);
+		if (threadIdx.x == 0)
+		{
+			float* st = rowStats + (size_t)row * 12;
+			st[9] = localCeSq;
+			st[10] = localCrmSq;
+			st[11] = localCeCrmDot;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ECHO — Excess-Copy Hinged Objective (2026-07-09,
+// docs/superpowers/specs/2026-07-09-chiron-loss-regularizers-design.md §5).
+// ---------------------------------------------------------------------------
+
+// Per-row excess-copy statistics.  One block per row, blockDim.x == w.
+// A 2x-load-factor shared-memory hash builds counts + first-slot ownership in
+// expected O(w), avoiding the original O(w^2) duplicate/count scans.  Active
+// owner slots are emitted as a compact bitmap rather than T*w vocabulary ids;
+// scatter recovers each id from tokens.  Thread 0 retains owner-slot accumulation
+// order, so PA/R remain deterministic and CPU-reference comparable.
+// huberDelta==0 is the exact hard hinge. For delta>0, sW=h'(p-margin),
+// sP=p*sW is the dense-gradient contribution, and sR is the Huberized loss.
+__global__ void echo_repeat_stats_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ tokens,
+    const int* __restrict__ targets,
+    int T, int V, int w, int hashSize,
+    float kappa, float tau0, float huberDelta,
+    float* __restrict__ PA,
+    float* __restrict__ Rrow,
+    uint32_t* __restrict__ activeBits,
+    float* __restrict__ activeWeights,
+    int* __restrict__ activeCount,
+    float* __restrict__ maxActiveProb)
+{
+	extern __shared__ float smemEcho[];
+	float* sP = smemEcho;                         // [w] p*h'(p-m), else 0
+	float* sR = smemEcho + w;                     // [w] Huberized hinge loss
+	float* sW = smemEcho + 2 * w;                 // [w] h'(p-m)
+	const int bitWords = (w + 31) / 32;
+	uint32_t* sBits = (uint32_t*)(smemEcho + 3 * w); // [ceil(w/32)]
+	int* hashKeys = (int*)(sBits + bitWords);      // [hashSize], -1 = empty
+	int* hashCounts = hashKeys + hashSize;         // [hashSize]
+	int* hashOwners = hashCounts + hashSize;       // [hashSize], minimum slot
+
+	const int t = blockIdx.x;
+	if (t >= T) return;
+	const int s = threadIdx.x;
+	const int wEff = (t + 1 < w) ? (t + 1) : w;
+	const int base = t - wEff + 1;
+
+	int v = -1;
+	if (s < wEff) v = tokens[base + s];
+	sP[s] = 0.0f;
+	sR[s] = 0.0f;
+	sW[s] = 0.0f;
+	if (s < bitWords) sBits[s] = 0u;
+	for (int i = s; i < hashSize; i += blockDim.x)
+	{
+		hashKeys[i] = -1;
+		hashCounts[i] = 0;
+		hashOwners[i] = w;
+	}
+	__syncthreads();
+
+	if (s < wEff && v >= 0 && v < V)
+	{
+		int h = (int)(((unsigned int)v * 2654435761u) & (unsigned int)(hashSize - 1));
+		for (int probe = 0; probe < hashSize; ++probe)
+		{
+			const int old = atomicCAS(hashKeys + h, -1, v);
+			if (old == -1 || old == v)
+			{
+				atomicAdd(hashCounts + h, 1);
+				atomicMin(hashOwners + h, s);
+				break;
+			}
+			h = (h + 1) & (hashSize - 1);
+		}
+	}
+	__syncthreads();
+
+	if (s < wEff && v >= 0 && v < V && v != targets[t])
+	{
+		int h = (int)(((unsigned int)v * 2654435761u) & (unsigned int)(hashSize - 1));
+		for (int probe = 0; probe < hashSize && hashKeys[h] != v; ++probe)
+			h = (h + 1) & (hashSize - 1);
+		if (hashKeys[h] == v && hashOwners[h] == s)
+		{
+			const int n = hashCounts[h];
+			const float ratio = __fdiv_rn((float)n, (float)w);
+			const float km = __fmul_rn(kappa, ratio);
+			const float m = __fadd_rn(km, tau0);
+			const float p = bf16_load(probs[(size_t)t * V + v]);
+			if (p > m)
+			{
+				const float x = __fadd_rn(p, -m);
+				float weight = 1.0f;
+				float contribution = x;
+				if (huberDelta > 0.0f && x < huberDelta)
+				{
+					weight = __fdiv_rn(x, huberDelta);
+					const float xw = __fmul_rn(x, weight);
+					contribution = __fmul_rn(0.5f, xw);
+				}
+				else if (huberDelta > 0.0f)
+				{
+					const float halfDelta = __fmul_rn(0.5f, huberDelta);
+					contribution = __fadd_rn(x, -halfDelta);
+				}
+				sP[s] = __fmul_rn(p, weight);
+				sR[s] = contribution;
+				sW[s] = weight;
+				atomicOr((unsigned int*)(sBits + (s >> 5)), 1u << (s & 31));
+			}
+		}
+	}
+	__syncthreads();
+
+	if (s == 0)
+	{
+		float pa = 0.0f, r = 0.0f, pmax = 0.0f;
+		int cnt = 0;
+		for (int s2 = 0; s2 < wEff; ++s2)
+		{
+			if ((sBits[s2 >> 5] & (1u << (s2 & 31))) == 0u) continue;
+			pa = __fadd_rn(pa, sP[s2]);
+			r = __fadd_rn(r, sR[s2]);
+			if (activeWeights) activeWeights[(size_t)t * w + s2] = sW[s2];
+			const int id = tokens[base + s2];
+			const float p = bf16_load(probs[(size_t)t * V + id]);
+			if (p > pmax) pmax = p;
+			++cnt;
+		}
+		PA[t] = pa;
+		Rrow[t] = r;
+		activeCount[t] = cnt;
+		if (maxActiveProb) maxActiveProb[t] = pmax;
+	}
+	for (int i = s; i < bitWords; i += blockDim.x)
+		activeBits[(size_t)t * bitWords + i] = sBits[i];
+}
+
+// One deterministic block reduces ECHO's per-row diagnostics to 11 scalars.
+// The trainer already synchronizes to read its CE scalar each step; replacing
+// four O(T) downloads with this small vector removes avoidable PCIe traffic and
+// host reduction work without touching the regularizer gradient.
+__global__ void echo_summarize_stats_kernel(
+    const float* __restrict__ Rrow,
+    const float* __restrict__ PA,
+    const float* __restrict__ maxActiveProb,
+    const int* __restrict__ activeCount,
+    int T, float* __restrict__ summary)
+{
+	extern __shared__ float sSummary[];
+	float local[ECHO_SUMMARY_SIZE];
+	#pragma unroll
+	for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f) local[f] = 0.0f;
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	{
+		const int cnt = activeCount[t];
+		const float pmax = maxActiveProb[t];
+		local[ECHO_SUM_R] += Rrow[t];
+		local[ECHO_SUM_PA] += PA[t];
+		local[ECHO_ACTIVE_IDS] += (float)cnt;
+		if (cnt > 0)
+		{
+			local[ECHO_SUM_PMAX] += pmax;
+			if (pmax > local[ECHO_MAX_P]) local[ECHO_MAX_P] = pmax;
+			local[ECHO_ACTIVE_ROWS] += 1.0f;
+			const int hist = pmax < 0.10f ? 0 : (pmax < 0.25f ? 1 :
+			                 (pmax < 0.50f ? 2 : (pmax < 0.75f ? 3 : 4)));
+			local[ECHO_HIST_0 + hist] += 1.0f;
+		}
+	}
+	#pragma unroll
+	for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f)
+		sSummary[f * blockDim.x + threadIdx.x] = local[f];
+	__syncthreads();
+	for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			#pragma unroll
+			for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f)
+			{
+				const float b = sSummary[f * blockDim.x + threadIdx.x + stride];
+				float& a = sSummary[f * blockDim.x + threadIdx.x];
+				if (f == ECHO_MAX_P) { if (b > a) a = b; }
+				else a += b;
+			}
+		}
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+		for (int f = 0; f < ECHO_SUMMARY_SIZE; ++f) summary[f] = sSummary[f * blockDim.x];
+}
+
+// Dense ECHO term folded into the zloss CE backward: source is the shipped
+// softmax_cross_entropy_backward_bf16_zloss kernel with ONE appended
+// statement (v += eterm * p).  At echoCoef == 0, eterm*p is a signed zero
+// and v += (-0.0f) is the identity on every float, so the output is
+// bit-identical to the shipped kernel (unit-enforced by
+// CHIRONEchoZlossZeroCoefBitParityTest); the trainer additionally never
+// dispatches this kernel at echoCoef == 0.
+__global__ void softmax_cross_entropy_backward_bf16_zloss_echo(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    const float* __restrict__ logZ,
+    float zlossCoef,
+    float echoCoef,
+    const float* __restrict__ PA,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float lz = logZ[row];
+	const float zterm = 2.0f * zlossCoef * lz;
+	const float eterm = -echoCoef * PA[row];
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = bf16_load(pRow[i]);
+		float v = (i == target) ? (p - 1.0f) : p;
+		v += zterm * p;
+		v += eterm * p;
+		dRow[i] = bf16_store(v);
+	}
+}
+
+// Standalone dense ECHO field for detached gradient-attribution passes.  The
+// sparse positive term is added by echo_scatter_bf16[_weighted] immediately
+// afterward, matching the decomposition used by the combined training kernel.
+__global__ void echo_dense_backward_bf16(
+    const unsigned short* __restrict__ probs,
+    float echoCoef,
+    const float* __restrict__ PA,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	const int row = blockIdx.x;
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+	const float eterm = __fmul_rn(-echoCoef, PA[row]);
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		dRow[i] = bf16_store(__fmul_rn(eterm, bf16_load(pRow[i])));
+}
+
+// Sparse ECHO scatter. activeWeights is null for the hard hinge and stores
+// h'(p-margin) at original owner slots for the optional Huberized knee.
+__global__ void echo_scatter_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ tokens,
+    const uint32_t* __restrict__ activeBits,
+    const float* __restrict__ activeWeights,
+    float echoCoef, int V, int w,
+    unsigned short* __restrict__ dlogits)
+{
+	const int t = blockIdx.x;
+	const int bitWords = (w + 31) / 32;
+	const int wEff = (t + 1 < w) ? (t + 1) : w;
+	const int base = t - wEff + 1;
+	for (int s = threadIdx.x; s < wEff; s += blockDim.x)
+	{
+		const uint32_t bits = activeBits[(size_t)t * bitWords + (s >> 5)];
+		if ((bits & (1u << (s & 31))) == 0u) continue;
+		const int id = tokens[base + s];
+		if (id < 0 || id >= V) continue;
+		const size_t off = (size_t)t * V + id;
+		const float weight = activeWeights ? activeWeights[(size_t)t * w + s] : 1.0f;
+		const float weightedP = __fmul_rn(weight, bf16_load(probs[off]));
+		const float add = __fmul_rn(echoCoef, weightedP);
+		const float d = __fadd_rn(bf16_load(dlogits[off]), add);
+		dlogits[off] = bf16_store(d);
+	}
+}
+
 __global__ void scale_array_bf16_kernel(unsigned short* __restrict__ x,
                                          float scale, int n)
 {
@@ -3533,21 +4794,25 @@ __global__ void cross_entropy_nll_bf16_kernel(
     const int* __restrict__ targets,
     int T, int vocabSize, int padToken,
     float* __restrict__ loss_sum,
-    int* __restrict__ valid_count)
+    int* __restrict__ valid_count,
+    float* __restrict__ perTokenNll)
 {
 	extern __shared__ float smem[];
 	float* sLoss = smem;
 
 	float localLoss = 0.0f;
 	int localCount = 0;
-	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
+	     t += blockDim.x * gridDim.x)
 	{
 		int tgt = targets[t];
 		if (padToken >= 0 && tgt == padToken) continue;
 		if (tgt < 0 || tgt >= vocabSize) continue;
 		float p = bf16_load(probs[(size_t)t * vocabSize + tgt]);
 		if (p < 1e-12f) p = 1e-12f;
-		localLoss += -logf(p);
+		const float nll = -logf(p);
+		if (perTokenNll) perTokenNll[t] = nll;
+		localLoss += nll;
 		++localCount;
 	}
 
@@ -3615,7 +4880,8 @@ __global__ void argmax_count_bf16_warp_kernel(
     const int* __restrict__ targets,
     int T, int vocabSize, int padToken,
     int* __restrict__ correct_count,
-    int* __restrict__ valid_count)
+    int* __restrict__ valid_count,
+    unsigned char* __restrict__ perTokenTop1)
 {
 	const int warpsPerBlock = blockDim.x / 32;
 	const int lane          = threadIdx.x & 31;
@@ -3648,8 +4914,10 @@ __global__ void argmax_count_bf16_warp_kernel(
 	{
 		if (isValid)
 		{
+			const bool hit = bestIdx == tgt;
+			if (perTokenTop1) perTokenTop1[row] = hit ? 1u : 0u;
 			atomicAdd(valid_count, 1);
-			if (bestIdx == tgt) atomicAdd(correct_count, 1);
+			if (hit) atomicAdd(correct_count, 1);
 		}
 	}
 }
@@ -3707,6 +4975,166 @@ bool softmax_cross_entropy_bwd_bf16_zloss(const unsigned short* probs,
 	return true;
 }
 
+bool chiron_crm_forward_backward(const float* logits, const int* targets,
+                                 float coefficient, float margin,
+                                 float temperature, int rows, int cols,
+                                 float* dlogits, float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<false><<<rows, block, smem, computeStream()>>>(
+	    logits, NULL, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_crm_forward_backward_bf16(const unsigned short* logits,
+                                      const int* targets,
+                                      float coefficient, float margin,
+                                      float temperature, int rows, int cols,
+                                      unsigned short* dlogits, float* rowStats)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<true><<<rows, block, smem, computeStream()>>>(
+	    logits, NULL, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_crm_forward_backward_bf16_observed(const unsigned short* logits,
+                                               const unsigned short* probs,
+                                               const int* targets,
+                                               float coefficient, float margin,
+                                               float temperature, int rows, int cols,
+                                               unsigned short* dlogits,
+                                               float* rowStats,
+                                               float* hardNegativeMass)
+{
+	if (coefficient == 0.0f || rows == 0) return true;
+	if (!logits || !probs || !targets || !dlogits || !rowStats || rows < 0 || cols < 2 ||
+	    coefficient < 0.0f || !std::isfinite(coefficient) ||
+	    !std::isfinite(margin) || temperature <= 0.0f ||
+	    !std::isfinite(temperature)) return false;
+	const int block = rowBlockSize(cols);
+	const int smem = 3 * ((block + 31) / 32) * (int)sizeof(float);
+	chiron_crm_forward_backward_kernel<true><<<rows, block, smem, computeStream()>>>(
+	    logits, probs, targets, coefficient, margin, temperature, cols, dlogits,
+	    rowStats, hardNegativeMass);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_repeat_stats_huber(const unsigned short* probs, const int* tokens,
+                             const int* targets, int T, int V, int w,
+                             float kappa, float tau0, float huberDelta,
+                             float* PA, float* Rrow, uint32_t* activeBits,
+                             float* activeWeights, int* activeCount,
+                             float* maxActiveProb)
+{
+	if (T <= 0 || V <= 0) return true;
+	if (w < 1 || w > 1024 || huberDelta < 0.0f) return false;
+	int hashSize = 2;
+	while (hashSize < 2 * w) hashSize <<= 1;
+	const int bitWords = (w + 31) / 32;
+	const int smem = w * 3 * (int)sizeof(float) + bitWords * (int)sizeof(uint32_t)
+	               + hashSize * 3 * (int)sizeof(int);
+	echo_repeat_stats_kernel<<<T, w, smem, computeStream()>>>(
+	    probs, tokens, targets, T, V, w, hashSize, kappa, tau0, huberDelta,
+	    PA, Rrow, activeBits, activeWeights, activeCount, maxActiveProb);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_repeat_stats(const unsigned short* probs, const int* tokens,
+                       const int* targets, int T, int V, int w,
+                       float kappa, float tau0,
+                       float* PA, float* Rrow, uint32_t* activeBits,
+                       int* activeCount)
+{
+	return echo_repeat_stats_huber(probs, tokens, targets, T, V, w,
+	    kappa, tau0, 0.0f, PA, Rrow, activeBits, NULL, activeCount, NULL);
+}
+
+bool echo_summarize_stats(const float* Rrow, const float* PA,
+                          const float* maxActiveProb, const int* activeCount,
+                          int T, float* summary)
+{
+	if (T <= 0) return true;
+	const int block = 256;
+	const int smem = ECHO_SUMMARY_SIZE * block * (int)sizeof(float);
+	echo_summarize_stats_kernel<<<1, block, smem, computeStream()>>>(
+	    Rrow, PA, maxActiveProb, activeCount, T, summary);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_cross_entropy_bwd_bf16_zloss_echo(const unsigned short* probs,
+                                                const int* targets,
+                                                const float* logZ,
+                                                float zlossCoef,
+                                                float echoCoef,
+                                                const float* PA,
+                                                int rows, int cols,
+                                                unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_bf16_zloss_echo<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, logZ, zlossCoef, echoCoef, PA, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_dense_bwd_bf16(const unsigned short* probs, float echoCoef,
+                          const float* PA, int rows, int cols,
+                          unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	const int block = rowBlockSize(cols);
+	echo_dense_backward_bf16<<<rows, block, 0, computeStream()>>>(
+	    probs, echoCoef, PA, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_scatter_bf16_weighted(const unsigned short* probs,
+                                const int* tokens,
+                                const uint32_t* activeBits,
+                                const float* activeWeights, float echoCoef,
+                                int rows, int cols, int w,
+                                unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	if (w < 1 || w > 1024) return false;
+	int block = (w < 32) ? 32 : ((w > 256) ? 256 : w);
+	echo_scatter_bf16_kernel<<<rows, block, 0, computeStream()>>>(
+	    probs, tokens, activeBits, activeWeights,
+	    echoCoef, cols, w, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_scatter_bf16(const unsigned short* probs, const int* tokens,
+                       const uint32_t* activeBits, float echoCoef,
+                       int rows, int cols, int w, unsigned short* dlogits)
+{
+	return echo_scatter_bf16_weighted(probs, tokens, activeBits, NULL,
+	    echoCoef, rows, cols, w, dlogits);
+}
+
 bool scale_array_bf16(unsigned short* x, float scale, int n)
 {
 	if (n <= 0) return true;
@@ -3729,7 +5157,7 @@ bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
 	if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
 	int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
 	cross_entropy_nll_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(
-	    probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
+	    probs, targets, T, vocabSize, padToken, loss_sum, valid_count, NULL);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -3749,7 +5177,38 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
 	const int block = WARPS_PER_BLOCK * 32;        // 1024
 	int grid = (T + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 	argmax_count_bf16_warp_kernel<<<grid, block, 0, computeStream()>>>(
-	    probs, targets, T, vocabSize, padToken, correct_count, valid_count);
+	    probs, targets, T, vocabSize, padToken, correct_count, valid_count, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_vitals_output_vectors_bf16(const unsigned short* probs,
+                                        const int* targets,
+                                        int T, int vocabSize, int padToken,
+                                        float* loss_sum, int* loss_count,
+                                        int* correct_count, int* valid_count,
+                                        float* perTokenNll,
+                                        unsigned char* perTokenTop1)
+{
+	if (!probs || !targets || !loss_sum || !loss_count || !valid_count || !correct_count
+	    || !perTokenNll || !perTokenTop1 || T <= 0 || vocabSize <= 0) return false;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_sum, 0, sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(loss_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(valid_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(correct_count, 0, sizeof(int), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenNll, 0, (size_t)T * sizeof(float), computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(perTokenTop1, 0, (size_t)T * sizeof(unsigned char), computeStream()));
+	const int blockLoss = 256;
+	int gridLoss = (T + blockLoss - 1) / blockLoss; if (gridLoss > 128) gridLoss = 128;
+	const int smemLoss = (blockLoss / 32 + 2) * (int)sizeof(float);
+	cross_entropy_nll_bf16_kernel<<<gridLoss, blockLoss, smemLoss, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, loss_sum, loss_count, perTokenNll);
+	const int warpsPerBlock = 32;
+	const int blockArg = warpsPerBlock * 32;
+	const int gridArg = (T + warpsPerBlock - 1) / warpsPerBlock;
+	argmax_count_bf16_warp_kernel<<<gridArg, blockArg, 0, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, correct_count, valid_count,
+	    perTokenTop1);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -4287,6 +5746,302 @@ bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
         GLADES_CUDA_CHECK(cudaGetLastError());
     }
 
+    return true;
+}
+
+// ===========================================================================
+//  Frozen-feature rank-cause diagnostics: margin objective + L-BFGS vectors
+// ===========================================================================
+
+namespace {
+
+__global__ void k_margin_init(float* best, float* target, float* hinge,
+                              int* competitor, int T)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    best[t] = -INFINITY;
+    target[t] = NAN;
+    hinge[t] = 0.0f;
+    competitor[t] = -1;
+}
+
+// One deterministic thread per row. Vocabulary chunks are visited in ascending
+// token-ID order by the host wrapper; exact ties therefore select the lower ID.
+__global__ void k_margin_chunk_update(const float* logits, const int* targets,
+                                      int T, int Vch, int chunkStart,
+                                      float* best, float* target,
+                                      int* competitor)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const int y = targets[t];
+    const float* row = logits + (size_t)t * Vch;
+    float bestValue = best[t];
+    int bestId = competitor[t];
+    for (int j = 0; j < Vch; ++j)
+    {
+        const int id = chunkStart + j;
+        const float value = row[j];
+        if (id == y) { target[t] = value; continue; }
+        if (value > bestValue || (value == bestValue && (bestId < 0 || id < bestId)))
+        { bestValue = value; bestId = id; }
+    }
+    best[t] = bestValue;
+    competitor[t] = bestId;
+}
+
+__global__ void k_margin_finalize(const float* best, const float* target,
+                                  const int* competitor, int T, float margin,
+                                  float* hinge, float* lossSum, int* validCount)
+{
+    __shared__ float sums[256];
+    __shared__ int counts[256];
+    const int tid = threadIdx.x;
+    float local = 0.0f;
+    int count = 0;
+    for (int t = tid; t < T; t += blockDim.x)
+    {
+        if (competitor[t] >= 0 && isfinite(target[t]) && isfinite(best[t]))
+        {
+            const float h = fmaxf(0.0f, margin - target[t] + best[t]);
+            hinge[t] = h;
+            local += h * h;
+            ++count;
+        }
+        else hinge[t] = 0.0f;
+    }
+    sums[tid] = local;
+    counts[tid] = count;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        { sums[tid] += sums[tid + stride]; counts[tid] += counts[tid + stride]; }
+        __syncthreads();
+    }
+    if (tid == 0) { *lossSum = sums[0]; *validCount = counts[0]; }
+}
+
+__global__ void k_margin_dlogits(float* dlogits, const int* targets,
+                                 const int* competitor, const float* hinge,
+                                 int T, int Vch, int chunkStart, float invValid)
+{
+    const size_t total = (size_t)T * Vch;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (size_t)blockDim.x * gridDim.x)
+    {
+        const int t = (int)(i / Vch);
+        const int id = chunkStart + (int)(i % Vch);
+        const float scale = 2.0f * hinge[t] * invValid;
+        float value = 0.0f;
+        if (id == competitor[t]) value += scale;
+        if (id == targets[t]) value -= scale;
+        dlogits[i] = value;
+    }
+}
+
+__global__ void k_dot_partials(const float* a, const float* b, int n,
+                               float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int begin = blockIdx.x * blockDim.x;
+    const int i = begin + tid;
+    sums[tid] = i < n ? a[i] * b[i] : 0.0f;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride) sums[tid] += sums[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_anchor_regularizer(const float* value, const float* anchor,
+                                     int n, int stride, int weightCols,
+                                     float lambda, float* gradient,
+                                     float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + tid;
+    float contribution = 0.0f;
+    if (i < n)
+    {
+        const int rows = n / stride;
+        const bool bias = (i % stride) >= weightCols;
+        const float denominator = bias ? (float)rows : (float)(rows * weightCols);
+        const float delta = value[i] - anchor[i];
+        contribution = lambda * delta * delta / denominator;
+        gradient[i] += 2.0f * lambda * delta / denominator;
+    }
+    sums[tid] = contribution;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_bias_sum_partials(const float* value, int rows, int stride,
+                                    float* partials)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x * blockDim.x + tid;
+    sums[tid] = row < rows ? value[(size_t)row * stride + (stride - 1)] : 0.0f;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sums[0];
+}
+
+__global__ void k_reduce_partials(float* partials, int n)
+{
+    __shared__ float sums[256];
+    const int tid = threadIdx.x;
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) local += partials[i];
+    sums[tid] = local;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) partials[0] = sums[0];
+}
+
+__global__ void k_subtract_bias_mean(float* value, int rows, int stride,
+                                     const float* sum)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) value[(size_t)row * stride + (stride - 1)] -= sum[0] / rows;
+}
+
+} // anonymous namespace
+
+bool chunked_squared_hinge_loss(const float* X_aug, const float* W_aug,
+                                const int* targets,
+                                int T, int V, int dAug, int V_chunk_size,
+                                float margin,
+                                float* loss_sum, int* valid_count,
+                                int* competitor, float* scratch)
+{
+    if (!X_aug || !W_aug || !targets || !loss_sum || !valid_count ||
+        !competitor || !scratch || T <= 0 || V <= 1 || dAug <= 1 ||
+        V_chunk_size <= 0 || !(margin > 0.0f)) return false;
+    float* logits = scratch;
+    float* best = logits + (size_t)T * V_chunk_size;
+    float* target = best + T;
+    float* hinge = target + T;
+    const int block = 128;
+    const int grid = (T + block - 1) / block;
+    k_margin_init<<<grid, block, 0, computeStream()>>>(best, target, hinge, competitor, T);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int Vch = ce - cs;
+        if (!sgemm_rowmajor_abt(T, Vch, dAug, 1.0f, X_aug, dAug,
+                                W_aug + (size_t)cs * dAug, dAug,
+                                0.0f, logits, Vch)) return false;
+        k_margin_chunk_update<<<grid, block, 0, computeStream()>>>(
+            logits, targets, T, Vch, cs, best, target, competitor);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+    }
+    k_margin_finalize<<<1, 256, 0, computeStream()>>>(
+        best, target, competitor, T, margin, hinge, loss_sum, valid_count);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool chunked_squared_hinge_backward(const float* X_aug,
+                                    const int* targets,
+                                    const int* competitor,
+                                    const float* hinge,
+                                    int T, int V, int dAug, int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dW_aug, float* scratch)
+{
+    if (!X_aug || !targets || !competitor || !hinge || !dW_aug || !scratch ||
+        T <= 0 || V <= 1 || dAug <= 1 || V_chunk_size <= 0 || valid_count <= 0)
+        return false;
+    if (!accumulate)
+        GLADES_CUDA_CHECK(cudaMemsetAsync(dW_aug, 0,
+            (size_t)V * dAug * sizeof(float), computeStream()));
+    const float invValid = 1.0f / valid_count;
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int Vch = ce - cs;
+        const size_t total = (size_t)T * Vch;
+        const int block = 256;
+        const size_t blocks = (total + block - 1) / block;
+        const int grid = (int)(blocks < (size_t)65535 ? blocks : (size_t)65535);
+        k_margin_dlogits<<<grid, block, 0, computeStream()>>>(
+            scratch, targets, competitor, hinge, T, Vch, cs, invValid);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+        if (!sgemm_rowmajor_atb(Vch, dAug, T, 1.0f,
+                                scratch, Vch, X_aug, dAug, 1.0f,
+                                dW_aug + (size_t)cs * dAug, dAug)) return false;
+    }
+    return true;
+}
+
+int deterministic_dot_partial_count(int n)
+{
+    return n > 0 ? (n + 255) / 256 : 0;
+}
+
+bool deterministic_dot_partials(const float* a, const float* b, int n,
+                                float* partials, int partial_count)
+{
+    const int required = deterministic_dot_partial_count(n);
+    if (!a || !b || !partials || required <= 0 || partial_count < required) return false;
+    k_dot_partials<<<required, 256, 0, computeStream()>>>(a, b, n, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool add_anchor_regularizer(const float* value, const float* anchor,
+                            int rows, int weight_cols, float lambda,
+                            float* gradient, float* partials,
+                            int partial_count)
+{
+    if (!value || !anchor || !gradient || !partials || rows <= 0 ||
+        weight_cols <= 0 || lambda < 0.0f) return false;
+    const int stride = weight_cols + 1;
+    const int n = rows * stride;
+    const int required = deterministic_dot_partial_count(n);
+    if (partial_count < required) return false;
+    k_anchor_regularizer<<<required, 256, 0, computeStream()>>>(
+        value, anchor, n, stride, weight_cols, lambda, gradient, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool project_augmented_bias_gauge(float* value, int rows, int stride,
+                                  float* partials, int partial_count)
+{
+    if (!value || !partials || rows <= 0 || stride <= 1) return false;
+    const int required = deterministic_dot_partial_count(rows);
+    if (partial_count < required || required > 256) return false;
+    k_bias_sum_partials<<<required, 256, 0, computeStream()>>>(
+        value, rows, stride, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    k_reduce_partials<<<1, 256, 0, computeStream()>>>(partials, required);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    k_subtract_bias_mean<<<required, 256, 0, computeStream()>>>(
+        value, rows, stride, partials);
+    GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
@@ -6089,11 +7844,11 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 	// inside one block.  At T=2048, vocabSize=32000 this was ~24 ms/call,
 	// consuming ~8% of GPU time per training step.
 	//
-	// The properly-parallelized implementation is already present as two
-	// separate kernels (cross_entropy_nll_loss + argmax_count_matches) —
-	// both use grid=(T+block-1)/block clamped at 128 blocks.  Route
-	// collect_token_lm_metrics through those to restore the pre-eecdb97c1
-	// throughput.
+	// Keep the work split between the target-only CE reduction and the
+	// vocabulary-wide argmax. CE uses one deterministic block over T target
+	// probabilities; argmax remains parallel across up to 128 blocks. This
+	// avoids serializing the expensive T×vocabSize scan while preserving a
+	// bit-exact NLL reduction order across launches.
 	//
 	// Output layout (unchanged for call-site compatibility):
 	//   out[0] = loss_sum  (bit-cast float)
@@ -6120,7 +7875,8 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 namespace {
 
 __global__ void sum_sq_kernel(const float* __restrict__ data, int n,
-                              float* __restrict__ acc)
+                              float* __restrict__ acc,
+                              float* __restrict__ secondary)
 {
 	extern __shared__ float smem[];
 	float localSum = 0.0f;
@@ -6132,7 +7888,10 @@ __global__ void sum_sq_kernel(const float* __restrict__ data, int n,
 	}
 	float sum = blockReduceSum(localSum, smem);
 	if (threadIdx.x == 0)
+	{
 		atomicAdd(acc, sum);
+		if (secondary) atomicAdd(secondary, sum);
+	}
 }
 
 } // anonymous namespace
@@ -6144,7 +7903,19 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 	int grid = (n + block - 1) / block;
 	if (grid > 256) grid = 256;
 	int smemBytes = ((block / 32) + 1) * sizeof(float);
-	sum_sq_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator);
+	sum_sq_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool sum_squared_accumulate_dual(const float* data, int n,
+                                 float* d_accumulator, float* d_secondary)
+{
+	if (!d_accumulator || !d_secondary || n <= 0) return n <= 0;
+	int block = 256, grid = (n + block - 1) / block; if (grid > 256) grid = 256;
+	int smemBytes = ((block / 32) + 1) * sizeof(float);
+	sum_sq_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	    data, n, d_accumulator, d_secondary);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -6152,7 +7923,8 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 namespace {
 
 __global__ void sum_sq_bf16_kernel(const uint16_t* __restrict__ data, int n,
-                                    float* __restrict__ acc)
+                                    float* __restrict__ acc,
+                                    float* __restrict__ secondary)
 {
 	extern __shared__ float smem[];
 	float localSum = 0.0f;
@@ -6166,7 +7938,10 @@ __global__ void sum_sq_bf16_kernel(const uint16_t* __restrict__ data, int n,
 	}
 	float sum = blockReduceSum(localSum, smem);
 	if (threadIdx.x == 0)
+	{
 		atomicAdd(acc, sum);
+		if (secondary) atomicAdd(secondary, sum);
+	}
 }
 
 } // anonymous namespace
@@ -6178,7 +7953,19 @@ bool sum_squared_accumulate_bf16(const uint16_t* data, int n, float* d_accumulat
 	int grid = (n + block - 1) / block;
 	if (grid > 256) grid = 256;
 	int smemBytes = ((block / 32) + 1) * sizeof(float);
-	sum_sq_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator);
+	sum_sq_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator, NULL);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool sum_squared_accumulate_bf16_dual(const uint16_t* data, int n,
+                                      float* d_accumulator, float* d_secondary)
+{
+	if (!d_accumulator || !d_secondary || n <= 0) return n <= 0;
+	int block = 256, grid = (n + block - 1) / block; if (grid > 256) grid = 256;
+	int smemBytes = ((block / 32) + 1) * sizeof(float);
+	sum_sq_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	    data, n, d_accumulator, d_secondary);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -8359,26 +10146,118 @@ bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
 //  SCFA (paradigm shift #42) — Spectral Compressed Flow Attention primitives.
 // ===========================================================================
 //
-// SCFA replaces full T-token attention with attention in a k-dim sequence-
-// spectral basis B ∈ ℝ^{T×k} (k ≪ T) + a depthwise causal conv D covering
-// the out-of-spectrum residual.  Forward:
+// Causal SCFA replaces full T-token attention with attention over k contiguous
+// block summaries plus a depthwise causal residual mixer. C compresses each
+// block; A exposes summary b only to block b+1:
 //
-//   q_compr = B^T q                       (T → k compression)
-//   y_compr = SoftmaxAttn(q_compr ...)    (k-dim attention; existing kernel)
-//   y_∥     = B · y_compr                 (k → T lift)
-//   y_⊥     = D(q - B B^T q)              (depthwise causal conv on residual)
-//   y       = y_∥ + y_⊥
+//   q_compr = C q                         (T → k block compression)
+//   y_compr = CausalAttn(q_compr ...)     (k-summary attention)
+//   y_par   = A y_compr                   (one-block-delayed lift)
+//   y_perp  = D(q - A q_compr)            (causal residual convolution)
 //
-// This file ships the two SCFA-specific primitives:
-//   scfa_dct_basis_init    — fill B with normalized DCT-II basis (orthonormal)
-//   scfa_depthwise_causal_conv_fwd — y_⊥ = D(x) with causal kernel size 2w+1,
-//     one filter per channel; m channels, T positions, w half-width.
-//
-// The compression/lift steps reuse sgemm_rowmajor (in this same file).
-// Theorem 3 reversibility integration with CHIRON shears is handled at the
-// chiron_main.cpp level; these kernels are paradigm-agnostic linear algebra.
+// The legacy DCT initializer remains for compatibility with isolated research
+// tests, but causal CHIRON forward paths use the block/lag operators below.
 
 namespace {
+
+__device__ __forceinline__ int scfa_block_start(int b, int T, int k)
+{
+	return (int)(((long long)b * (long long)T) / (long long)k);
+}
+
+__device__ __forceinline__ int scfa_token_block(int t, int T, int k)
+{
+	// Inverse of start(b)=floor(b*T/k), valid for 0 < k <= T.
+	int b = (int)((((long long)(t + 1) * (long long)k) - 1ll) / (long long)T);
+	return b < k ? b : k - 1;
+}
+
+__global__ void scfa_block_compress_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	int b = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (b >= k || c >= m) return;
+	int begin = scfa_block_start(b, T, k);
+	int end = scfa_block_start(b + 1, T, k);
+	float sum = 0.0f;
+	for (int t = begin; t < end; ++t)
+		sum += x[(size_t)t * (size_t)m + (size_t)c];
+	float v = alpha * sum * rsqrtf((float)(end - begin));
+	size_t o = (size_t)b * (size_t)m + (size_t)c;
+	out[o] = beta == 0.0f ? v : v + beta * out[o];
+}
+
+__global__ void scfa_causal_lag_lift_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)T * (size_t)m;
+	if (idx >= n) return;
+	int t = (int)(idx / (size_t)m);
+	int c = (int)(idx % (size_t)m);
+	int dstBlock = scfa_token_block(t, T, k);
+	float v = 0.0f;
+	if (dstBlock > 0)
+	{
+		int srcBlock = dstBlock - 1;
+		int begin = scfa_block_start(srcBlock, T, k);
+		int end = scfa_block_start(srcBlock + 1, T, k);
+		v = alpha * x[(size_t)srcBlock * (size_t)m + (size_t)c]
+		    * rsqrtf((float)(end - begin));
+	}
+	out[idx] = beta == 0.0f ? v : v + beta * out[idx];
+}
+
+__global__ void scfa_lag_row_kernel(
+    const float* __restrict__ summary, int m, int blockWidth,
+    float* __restrict__ out)
+{
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (c >= m) return;
+	out[c] = summary[c] * rsqrtf((float)blockWidth);
+}
+
+__global__ void scfa_causal_lag_reduce_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	int b = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (b >= k || c >= m) return;
+	float sum = 0.0f;
+	if (b + 1 < k)
+	{
+		int begin = scfa_block_start(b + 1, T, k);
+		int end = scfa_block_start(b + 2, T, k);
+		for (int t = begin; t < end; ++t)
+			sum += x[(size_t)t * (size_t)m + (size_t)c];
+	}
+	int srcBegin = scfa_block_start(b, T, k);
+	int srcEnd = scfa_block_start(b + 1, T, k);
+	float v = alpha * sum * rsqrtf((float)(srcEnd - srcBegin));
+	size_t o = (size_t)b * (size_t)m + (size_t)c;
+	out[o] = beta == 0.0f ? v : v + beta * out[o];
+}
+
+__global__ void scfa_block_expand_kernel(
+    const float* __restrict__ x, int T, int m, int k,
+    float alpha, float beta, float* __restrict__ out)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)T * (size_t)m;
+	if (idx >= n) return;
+	int t = (int)(idx / (size_t)m);
+	int c = (int)(idx % (size_t)m);
+	int b = scfa_token_block(t, T, k);
+	int begin = scfa_block_start(b, T, k);
+	int end = scfa_block_start(b + 1, T, k);
+	float v = alpha * x[(size_t)b * (size_t)m + (size_t)c]
+	          * rsqrtf((float)(end - begin));
+	out[idx] = beta == 0.0f ? v : v + beta * out[idx];
+}
 
 // Apply 1-D depthwise causal conv: y[t, c] = Σ_{i=-w..0} K[c, w+i] · x[t+i, c]
 // for t ∈ [0, T), c ∈ [0, m).  Out-of-bounds left taps zero-padded.
@@ -8659,6 +10538,72 @@ __global__ void scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled_kernel(
 }
 
 } // anonymous namespace
+
+bool scfa_block_compress(const float* x, int T, int m, int k,
+                         float alpha, float beta, float* out,
+                         cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	dim3 grid((m + block - 1) / block, k);
+	scfa_block_compress_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_causal_lag_lift(const float* x, int T, int m, int k,
+                          float alpha, float beta, float* out,
+                          cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	size_t n = (size_t)T * (size_t)m;
+	int block = 256;
+	int grid = (int)((n + block - 1) / block);
+	scfa_causal_lag_lift_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_causal_lag_reduce(const float* x, int T, int m, int k,
+                            float alpha, float beta, float* out,
+                            cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	dim3 grid((m + block - 1) / block, k);
+	scfa_causal_lag_reduce_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_block_expand(const float* x, int T, int m, int k,
+                       float alpha, float beta, float* out,
+                       cudaStream_t stream)
+{
+	if (!x || !out || T <= 0 || m <= 0 || k <= 0 || k > T) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	size_t n = (size_t)T * (size_t)m;
+	int block = 256;
+	int grid = (int)((n + block - 1) / block);
+	scfa_block_expand_kernel<<<grid, block, 0, s>>>(x, T, m, k, alpha, beta, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scfa_lag_row(const float* summary, int m, int blockWidth, float* out,
+                  cudaStream_t stream)
+{
+	if (!summary || !out || m <= 0 || blockWidth <= 0) return false;
+	cudaStream_t s = stream ? stream : computeStream();
+	int block = 256;
+	int grid = (m + block - 1) / block;
+	scfa_lag_row_kernel<<<grid, block, 0, s>>>(summary, m, blockWidth, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
                                      int T, int m, int w, float* y,
@@ -9063,6 +11008,86 @@ __global__ void scfa_dwconv_dx_tiled_kernel_dual_out(
 	}
 }
 
+// Cast-elim Port B (2026-06-12): identical to scfa_dwconv_dx_tiled_kernel_
+// dual_out but additionally side-writes the BF16 RNE mirror of dx_secondary
+// (bit-identical to a subsequent cast_f32_to_bf16 of dx_secondary).  Lets
+// the downstream B^T·dq_perp FAST_16BF GEMM consume the mirror instead of
+// launching a standalone T×m cast.  Separate kernel (not a runtime branch
+// in the original) so the legacy path's codegen is untouched — FMA-emit
+// drift class precaution.  See research/CAST_CENSUS_2026_06_12.md.
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror(
+    const float* __restrict__ dy,
+    const float* __restrict__ K,
+    int T, int m,
+    float* __restrict__ dx_primary,
+    float* __restrict__ dx_secondary,
+    unsigned short* __restrict__ dx_secondary_bf16)
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int DY_ROWS = N_OUT + W_FILTER - 1;
+
+	__shared__ float dy_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			const int t_in = t_base + k;
+			dy_smem[k][threadIdx.x] = (t_in < T)
+			    ? dy[(size_t)t_in * (size_t)m + (size_t)c]
+			    : 0.0f;
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < DY_ROWS; ++k) {
+			dy_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t = t_base + dt;
+		if (t >= T) return;
+
+		float acc = 0.0f;
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t + i >= T) break;
+			acc += K_smem[threadIdx.x][i] * dy_smem[dt + i][threadIdx.x];
+		}
+		const size_t idx = (size_t)t * (size_t)m + (size_t)c;
+		dx_primary[idx]  += acc;
+		dx_secondary[idx] = acc;
+		// BF16 RNE encode of acc — same semantics as k_cast_f32_to_bf16.
+		union { float f; uint32_t u; } enc;
+		enc.f = acc;
+		if (isnan(acc)) {
+			const uint32_t sign = enc.u & 0x80000000u;
+			dx_secondary_bf16[idx] = (unsigned short)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (enc.u >> 16) & 1u;
+			dx_secondary_bf16[idx] = (unsigned short)((enc.u + 0x7FFFu + lsb) >> 16);
+		}
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
@@ -9194,6 +11219,56 @@ bool scfa_depthwise_causal_conv_bwd_dual_out(const float* x, const float* K,
 		dim3 grid((m + block - 1) / block, T);
 		scfa_dwconv_dx_kernel_dual_out<<<grid, block, 0, s>>>(
 		    dy, K, T, m, w, dx_primary, dx_secondary);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// dK kernel: same _par variant as the legacy bwd.
+	{
+		const int BLOCK_M = 64;
+		const int BLOCK_T = 8;
+		int wp1 = w + 1;
+		dim3 grid((m + BLOCK_M - 1) / BLOCK_M, wp1);
+		dim3 block(BLOCK_M, BLOCK_T);
+		scfa_dwconv_dK_kernel_par<64, 8><<<grid, block, 0, s>>>(
+		    x, dy, T, m, w, dK);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+bool scfa_depthwise_causal_conv_bwd_dual_out_bf16mirror(
+    const float* x, const float* K,
+    const float* dy,
+    int T, int m, int w,
+    float* dx_primary,
+    float* dx_secondary,
+    unsigned short* dx_secondary_bf16,
+    float* dK,
+    cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	// Mirror variant is implemented for the tiled w ∈ {4, 8} paths only
+	// (the production iter-99 dispatch gate).  No mirror → use the plain
+	// dual_out path.
+	if (!dx_secondary_bf16)
+		return scfa_depthwise_causal_conv_bwd_dual_out(
+		    x, K, dy, T, m, w, dx_primary, dx_secondary, dK, stream);
+	if (w != 4 && w != 8) return false;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+
+	{
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		if (w == 4)
+			scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror<COLS, N_OUT, 5>
+			    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary,
+			                            dx_secondary_bf16);
+		else
+			scfa_dwconv_dx_tiled_kernel_dual_out_bf16mirror<COLS, N_OUT, 9>
+			    <<<grid, block, 0, s>>>(dy, K, T, m, dx_primary, dx_secondary,
+			                            dx_secondary_bf16);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 

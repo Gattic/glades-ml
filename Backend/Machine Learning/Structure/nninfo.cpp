@@ -96,18 +96,19 @@ glades::NNInfo::NNInfo(const shmea::GString& newName)
  * @param hidden the desired hidden layers
  * @param newOutputLayer the desired output layer
  */
-glades::NNInfo::NNInfo(const shmea::GString& newName, InputLayerInfo* newInputLayer,
-					   const std::vector<HiddenLayerInfo*>& hidden, OutputLayerInfo* newOutputLayer)
+glades::NNInfo::NNInfo(
+	const shmea::GString& newName,
+	shmea::GPointer<InputLayerInfo> newInputLayer,
+	std::vector<shmea::GPointer<HiddenLayerInfo>> hidden,
+	shmea::GPointer<OutputLayerInfo> newOutputLayer)
+	: name(newName),
+	  inputType(0),
+	  inputLayer(std::move(newInputLayer)),
+	  outputLayer(std::move(newOutputLayer)),
+	  layers(std::move(hidden)),
+	  hiddenLayerCount(static_cast<int>(layers.size())),
+	  batchSize(0)
 {
-	name = newName;
-	inputType = 0;
-	hiddenLayerCount = hidden.size();
-	inputLayer = shmea::GPointer<InputLayerInfo>(newInputLayer);
-	outputLayer = shmea::GPointer<OutputLayerInfo>(newOutputLayer);
-
-	// populate the hidden layers
-	for (int i = 0; i < hiddenLayerCount; ++i)
-		layers.push_back(shmea::GPointer<HiddenLayerInfo>(hidden[i]));
 }
 
 /*!
@@ -556,12 +557,11 @@ void glades::NNInfo::setOutputSize(int newOutputSize)
  * @param newLayers the desired layers, a vector where each index `i` corresponds to the number of
  * nodes in the `i`th layer
  */
-void glades::NNInfo::setLayers(const std::vector<HiddenLayerInfo*>& newLayers)
+void glades::NNInfo::setLayers(
+	std::vector<shmea::GPointer<HiddenLayerInfo>> newLayers)
 {
-	layers.clear();
-	layers.reserve(newLayers.size());
-	for (unsigned int i = 0; i < newLayers.size(); ++i)
-		layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayers[i]));
+	layers = std::move(newLayers);
+	hiddenLayerCount = static_cast<int>(layers.size());
 }
 
 /*!
@@ -718,12 +718,14 @@ void glades::NNInfo::setActivationParam(unsigned int index, float newActivationP
 	}
 }
 
-void glades::NNInfo::addHiddenLayer(HiddenLayerInfo* newLayer)
+void glades::NNInfo::addHiddenLayer(
+	shmea::GPointer<HiddenLayerInfo> newLayer)
 {
 	if (!newLayer)
 		return;
 
-	layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayer));
+	layers.push_back(std::move(newLayer));
+	hiddenLayerCount = static_cast<int>(layers.size());
 }
 
 void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
@@ -740,7 +742,7 @@ void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
 	if (!layers[src])
 		return;
 
-	layers[dst]->copyParamsFrom(layers[src]);
+	layers[dst]->copyParamsFrom(layers[src].get());
 }
 
 void glades::NNInfo::resizeHiddenLayers(unsigned int newCount)
@@ -753,8 +755,8 @@ void glades::NNInfo::resizeHiddenLayers(unsigned int newCount)
 
 	while (layers.size() < newCount)
 	{
-		layers.push_back(shmea::GPointer<HiddenLayerInfo>(
-			new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0)));
+		layers.push_back(
+			shmea::make_gpointer<HiddenLayerInfo>(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0));
 	}
 }
 
@@ -827,37 +829,36 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 				tbpttWindow = (minibatch > 1) ? minibatch : 0;
 			}
 
-			inputLayer = shmea::GPointer<InputLayerInfo>(
-				new InputLayerInfo(minibatch, // minibatch size (NOT layer size)
-									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
-									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
-									newTable.getCell(i, COL_PDROPOUT).getFloat(),
-									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
-									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat(),
-									tbpttWindow));
+			inputLayer = shmea::make_gpointer<InputLayerInfo>(
+				minibatch, // minibatch size (NOT layer size)
+				newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
+				newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
+				newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+				newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
+				newTable.getCell(i, COL_PDROPOUT).getFloat(),
+				newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
+				newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat(),
+				tbpttWindow);
 		}
 		else if (i == newTable.numberOfRows() - 1)
 		{
 			// Output Layer
-			outputLayer = shmea::GPointer<OutputLayerInfo>(
-				new OutputLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
-											  newTable.getCell(i, COL_OUTPUT_TYPE).getFloat()));
+			outputLayer = shmea::make_gpointer<OutputLayerInfo>(
+				newTable.getCell(i, COL_SIZE).getInt(),
+				newTable.getCell(i, COL_OUTPUT_TYPE).getFloat());
 		}
 		else
 		{
 			// Hidden layer
-			HiddenLayerInfo* newLayer =
-				new HiddenLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
-									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
-									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
-									newTable.getCell(i, COL_PDROPOUT).getFloat(),
-									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
-									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
-			layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayer));
+			layers.push_back(shmea::make_gpointer<HiddenLayerInfo>(
+				newTable.getCell(i, COL_SIZE).getInt(),
+				newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
+				newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
+				newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+				newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
+				newTable.getCell(i, COL_PDROPOUT).getFloat(),
+				newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
+				newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat()));
 		}
 	}
 

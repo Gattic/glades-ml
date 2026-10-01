@@ -59,7 +59,7 @@ void NNCVUnitTestValidation()
 	}
 
 	// Simple DFF binary classifier (no hidden layers).
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 10,
 	    /*learningRate*/ 0.20f,
 	    /*momentumFactor*/ 0.0f,
@@ -68,8 +68,8 @@ void NNCVUnitTestValidation()
 	    /*pDropout*/ 0.0f,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(2, glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("ut_cv_bin", in, hidden, out);
 
 	glades::NNetwork net1(info, glades::NNetwork::TYPE_DFF);

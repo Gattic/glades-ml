@@ -62,14 +62,14 @@ struct SmallDecoderLm
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		info = new glades::NNInfo("ut_transformer_verification_decoder_lm", in, hidden, out);
 
 		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -132,14 +132,14 @@ struct TrainableDecoderLm
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		info = new glades::NNInfo("ut_transformer_verification_train_decoder_lm", in, hidden, out);
 
 		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -1008,6 +1008,18 @@ static void test_training_gradient_checkpointing_parity()
 	ASSERT("forward after no-checkpoint train", noCheckpoint.net->transformerLmForwardLastLogits(probe, logitsNoCheckpoint).ok());
 	ASSERT("forward after checkpoint train", withCheckpoint.net->transformerLmForwardLastLogits(probe, logitsCheckpoint).ok());
 	ASSERT("checkpointing logits size parity", logitsNoCheckpoint.size() == logitsCheckpoint.size());
+
+	std::vector<float> traceLogits;
+	glades::TransformerForwardTrace trace;
+	ASSERT("diagnostic trace forward", noCheckpoint.net->transformerLmForwardLastTrace(
+			probe, traceLogits, trace).ok());
+	ASSERT("diagnostic trace logits size", traceLogits.size() == logitsNoCheckpoint.size());
+	ASSERT("diagnostic trace hidden size", trace.hiddenSize > 0u);
+	ASSERT("diagnostic trace has layers", trace.layers > 0u);
+	ASSERT("diagnostic trace stage shape",
+	       trace.lastHidden.size() == (static_cast<size_t>(trace.layers) + 1u) * trace.hiddenSize);
+	for (size_t i = 0u; i < traceLogits.size(); ++i)
+		ASSERT("diagnostic trace logits exactly match normal forward", traceLogits[i] == logitsNoCheckpoint[i]);
 
 	double maxAbs = 0.0;
 	for (size_t i = 0u; i < logitsNoCheckpoint.size(); ++i)

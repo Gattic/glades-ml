@@ -69,6 +69,8 @@ public:
 	virtual bool getTrainExpectedTokenId(unsigned int i, int& out) const { out = 0; if (i >= trainNext.size()) return false; out = trainNext[i]; return true; }
 	virtual bool getTestTokenId(unsigned int i, int& out) const { out = 0; if (i >= testTok.size()) return false; out = testTok[i]; return true; }
 	virtual bool getTestExpectedTokenId(unsigned int i, int& out) const { out = 0; if (i >= testNext.size()) return false; out = testNext[i]; return true; }
+	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
 
 	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
 	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
@@ -108,13 +110,15 @@ struct SmallNet
 		di = new TestTokenInput();
 		di->setTrainTokens(toks, static_cast<int>(pad));
 		di->mirrorTrainToTest();
+		ASSERT("numerical-edge: token input capability missing", di->hasTokenIdInput());
+		ASSERT("numerical-edge: token expected-output capability missing", di->hasTokenIdExpectedOutput());
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 			1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			static_cast<int>(DMODEL), 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 			static_cast<int>(VOCAB), glades::OutputLayerInfo::CLASSIFICATION);
 
 		info = new glades::NNInfo("ut_numerical_edge", in, hidden, out);

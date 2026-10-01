@@ -55,21 +55,8 @@ inline void seed_engine(Engine& e, uint64_t newSeed)
 
 inline Engine& default_engine()
 {
-	// Thread-safe default RNG engine.
-	//
-	// IMPORTANT:
-	// - In C++98 builds, we use `__thread` (when available) for TLS. GCC's `__thread` does not
-	//   support non-POD types with constructors/destructors, so we store a TLS *pointer* and
-	//   lazily allocate the Engine.
-	// - This intentionally leaks one Engine per thread for the lifetime of the process.
-	//   (In the ML engine, thread count is expected to be small and long-lived.)
-	//
-	// If TLS is not available (GLADES_THREAD_LOCAL is empty), this falls back to a single
-	// process-global default engine and is NOT thread-safe. Production builds should enable TLS.
-	static GLADES_THREAD_LOCAL Engine* p = 0;
-	if (!p)
-		p = new Engine();
-	return *p;
+	static thread_local Engine engine;
+	return engine;
 }
 
 // ===== Explicit-engine API (preferred) =====

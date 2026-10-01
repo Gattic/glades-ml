@@ -774,14 +774,14 @@ static float train_small_lm(unsigned int seed, unsigned int epochs)
 	di->setTrainTokens(toks, static_cast<int>(padTokenId));
 	di->mirrorTrainToTest();
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("ut_parallel_e2e", in, hidden, out);
 
@@ -889,14 +889,14 @@ static void test_kv_parity_after_training()
 	di->setTrainTokens(toks, static_cast<int>(padTokenId));
 	di->mirrorTrainToTest();
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("ut_parallel_kv_after_train", in, hidden, out);
 
@@ -1244,15 +1244,15 @@ static void test_training_various_configs()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 		const int dModel = c.nHeads * 4; // dHead=4
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    dModel, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    dModel, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 		    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_par_cfg", in, hidden, out);
 
@@ -1323,14 +1323,14 @@ static void test_triple_determinism()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 		    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_par_triple_det", in, hidden, out);
 
@@ -1500,14 +1500,14 @@ static void test_training_t1()
 	di->setTrainTokens(toks, static_cast<int>(padTokenId));
 	di->mirrorTrainToTest();
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("ut_par_t1", in, hidden, out);
 
@@ -1611,14 +1611,14 @@ static void test_transformer_run_lock_reentry_rejection()
 	di->setTrainTokens(toks, static_cast<int>(padTokenId));
 	di->mirrorTrainToTest();
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("ut_par_transformer_runlock", in, hidden, out);
 

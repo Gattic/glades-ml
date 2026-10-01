@@ -125,6 +125,96 @@ struct TransformerGenerateResult
 	}
 };
 
+// Aggregate next-token metrics from one full-sequence GPU forward.
+// `nllSum` is the sum over valid targets; `tokenCount` is the denominator.
+struct TransformerTokenMetrics
+{
+	double nllSum;
+	unsigned long long tokenCount;
+	unsigned long long correct;
+
+	TransformerTokenMetrics()
+	    : nllSum(0.0), tokenCount(0ULL), correct(0ULL)
+	{
+	}
+
+	void clear()
+	{
+		nllSum = 0.0;
+		tokenCount = 0ULL;
+		correct = 0ULL;
+	}
+};
+
+// Diagnostic-only last-position hidden trace from a full causal forward.
+// `lastHidden` is stage-major: embedded/positioned input first, then one row
+// after each Transformer block. It deliberately excludes attention matrices
+// and full-sequence activations so callers cannot accidentally turn this into
+// a high-memory serving path.
+// Diagnostic full-sequence output from the canonical GPU forward. `finalHidden`
+// is the exact row consumed by the tied readout after the final norm; `logits`
+// is transient evaluator evidence and callers should release it after streaming
+// metrics/hashes.
+struct TransformerReadoutParameters
+{
+	unsigned int hiddenSize;
+	unsigned int vocabSize;
+	std::vector<float> weight; // [vocabSize, hiddenSize]
+	std::vector<float> bias;   // [vocabSize], explicit zeros when absent
+
+	TransformerReadoutParameters()
+	    : hiddenSize(0u), vocabSize(0u), weight(), bias()
+	{
+	}
+
+	void clear()
+	{
+		hiddenSize = vocabSize = 0u;
+		weight.clear();
+		bias.clear();
+	}
+};
+
+struct TransformerFullSequenceFeatures
+{
+	unsigned int positions;
+	unsigned int hiddenSize;
+	unsigned int vocabSize;
+	std::vector<float> finalHidden; // [positions, hiddenSize]
+	std::vector<float> logits;      // [positions, vocabSize]
+
+	TransformerFullSequenceFeatures()
+	    : positions(0u), hiddenSize(0u), vocabSize(0u), finalHidden(), logits()
+	{
+	}
+
+	void clear()
+	{
+		positions = hiddenSize = vocabSize = 0u;
+		finalHidden.clear();
+		logits.clear();
+	}
+};
+
+struct TransformerForwardTrace
+{
+	unsigned int hiddenSize;
+	unsigned int layers;
+	std::vector<float> lastHidden;
+
+	TransformerForwardTrace()
+	    : hiddenSize(0u), layers(0u), lastHidden()
+	{
+	}
+
+	void clear()
+	{
+		hiddenSize = 0u;
+		layers = 0u;
+		lastHidden.clear();
+	}
+};
+
 struct TransformerServeRequest
 {
 	std::vector<unsigned int> promptTokens;

@@ -10,7 +10,7 @@ endif()
 file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
 
 #Init
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0091 NEW)
 
 # CUDA GPU offloading (must match main build when linking CUDA-built libraries)
@@ -25,7 +25,9 @@ if(GLADES_ENABLE_CUDA)
 	add_definitions(-DGLADES_HAVE_CUDA=1)
 endif()
 
-set(CMAKE_CXX_STANDARD 98)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 #Project

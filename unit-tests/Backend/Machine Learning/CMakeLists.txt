@@ -33,6 +33,11 @@ atlas-alt-bench.cpp
 vesta-test.cpp
 helios-test.cpp
 chiron-test.cpp
+chiron-rank-cause-test.cpp
+chiron-orbit-test.cpp
+chiron-vitals-test.cpp
+chiron-model-test.cpp
+chiron-generate-test.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sfa-parity-test.cpp

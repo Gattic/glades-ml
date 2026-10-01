@@ -3,6 +3,8 @@
 
 #include "gpu_buffer.h"
 
+#include <memory>
+
 #ifdef GLADES_HAVE_CUDA
 
 namespace glades {
@@ -51,17 +53,16 @@ struct GpuCNNWeights
 		GpuBuffer<float> v2Bias;
 	};
 
-	ConvLayer* convLayers;
-	FCLayer* fcLayers;
+	std::unique_ptr<ConvLayer[]> convLayers;
+	std::unique_ptr<FCLayer[]> fcLayers;
 
-	GpuCNNWeights() : initialized(false), numConvLayers(0), numFCLayers(0),
-	                   convLayers(0), fcLayers(0) {}
+	GpuCNNWeights() : initialized(false), numConvLayers(0), numFCLayers(0) {}
 	~GpuCNNWeights() { free(); }
 
 	void free()
 	{
-		if (convLayers) { delete[] convLayers; convLayers = 0; }
-		if (fcLayers) { delete[] fcLayers; fcLayers = 0; }
+		convLayers.reset();
+		fcLayers.reset();
 		numConvLayers = 0;
 		numFCLayers = 0;
 		initialized = false;
@@ -90,14 +91,14 @@ struct GpuCNNScratch
 	};
 
 	unsigned int numConvLayers;
-	ConvLayerScratch* convScratch;
+	std::unique_ptr<ConvLayerScratch[]> convScratch;
 
-	GpuCNNScratch() : initialized(false), numConvLayers(0), convScratch(0) {}
+	GpuCNNScratch() : initialized(false), numConvLayers(0) {}
 	~GpuCNNScratch() { free(); }
 
 	void free()
 	{
-		if (convScratch) { delete[] convScratch; convScratch = 0; }
+		convScratch.reset();
 		numConvLayers = 0;
 		initialized = false;
 	}

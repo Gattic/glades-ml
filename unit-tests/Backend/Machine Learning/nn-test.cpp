@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -847,12 +848,12 @@ static bool read_last_result_pred(const glades::NNetwork& net, float& outPred)
 	return true;
 }
 
-static glades::NNetwork* load_with_overridden_weights_DFF(const glades::NNInfo* info,
-                                                         const glades::NumberInput* di,
-                                                         const std::string& modelName,
-                                                         unsigned int seed,
-                                                         float w,
-                                                         float b)
+static std::unique_ptr<glades::NNetwork> load_with_overridden_weights_DFF(const glades::NNInfo* info,
+                                                        const glades::NumberInput* di,
+                                                        const std::string& modelName,
+                                                        unsigned int seed,
+                                                        float w,
+                                                        float b)
 {
 	// These override-style tests intentionally patch weights.bin after saveModel().
 	// Ensure file integrity verification is disabled regardless of caller environment.
@@ -864,7 +865,7 @@ static glades::NNetwork* load_with_overridden_weights_DFF(const glades::NNInfo* 
 	bootstrap.setSeed(seed);
 	bootstrap.getTerminatorMutable().setEpoch(1);
 	bootstrap.getTerminatorMutable().setAccuracy(0);
-	// Ensure test split is present (the runtime uses test split for net.test()).
+	// Ensure test split is present (the runtime uses test split for net->test()).
 	// These unit tests often only populate trainMatrix/trainExpectedMatrix.
 	glades::NumberInput* diMut = const_cast<glades::NumberInput*>(di);
 	if (diMut && diMut->getTestSize() == 0u && diMut->getTrainSize() > 0u)
@@ -883,18 +884,18 @@ static glades::NNetwork* load_with_overridden_weights_DFF(const glades::NNInfo* 
 	         write_dff_weights("database/models/" + modelName + "/weights.bin", w, b));
 
 	// 3) Load into a fresh net (ensures runtime uses the overridden packed weights).
-	glades::NNetwork* net = new glades::NNetwork(glades::NNetwork::TYPE_DFF);
+	auto net = std::make_unique<glades::NNetwork>(glades::NNetwork::TYPE_DFF);
 	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::DFF_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
 }
 
-static glades::NNetwork* load_with_overridden_weights_RNN_1x1x1(const glades::NNInfo* info,
-                                                                const glades::NumberInput* di,
-                                                                const std::string& modelName,
-                                                                unsigned int seed,
-                                                                float Wxh, float Whh, float bh,
-                                                                float Why, float by)
+static std::unique_ptr<glades::NNetwork> load_with_overridden_weights_RNN_1x1x1(const glades::NNInfo* info,
+                                                               const glades::NumberInput* di,
+                                                               const std::string& modelName,
+                                                               unsigned int seed,
+                                                               float Wxh, float Whh, float bh,
+                                                               float Why, float by)
 {
 	// These override-style tests intentionally patch weights.bin after saveModel().
 	// Ensure file integrity verification is disabled regardless of caller environment.
@@ -920,20 +921,20 @@ static glades::NNetwork* load_with_overridden_weights_RNN_1x1x1(const glades::NN
 	G_assert(__FILE__, __LINE__, "==============NN::RNN_WriteOverrideWeights() Failed==============",
 	         write_rnn_weights_1x1x1("database/models/" + modelName + "/weights.bin", Wxh, Whh, bh, Why, by));
 
-	glades::NNetwork* net = new glades::NNetwork(glades::NNetwork::TYPE_RNN);
+	auto net = std::make_unique<glades::NNetwork>(glades::NNetwork::TYPE_RNN);
 	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::RNN_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
 }
 
-static glades::NNetwork* load_with_overridden_weights_Gated_1layer_1x1x1(const glades::NNInfo* info,
-                                                                         const glades::NumberInput* di,
-                                                                         const std::string& modelName,
-                                                                         int netType,
-                                                                         unsigned int seed,
-                                                                         unsigned int gateCount,
-                                                                         float Why,
-                                                                         float by)
+static std::unique_ptr<glades::NNetwork> load_with_overridden_weights_Gated_1layer_1x1x1(const glades::NNInfo* info,
+                                                                        const glades::NumberInput* di,
+                                                                        const std::string& modelName,
+                                                                        int netType,
+                                                                        unsigned int seed,
+                                                                        unsigned int gateCount,
+                                                                        float Why,
+                                                                        float by)
 {
 	// Ensure file integrity verification is disabled regardless of caller environment.
 	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
@@ -962,7 +963,7 @@ static glades::NNetwork* load_with_overridden_weights_Gated_1layer_1x1x1(const g
 	                                          Why,
 	                                          by));
 
-	glades::NNetwork* net = new glades::NNetwork(netType);
+	auto net = std::make_unique<glades::NNetwork>(netType);
 	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::Gated_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
@@ -996,7 +997,7 @@ static void ModelPackageIntegrityVerificationUnitTest()
 	di->testMatrix = di->trainMatrix;
 	di->testExpectedMatrix = di->trainExpectedMatrix;
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 1,
 	    /*learningRate*/ 0.1f,
 	    /*momentumFactor*/ 0.0f,
@@ -1005,8 +1006,8 @@ static void ModelPackageIntegrityVerificationUnitTest()
 	    /*pDropout*/ 0.0f,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 	glades::NNInfo* info = new glades::NNInfo("ut_pkg_verify_integrity", in, hidden, out);
 
 	const std::string modelName = "ut_pkg_verify_integrity";
@@ -1076,7 +1077,7 @@ void NNUnitTest()
 		di->trainMatrix[1][0] = 2.0f;
 		di->trainExpectedMatrix[1][0] = 1.0f;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 10,
             /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
@@ -1085,17 +1086,18 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_minibatch_timing", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_minibatch", 123u, /*w*/ 1.0f, /*b*/ 0.0f);
-		net->getTerminatorMutable().setEpoch(1);
-		net->getTerminatorMutable().setAccuracy(0);
+		auto netOwner = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_minibatch", 123u, /*w*/ 1.0f, /*b*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch TrainStatus() Failed==============", st.ok());
-		const glades::NNetworkStatus stSave = net->saveModel("ut_pkg_dff_minibatch_after");
+		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_minibatch_after");
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch SaveModel() Failed==============", stSave.ok());
 
 		float wFinal = 0.0f;
@@ -1107,7 +1109,6 @@ void NNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_MinibatchUpdate() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
-		delete net;
 		delete di;
 		delete info;
     }
@@ -1120,7 +1121,7 @@ void NNUnitTest()
 		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
 		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 1,
 		    /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
@@ -1129,17 +1130,18 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l2", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l2", 321u, /*w*/ 1.0f, /*b*/ 0.0f);
-		net->getTerminatorMutable().setEpoch(1);
-		net->getTerminatorMutable().setAccuracy(0);
+		auto netOwner = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l2", 321u, /*w*/ 1.0f, /*b*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net->train(di);
+		const glades::NNetworkStatus st = net.train(di);
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 TrainStatus() Failed==============", st.ok());
-		const glades::NNetworkStatus stSave = net->saveModel("ut_pkg_dff_l2_after");
+		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_l2_after");
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 SaveModel() Failed==============", stSave.ok());
 
 		float wFinal = 0.0f;
@@ -1151,7 +1153,6 @@ void NNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2WeightDecay() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
-		delete net;
 		delete di;
 		delete info;
     }
@@ -1170,7 +1171,7 @@ void NNUnitTest()
 
 		// w0=+1 => w1=0.9
         {
-            glades::InputLayerInfo* in = new glades::InputLayerInfo(
+            auto in = shmea::make_gpointer<glades::InputLayerInfo>(
                 /*batchSize*/ 1,
                 /*learningRate*/ lr,
                 /*momentumFactor*/ 0.0f,
@@ -1179,14 +1180,15 @@ void NNUnitTest()
                 /*pDropout*/ 0.0f,
                 /*activationType*/ glades::GMath::LINEAR,
 			    /*activationParam*/ 1.0f);
-            std::vector<glades::HiddenLayerInfo*> hidden;
-            glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+            std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+            auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_pos", in, hidden, out);
-			glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_pos", 777u, /*w*/ 1.0f, /*b*/ 0.0f);
-            net->getTerminatorMutable().setEpoch(1);
-            net->getTerminatorMutable().setAccuracy(0);
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) TrainStatus() Failed==============", net->train(di).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) SaveModel() Failed==============", net->saveModel("ut_pkg_dff_l1_pos_after").ok());
+			auto netOwner = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_pos", 777u, /*w*/ 1.0f, /*b*/ 0.0f);
+			glades::NNetwork& net = *netOwner;
+            net.getTerminatorMutable().setEpoch(1);
+            net.getTerminatorMutable().setAccuracy(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) TrainStatus() Failed==============", net.train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_pos_after").ok());
 			float wFinal = 0.0f;
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) ReadWeight() Failed==============",
 			         read_first_dff_weight("database/models/ut_pkg_dff_l1_pos_after/weights.bin", wFinal));
@@ -1194,13 +1196,12 @@ void NNUnitTest()
 			printf("[UT] DFF L1(+1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
-            delete net;
             delete info;
         }
 
 		// w0=-1 => w1=-0.9
         {
-            glades::InputLayerInfo* in = new glades::InputLayerInfo(
+            auto in = shmea::make_gpointer<glades::InputLayerInfo>(
                 /*batchSize*/ 1,
                 /*learningRate*/ lr,
                 /*momentumFactor*/ 0.0f,
@@ -1209,14 +1210,15 @@ void NNUnitTest()
                 /*pDropout*/ 0.0f,
                 /*activationType*/ glades::GMath::LINEAR,
 			    /*activationParam*/ 1.0f);
-            std::vector<glades::HiddenLayerInfo*> hidden;
-            glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+            std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+            auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_neg", in, hidden, out);
-			glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_neg", 778u, /*w*/ -1.0f, /*b*/ 0.0f);
-            net->getTerminatorMutable().setEpoch(1);
-            net->getTerminatorMutable().setAccuracy(0);
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) TrainStatus() Failed==============", net->train(di).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) SaveModel() Failed==============", net->saveModel("ut_pkg_dff_l1_neg_after").ok());
+			auto netOwner = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_neg", 778u, /*w*/ -1.0f, /*b*/ 0.0f);
+			glades::NNetwork& net = *netOwner;
+            net.getTerminatorMutable().setEpoch(1);
+            net.getTerminatorMutable().setAccuracy(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) TrainStatus() Failed==============", net.train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_neg_after").ok());
 			float wFinal = 0.0f;
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) ReadWeight() Failed==============",
 			         read_first_dff_weight("database/models/ut_pkg_dff_l1_neg_after/weights.bin", wFinal));
@@ -1224,7 +1226,6 @@ void NNUnitTest()
 			printf("[UT] DFF L1(-1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
-            delete net;
             delete info;
         }
 
@@ -1263,7 +1264,7 @@ void NNUnitTest()
 		di->trainMatrix = di->testMatrix;
 		di->trainExpectedMatrix = di->testExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
@@ -1272,14 +1273,15 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_reg_metrics", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_reg_metrics", 999u, /*w*/ 1.0f, /*b*/ 0.0f);
+		auto netOwner = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_reg_metrics", 999u, /*w*/ 1.0f, /*b*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
 
         CaptureMetricsCb cb;
-		const glades::NNetworkStatus st = net->test(di, &cb);
+		const glades::NNetworkStatus st = net.test(di, &cb);
 		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics TestStatus() Failed==============", st.ok());
 		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics SawMetrics() Failed==============", cb.saw);
 
@@ -1295,7 +1297,6 @@ void NNUnitTest()
 			G_assert(__FILE__, __LINE__, "==============NN::RegMetrics RMSE() Failed==============", fabs(cb.last.regRMSE - expRMSE) < tol);
 		}
 
-		delete net;
 		delete di;
 		delete info;
     }
@@ -1326,7 +1327,7 @@ void NNUnitTest()
 		di->trainMatrix[0][0] = 10.0f;
 		di->trainExpectedMatrix[0][0] = 0.0f;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 1,
             /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
@@ -1335,8 +1336,8 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_grad_clip_disabled", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -1388,7 +1389,7 @@ void NNUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ static_cast<int>(N),
 		    /*learningRate*/ 0.15f,
             /*momentumFactor*/ 0.0f,
@@ -1397,8 +1398,8 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(2, glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_class_bin_train_100", in, hidden, out);
 
 		// Pick a deterministic seed where Xavier init is NOT already perfect.
@@ -1470,7 +1471,7 @@ void NNUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ static_cast<int>(N),
 		    /*learningRate*/ 0.10f,
             /*momentumFactor*/ 0.0f,
@@ -1479,8 +1480,8 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(3, glades::OutputLayerInfo::CLASSIFICATION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(3, glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_class_3way_train_100", in, hidden, out);
 
 		glades::NNetwork* net = NULL;
@@ -1555,7 +1556,7 @@ void NNUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ static_cast<int>(N),
 		    /*learningRate*/ 0.20f,
 		    /*momentumFactor*/ 0.0f,
@@ -1564,8 +1565,8 @@ void NNUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::SIGMOID,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 4,
 		    /*learningRate*/ 0.20f,
             /*momentumFactor*/ 0.0f,
@@ -1574,7 +1575,7 @@ void NNUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(2, glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_class_hidden_train_100", in, hidden, out);
 
 		glades::NNetwork* net = NULL;
@@ -1691,7 +1692,7 @@ void NNRecurrentUnitTest()
 		di->trainMatrix = di->testMatrix;
 		di->trainExpectedMatrix = di->testExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 1,
             /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
@@ -1700,8 +1701,8 @@ void NNRecurrentUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
             /*size*/ 1,
             /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
@@ -1710,17 +1711,18 @@ void NNRecurrentUnitTest()
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_rnn_forward", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_forward", 4242u,
-		                                                               /*Wxh*/ 1.0f, /*Whh*/ 1.0f, /*bh*/ 0.0f,
-		                                                               /*Why*/ 1.0f, /*by*/ 0.0f);
-		const glades::NNetworkStatus st = net->test(di);
+		auto netOwner = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_forward", 4242u,
+		                                                              /*Wxh*/ 1.0f, /*Whh*/ 1.0f, /*bh*/ 0.0f,
+		                                                              /*Why*/ 1.0f, /*by*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		const glades::NNetworkStatus st = net.test(di);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward TestStatus() Failed==============", st.ok());
 
 		float pred = 0.0f;
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward GetPred() Failed==============", read_last_result_pred(*net, pred));
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward GetPred() Failed==============", read_last_result_pred(net, pred));
 		// h1=2, h2=3 + 2 = 5, y2=5
 		const float expected = 5.0f;
 		const float tol = 1e-4f;
@@ -1729,7 +1731,7 @@ void NNRecurrentUnitTest()
 
 		// End-to-end persistence: save model, reload, and re-check the same prediction.
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward SaveModel() Failed==============",
-		         net->saveModel("ut_pkg_rnn_forward_after").ok());
+		         net.saveModel("ut_pkg_rnn_forward_after").ok());
 		glades::NNetwork net2(glades::NNetwork::TYPE_RNN);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward ReloadModel() Failed==============",
 		         net2.loadModel("ut_pkg_rnn_forward_after", di).ok());
@@ -1739,7 +1741,6 @@ void NNRecurrentUnitTest()
 		printf("[UT] RNN reload last pred = %f (expected %f)\n", pred2, expected);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward Reload PredMismatch() Failed==============", fabs(pred2 - expected) < tol);
 
-		delete net;
 		delete di;
 		delete info;
     }
@@ -1774,7 +1775,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 2,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -1783,8 +1784,8 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 1,
 		    // NOTE: In the current NNInfo indexing scheme, recurrent output hyperparams
 		    // are retrieved via layer index == numHiddenLayers, which maps to the *last hidden*
@@ -1797,16 +1798,17 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_rnn_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_minibatch_semantics", 1234u,
-		                                                                /*Wxh*/ 0.0f, /*Whh*/ 0.0f, /*bh*/ 0.0f,
-		                                                                /*Why*/ 0.0f, /*by*/ 0.0f);
-		net->getTerminatorMutable().setEpoch(1);
-		net->getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch TrainStatus() Failed==============", net->train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_rnn_minibatch_semantics_after").ok());
+		auto netOwner = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_minibatch_semantics", 1234u,
+		                                                              /*Wxh*/ 0.0f, /*Whh*/ 0.0f, /*bh*/ 0.0f,
+		                                                              /*Why*/ 0.0f, /*by*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_rnn_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch ReadOutBias() Failed==============",
@@ -1817,7 +1819,6 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
-		delete net;
 		delete di;
 		delete info;
 	}
@@ -1842,7 +1843,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 2,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -1851,8 +1852,8 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 1,
 		    /*learningRate*/ 1.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -1861,19 +1862,20 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_gru_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_gru_minibatch_semantics",
-		                                                                        glades::NNetwork::TYPE_GRU,
-		                                                                        2233u,
-		                                                                        /*gateCount*/ 3u,
-		                                                                        /*Why*/ 0.0f,
-		                                                                        /*by*/ 0.0f);
-		net->getTerminatorMutable().setEpoch(1);
-		net->getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch TrainStatus() Failed==============", net->train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_gru_minibatch_semantics_after").ok());
+		auto netOwner = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_gru_minibatch_semantics",
+		                                                                       glades::NNetwork::TYPE_GRU,
+		                                                                       2233u,
+		                                                                       /*gateCount*/ 3u,
+		                                                                       /*Why*/ 0.0f,
+		                                                                       /*by*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_gru_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch ReadOutBias() Failed==============",
@@ -1886,7 +1888,6 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
-		delete net;
 		delete di;
 		delete info;
 	}
@@ -1911,7 +1912,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 2,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -1920,8 +1921,8 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 1,
 		    /*learningRate*/ 1.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -1930,19 +1931,20 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_lstm_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork* net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_lstm_minibatch_semantics",
-		                                                                        glades::NNetwork::TYPE_LSTM,
-		                                                                        3344u,
-		                                                                        /*gateCount*/ 4u,
-		                                                                        /*Why*/ 0.0f,
-		                                                                        /*by*/ 0.0f);
-		net->getTerminatorMutable().setEpoch(1);
-		net->getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch TrainStatus() Failed==============", net->train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_lstm_minibatch_semantics_after").ok());
+		auto netOwner = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_lstm_minibatch_semantics",
+		                                                                       glades::NNetwork::TYPE_LSTM,
+		                                                                       3344u,
+		                                                                       /*gateCount*/ 4u,
+		                                                                       /*Why*/ 0.0f,
+		                                                                       /*by*/ 0.0f);
+		glades::NNetwork& net = *netOwner;
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_lstm_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch ReadOutBias() Failed==============",
@@ -1955,7 +1957,6 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
-		delete net;
 		delete di;
 		delete info;
 	}
@@ -1976,7 +1977,7 @@ void NNRecurrentUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -1985,8 +1986,8 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 2,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -1995,7 +1996,7 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_gru_smoke", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_GRU);
@@ -2028,7 +2029,7 @@ void NNRecurrentUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -2037,8 +2038,8 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 2,
 		    /*learningRate*/ 0.05f,
 		    /*momentumFactor*/ 0.0f,
@@ -2047,7 +2048,7 @@ void NNRecurrentUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_lstm_smoke", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_LSTM);
@@ -2098,10 +2099,10 @@ void NNTransformerUnitTest()
 			di->setTrainTokens(toks, static_cast<int>(padTokenId));
 			di->mirrorTrainToTest();
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=16
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=16
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_gate_kv_parity_rope", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2162,10 +2163,10 @@ void NNTransformerUnitTest()
 			di->setTrainTokens(prefix, static_cast<int>(padTokenId));
 			di->mirrorTrainToTest();
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_gate_determinism", in, hidden, out);
 
 			glades::NNetwork a(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2316,7 +2317,7 @@ void NNTransformerUnitTest()
 		di->testMatrix = di->trainMatrix;
 		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-        glades::InputLayerInfo* in = new glades::InputLayerInfo(
+        auto in = shmea::make_gpointer<glades::InputLayerInfo>(
             /*batchSize*/ 1,
 		    /*learningRate*/ 0.01f,
             /*momentumFactor*/ 0.0f,
@@ -2328,8 +2329,8 @@ void NNTransformerUnitTest()
 
 		// Transformer blocks are represented as hidden layers with constant size == dModel.
 		// Heads and dFF are configured via TrainingConfig.transformer overrides.
-        std::vector<glades::HiddenLayerInfo*> hidden;
-        hidden.push_back(new glades::HiddenLayerInfo(
+        std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+        hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 8,                 // dModel
 		    /*learningRate*/ 0.01f,
             /*momentumFactor*/ 0.0f,
@@ -2339,7 +2340,7 @@ void NNTransformerUnitTest()
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
 
-        glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+        auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_smoke", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
@@ -2403,7 +2404,7 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -2415,8 +2416,8 @@ void NNTransformerUnitTest()
 
 		// Transformer blocks are represented as hidden layers with constant size == dModel.
 		// Heads/dFF are configured via TrainingConfig.transformer overrides.
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 16,                // dModel
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -2425,7 +2426,7 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 16,
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -2435,7 +2436,7 @@ void NNTransformerUnitTest()
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2517,7 +2518,7 @@ void NNTransformerUnitTest()
 				di->setTrainTokens(toks, static_cast<int>(padTokenId));
 				di->mirrorTrainToTest();
 
-				glades::InputLayerInfo* in = new glades::InputLayerInfo(
+				auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 				    /*batchSize*/ 1,
 				    /*learningRate*/ 0.01f,
 				    /*momentumFactor*/ 0.0f,
@@ -2527,8 +2528,8 @@ void NNTransformerUnitTest()
 				    /*activationType*/ glades::GMath::LINEAR,
 				    /*activationParam*/ 1.0f);
 
-				std::vector<glades::HiddenLayerInfo*> hidden;
-				hidden.push_back(new glades::HiddenLayerInfo(
+				std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+				hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 				    /*size*/ 12,                // dModel
 				    /*learningRate*/ 0.01f,
 				    /*momentumFactor*/ 0.0f,
@@ -2538,7 +2539,7 @@ void NNTransformerUnitTest()
 				    /*activationType*/ glades::GMath::LINEAR,
 				    /*activationParam*/ 1.0f));
 
-				glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 				glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_variants", in, hidden, out);
 
 				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2612,11 +2613,11 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_padding_mask", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2687,11 +2688,11 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(p0, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_batch_session", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2813,11 +2814,11 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_cache_fp16_parity", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2894,11 +2895,11 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_cache_bf16_parity", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -2973,7 +2974,7 @@ void NNTransformerUnitTest()
 		di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		di->mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -2983,8 +2984,8 @@ void NNTransformerUnitTest()
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
 
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ 12,                // dModel
 		    /*learningRate*/ 0.01f,
 		    /*momentumFactor*/ 0.0f,
@@ -2994,7 +2995,7 @@ void NNTransformerUnitTest()
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
 
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_rope_dim_override", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3059,10 +3060,10 @@ void NNTransformerUnitTest()
 			di->mirrorTrainToTest();
 		}
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_rope_theta_sensitivity", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3134,7 +3135,7 @@ void NNTransformerUnitTest()
 			di->mirrorTrainToTest();
 		}
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3143,8 +3144,8 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ static_cast<int>(dModel),
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3153,7 +3154,7 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_identity_logits", in, hidden, out);
 
 		// 1) Bootstrap a package with the right manifest config.
@@ -3244,7 +3245,7 @@ void NNTransformerUnitTest()
 			di->mirrorTrainToTest();
 		}
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3253,8 +3254,8 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ static_cast<int>(dModel),
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3263,7 +3264,7 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_sinusoidal", in, hidden, out);
 
 		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3366,10 +3367,10 @@ void NNTransformerUnitTest()
 
 		// Decoder net but token LM not enabled.
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_api", in, hidden, out);
 
 			glades::NNetwork dec(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3393,10 +3394,10 @@ void NNTransformerUnitTest()
 				di->mirrorTrainToTest();
 			}
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_bad_posenc", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3428,10 +3429,10 @@ void NNTransformerUnitTest()
 				di->mirrorTrainToTest();
 			}
 
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_append_bounds", in, hidden, out);
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3445,6 +3446,34 @@ void NNTransformerUnitTest()
 				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
 			}
 			G_assert(__FILE__, __LINE__, "==============NN::InferApi AppendBounds InitTestStatus() Failed==============", net.test(di).ok());
+
+#ifdef GLADES_HAVE_CUDA
+			// Full-sequence GPU token metrics reduce on device and preserve the
+			// position-aligned target denominator.
+			{
+				net.getTrainingConfigMutable().gpu.enable = true;
+				net.getTrainingConfigMutable().gpu.deviceId = 0;
+				std::vector<unsigned int> inputs;
+				inputs.push_back(1u);
+				inputs.push_back(2u);
+				std::vector<int> targets;
+				targets.push_back(2);
+				targets.push_back(3);
+				glades::TransformerTokenMetrics metrics;
+				const glades::NNetworkStatus st =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsStatus Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCount Failed==============", metrics.tokenCount == 2ULL);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsCorrect Failed==============", metrics.correct <= metrics.tokenCount);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFinite Failed==============", std::isfinite(metrics.nllSum));
+
+				targets.pop_back();
+				const glades::NNetworkStatus mismatch =
+				    glades::TransformerPublicAPI::evaluateTokenMetricsGpu(net, inputs, targets, metrics);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsMismatchShouldFail Failed==============", !mismatch.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi GpuTokenMetricsFailureClearsOutput Failed==============", metrics.tokenCount == 0ULL && metrics.correct == 0ULL && metrics.nllSum == 0.0);
+			}
+#endif
 
 			// Append before reset should fail.
 			{
@@ -3545,10 +3574,10 @@ void NNTransformerUnitTest()
 					di->mirrorTrainToTest();
 				}
 
-				glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-				std::vector<glades::HiddenLayerInfo*> hidden;
-				hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-				glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+				std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+				hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+				auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 				glades::NNInfo* info = new glades::NNInfo("ut_transformer_serve_buffer_cap", in, hidden, out);
 
 				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3599,10 +3628,10 @@ void NNTransformerUnitTest()
 
 			// Token LM enabled but tensors not initialized yet.
 			{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_api2", in, hidden, out);
 
 			glades::NNetwork dec(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3675,10 +3704,10 @@ void NNTransformerUnitTest()
 					di->mirrorTrainToTest();
 				}
 
-				glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-				std::vector<glades::HiddenLayerInfo*> hidden;
-				hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-				glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+				std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+				hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+				auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 				glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_runlock", in, hidden, out);
 
 				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3711,9 +3740,9 @@ void NNTransformerUnitTest()
 	printf("Trainer preflight diagnostics\n");
 	printf("-----------------------------------\n");
 	{
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_trainer_preflight_diag", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
@@ -3902,7 +3931,7 @@ void NNTransformerUnitTest()
 			di->setTrainTokens(toks, static_cast<int>(padTokenId));
 		}
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3911,8 +3940,8 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ static_cast<int>(dModel),
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -3921,7 +3950,7 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_uniform", in, hidden, out);
 
 		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -3996,7 +4025,7 @@ void NNTransformerUnitTest()
 			di->mirrorTrainToTest();
 		}
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -4005,8 +4034,8 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		hidden.push_back(new glades::HiddenLayerInfo(
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    /*size*/ static_cast<int>(dModel),
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -4015,7 +4044,7 @@ void NNTransformerUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_bias_only", in, hidden, out);
 
 		// 1) Bootstrap package.
@@ -4454,10 +4483,10 @@ void NNTransformerUnitTest()
 
 		// dModel must be divisible by nHeads.
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=10
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=10
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_heads", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			net.getTrainingConfigMutable().transformer.nHeadsOverride = 4; // 10 % 4 != 0
@@ -4471,10 +4500,10 @@ void NNTransformerUnitTest()
 
 		// nKVHeads must divide nHeads (GQA grouping).
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_kv_heads", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			net.getTrainingConfigMutable().transformer.nHeadsOverride = 4;
@@ -4489,11 +4518,11 @@ void NNTransformerUnitTest()
 
 		// Transformer requires constant hidden size across blocks.
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			hidden.push_back(new glades::HiddenLayerInfo(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // mismatch
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // mismatch
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_hidden_sizes", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			net.getTrainingConfigMutable().transformer.nHeadsOverride = 2;
@@ -4507,10 +4536,10 @@ void NNTransformerUnitTest()
 
 		// Token LM mode currently requires tieEmbeddings=true (explicit invariant).
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_tie", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			net.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
@@ -4523,10 +4552,10 @@ void NNTransformerUnitTest()
 
 		// setTrainingConfig should reject invalid runtime config before execution starts.
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_config_boundary", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			glades::TrainingConfig cfg = net.getTrainingConfig();
@@ -4540,10 +4569,10 @@ void NNTransformerUnitTest()
 		}
 
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_gpu_metrics_cfg", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			glades::NNetwork::TransformerMetricsConfig metricsCfg = net.getTransformerMetricsConfig();
@@ -4563,10 +4592,10 @@ void NNTransformerUnitTest()
 		}
 
 		{
-			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-			std::vector<glades::HiddenLayerInfo*> hidden;
-			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			auto out = shmea::make_gpointer<glades::OutputLayerInfo>(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_sampled_softmax", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			glades::TrainingConfig cfg = net.getTrainingConfig();

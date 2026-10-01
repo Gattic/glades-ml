@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <memory>
 #include <string>
 #include <vector> 
 #include "GVector.h"
@@ -54,7 +55,7 @@ protected:
 	unsigned int width;
 	unsigned int height;
 	int pitch;
-	RGBA* data;
+	std::unique_ptr<RGBA[]> data;
 
 	void copy_helper(const Image& image)
 	{
@@ -86,27 +87,19 @@ public:
 		return *this;
 	}
 
-	virtual ~Image()
-	{
-		delete[] data;
-	}
+	virtual ~Image() = default;
 
 	// initialize an image of a specific size
 	void Allocate(unsigned int width, unsigned int height)
 	{
 		this->width = width;
 		this->height = height;
-		delete[] data;
+		data.reset();
 		if (width == 0 && height == 0)
-		{
-			data = NULL;
-		}
-		else
-		{
-			if (!(width > 0 && height > 0))
-				return;
-			data = new RGBA[width * height];
-		}
+			return;
+		if (!(width > 0 && height > 0))
+			return;
+		data = std::make_unique<RGBA[]>(width * height);
 	}
 
 	// gets
@@ -144,8 +137,8 @@ public:
 	}
 
 	// Raw data access for performance-critical loops where bounds are known safe
-	RGBA* getData() { return data; }
-	const RGBA* getData() const { return data; }
+	RGBA* getData() { return data.get(); }
+	const RGBA* getData() const { return data.get(); }
 
 	// sets
 	void SetAllPixels(const RGBA& value)

@@ -955,6 +955,9 @@ bool atlas_gpu_guard(float* d_W, size_t mn);
 namespace glades {
 namespace gpu {
 
+struct GpuMatraBatchItem;
+struct GpuMuonBatchItem;
+
 struct GpuAtlasWeightState
 {
 	float totalTrace;

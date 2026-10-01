@@ -267,6 +267,53 @@ struct TransformerRunConfig
 	// arc uses linear-rising exclusively.
 	bool layerDropLinearSchedule;
 
+	// SIRA (Symplectic-Invariant Regularized Action) — CHIRON-native
+	// phase-space regularizer.  When siraCoef > 0, a training caller may add
+	// lambda * [w_E * energy-drift + w_B * p/q-balance-drift + w_A *
+	// action-curvature] computed from CHIRON's paired (p, q) trajectory.
+	// Default 0.0f = disabled; helpers take an early return at coef <= 0 so
+	// disabled mode performs no reads, writes, RNG draws, or FP work.
+	float siraCoef;
+	float siraEnergyWeight;
+	float siraBalanceWeight;
+	float siraActionWeight;
+	float siraHuberTau;
+	int siraWarmupSteps;
+
+	// SIRA shadow trajectory diagnostics.  This is the default-off Phase-0
+	// instrumentation path from the 2026-05-24 plan: callers may log detached
+	// layer/position-bucket phase trajectory terms without adding a loss,
+	// sample/token weighting, RNG, or hidden-state gradients.  If
+	// siraProbeLayers is empty, trainer callers may choose an architecture-aware
+	// default schedule such as 0,4,8,12,16,20,last.
+	bool siraShadowDiagnostics;
+	int siraLogEverySteps;
+	int siraPositionBuckets;
+	std::vector<int> siraProbeLayers;
+
+	// PHS (Phase-Homeostatic Servo) shadow diagnostics.  This is the default-off
+	// logging-only precursor to the future PHS curriculum/controller: callers may
+	// reduce detached CHIRON phase statistics by data group and position bucket,
+	// then EMA/log them.  These flags do NOT enable sample weighting, token-loss
+	// weighting, or hidden-state gradients.  With phsShadowDiagnostics=false, the
+	// helper path is a strict no-op and production CHIRON defaults are unchanged.
+	bool phsShadowDiagnostics;
+	int phsDataGroups;
+	int phsPositionBuckets;
+	int phsLogEverySteps;
+	float phsEmaDecay;
+
+	// PTOC (Phase-space Tangent Operator Consistency) shadow diagnostics.
+	// Default-off and detached.  The helper consumes already-computed finite-
+	// difference triplets (F(x-eps*u), F(x), F(x+eps*u)) and reports local gain /
+	// curvature summaries.  It does not define a training loss or inject gradients.
+	bool ptocShadowDiagnostics;
+	int ptocLogEverySteps;
+	int ptocSampleLayers;
+	int ptocSampleTokens;
+	float ptocEps;
+	float ptocEta;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -306,7 +353,28 @@ struct TransformerRunConfig
 	      mtpDepth(0),
 	      mtpCoef(0.1f),
 	      layerDropPMax(0.0f),
-	      layerDropLinearSchedule(true)
+	      layerDropLinearSchedule(true),
+	      siraCoef(0.0f),
+	      siraEnergyWeight(1.0f),
+	      siraBalanceWeight(0.25f),
+	      siraActionWeight(0.5f),
+	      siraHuberTau(0.2f),
+	      siraWarmupSteps(1000),
+	      siraShadowDiagnostics(false),
+	      siraLogEverySteps(0),
+	      siraPositionBuckets(8),
+	      siraProbeLayers(),
+	      phsShadowDiagnostics(false),
+	      phsDataGroups(1),
+	      phsPositionBuckets(8),
+	      phsLogEverySteps(0),
+	      phsEmaDecay(0.95f),
+	      ptocShadowDiagnostics(false),
+	      ptocLogEverySteps(0),
+	      ptocSampleLayers(2),
+	      ptocSampleTokens(64),
+	      ptocEps(1e-3f),
+	      ptocEta(1e-12f)
 	{
 	}
 };

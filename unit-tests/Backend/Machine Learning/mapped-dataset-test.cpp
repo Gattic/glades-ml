@@ -266,7 +266,7 @@ void MappedDatasetUnitTest()
 
 		// Integration: run a trivial net.test() on MappedNumberInput to ensure the training loop
 		// can consume the view APIs (zero-copy) without relying on GMatrix internals.
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    /*batchSize*/ 1,
 		    /*learningRate*/ 0.0f,
 		    /*momentumFactor*/ 0.0f,
@@ -275,8 +275,8 @@ void MappedDatasetUnitTest()
 		    /*pDropout*/ 0.0f,
 		    /*activationType*/ glades::GMath::LINEAR,
 		    /*activationParam*/ 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_mapped_input_smoke", in, hidden, out);
 
 		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);

@@ -1321,14 +1321,14 @@ void VESTATransformerBf16ParityTest()
 		di.setTrainTokens(toks, -1);
 		di.mirrorTrainToTest();
 
-		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 		    1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-		std::vector<glades::HiddenLayerInfo*> hidden;
+		std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 		for (unsigned int i = 0; i < nLayers; ++i)
-			hidden.push_back(new glades::HiddenLayerInfo(
+			hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 			    static_cast<int>(dModel), 1e-3f, 0.0f, 0.0f, 0.0f, 0.0f,
 			    glades::GMath::LINEAR, 1.0f));
-		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 		    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 		glades::NNInfo* info = new glades::NNInfo("bf16_parity", in, hidden, out);
 
@@ -1547,11 +1547,11 @@ void VESTATransformerGpuIntegrationTest()
 		di.mirrorTrainToTest();
 	}
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	hidden.push_back(new glades::HiddenLayerInfo(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("vesta_gpu_integration", in, hidden, out);
 
 	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -1606,10 +1606,10 @@ void VESTATransformerIntegrationTest()
 		di.mirrorTrainToTest();
 	}
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("vesta_transformer_integration", in, hidden, out);
 
 	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
@@ -1763,13 +1763,13 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 	di.setTrainTokens(trainToks, -1);
 	di.setTestTokens(testToks, -1);
 
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
 	for (unsigned int i = 0; i < spec.nLayers; ++i)
-		hidden.push_back(new glades::HiddenLayerInfo(
+		hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 		    static_cast<int>(spec.dModel), spec.learningRate, 0.0f, 0.0f, 0.0f, 0.0f,
 		    glades::GMath::LINEAR, 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(
 	    static_cast<int>(spec.vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("vesta_sweep", in, hidden, out);
 

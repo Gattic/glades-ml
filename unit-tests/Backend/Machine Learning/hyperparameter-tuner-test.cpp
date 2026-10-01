@@ -411,7 +411,7 @@ void HyperparameterTunerFullLoopTest()
 	trainDI->testExpectedMatrix = trainDI->trainExpectedMatrix;
 
 	// ---- Build the template network ----
-	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	auto in = shmea::make_gpointer<glades::InputLayerInfo>(
 	    /*batchSize*/ 4,
 	    /*learningRate*/ 0.1f,
 	    /*momentumFactor*/ 0.0f,
@@ -420,8 +420,8 @@ void HyperparameterTunerFullLoopTest()
 	    /*pDropout*/ 0.0f,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f);
-	std::vector<glades::HiddenLayerInfo*> hidden;
-	hidden.push_back(new glades::HiddenLayerInfo(
+	std::vector<shmea::GPointer<glades::HiddenLayerInfo>> hidden;
+	hidden.push_back(shmea::make_gpointer<glades::HiddenLayerInfo>(
 	    /*size*/ 4,
 	    /*learningRate*/ 0.1f,
 	    /*momentumFactor*/ 0.0f,
@@ -430,7 +430,7 @@ void HyperparameterTunerFullLoopTest()
 	    /*pDropout*/ 0.0f,
 	    /*activationType*/ glades::GMath::LINEAR,
 	    /*activationParam*/ 1.0f));
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	auto out = shmea::make_gpointer<glades::OutputLayerInfo>(1, glades::OutputLayerInfo::REGRESSION);
 	glades::NNInfo* info = new glades::NNInfo("ut_hp_tuner_full", in, hidden, out);
 
 	glades::NNetwork templateNet(info, glades::NNetwork::TYPE_DFF);
