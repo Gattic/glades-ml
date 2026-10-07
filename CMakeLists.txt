@@ -2,13 +2,6 @@ if(NOT (${CMAKE_BINARY_DIR} STREQUAL "${CMAKE_SOURCE_DIR}/build"))
 	message(FATAL_ERROR "Must be in \"build\" directory")
 endif()
 
-if(WIN32)
-    set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/glades" CACHE PATH "default install path" FORCE)
-else()
-    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
-endif()
-file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
-
 #Init
 cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0091 NEW)
@@ -19,7 +12,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 # CUDA GPU offloading (optional, default OFF)
 option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
-option(DEV_MODE "Copy shmea headers into include/ from source tree for development" OFF)
+option(DEV_MODE "Copy shmea headers into build/shmea-include/ from source tree for development" OFF)
 if(GLADES_ENABLE_CUDA)
 	cmake_minimum_required(VERSION 3.18) # for CUDA_ARCHITECTURES
 
@@ -92,11 +85,22 @@ if(GLADES_ENABLE_CUDA)
 endif()
 
 #Compiler Flags
-set(CMAKE_BUILD_TYPE Release) # -O3
+
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 #Project
 project(glades)
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    if(WIN32)
+        set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/glades" CACHE PATH "Install prefix" FORCE)
+    else()
+        set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install prefix" FORCE)
+    endif()
+endif()
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 if(MSVC)
     # Guard MSVC flags with COMPILE_LANGUAGE so they don't leak into nvcc
@@ -202,25 +206,24 @@ if(EMSCRIPTEN)
 else()
     if(NOT WIN32)
         list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/.local")
-        link_directories("$ENV{HOME}/.local/lib")
     endif()
     find_package(shmea 0.58 CONFIG REQUIRED)
     if(DEV_MODE)
-        # Dev mode: copy shmea headers from source tree into include/
+        # Dev mode: copy shmea headers from source tree into build/shmea-include/
         if(NOT SHMEA_SOURCE_DIR)
             set(SHMEA_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../ShmeaDB")
         endif()
         if(NOT EXISTS "${SHMEA_SOURCE_DIR}/Backend")
             message(FATAL_ERROR "DEV_MODE requires SHMEA_SOURCE_DIR (default: ../ShmeaDB). Not found at: ${SHMEA_SOURCE_DIR}")
         endif()
-        message(STATUS "DEV_MODE: copying shmea headers from ${SHMEA_SOURCE_DIR} into include/")
-        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Core/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Core" FILES_MATCHING PATTERN "*.h")
-        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Database/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Database" FILES_MATCHING PATTERN "*.h")
-        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Networking/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Networking" FILES_MATCHING PATTERN "*.h")
-        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Plotter/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Plotter" FILES_MATCHING PATTERN "*.h")
-        file(COPY "${SHMEA_SOURCE_DIR}/main.h" DESTINATION "${CMAKE_SOURCE_DIR}/include")
-        file(COPY "${SHMEA_SOURCE_DIR}/g_export.h" DESTINATION "${CMAKE_SOURCE_DIR}/include")
-        include_directories("include")
+        message(STATUS "DEV_MODE: copying shmea headers from ${SHMEA_SOURCE_DIR} into build/shmea-include/")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Core/" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include/Backend/Core" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Database/" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include/Backend/Database" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Networking/" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include/Backend/Networking" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Plotter/" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include/Backend/Plotter" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/main.h" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include")
+        file(COPY "${SHMEA_SOURCE_DIR}/g_export.h" DESTINATION "${CMAKE_BINARY_DIR}/shmea-include")
+        include_directories(BEFORE "${CMAKE_BINARY_DIR}/shmea-include")
     else()
         if(NOT TARGET shmea)
             message(FATAL_ERROR
@@ -275,7 +278,7 @@ install(TARGETS ${PROJECT_NAME} EXPORT gladesConfig
 install(DIRECTORY "Backend/Machine Learning/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning" FILES_MATCHING
     PATTERN "*.h"
     PATTERN "*.inc")
-install(FILES main.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES main.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/glades)
 
 # ---- Package config / exports ----
 # Export all targets collected into the `gladesConfig` export set (glades, ML, etc).

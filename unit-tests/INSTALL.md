@@ -10,33 +10,27 @@ glades-ml and shmea must be built and installed before running unit tests.
 
 ## Linux
 
-### Prod (uses installed shmea headers)
+Build and install ShmeaDB and build the main glades-ml library first. From the
+repository root:
 
-```
-mkdir build
-cd build
-cmake ..
-make run
-```
-
-### Dev (uses shmea headers from source tree)
-
-Run the main project's dev build first to populate `include/`:
-```
-cd ..
-mkdir build && cd build
-cmake .. -DDEV_MODE=ON
-make
-cd ../unit-tests
+```sh
+bash build-and-install.sh
+bash unit-tests/build-and-run.sh cv
 ```
 
-Then build and run the unit tests with dev mode:
+For development headers:
+
+```sh
+bash dev-build.sh
+bash unit-tests/dev-run.sh gan
 ```
-mkdir build
-cd build
-cmake .. -DDEV_MODE=ON
-make run
-```
+
+The helpers accept `cuda`, selectors, and quoted CMake `-DNAME=VALUE` overrides.
+The default selector is `nnall`; GPU suites require a CUDA build. Development
+headers live in the main `build/shmea-include/`. For additional focused tests,
+reuse the executable via `bash unit-tests/test.sh <selector>`.
+See [the library installation guide](../INSTALL.md) for prerequisites and custom
+prefixes.
 
 ---
 
@@ -59,6 +53,6 @@ With CUDA:
 
 | | Prod (`build-and-run.bat`) | Dev (`cmake .. -DDEV_MODE=ON`) |
 |---|---|---|
-| Shmea headers | From installed shmea | From ShmeaDB source tree via `include/` |
+| Shmea headers | From installed shmea | From ShmeaDB source tree via `build/shmea-include/` |
 | Cleans `include/` | Yes, automatically | No |
 | Use case | CI, releases | Active development |

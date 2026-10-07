@@ -65,10 +65,16 @@ if(GLADES_ENABLE_CUDA)
 	# archive being processed in the same pass.  Past failure mode:
 	# `nm libglades.so | grep initGlorotUniform` empty, runtime dlsym fail
 	# the moment ensureGpuState() ran on a deferred-init transformer.
-	target_link_libraries(Networks
-		"-Wl,--whole-archive"
-		GladesCUDA
-		"-Wl,--no-whole-archive")
+	if(MSVC)
+		target_link_libraries(Networks GladesCUDA)
+		target_link_options(Networks INTERFACE "/WHOLEARCHIVE:$<TARGET_FILE:GladesCUDA>")
+	elseif(APPLE)
+		target_link_libraries(Networks GladesCUDA)
+		target_link_options(Networks INTERFACE "LINKER:-force_load,$<TARGET_FILE:GladesCUDA>")
+	else()
+		target_link_libraries(Networks
+			"-Wl,--whole-archive" GladesCUDA "-Wl,--no-whole-archive")
+	endif()
 	target_include_directories(Networks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cuda)
 	target_include_directories(Networks PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 	target_compile_definitions(Networks PRIVATE GLADES_HAVE_CUDA=1)

@@ -6,7 +6,7 @@ setlocal enabledelayedexpansion
 ::   dev-run.bat              (VS 2022, no CUDA)
 ::   dev-run.bat 2022 cuda    (VS 2022, with CUDA)
 ::
-:: Dev mode uses shmea headers from ..\include\Backend\
+:: Dev mode uses shmea headers from ..\build\shmea-include\Backend\
 :: (populated by running dev-build.bat from the project root).
 
 set "VS_VER=2022"
@@ -24,7 +24,7 @@ echo  glades-ml Unit Tests - Dev Build and Run (Windows)
 echo  Visual Studio version: !VS_VER!
 if defined CUDA_FLAG echo  CUDA: ENABLED
 if not defined CUDA_FLAG echo  CUDA: disabled
-echo  DEV_MODE: using shmea headers from ..\include\
+echo  DEV_MODE: using shmea headers from ..\build\shmea-include\
 echo ============================================
 echo.
 
@@ -91,14 +91,14 @@ exit /b 1
 echo [OK] VCPKG_ROOT = !VCPKG_ROOT!
 
 :: --------------------------------------------------
-:: 3. Verify dev include/ and installed libs
+:: 3. Verify dev build/shmea-include/ and installed libs
 :: --------------------------------------------------
-if not exist "..\include\Backend" (
-    echo [ERROR] Dev-mode include\Backend\ not found.
-    echo         Run dev-build.bat from the project root first to populate include\.
+if not exist "..\build\shmea-include\Backend" (
+    echo [ERROR] Dev-mode build\shmea-include\Backend\ not found.
+    echo         Run dev-build.bat from the project root first to populate build\shmea-include\.
     exit /b 1
 )
-echo [OK] Dev-mode include\Backend\ found.
+echo [OK] Dev-mode build\shmea-include\Backend\ found.
 
 if not exist "!USERPROFILE!\shmea\bin\shmea.dll" (
     echo [ERROR] shmea.dll not found at !USERPROFILE!\shmea\bin\shmea.dll

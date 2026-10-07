@@ -29,52 +29,45 @@ See the [Windows](#windows-build) section below.
 
 ---
 
-## Linux Build
+## Linux build and tests
 
-### Compilation (prod)
+Use CMake 3.25 or newer for the presets, Make, a C++23 compiler, and FreeType
+headers. Build and install sibling ShmeaDB first. From this repository's root:
 
-Requires shmea to be installed (`make install` from ShmeaDB).
-
-```
-mkdir build
-cd build
-cmake ..
-make
-```
-
-Or using presets:
-```
-cmake --preset linux-release
-cmake --build --preset linux-release
+```sh
+bash build-and-install.sh                 # CPU build and install
+bash dev-build.sh                         # CPU build with source Shmea headers
+bash unit-tests/build-and-run.sh cv        # build tests and run a focused selector
+bash unit-tests/dev-run.sh gan             # after dev-build.sh
+bash unit-tests/test.sh numerical-edge     # reuse the built test executable
+bash unit-tests/test.sh package-consumer   # build/install consumer and model reads
 ```
 
-### Compilation (dev)
+The test build helper defaults to `nnall`. CPU-only builds do not run GPU suites.
+With an installed CUDA toolkit and supported host compiler, append `cuda` to
+`build-and-install.sh`, `dev-build.sh`, `unit-tests/build-and-run.sh`, or
+`unit-tests/dev-run.sh`. CUDA device compilation uses C++17. Switching back to
+the CPU preset explicitly disables CUDA.
 
-Dev mode copies shmea headers from the ShmeaDB source tree into `include/` so they stay in sync. Shmea must still be installed for linking.
+Installations default to `$HOME/.local`. The unit-test helpers use this repository's
+`build/gladesConfig.cmake`, so tests exercise the library just built. The root
+convenience header is installed as `glades/main.h`, leaving ShmeaDB's `main.h`
+intact. The package also provides the namespaced ML header tree.
 
-```
-mkdir build
-cd build
-cmake .. -DDEV_MODE=ON
-make
-```
+All helpers accept quoted CMake `-DNAME=VALUE` overrides and stop on failure.
+For a custom dependency/install prefix, for example:
 
-By default, `SHMEA_SOURCE_DIR` points to `../ShmeaDB`. Override it if your ShmeaDB source is elsewhere:
-```
-cmake .. -DDEV_MODE=ON -DSHMEA_SOURCE_DIR=/path/to/ShmeaDB
-```
-
-### Installation
-
-```
-make install
+```sh
+bash build-and-install.sh -DCMAKE_INSTALL_PREFIX="$HOME/libs" -DCMAKE_PREFIX_PATH="$HOME/libs"
 ```
 
-### Uninstall
-
-```
-make uninstall
-```
+When changing from an existing cached dependency, also pass
+`-Dshmea_DIR="$HOME/libs/share/shmea/cmake"`. Use
+`CMAKE_BUILD_PARALLEL_LEVEL=4` to adjust build concurrency (default: 8).
+Run helpers from any working directory; they resolve their own repository path.
+Builds reuse `build/` incrementally. Development headers for glades-ml and
+gfxplusplus live under `build/shmea-include/` and do not modify source `include/`
+folders. ShmeaDB still needs to be built and installed for linking.
 
 ---
 
@@ -109,7 +102,7 @@ With CUDA:
 
 ### Dev build
 
-Copies shmea headers from the ShmeaDB source tree (expected at `..\ShmeaDB`) into `include/`. Shmea must still be installed for linking.
+Copies shmea headers from the ShmeaDB source tree (expected at `..\ShmeaDB`) into `build/shmea-include/`. Shmea must still be installed for linking.
 
 ```powershell
 .\dev-build.bat
@@ -126,7 +119,7 @@ With CUDA:
 |---|---|---|
 | Shmea headers | From installed shmea | Copied from ShmeaDB source tree |
 | Shmea library | Installed (`shmea.dll`) | Installed (`shmea.dll`) |
-| `include/` folder | Not created | Created with fresh headers |
+| `build/shmea-include/` folder | Not created | Created with fresh headers |
 | Use case | CI, releases, end users | Active development |
 
-The `include/` directory is gitignored and regenerated on each dev configure.
+The `build/shmea-include/` directory is gitignored and updated on each dev configure.

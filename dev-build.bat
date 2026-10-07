@@ -6,7 +6,7 @@ setlocal enabledelayedexpansion
 ::   dev-build.bat              (VS 2022, no CUDA)
 ::   dev-build.bat 2022 cuda    (VS 2022, with CUDA)
 ::
-:: Dev mode copies shmea headers from ../ShmeaDB into include/
+:: Dev mode copies shmea headers from ../ShmeaDB into build/shmea-include/
 :: so they stay in sync with the source tree.
 
 set "VS_VER=2022"
@@ -180,7 +180,7 @@ echo.
 
 echo ============================================
 echo  Done! glades-ml dev build installed to %USERPROFILE%\glades
-echo  Shmea headers copied to include\Backend\
+echo  Shmea headers copied to build\shmea-include\Backend\
 echo ============================================
 
 endlocal

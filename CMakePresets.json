@@ -9,7 +9,9 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_INSTALL_PREFIX": "$env{HOME}/.local",
-                "CMAKE_PREFIX_PATH": "$env{HOME}/.local"
+                "CMAKE_PREFIX_PATH": "$env{HOME}/.local",
+                "DEV_MODE": "OFF",
+                "GLADES_ENABLE_CUDA": "OFF"
             },
             "condition": {
                 "type": "notEquals",
@@ -68,6 +70,20 @@
             "cacheVariables": {
                 "GLADES_ENABLE_CUDA": "ON"
             }
+        },
+        {
+            "name": "linux-dev",
+            "inherits": "linux-release",
+            "cacheVariables": {
+                "DEV_MODE": "ON"
+            }
+        },
+        {
+            "name": "linux-dev-cuda",
+            "inherits": "linux-dev",
+            "cacheVariables": {
+                "GLADES_ENABLE_CUDA": "ON"
+            }
         }
     ],
     "buildPresets": [
@@ -94,6 +110,14 @@
         {
             "name": "windows-dev-cuda",
             "configurePreset": "windows-dev-cuda"
+        },
+        {
+            "name": "linux-dev",
+            "configurePreset": "linux-dev"
+        },
+        {
+            "name": "linux-dev-cuda",
+            "configurePreset": "linux-dev-cuda"
         }
     ]
 }
