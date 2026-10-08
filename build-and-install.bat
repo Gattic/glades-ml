@@ -97,12 +97,12 @@ echo [OK] VCPKG_ROOT = !VCPKG_ROOT!
 :: --------------------------------------------------
 :: 3. Verify ShmeaDB is installed
 :: --------------------------------------------------
-if not exist "%USERPROFILE%\shmea\bin\shmea.dll" (
-    echo [ERROR] shmea.dll not found at %USERPROFILE%\shmea\bin\shmea.dll
+if not exist "C:\GatticSDK\bin\shmea.dll" (
+    echo [ERROR] shmea.dll not found at C:\GatticSDK\bin\shmea.dll
     echo         Build and install ShmeaDB first.
     exit /b 1
 )
-echo [OK] ShmeaDB installation found at %USERPROFILE%\shmea
+echo [OK] ShmeaDB installation found at C:\GatticSDK
 
 :: --------------------------------------------------
 :: 4. Verify CUDA if requested
@@ -149,7 +149,7 @@ if exist "include\Backend" (
 :: 7. Configure
 :: --------------------------------------------------
 echo [STEP] Configuring with CMake preset '!CMAKE_PRESET!'...
-cmake --preset !CMAKE_PRESET!
+cmake --preset !CMAKE_PRESET! -Ushmea_DIR -Uglades_DIR -Ugfxplusplus_DIR
 if !errorlevel! neq 0 (
     echo [ERROR] CMake configure failed.
     exit /b 1
@@ -172,17 +172,17 @@ echo.
 :: --------------------------------------------------
 :: 8. Install
 :: --------------------------------------------------
-echo [STEP] Installing to %USERPROFILE%\glades ...
+echo [STEP] Installing to C:\GatticSDK ...
 cmake --install build
 if !errorlevel! neq 0 (
     echo [ERROR] Install failed.
     exit /b 1
 )
-echo [OK] Installed to %USERPROFILE%\glades
+echo [OK] Installed to C:\GatticSDK
 echo.
 
 echo ============================================
-echo  Done! glades-ml installed to %USERPROFILE%\glades
+echo  Done! glades-ml installed to C:\GatticSDK
 echo ============================================
 
 endlocal

@@ -1,5 +1,10 @@
 # Install, Compile, and Run
 
+Windows development installs use `%USERPROFILE%\dev\installed` via
+`dev-build.bat` / `windows-dev`. Release installs use `C:\GatticSDK` via
+`build-and-install.bat` / `windows-release`. Build ShmeaDB into the same prefix
+first. See [the shared build guide](../InformationGattic/build-guide.md).
+
 ---
 
 ## Dependencies

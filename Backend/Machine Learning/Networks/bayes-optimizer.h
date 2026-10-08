@@ -23,6 +23,7 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <numbers>
 #include <limits>
 #include <cstdlib>
 #include <ctime>
@@ -146,7 +147,7 @@ public:
 
 	static float pdf(float x)
 	{
-		return exp(-0.5f * x * x) / sqrt(2.0f * M_PI);
+		return exp(-0.5f * x * x) / sqrt(2.0f * std::numbers::pi);
 	}
 
 	// Legacy 1D Expected Improvement (maximization)

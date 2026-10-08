@@ -27,9 +27,11 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_C_COMPILER": "cl.exe",
                 "CMAKE_CXX_COMPILER": "cl.exe",
-                "CMAKE_PREFIX_PATH": "$env{USERPROFILE}/shmea;$env{USERPROFILE}/glades",
+                "CMAKE_PREFIX_PATH": "C:/GatticSDK",
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL"
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
+                "DEV_MODE": "OFF",
+                "GLADES_ENABLE_CUDA": "OFF"
             },
             "condition": {
                 "type": "equals",
@@ -50,7 +52,8 @@
             "displayName": "Windows Dev (MSVC, local shmea headers)",
             "inherits": "windows-release",
             "cacheVariables": {
-                "DEV_MODE": "ON"
+                "DEV_MODE": "ON",
+                "CMAKE_PREFIX_PATH": "$env{USERPROFILE}/dev/installed"
             }
         },
         {

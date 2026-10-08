@@ -92,19 +92,19 @@ echo [OK] VCPKG_ROOT = !VCPKG_ROOT!
 :: --------------------------------------------------
 :: 3. Verify ShmeaDB and glades-ml are installed
 :: --------------------------------------------------
-if not exist "%USERPROFILE%\shmea\bin\shmea.dll" (
-    echo [ERROR] shmea.dll not found at %USERPROFILE%\shmea\bin\shmea.dll
+if not exist "C:\GatticSDK\bin\shmea.dll" (
+    echo [ERROR] shmea.dll not found at C:\GatticSDK\bin\shmea.dll
     echo         Build and install ShmeaDB first.
     exit /b 1
 )
-echo [OK] ShmeaDB installation found at %USERPROFILE%\shmea
+echo [OK] ShmeaDB installation found at C:\GatticSDK
 
-if not exist "%USERPROFILE%\glades\bin\glades.dll" (
-    echo [ERROR] glades.dll not found at %USERPROFILE%\glades\bin\glades.dll
+if not exist "C:\GatticSDK\bin\glades.dll" (
+    echo [ERROR] glades.dll not found at C:\GatticSDK\bin\glades.dll
     echo         Build and install glades-ml first -- run build-and-install.bat from the root.
     exit /b 1
 )
-echo [OK] glades-ml installation found at %USERPROFILE%\glades
+echo [OK] glades-ml installation found at C:\GatticSDK
 
 :: --------------------------------------------------
 :: 4. Verify CUDA if requested
@@ -122,7 +122,7 @@ if defined CUDA_FLAG (
 :: --------------------------------------------------
 :: 5. Set PATH so DLLs are found at runtime
 :: --------------------------------------------------
-set "PATH=%USERPROFILE%\shmea\bin;%USERPROFILE%\glades\bin;!VCPKG_ROOT!\installed\x64-windows\bin;!PATH!"
+set "PATH=C:\GatticSDK\bin;!VCPKG_ROOT!\installed\x64-windows\bin;!PATH!"
 echo [OK] PATH updated with shmea.dll, glades.dll, and freetype.dll locations.
 if defined CUDA_FLAG (
     if defined CUDA_PATH (
@@ -171,7 +171,7 @@ if exist "build\CMakeCache.txt" (
 :: 9. Configure
 :: --------------------------------------------------
 echo [STEP] Configuring unit tests with CMake preset '!CMAKE_PRESET!'...
-cmake --preset !CMAKE_PRESET!
+cmake --preset !CMAKE_PRESET! -Ushmea_DIR -Uglades_DIR -Ugfxplusplus_DIR
 if !errorlevel! neq 0 (
     echo [ERROR] CMake configure failed.
     exit /b 1
