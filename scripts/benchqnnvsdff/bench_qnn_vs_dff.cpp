@@ -1211,7 +1211,8 @@ static void configure_net(glades::NNetwork& net,
 static int run_worker(const ModelSpec& spec,
                       const std::string& dataDir,
                       const std::string& repoDataDir,
-                      unsigned int predictRepeats)
+                      unsigned int predictRepeats,
+                      bool jsonOut)
 {
 	shmea::GLogger quietLogger(shmea::GLogger::LOG_FATAL);
 	quietLogger.setPrintToConsole(false);
@@ -1926,6 +1927,68 @@ static int run_worker(const ModelSpec& spec,
 	const double peakHeapKib = static_cast<double>(maxHeapDeltaBytes) / 1024.0;
 	const long rssKib = peak_rss_kib();
 
+	if (jsonOut)
+	{
+		std::printf(
+		    "{\"task\": \"%s\", \"model_id\": \"%s\", \"label\": \"%s\", "
+		    "\"active_params\": %u, \"stored_params\": %u, \"budget_epochs\": %u, "
+		    "\"runs\": %u, \"converged_runs\": %u, "
+		    "\"train_acc_mean\": %.10g, \"train_acc_std\": %.10g, "
+		    "\"test_acc_mean\": %.10g, \"test_acc_std\": %.10g, \"canon_test_acc\": %.10g, "
+		    "\"ep_metric1_mean\": %.10g, \"ep_metric1_med\": %.10g, \"ep_metric2_mean\": %.10g, "
+		    "\"train_loss_mean\": %.10g, \"test_loss_mean\": %.10g, \"test_loss_std\": %.10g, "
+		    "\"test_brier_mean\": %.10g, "
+		    "\"f1_c0\": %.10g, \"f1_c1\": %.10g, \"f1_c2\": %.10g, "
+		    "\"macro_f1_mean\": %.10g, \"macro_f1_std\": %.10g, "
+		    "\"train_ms_mean\": %.10g, \"train_ms_std\": %.10g, "
+		    "\"predict_split_us\": %.10g, \"predict_sample_us\": %.10g, "
+		    "\"peak_heap_delta_kib\": %.10g, \"core_state_bytes\": %u, "
+		    "\"weights_bin_bytes\": %lu, \"peak_rss_kib\": %ld, "
+		    "\"reg_rmse_mean\": %.10g, \"reg_rmse_std\": %.10g, "
+		    "\"reg_aux_mean\": %.10g, \"reg_aux_std\": %.10g, "
+		    "\"reg_r2_mean\": %.10g, \"equiv_err_mean\": %.10g}\n",
+		    spec.task,
+		    spec.id,
+		    spec.label,
+		    activeParams,
+		    storedParams,
+		    spec.epochs,
+		    totalRuns,
+		    convergedRuns,
+		    vec_mean(trainAccs),
+		    vec_std(trainAccs),
+		    vec_mean(testAccs),
+		    vec_std(testAccs),
+		    vec_mean(canonTestAccs),
+		    vec_mean(epM1),
+		    vec_median(epM1),
+		    vec_mean(epM2),
+		    vec_mean(trainLosses),
+		    vec_mean(testLosses),
+		    vec_std(testLosses),
+		    vec_mean(testBriers),
+		    vec_mean(f1C0),
+		    vec_mean(f1C1),
+		    vec_mean(f1C2),
+		    vec_mean(macroF1s),
+		    vec_std(macroF1s),
+		    vec_mean(trainMs),
+		    vec_std(trainMs),
+		    meanPredSplitUs,
+		    meanPredSampleUs,
+		    peakHeapKib,
+		    coreStateBytes,
+		    static_cast<unsigned long>(weightsBinBytes),
+		    rssKib,
+		    vec_mean(regRmses),
+		    vec_std(regRmses),
+		    vec_mean(regAuxs),
+		    vec_std(regAuxs),
+		    vec_mean(regR2s),
+		    vec_mean(equivErrs));
+		return 0;
+	}
+
 	std::printf(
 	    "%s\t%s\t%s\t%u\t%u\t%u\t"
 	    "%u\t%u\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t"
@@ -1991,6 +2054,7 @@ int main(int argc, char** argv)
 	unsigned int predictRepeats = 0u;
 	bool doList = false;
 	bool doHeader = false;
+	bool jsonOut = false;
 
 	for (int i = 1; i < argc; ++i)
 	{
@@ -2001,6 +2065,10 @@ int main(int argc, char** argv)
 		else if (std::strcmp(argv[i], "--tsv-header") == 0)
 		{
 			doHeader = true;
+		}
+		else if (std::strcmp(argv[i], "--json") == 0)
+		{
+			jsonOut = true;
 		}
 		else if (std::strcmp(argv[i], "--task") == 0 && i + 1 < argc)
 		{
@@ -2042,7 +2110,7 @@ int main(int argc, char** argv)
 
 	if (task.empty() || modelId.empty())
 	{
-		std::fprintf(stderr, "Usage: %s --task <task> --model <id> [--data-dir PATH] [--repo-data-dir PATH] [--predict-repeats N]\n", argv[0]);
+		std::fprintf(stderr, "Usage: %s --task <task> --model <id> [--data-dir PATH] [--repo-data-dir PATH] [--predict-repeats N] [--json]\n", argv[0]);
 		return 1;
 	}
 
@@ -2061,7 +2129,7 @@ int main(int argc, char** argv)
 				else
 					predictRepeats = 50u;
 			}
-			return run_worker(kSpecs[i], dataDir, repoDataDir, predictRepeats);
+			return run_worker(kSpecs[i], dataDir, repoDataDir, predictRepeats, jsonOut);
 		}
 	}
 

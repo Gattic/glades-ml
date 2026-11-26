@@ -16,6 +16,7 @@ PREDICT_REPEATS_IRIS=50
 PREDICT_REPEATS_REG=20
 SKIP_BUILD=0
 NO_ARTIFACTS=0
+JSON_MODE=0
 DO_LIST=0
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR=""
@@ -45,6 +46,8 @@ Options:
   --models LIST                Comma-separated model IDs to run (default: all for selected tasks)
   --out-dir PATH               Directory for results.tsv and report.md
                                (default: artifacts/bench_qnn_vs_dff_<timestamp>)
+  --json                       Emit one JSON object per (task, model) run into
+                               results.json instead of results.tsv/report.md
   --no-artifacts               Do not save artifacts under artifacts/ (print tables to stdout only)
   --skip-build                 Skip building glades and the benchmark runner
   --predict-repeats-xor N      Full-split net.test() repeats for truth-table tasks (default: 100)
@@ -71,6 +74,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--no-artifacts)
 			NO_ARTIFACTS=1
+			shift
+			;;
+		--json)
+			JSON_MODE=1
 			shift
 			;;
 		--skip-build)
@@ -236,10 +243,15 @@ else
 fi
 mkdir -p "$RUN_OUT_DIR"
 
-TSV_FILE="$RUN_OUT_DIR/results.tsv"
-REPORT_FILE="$RUN_OUT_DIR/report.md"
-
-"$BENCH_BIN" --tsv-header > "$TSV_FILE"
+if [[ "$JSON_MODE" -eq 1 ]]; then
+	TSV_FILE="$RUN_OUT_DIR/results.json"
+	REPORT_FILE=""
+	: > "$TSV_FILE"
+else
+	TSV_FILE="$RUN_OUT_DIR/results.tsv"
+	REPORT_FILE="$RUN_OUT_DIR/report.md"
+	"$BENCH_BIN" --tsv-header > "$TSV_FILE"
+fi
 
 csv_contains() {
 	local csv="$1"
@@ -300,12 +312,17 @@ for line in "${ALL_PAIRS[@]}"; do
 	echo "[benchqnnvsdff] ($IDX/$SELECTED_COUNT) task=$task model=$model_id ($label)" >&2
 	(
 		cd "$TMP_WORKDIR"
+		json_flag=()
+		if [[ "$JSON_MODE" -eq 1 ]]; then
+			json_flag=(--json)
+		fi
 		"$BENCH_BIN" \
 			--task "$task" \
 			--model "$model_id" \
 			--data-dir "$DATA_DIR" \
 			--repo-data-dir "$REPO_DATA_DIR" \
-			--predict-repeats "$repeats"
+			--predict-repeats "$repeats" \
+			"${json_flag[@]}"
 	) >> "$TSV_FILE"
 done
 
@@ -476,9 +493,15 @@ render_markdown() {
 	render_tier2_joint_table  "$tsv" "orbital_kepler_ood" "## 20. Tier 2D-OOD: 3D Keplerian Orbital Energy + Laplace-Runge-Lenz Eccentricity Vector OOD Orbital Plane (Train i in [0,25 deg] -> Test i in [65,180 deg], N_train=192, N_test=256, 5 Seeds)" "Energy RMSE" "LRL Ang (deg)"
 }
 
-render_markdown "$TSV_FILE" | tee "$REPORT_FILE"
+if [[ "$JSON_MODE" -eq 1 ]]; then
+	if [[ "$NO_ARTIFACTS" -eq 0 ]]; then
+		echo "[benchqnnvsdff] Saved raw JSON: $TSV_FILE" >&2
+	fi
+else
+	render_markdown "$TSV_FILE" | tee "$REPORT_FILE"
 
-if [[ "$NO_ARTIFACTS" -eq 0 ]]; then
-	echo "[benchqnnvsdff] Saved raw TSV: $TSV_FILE" >&2
-	echo "[benchqnnvsdff] Saved report : $REPORT_FILE" >&2
+	if [[ "$NO_ARTIFACTS" -eq 0 ]]; then
+		echo "[benchqnnvsdff] Saved raw TSV: $TSV_FILE" >&2
+		echo "[benchqnnvsdff] Saved report : $REPORT_FILE" >&2
+	fi
 fi

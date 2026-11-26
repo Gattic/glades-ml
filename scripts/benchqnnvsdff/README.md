@@ -6,7 +6,7 @@ For architectural trade-offs and guidance on when to pick `TYPE_QNN` (or `LAYER_
 
 ## Files
 
-- `scripts/benchqnnvsdff.sh` — Entry-point driver that builds `glades` and the standalone worker binary (forwarding `CMAKE_CUDA_COMPILER` / `CMAKE_CUDA_ARCHITECTURES` from `build/CMakeCache.txt`), spawns one fresh OS process per `(task, model)`, writes `results.tsv`, and renders Markdown summary tables (`report.md`).
+- `scripts/benchqnnvsdff.sh` — Entry-point driver that builds `glades` and the standalone worker binary (forwarding `CMAKE_CUDA_COMPILER` / `CMAKE_CUDA_ARCHITECTURES` from `build/CMakeCache.txt`), spawns one fresh OS process per `(task, model)`, writes `results.tsv`, and renders Markdown summary tables (`report.md`). With `--json` it instead writes one JSON object per run into `results.json`.
 - `scripts/benchqnnvsdff/bench_qnn_vs_dff.cpp` — C++98-compatible isolated worker executable implementing all datasets, model matrices, training/evaluation loops, equivariance/invariance probes, and timing/memory probes.
 - `scripts/benchqnnvsdff/CMakeLists.txt` — Minimal CMake project linking against the in-tree `build/` `glades` target (`find_package(glades REQUIRED)`), automatically matching `GLADES_ENABLE_CUDA` from `build/CMakeCache.txt`.
 
@@ -36,7 +36,16 @@ bash scripts/benchqnnvsdff.sh --skip-build --tasks tier2 --no-artifacts
 
 # List all supported (task, model_id, label) rows
 bash scripts/benchqnnvsdff.sh --list
+
+# Emit machine-readable JSON (one object per run) for the Tier 2 suite
+bash scripts/benchqnnvsdff.sh --tasks tier2 --json --out-dir /tmp/qnn_tier2
 ```
+
+The Tier 2 tables in [`docs/qnn-vs-dff.md`](../../docs/qnn-vs-dff.md) are
+verified against that JSON by
+`bash unit-tests/checkdocstier2.sh` (committed snapshot
+`unit-tests/data/qnn_tier2_benchmark.json`; `--generate` re-runs the suite,
+`--json PATH` checks a specific file).
 
 Supported task aliases:
 - `tier1` $\to$ `so3_rot_curve,so3_rot_ood,so3_comp_id,so3_comp_ood,xorparity3,parity3_odd,parity4,dow_ohlc,wine`
@@ -92,6 +101,20 @@ By default, artifacts are written to `artifacts/bench_qnn_vs_dff_<YYYYMMDD-HHMMS
   - Scalar invariant task (`orbital_slater_*`): `Test RMSE`, `Test MAE`, `Test R2`, and `Invar Err (max)` ($\max |f(u \mathbf{q} u^*) - f(\mathbf{q})|$ over 32 random rotations of 3-quaternion inputs).
 - **Dow Jones OHLC (`dow_ohlc`)**: Test RMSE in $\sigma$ and USD, test MAE ($\sigma$), test $R^2$, and directional accuracy (% of Q2 weeks where `sign(pred - close) == sign(actual_next_close - close)`).
 - **Wall-Clock & Memory**: `Train (ms)` (`CLOCK_MONOTONIC`), `Predict us/split (us/smp)` averaged over `--predict-repeats-*`, `Peak Heap Delta (KiB)` (`mallinfo2().uordblks`), analytical `Core` state bytes vs. serialized `weights.bin` bytes, and isolated `Peak RSS (KiB)` (`getrusage`).
+
+## Output Schema (`results.json`, `--json`)
+
+`--json` emits JSON Lines: one object per `(task, model)` run with the same
+fields as the TSV schema below, using full `%.10g` precision. Field names:
+`task`, `model_id`, `label`, `active_params`, `stored_params`, `budget_epochs`,
+`runs`, `converged_runs`, `train_acc_mean`, `train_acc_std`, `test_acc_mean`,
+`test_acc_std`, `canon_test_acc`, `ep_metric1_mean`, `ep_metric1_med`,
+`ep_metric2_mean`, `train_loss_mean`, `test_loss_mean`, `test_loss_std`,
+`test_brier_mean`, `f1_c0`, `f1_c1`, `f1_c2`, `macro_f1_mean`, `macro_f1_std`,
+`train_ms_mean`, `train_ms_std`, `predict_split_us`, `predict_sample_us`,
+`peak_heap_delta_kib`, `core_state_bytes`, `weights_bin_bytes`, `peak_rss_kib`,
+`reg_rmse_mean`, `reg_rmse_std`, `reg_aux_mean`, `reg_aux_std`, `reg_r2_mean`,
+`equiv_err_mean`.
 
 ## Output Schema (`results.tsv`)
 
