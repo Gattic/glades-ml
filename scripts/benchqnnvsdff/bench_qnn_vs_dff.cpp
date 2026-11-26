@@ -39,9 +39,10 @@ struct ModelSpec
 {
 	const char* id;
 	const char* label;
-	const char* task; // xor, iris80, iris40, so3_rot_curve, so3_rot_ood, so3_comp_id, so3_comp_ood, xorparity3, parity3_odd, parity4, dow_ohlc, wine
+	const char* task; // xor, iris80, iris40, tier1 tasks, tier2 tasks (mol_pes_*, mol_chiral_*, orbital_slater_*, orbital_kepler_*)
 	int netType;      // NNetwork::TYPE_QNN or NNetwork::TYPE_DFF
 	unsigned int hiddenSize;
+	unsigned int hiddenSize2; // 0 for 1-hidden-layer; >0 for 2-hidden-layer
 	glades::QuaternionConfig::InputPackingMode qnnPacking;
 	glades::QuaternionConfig::OutputReadoutMode qnnReadout;
 	glades::QuaternionConfig::LayerMode qnnLayerMode;
@@ -51,7 +52,7 @@ struct ModelSpec
 	float momentum;
 	float wd2;
 	unsigned int epochs;
-	unsigned int taskParam; // e.g., N_train for so3_rot_curve
+	unsigned int taskParam; // e.g., N_train for so3_rot_curve / tier2 tasks
 };
 
 // Shorthand constants for concise table declarations (C++98 compatible)
@@ -69,47 +70,74 @@ struct ModelSpec
 #define TDFF glades::NNetwork::TYPE_DFF
 
 #define SO3_ROT_CURVE_BLOCK(N) \
-	{ "qnn_equiv_polar_adamw_n" #N, "QNN-SO3-Equiv 2->8->1 Polar (AdamW) [N=" #N "]", "so3_rot_curve", TQNN,  8u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
-	{ "qnn_equiv_polar_sgdm_n"  #N, "QNN-SO3-Equiv 2->8->1 Polar (SGD+M) [N=" #N "]", "so3_rot_curve", TQNN,  8u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
-	{ "qnn_std_polar_adamw_n"   #N, "QNN-Std 2->8->1 Polar (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
-	{ "qnn_std_split_adamw_n"   #N, "QNN-Std 2->8->1 Split (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
-	{ "qnn_std_split_sgdm_n"    #N, "QNN-Std 2->8->1 Split (SGD+M) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
-	{ "dff_8_32_4_sgdm_n"       #N, "DFF 8->32->4 [width=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 32u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
-	{ "dff_8_10_4_sgdm_n"       #N, "DFF 8->10->4 [param=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 10u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }
+	{ "qnn_equiv_polar_adamw_n" #N, "QNN-SO3-Equiv 2->8->1 Polar (AdamW) [N=" #N "]", "so3_rot_curve", TQNN,  8u, 0u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_equiv_polar_sgdm_n"  #N, "QNN-SO3-Equiv 2->8->1 Polar (SGD+M) [N=" #N "]", "so3_rot_curve", TQNN,  8u, 0u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_polar_adamw_n"   #N, "QNN-Std 2->8->1 Polar (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, 0u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_split_adamw_n"   #N, "QNN-Std 2->8->1 Split (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_split_sgdm_n"    #N, "QNN-Std 2->8->1 Split (SGD+M) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "dff_8_32_4_sgdm_n"       #N, "DFF 8->32->4 [width=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 32u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "dff_8_10_4_sgdm_n"       #N, "DFF 8->10->4 [param=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 10u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }
+
+#define TIER2_JOINT4_BLOCK(TASK_ID, LR_EQ_SGDM, LR_STD_SGDM) \
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->8->6->1 Polar (AdamW)", TASK_ID, TQNN,  8u,  6u, PK4, RDS, LEQV, APOL, ADMW, 0.015f,     0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->8->6->1 Polar (SGD+M)", TASK_ID, TQNN,  8u,  6u, PK4, RDS, LEQV, APOL, SGDM, LR_EQ_SGDM, 0.9f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->8->6->1 Polar (AdamW)",       TASK_ID, TQNN,  8u,  6u, PK4, RDS, LSTD, APOL, ADMW, 0.015f,     0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_split_adamw",   "QNN-Std 2->8->6->1 Split (AdamW)",       TASK_ID, TQNN,  8u,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.015f,     0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->8->6->1 Split (SGD+M)",       TASK_ID, TQNN,  8u,  6u, PK4, RDS, LSTD, ASPL, SGDM, LR_STD_SGDM,0.9f, 1e-5f, 400u, 192u }, \
+	{ "dff_8_32_24_4_sgdm",    "DFF 8->32->24->4 [width=] (SGD+M)",      TASK_ID, TDFF, 32u, 24u, PK4, RDS, LSTD, ASPL, SGDM, LR_STD_SGDM,0.9f, 1e-5f, 400u, 192u }, \
+	{ "dff_8_14_11_4_sgdm",    "DFF 8->14->11->4 [param=] (SGD+M)",      TASK_ID, TDFF, 14u, 11u, PK4, RDS, LSTD, ASPL, SGDM, LR_STD_SGDM,0.9f, 1e-5f, 400u, 192u }
+
+#define TIER2_CHIRAL_BLOCK(TASK_ID) \
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 3->8->3 Polar (AdamW)",    TASK_ID, TQNN,  8u,  0u, PK4, RDR, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 180u }, \
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 3->8->3 Polar (SGD+M)",    TASK_ID, TQNN,  8u,  0u, PK4, RDR, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-4f, 300u, 180u }, \
+	{ "qnn_std_polar_adamw",   "QNN-Std 3->8->3 Polar (AdamW)",          TASK_ID, TQNN,  8u,  0u, PK4, RDR, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 180u }, \
+	{ "qnn_std_split_adamw",   "QNN-Std 3->8->3 Split (AdamW)",          TASK_ID, TQNN,  8u,  0u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 180u }, \
+	{ "qnn_std_split_sgdm",    "QNN-Std 3->8->3 Split (SGD+M)",          TASK_ID, TQNN,  8u,  0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 300u, 180u }, \
+	{ "dff_12_32_3_sgdm",      "DFF 12->32->3 [width=] (SGD+M)",         TASK_ID, TDFF, 32u,  0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 300u, 180u }, \
+	{ "dff_12_14_3_sgdm",      "DFF 12->14->3 [param=] (SGD+M)",         TASK_ID, TDFF, 14u,  0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 300u, 180u }
+
+#define TIER2_SLATER_BLOCK(TASK_ID) \
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 3->8->6->1 Polar (AdamW)", TASK_ID, TQNN,  8u,  6u, PK4, RDR, LEQV, APOL, ADMW, 0.015f, 0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 3->8->6->1 Polar (SGD+M)", TASK_ID, TQNN,  8u,  6u, PK4, RDR, LEQV, APOL, SGDM, 0.020f, 0.9f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_polar_adamw",   "QNN-Std 3->8->6->1 Polar (AdamW)",       TASK_ID, TQNN,  8u,  6u, PK4, RDR, LSTD, APOL, ADMW, 0.015f, 0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_split_adamw",   "QNN-Std 3->8->6->1 Split (AdamW)",       TASK_ID, TQNN,  8u,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.015f, 0.0f, 1e-5f, 400u, 192u }, \
+	{ "qnn_std_split_sgdm",    "QNN-Std 3->8->6->1 Split (SGD+M)",       TASK_ID, TQNN,  8u,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.030f, 0.9f, 1e-5f, 400u, 192u }, \
+	{ "dff_12_32_24_1_sgdm",   "DFF 12->32->24->1 [width=] (SGD+M)",     TASK_ID, TDFF, 32u, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.030f, 0.9f, 1e-5f, 400u, 192u }, \
+	{ "dff_12_14_11_1_sgdm",   "DFF 12->14->11->1 [param=] (SGD+M)",     TASK_ID, TDFF, 14u, 11u, PK4, RDR, LSTD, ASPL, SGDM, 0.030f, 0.9f, 1e-5f, 400u, 192u }
 
 static const ModelSpec kSpecs[] = {
 	// === XOR Gate (4 samples, batch=4, TANH -> SIGMOID, 20 seeds) ===
-	{ "qnn_1_4_1_sgdm",       "QNN 1->4->1 (SGD+M)",             "xor",    TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
-	{ "dff_2_16_1_sgdm",      "DFF 2->16->1 [width=] (SGD+M)",   "xor",    TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
-	{ "dff_2_12_1_sgdm",      "DFF 2->12->1 [param=] (SGD+M)",   "xor",    TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
-	{ "qnn_1_4_1_adamw",      "QNN 1->4->1 (AdamW)",             "xor",    TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f,  800u, 0u },
-	{ "qnn_1_1_1_sgdm",       "QNN 1->1->1 (SGD+M)",             "xor",    TQNN,  1u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
-	{ "dff_2_4_1_sgdm",       "DFF 2->4->1 [width=] (SGD+M)",    "xor",    TDFF,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
-	{ "dff_2_3_1_sgdm",       "DFF 2->3->1 [param=] (SGD+M)",    "xor",    TDFF,  3u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
-	{ "dff_2_2_1_sgdm",       "DFF 2->2->1 [min] (SGD+M)",       "xor",    TDFF,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
-	{ "qnn_1_1_1_adamw",      "QNN 1->1->1 (AdamW)",             "xor",    TQNN,  1u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f, 1500u, 0u },
+	{ "qnn_1_4_1_sgdm",       "QNN 1->4->1 (SGD+M)",             "xor",    TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "dff_2_16_1_sgdm",      "DFF 2->16->1 [width=] (SGD+M)",   "xor",    TDFF, 16u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "dff_2_12_1_sgdm",      "DFF 2->12->1 [param=] (SGD+M)",   "xor",    TDFF, 12u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "qnn_1_4_1_adamw",      "QNN 1->4->1 (AdamW)",             "xor",    TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f,  800u, 0u },
+	{ "qnn_1_1_1_sgdm",       "QNN 1->1->1 (SGD+M)",             "xor",    TQNN,  1u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_4_1_sgdm",       "DFF 2->4->1 [width=] (SGD+M)",    "xor",    TDFF,  4u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_3_1_sgdm",       "DFF 2->3->1 [param=] (SGD+M)",    "xor",    TDFF,  3u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_2_1_sgdm",       "DFF 2->2->1 [min] (SGD+M)",       "xor",    TDFF,  2u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "qnn_1_1_1_adamw",      "QNN 1->1->1 (AdamW)",             "xor",    TQNN,  1u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f, 1500u, 0u },
 
 	// === Iris 80/20 (120 train / 30 test, batch=16, 5 splits x 5 seeds) ===
-	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris80", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris80", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris80", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris80", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris80", TDFF,  9u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris80", TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris80", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris80", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
-	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris80", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris80", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris80", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris80", TDFF, 24u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris80", TDFF, 15u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris80", TDFF,  9u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris80", TDFF,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris80", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris80", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris80", TDFF, 15u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
 
 	// === Iris 40/60 (60 train / 90 test, batch=16, 5 splits x 5 seeds) ===
-	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris40", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris40", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris40", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris40", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris40", TDFF,  9u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris40", TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris40", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
-	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris40", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
-	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris40", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris40", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris40", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris40", TDFF, 24u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris40", TDFF, 15u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris40", TDFF,  9u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris40", TDFF,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris40", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris40", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris40", TDFF, 15u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
 
 	// === Tier 1A: SO(3) 3D Vector Rotation Sample-Efficiency Curve (N in {32,64,128,256,512}) ===
 	SO3_ROT_CURVE_BLOCK(32),
@@ -119,81 +147,97 @@ static const ModelSpec kSpecs[] = {
 	SO3_ROT_CURVE_BLOCK(512),
 
 	// === Tier 1B: SO(3) 3D Vector Rotation OOD (Opposite Hemisphere + Unseen Angle [pi/2, pi], N=128) ===
-	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->8->1 Polar (AdamW)", "so3_rot_ood", TQNN,  8u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->8->1 Polar (SGD+M)", "so3_rot_ood", TQNN,  8u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "qnn_std_polar_adamw",   "QNN-Std 2->8->1 Polar (AdamW)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_adamw",   "QNN-Std 2->8->1 Split (AdamW)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_sgdm",    "QNN-Std 2->8->1 Split (SGD+M)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_32_4_sgdm",       "DFF 8->32->4 [width=] (SGD+M)",       "so3_rot_ood", TDFF, 32u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_10_4_sgdm",       "DFF 8->10->4 [param=] (SGD+M)",       "so3_rot_ood", TDFF, 10u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->8->1 Polar (AdamW)", "so3_rot_ood", TQNN,  8u, 0u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->8->1 Polar (SGD+M)", "so3_rot_ood", TQNN,  8u, 0u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->8->1 Polar (AdamW)",       "so3_rot_ood", TQNN,  8u, 0u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->8->1 Split (AdamW)",       "so3_rot_ood", TQNN,  8u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->8->1 Split (SGD+M)",       "so3_rot_ood", TQNN,  8u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_32_4_sgdm",       "DFF 8->32->4 [width=] (SGD+M)",       "so3_rot_ood", TDFF, 32u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_10_4_sgdm",       "DFF 8->10->4 [param=] (SGD+M)",       "so3_rot_ood", TDFF, 10u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
 
 	// === Tier 1C: SO(3) Quaternion Composition q1 (x) q2 (In-Dist & OOD Rotated Frame, N=128) ===
-	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_id",  TQNN,  6u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_id",  TQNN,  6u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_id",  TDFF, 24u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_id",  TDFF,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_id",  TQNN,  6u, 0u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_id",  TQNN,  6u, 0u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_id",  TQNN,  6u, 0u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_id",  TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_id",  TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_id",  TDFF, 24u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_id",  TDFF,  8u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
 
-	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_ood", TQNN,  6u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_ood", TQNN,  6u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
-	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_ood", TDFF, 24u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
-	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_ood", TDFF,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_ood", TQNN,  6u, 0u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_ood", TQNN,  6u, 0u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_ood", TQNN,  6u, 0u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_ood", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_ood", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_ood", TDFF, 24u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_ood", TDFF,  8u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
 
 	// === Tier 1D: In-repo datasets/xorparity3.csv (8 rows, exact-one-bit sum==1, 20 seeds) ===
-	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
-	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
-	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 0u },
-	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "xorparity3",   TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
-	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "xorparity3",   TDFF, 10u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
-	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "xorparity3",   TQNN,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
-	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "xorparity3",   TDFF,  5u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "xorparity3",   TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "xorparity3",   TQNN,  4u, 0u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "xorparity3",   TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 0u },
+	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "xorparity3",   TDFF, 16u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "xorparity3",   TDFF, 10u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "xorparity3",   TQNN,  2u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "xorparity3",   TDFF,  5u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
 
 	// === Tier 1E: Synthetic 3-bit Odd Parity (8 rows, 20 seeds) ===
-	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
-	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
-	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 3u },
-	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "parity3_odd",  TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
-	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "parity3_odd",  TDFF, 10u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
-	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "parity3_odd",  TQNN,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
-	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "parity3_odd",  TDFF,  5u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "parity3_odd",  TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "parity3_odd",  TQNN,  4u, 0u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "parity3_odd",  TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 3u },
+	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "parity3_odd",  TDFF, 16u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "parity3_odd",  TDFF, 10u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "parity3_odd",  TQNN,  2u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
+	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "parity3_odd",  TDFF,  5u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
 
 	// === Tier 1F: Synthetic 4-bit Odd Parity (16 rows, 20 seeds) ===
-	{ "qnn_1_6_1_split_sgdm",  "QNN 1->6->1 Split (SGD+M)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
-	{ "qnn_1_6_1_polar_sgdm",  "QNN 1->6->1 Polar (SGD+M)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
-	{ "qnn_1_6_1_split_adamw", "QNN 1->6->1 Split (AdamW)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1200u, 4u },
-	{ "dff_4_24_1_sgdm",       "DFF 4->24->1 [width=] (SGD+M)",       "parity4",      TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
-	{ "dff_4_12_1_sgdm",       "DFF 4->12->1 [param=] (SGD+M)",       "parity4",      TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
-	{ "qnn_1_3_1_split_sgdm",  "QNN 1->3->1 Split (SGD+M)",           "parity4",      TQNN,  3u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
-	{ "dff_4_6_1_sgdm",        "DFF 4->6->1 [param=] (SGD+M)",        "parity4",      TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
+	{ "qnn_1_6_1_split_sgdm",  "QNN 1->6->1 Split (SGD+M)",           "parity4",      TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_6_1_polar_sgdm",  "QNN 1->6->1 Polar (SGD+M)",           "parity4",      TQNN,  6u, 0u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_6_1_split_adamw", "QNN 1->6->1 Split (AdamW)",           "parity4",      TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1200u, 4u },
+	{ "dff_4_24_1_sgdm",       "DFF 4->24->1 [width=] (SGD+M)",       "parity4",      TDFF, 24u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "dff_4_12_1_sgdm",       "DFF 4->12->1 [param=] (SGD+M)",       "parity4",      TDFF, 12u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_3_1_split_sgdm",  "QNN 1->3->1 Split (SGD+M)",           "parity4",      TQNN,  3u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
+	{ "dff_4_6_1_sgdm",        "DFF 4->6->1 [param=] (SGD+M)",        "parity4",      TDFF,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
 
 	// === Tier 1G: In-repo Dow Jones OHLC (360 Q1 train -> 390 Q2 test, 5 seeds) ===
-	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
-	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
-	{ "qnn_1_4_1_equiv_sgdm",  "QNN-SO3-Equiv 1->4->1 Polar (SGD+M lr=0.01)", "dow_ohlc", TQNN, 4u, PK4, RDR, LEQV, APOL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
-	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
-	{ "qnn_1_4_1_polar_adamw", "QNN 1->4->1 Polar (AdamW)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
-	{ "qnn_1_4_1_equiv_adamw", "QNN-SO3-Equiv 1->4->1 Polar (AdamW)", "dow_ohlc",     TQNN,  4u, PK4, RDR, LEQV, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
-	{ "dff_4_16_1_sgdm",       "DFF 4->16->1 [width=] (SGD+M)",       "dow_ohlc",     TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
-	{ "dff_4_8_1_sgdm",        "DFF 4->8->1 [param=] (SGD+M)",        "dow_ohlc",     TDFF,  8u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
-	{ "dff_4_16_1_sgdm_lr001", "DFF 4->16->1 [width=] (SGD+M lr=0.01)","dow_ohlc",    TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
-	{ "dff_4_8_1_sgdm_lr001",  "DFF 4->8->1 [param=] (SGD+M lr=0.01)", "dow_ohlc",    TDFF,  8u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "dow_ohlc",     TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "dow_ohlc",     TQNN,  4u, 0u, PK4, RDR, LSTD, APOL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_equiv_sgdm",  "QNN-SO3-Equiv 1->4->1 Polar (SGD+M lr=0.01)", "dow_ohlc", TQNN, 4u, 0u, PK4, RDR, LEQV, APOL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "dow_ohlc",     TQNN,  4u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_polar_adamw", "QNN 1->4->1 Polar (AdamW)",           "dow_ohlc",     TQNN,  4u, 0u, PK4, RDR, LSTD, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_equiv_adamw", "QNN-SO3-Equiv 1->4->1 Polar (AdamW)", "dow_ohlc",     TQNN,  4u, 0u, PK4, RDR, LEQV, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "dff_4_16_1_sgdm",       "DFF 4->16->1 [width=] (SGD+M)",       "dow_ohlc",     TDFF, 16u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_8_1_sgdm",        "DFF 4->8->1 [param=] (SGD+M)",        "dow_ohlc",     TDFF,  8u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_16_1_sgdm_lr001", "DFF 4->16->1 [width=] (SGD+M lr=0.01)","dow_ohlc",    TDFF, 16u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_8_1_sgdm_lr001",  "DFF 4->8->1 [param=] (SGD+M lr=0.01)", "dow_ohlc",    TDFF,  8u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
 
 	// === Tier 1H: In-repo Wine (178 rows, 13 feats, 3 classes, 5 splits x 5 seeds = 25 runs) ===
-	{ "qnn_4_6_3_pack4_sgdm",       "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-4)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_4_6_3_pack4_sgdm_wd1e2", "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-2)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
-	{ "qnn_4_6_3_pack4_sgdm_ep60",  "QNN 4->6->3 PACK4 Real (SGD+M, 60 ep)",    "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f,  60u, 0u },
-	{ "qnn_4_6_1_pack4_split_wd1e2","QNN 4->6->1 PACK4 Split (SGD+M, wd=1e-2)", "wine", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
-	{ "qnn_4_6_3_pack4_adamw_wd1e2","QNN 4->6->3 PACK4 Real (AdamW, wd=1e-2)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-2f, 300u, 0u },
-	{ "qnn_13_6_3_1pf_sgdm",        "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-4)", "wine", TQNN,  6u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "qnn_13_6_3_1pf_sgdm_wd1e2",  "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-2)", "wine", TQNN,  6u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
-	{ "dff_13_24_3_sgdm",           "DFF 13->24->3 [width=] (SGD+M, wd=1e-4)",  "wine", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_13_12_3_sgdm",           "DFF 13->12->3 [param=] (SGD+M, wd=1e-4)",  "wine", TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
-	{ "dff_13_12_3_sgdm_wd1e2",     "DFF 13->12->3 [param=] (SGD+M, wd=1e-2)",  "wine", TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u }
+	{ "qnn_4_6_3_pack4_sgdm",       "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-4)",  "wine", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_sgdm_wd1e2", "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-2)",  "wine", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_sgdm_ep60",  "QNN 4->6->3 PACK4 Real (SGD+M, 60 ep)",    "wine", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f,  60u, 0u },
+	{ "qnn_4_6_1_pack4_split_wd1e2","QNN 4->6->1 PACK4 Split (SGD+M, wd=1e-2)", "wine", TQNN,  6u, 0u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_adamw_wd1e2","QNN 4->6->3 PACK4 Real (AdamW, wd=1e-2)",  "wine", TQNN,  6u, 0u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-2f, 300u, 0u },
+	{ "qnn_13_6_3_1pf_sgdm",        "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-4)", "wine", TQNN,  6u, 0u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_13_6_3_1pf_sgdm_wd1e2",  "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-2)", "wine", TQNN,  6u, 0u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "dff_13_24_3_sgdm",           "DFF 13->24->3 [width=] (SGD+M, wd=1e-4)",  "wine", TDFF, 24u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_13_12_3_sgdm",           "DFF 13->12->3 [param=] (SGD+M, wd=1e-4)",  "wine", TDFF, 12u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_13_12_3_sgdm_wd1e2",     "DFF 13->12->3 [param=] (SGD+M, wd=1e-2)",  "wine", TDFF, 12u, 0u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+
+	// === Tier 2A: Triatomic H2O Molecular PES + Central-Atom Force (ID & OOD arbitrary 3D rotations) ===
+	TIER2_JOINT4_BLOCK("mol_pes_id",  0.015f, 0.03f),
+	TIER2_JOINT4_BLOCK("mol_pes_ood", 0.015f, 0.03f),
+
+	// === Tier 2B: Chiral Molecular Center (Planar / R / S Enantiomer 3-class, ID & OOD) ===
+	TIER2_CHIRAL_BLOCK("mol_chiral_id"),
+	TIER2_CHIRAL_BLOCK("mol_chiral_ood"),
+
+	// === Tier 2C: Quantum Slater-Koster p-p Molecular Orbital Overlap (ID & OOD hemisphere) ===
+	TIER2_SLATER_BLOCK("orbital_slater_id"),
+	TIER2_SLATER_BLOCK("orbital_slater_ood"),
+
+	// === Tier 2D: 3D Keplerian Orbital Energy + Laplace-Runge-Lenz Eccentricity Vector (ID & OOD plane) ===
+	TIER2_JOINT4_BLOCK("orbital_kepler_id",  0.010f, 0.02f),
+	TIER2_JOINT4_BLOCK("orbital_kepler_ood", 0.010f, 0.02f)
 };
 
 #undef PK4
@@ -209,6 +253,9 @@ static const ModelSpec kSpecs[] = {
 #undef TQNN
 #undef TDFF
 #undef SO3_ROT_CURVE_BLOCK
+#undef TIER2_JOINT4_BLOCK
+#undef TIER2_CHIRAL_BLOCK
+#undef TIER2_SLATER_BLOCK
 
 static const size_t kNumSpecs = sizeof(kSpecs) / sizeof(kSpecs[0]);
 
@@ -290,6 +337,7 @@ static glades::NNInfo* make_net_info(const char* name,
                                      float momentum,
                                      float wd2,
                                      unsigned int hiddenSize,
+                                     unsigned int hiddenSize2,
                                      int hiddenAct,
                                      int outSize,
                                      int outType,
@@ -298,8 +346,18 @@ static glades::NNInfo* make_net_info(const char* name,
 	shmea::GPointer<glades::InputLayerInfo> in(new glades::InputLayerInfo(
 	    batchSize, lr, momentum, 0.0f, wd2, 0.0f, hiddenAct, 1.0f));
 	std::vector< shmea::GPointer<glades::HiddenLayerInfo> > hidden;
-	hidden.push_back(shmea::GPointer<glades::HiddenLayerInfo>(new glades::HiddenLayerInfo(
-	    static_cast<int>(hiddenSize), lr, momentum, 0.0f, wd2, 0.0f, outAct, 1.0f)));
+	if (hiddenSize2 > 0u)
+	{
+		hidden.push_back(shmea::GPointer<glades::HiddenLayerInfo>(new glades::HiddenLayerInfo(
+		    static_cast<int>(hiddenSize), lr, momentum, 0.0f, wd2, 0.0f, hiddenAct, 1.0f)));
+		hidden.push_back(shmea::GPointer<glades::HiddenLayerInfo>(new glades::HiddenLayerInfo(
+		    static_cast<int>(hiddenSize2), lr, momentum, 0.0f, wd2, 0.0f, outAct, 1.0f)));
+	}
+	else
+	{
+		hidden.push_back(shmea::GPointer<glades::HiddenLayerInfo>(new glades::HiddenLayerInfo(
+		    static_cast<int>(hiddenSize), lr, momentum, 0.0f, wd2, 0.0f, outAct, 1.0f)));
+	}
 	shmea::GPointer<glades::OutputLayerInfo> out(new glades::OutputLayerInfo(
 	    outSize, outType));
 	return new glades::NNInfo(shmea::GString(name), in, hidden, out);
@@ -319,56 +377,88 @@ static void compute_param_and_state_sizes(const ModelSpec& spec,
 		        ? glades::QUAT_ONE_PER_FEATURE
 		        : glades::QUAT_PACK_GROUPS_OF_4;
 		const unsigned int qIn = glades::quaternionInputCount(realIn, pMode);
-		const unsigned int qH = spec.hiddenSize;
 		const glades::QuaternionOutputReadoutMode rMode =
 		    (spec.qnnReadout == glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS)
 		        ? glades::QUAT_READOUT_SPLIT_COMPONENTS
 		        : glades::QUAT_READOUT_REAL_PART;
 		const unsigned int qOut = glades::quaternionOutputCount(realOut, rMode);
-
 		const bool isEquiv = (spec.qnnLayerMode == glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT);
-		const unsigned int w0 = qH * qIn * 4u;
-		const unsigned int b0Stored = qH * 4u;
-		const unsigned int b0Active = isEquiv ? (qH * 3u) : b0Stored;
-		const unsigned int w1 = qOut * qH * 4u;
-		const unsigned int b1Stored = qOut * 4u;
-		const unsigned int b1Active = isEquiv ? (qOut * 3u) : realOut;
 
-		outStoredParams = w0 + b0Stored + w1 + b1Stored;
-		outActiveParams = w0 + b0Active + w1 + b1Active;
+		std::vector<unsigned int> layers;
+		layers.push_back(qIn);
+		layers.push_back(spec.hiddenSize);
+		if (spec.hiddenSize2 > 0u)
+			layers.push_back(spec.hiddenSize2);
+		layers.push_back(qOut);
+
+		unsigned int stored = 0u;
+		unsigned int active = 0u;
+		unsigned int transBytes = 0u;
+		unsigned int allSum = layers[0];
+		unsigned int nonInputSum = 0u;
+
+		for (size_t l = 0u; l + 1u < layers.size(); ++l)
+		{
+			const unsigned int inW = layers[l];
+			const unsigned int outW = layers[l + 1u];
+			const bool isOutLayer = (l + 2u == layers.size());
+			const unsigned int w = outW * inW * 4u;
+			const unsigned int bStored = outW * 4u;
+			const unsigned int bActive = isEquiv ? (outW * 3u) : (isOutLayer ? realOut : bStored);
+
+			stored += w + bStored;
+			active += w + bActive;
+			transBytes += 4u * (outW * inW + outW) * 16u;
+			allSum += outW;
+			nonInputSum += outW;
+		}
+
+		outStoredParams = stored;
+		outActiveParams = active;
 
 		// TensorQNNState: per transition W,vW,v2W,gW + bias,vBias,v2Bias,gBias (16 B/quat)
-		// plus scratch z (layers 1..2), a (layers 0..2), delta (layers 0..2), outReadout (4 B/float),
+		// plus scratch z (non-input layers), a (all layers), delta (all layers), outReadout (4 B/float),
 		// plus eqL, eqR for LAYER_SO3_EQUIVARIANT.
-		const unsigned int transBytes =
-		    4u * (qH * qIn + qH) * 16u +
-		    4u * (qOut * qH + qOut) * 16u;
-		const unsigned int eqScratchBytes = isEquiv ? (2u * (qH + qOut) * 16u) : 0u;
+		const unsigned int eqScratchBytes = isEquiv ? (2u * nonInputSum * 16u) : 0u;
 		const unsigned int scratchBytes =
-		    (qH + qOut) * 16u +
-		    2u * (qIn + qH + qOut) * 16u +
+		    nonInputSum * 16u +
+		    2u * allSum * 16u +
 		    realOut * 4u +
 		    eqScratchBytes;
 		outCoreStateBytes = transBytes + scratchBytes;
 	}
 	else
 	{
-		const unsigned int h = spec.hiddenSize;
-		const unsigned int w0 = h * realIn;
-		const unsigned int b0 = h;
-		const unsigned int w1 = realOut * h;
-		const unsigned int b1 = realOut;
+		std::vector<unsigned int> layers;
+		layers.push_back(realIn);
+		layers.push_back(spec.hiddenSize);
+		if (spec.hiddenSize2 > 0u)
+			layers.push_back(spec.hiddenSize2);
+		layers.push_back(realOut);
 
-		outStoredParams = w0 + b0 + w1 + b1;
-		outActiveParams = outStoredParams;
+		unsigned int totalParams = 0u;
+		unsigned int transBytes = 0u;
+		unsigned int allSum = layers[0];
+		unsigned int nonInputSum = 0u;
+
+		for (size_t l = 0u; l + 1u < layers.size(); ++l)
+		{
+			const unsigned int inW = layers[l];
+			const unsigned int outW = layers[l + 1u];
+			const unsigned int w = outW * inW;
+			const unsigned int b = outW;
+			totalParams += w + b;
+			transBytes += (3u * w + 2u * b) * 4u;
+			allSum += outW;
+			nonInputSum += outW;
+		}
+
+		outStoredParams = totalParams;
+		outActiveParams = totalParams;
 
 		// TensorDFFState core (excluding helm/aster): per transition W,vW,gW + bias,gBias (4 B/float)
-		// plus scratch a (layers 0..2) and delta (layers 1..2).
-		const unsigned int transBytes =
-		    (3u * w0 + 2u * b0 + 3u * w1 + 2u * b1) * 4u;
-		const unsigned int scratchBytes =
-		    (realIn + h + realOut) * 4u +
-		    (h + realOut) * 4u;
+		// plus scratch a (all layers) and delta (non-input layers).
+		const unsigned int scratchBytes = (allSum + nonInputSum) * 4u;
 		outCoreStateBytes = transBytes + scratchBytes;
 	}
 }
@@ -676,48 +766,66 @@ static bool eval_single_row_regression(glades::NNetwork& net,
 	return true;
 }
 
-static glades::Quaternion eval_two_quat_net(glades::NNetwork& net,
-                                            const glades::Quaternion& q0,
-                                            const glades::Quaternion& q1)
+static bool eval_multi_quat_net(glades::NNetwork& net,
+                                const std::vector<glades::Quaternion>& qIn,
+                                unsigned int realOut,
+                                std::vector<float>& outVals)
 {
+	const unsigned int realIn = static_cast<unsigned int>(qIn.size()) * 4u;
 	glades::NumberInput single;
-	single.testMatrix = shmea::GMatrix(1, shmea::GVector<float>(8u, 0.0f));
-	single.testExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(4u, 0.0f));
+	single.testMatrix = shmea::GMatrix(1, shmea::GVector<float>(realIn, 0.0f));
+	single.testExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(realOut, 0.0f));
+	for (size_t q = 0u; q < qIn.size(); ++q)
+	{
+		single.testMatrix[0][q * 4u + 0u] = qIn[q].r;
+		single.testMatrix[0][q * 4u + 1u] = qIn[q].i;
+		single.testMatrix[0][q * 4u + 2u] = qIn[q].j;
+		single.testMatrix[0][q * 4u + 3u] = qIn[q].k;
+	}
 	single.trainMatrix = single.testMatrix;
 	single.trainExpectedMatrix = single.testExpectedMatrix;
-	single.testMatrix[0][0] = q0.r;
-	single.testMatrix[0][1] = q0.i;
-	single.testMatrix[0][2] = q0.j;
-	single.testMatrix[0][3] = q0.k;
-	single.testMatrix[0][4] = q1.r;
-	single.testMatrix[0][5] = q1.i;
-	single.testMatrix[0][6] = q1.j;
-	single.testMatrix[0][7] = q1.k;
-	single.trainMatrix = single.testMatrix;
 	single.loaded = true;
 
-	net.test(&single);
+	if (!net.test(&single).ok())
+		return false;
 	shmea::GList res = net.getResults();
-	return glades::Quaternion(res.getFloat(1u), res.getFloat(3u), res.getFloat(5u), res.getFloat(7u));
+	if (res.size() != realOut * 2u)
+		return false;
+	outVals.assign(realOut, 0.0f);
+	for (unsigned int k = 0u; k < realOut; ++k)
+	{
+		const float v = res.getFloat(k * 2u + 1u);
+		if (!std::isfinite(v))
+			return false;
+		outVals[k] = v;
+	}
+	return true;
 }
 
-static double measure_so3_equivariance_error(glades::NNetwork& net, uint64_t seed)
+static double measure_so3_symmetry_error(glades::NNetwork& net,
+                                         unsigned int qInCount,
+                                         unsigned int realOut,
+                                         bool invariantOutput,
+                                         uint64_t seed)
 {
 	glades::rng::Engine eng;
 	glades::rng::seed_engine(eng, seed);
 	double maxErr = 0.0;
+	std::vector<glades::Quaternion> baseIn(qInCount);
+	std::vector<glades::Quaternion> rotIn(qInCount);
+	std::vector<float> baseOut;
+	std::vector<float> rotInOut;
+
 	for (unsigned int t = 0u; t < 32u; ++t)
 	{
-		const glades::Quaternion q0(
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f));
-		const glades::Quaternion q1(
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
-		    glades::rng::uniform_float(eng, -1.0f, 1.0f));
+		for (unsigned int q = 0u; q < qInCount; ++q)
+		{
+			baseIn[q] = glades::Quaternion(
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f));
+		}
 		glades::Quaternion u(
 		    glades::rng::standard_normal(eng),
 		    glades::rng::standard_normal(eng),
@@ -725,17 +833,174 @@ static double measure_so3_equivariance_error(glades::NNetwork& net, uint64_t see
 		    glades::rng::standard_normal(eng));
 		u = u.normalized();
 
-		const glades::Quaternion baseOut = eval_two_quat_net(net, q0, q1);
-		const glades::Quaternion rotInOut = eval_two_quat_net(
-		    net,
-		    glades::Quaternion::conjugateAction(u, q0),
-		    glades::Quaternion::conjugateAction(u, q1));
-		const glades::Quaternion rotBaseOut = glades::Quaternion::conjugateAction(u, baseOut);
-		const double err = static_cast<double>((rotInOut - rotBaseOut).norm());
+		for (unsigned int q = 0u; q < qInCount; ++q)
+			rotIn[q] = glades::Quaternion::conjugateAction(u, baseIn[q]);
+
+		if (!eval_multi_quat_net(net, baseIn, realOut, baseOut) ||
+		    !eval_multi_quat_net(net, rotIn, realOut, rotInOut))
+			return 1e9;
+
+		double err = 0.0;
+		if (invariantOutput || realOut != 4u)
+		{
+			double sq = 0.0;
+			for (unsigned int k = 0u; k < realOut; ++k)
+			{
+				const double d = static_cast<double>(rotInOut[k]) - static_cast<double>(baseOut[k]);
+				sq += d * d;
+			}
+			err = std::sqrt(sq);
+		}
+		else
+		{
+			const glades::Quaternion qBase(baseOut[0], baseOut[1], baseOut[2], baseOut[3]);
+			const glades::Quaternion qRotIn(rotInOut[0], rotInOut[1], rotInOut[2], rotInOut[3]);
+			const glades::Quaternion qRotBase = glades::Quaternion::conjugateAction(u, qBase);
+			err = static_cast<double>((qRotIn - qRotBase).norm());
+		}
 		if (err > maxErr)
 			maxErr = err;
 	}
 	return maxErr;
+}
+
+static double measure_so3_equivariance_error(glades::NNetwork& net, uint64_t seed)
+{
+	return measure_so3_symmetry_error(net, 2u, 4u, false, seed);
+}
+
+static bool eval_joint_scalar_vec3_split(glades::NNetwork& net,
+                                         const glades::NumberInput& di,
+                                         bool useTrainSplit,
+                                         double& outRmse4D,
+                                         double& outScalarRmse,
+                                         double& outVecAngleDeg,
+                                         double& outR2,
+                                         double& outMse4D)
+{
+	std::vector< std::vector<float> > preds;
+	if (!eval_single_row_regression(net, di, useTrainSplit, preds))
+		return false;
+
+	const unsigned int n = useTrainSplit ? di.getTrainSize() : di.getTestSize();
+	double meanY[4] = { 0.0, 0.0, 0.0, 0.0 };
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+		for (unsigned int c = 0u; c < 4u; ++c)
+			meanY[c] += static_cast<double>(y[c]);
+	}
+	for (unsigned int c = 0u; c < 4u; ++c)
+		meanY[c] /= static_cast<double>(n);
+
+	double sse4 = 0.0;
+	double sst4 = 0.0;
+	double sseScalar = 0.0;
+	double sumAngleDeg = 0.0;
+	unsigned int angleCount = 0u;
+	static const double kRadToDeg = 180.0 / 3.14159265358979323846;
+
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+
+		const double ds = static_cast<double>(preds[r][0]) - static_cast<double>(y[0]);
+		sseScalar += ds * ds;
+
+		double dotv = 0.0, np2 = 0.0, ny2 = 0.0;
+		for (unsigned int c = 0u; c < 4u; ++c)
+		{
+			const double p = static_cast<double>(preds[r][c]);
+			const double t = static_cast<double>(y[c]);
+			const double d = p - t;
+			sse4 += d * d;
+			const double dy = t - meanY[c];
+			sst4 += dy * dy;
+			if (c >= 1u)
+			{
+				dotv += p * t;
+				np2 += p * p;
+				ny2 += t * t;
+			}
+		}
+		if (np2 > 1e-10 && ny2 > 1e-10)
+		{
+			double cosA = dotv / std::sqrt(np2 * ny2);
+			if (cosA > 1.0) cosA = 1.0;
+			if (cosA < -1.0) cosA = -1.0;
+			sumAngleDeg += std::acos(cosA) * kRadToDeg;
+			++angleCount;
+		}
+	}
+
+	outMse4D = sse4 / static_cast<double>(n * 4u);
+	outRmse4D = std::sqrt(outMse4D);
+	outScalarRmse = std::sqrt(sseScalar / static_cast<double>(n));
+	outVecAngleDeg = (angleCount > 0u) ? (sumAngleDeg / static_cast<double>(angleCount)) : 0.0;
+	outR2 = (sst4 > 1e-12) ? (1.0 - (sse4 / sst4)) : 0.0;
+	return true;
+}
+
+static bool eval_scalar_reg_split(glades::NNetwork& net,
+                                  const glades::NumberInput& di,
+                                  bool useTrainSplit,
+                                  double& outRmse,
+                                  double& outMae,
+                                  double& outR2,
+                                  double& outMse)
+{
+	std::vector< std::vector<float> > preds;
+	if (!eval_single_row_regression(net, di, useTrainSplit, preds))
+		return false;
+
+	const unsigned int n = useTrainSplit ? di.getTrainSize() : di.getTestSize();
+	double meanY = 0.0;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+		meanY += static_cast<double>(y[0]);
+	}
+	meanY /= static_cast<double>(n);
+
+	double sse = 0.0;
+	double sst = 0.0;
+	double sae = 0.0;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+		const double p = static_cast<double>(preds[r][0]);
+		const double t = static_cast<double>(y[0]);
+		const double d = p - t;
+		sse += d * d;
+		sae += std::fabs(d);
+		const double dy = t - meanY;
+		sst += dy * dy;
+	}
+	outMse = sse / static_cast<double>(n);
+	outRmse = std::sqrt(outMse);
+	outMae = sae / static_cast<double>(n);
+	outR2 = (sst > 1e-12) ? (1.0 - (sse / sst)) : 0.0;
+	return true;
 }
 
 static bool eval_so3_split(glades::NNetwork& net,
@@ -967,6 +1232,17 @@ static int run_worker(const ModelSpec& spec,
 	const bool isSO3CompOod = (task == "so3_comp_ood");
 	const bool isSO3 = (isSO3RotCurve || isSO3RotOod || isSO3CompId || isSO3CompOod);
 	const bool isDow = (task == "dow_ohlc");
+	const bool isMolPesId = (task == "mol_pes_id");
+	const bool isMolPesOod = (task == "mol_pes_ood");
+	const bool isMolChiralId = (task == "mol_chiral_id");
+	const bool isMolChiralOod = (task == "mol_chiral_ood");
+	const bool isSlaterId = (task == "orbital_slater_id");
+	const bool isSlaterOod = (task == "orbital_slater_ood");
+	const bool isKeplerId = (task == "orbital_kepler_id");
+	const bool isKeplerOod = (task == "orbital_kepler_ood");
+	const bool isTier2Joint4 = (isMolPesId || isMolPesOod || isKeplerId || isKeplerOod);
+	const bool isTier2Chiral = (isMolChiralId || isMolChiralOod);
+	const bool isTier2Slater = (isSlaterId || isSlaterOod);
 
 	unsigned int realIn = 4u;
 	unsigned int realOut = 3u;
@@ -994,9 +1270,19 @@ static int run_worker(const ModelSpec& spec,
 		realIn = 13u; realOut = 3u; batchSize = 16;
 		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::LINEAR;
 	}
-	else if (isSO3)
+	else if (isSO3 || isTier2Joint4)
 	{
 		realIn = 8u; realOut = 4u; batchSize = 16;
+		outType = glades::OutputLayerInfo::REGRESSION; outAct = glades::GMath::LINEAR;
+	}
+	else if (isTier2Chiral)
+	{
+		realIn = 12u; realOut = 3u; batchSize = 16;
+		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::LINEAR;
+	}
+	else if (isTier2Slater)
+	{
+		realIn = 12u; realOut = 1u; batchSize = 16;
 		outType = glades::OutputLayerInfo::REGRESSION; outAct = glades::GMath::LINEAR;
 	}
 	else if (isDow)
@@ -1070,7 +1356,7 @@ static int run_worker(const ModelSpec& spec,
 			const size_t heapBaseline = current_heap_bytes();
 			glades::NNInfo* info = make_net_info(
 			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 			glades::NNetwork net(info, spec.netType);
 			delete info;
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
@@ -1164,7 +1450,7 @@ static int run_worker(const ModelSpec& spec,
 				const size_t heapBaseline = current_heap_bytes();
 				glades::NNInfo* info = make_net_info(
 				    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-				    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+				    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 				glades::NNetwork net(info, spec.netType);
 				delete info;
 				update_heap_delta(heapBaseline, maxHeapDeltaBytes);
@@ -1253,7 +1539,7 @@ static int run_worker(const ModelSpec& spec,
 			const size_t heapBaseline = current_heap_bytes();
 			glades::NNInfo* info = make_net_info(
 			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 			glades::NNetwork net(info, spec.netType);
 			delete info;
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
@@ -1311,6 +1597,252 @@ static int run_worker(const ModelSpec& spec,
 		}
 		totalRuns = static_cast<unsigned int>(regRmses.size());
 	}
+	else if (isTier2Joint4)
+	{
+		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
+		const unsigned int nTrain = (spec.taskParam > 0u) ? spec.taskParam : 192u;
+		const unsigned int nTest = 256u;
+		const bool isPes = (isMolPesId || isMolPesOod);
+		const bool isOod = (isMolPesOod || isKeplerOod);
+
+		for (unsigned int s = 0u; s < 5u; ++s)
+		{
+			glades::QuaternionInput di;
+			const bool ok = isPes
+			                    ? di.loadMolecularPES(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode)
+			                    : di.loadKeplerOrbit(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode);
+			if (!ok)
+			{
+				std::fprintf(stderr, "ERROR: failed to generate Tier 2 joint-4D dataset for %s\n", spec.task);
+				return 2;
+			}
+			splitTestRows = di.getTestSize();
+
+			const size_t heapBaseline = current_heap_bytes();
+			glades::NNInfo* info = make_net_info(
+			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			glades::NNetwork net(info, spec.netType);
+			delete info;
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			configure_net(net, spec, seeds[s], &quietLogger);
+			glades::Terminator term;
+			term.setEpoch(static_cast<int>(spec.epochs));
+			if (!net.setTerminator(term).ok())
+				return 3;
+
+			EpochTracker cb(1u, false, true, heapBaseline, &maxHeapDeltaBytes);
+			const double t0 = now_seconds();
+			glades::NNetworkStatus st = net.train(&di, &cb);
+			const double t1 = now_seconds();
+			if (!st.ok())
+			{
+				std::fprintf(stderr, "ERROR: train failed for %s seed=%u: %s\n", spec.id, s, st.message.c_str());
+				return 4;
+			}
+			trainMs.push_back((t1 - t0) * 1000.0);
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			const double p0 = now_seconds();
+			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
+			{
+				st = net.test(&di);
+				if (!st.ok())
+					return 5;
+			}
+			const double p1 = now_seconds();
+			predictSplitUs.push_back(((p1 - p0) * 1e6) / static_cast<double>(predictRepeats));
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			double trRmse4 = 0.0, trScalarRmse = 0.0, trAng = 0.0, trR2 = 0.0, trMse4 = 0.0;
+			double teRmse4 = 0.0, teScalarRmse = 0.0, teAng = 0.0, teR2 = 0.0, teMse4 = 0.0;
+			if (!eval_joint_scalar_vec3_split(net, di, true, trRmse4, trScalarRmse, trAng, trR2, trMse4))
+				return 6;
+			if (!eval_joint_scalar_vec3_split(net, di, false, teRmse4, teScalarRmse, teAng, teR2, teMse4))
+				return 6;
+			const double eqErr = measure_so3_symmetry_error(net, 2u, 4u, false, 60000ULL + seeds[s]);
+
+			trainLosses.push_back(trMse4);
+			testLosses.push_back(teMse4);
+			testBriers.push_back(teScalarRmse); // Scalar (Energy) RMSE in $20
+			regRmses.push_back(teRmse4);
+			regAuxs.push_back(teAng);           // Vector (Force / LRL) angle error in deg
+			regR2s.push_back(teR2);
+			equivErrs.push_back(eqErr);
+			trainAccs.push_back(trR2 * 100.0);
+			testAccs.push_back(teR2 * 100.0);
+			if (teR2 >= 0.95)
+				++convergedRuns;
+
+			if (s == 4u)
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
+		}
+		totalRuns = static_cast<unsigned int>(regRmses.size());
+	}
+	else if (isTier2Slater)
+	{
+		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
+		const unsigned int nTrain = (spec.taskParam > 0u) ? spec.taskParam : 192u;
+		const unsigned int nTest = 256u;
+		const bool isOod = isSlaterOod;
+
+		for (unsigned int s = 0u; s < 5u; ++s)
+		{
+			glades::QuaternionInput di;
+			if (!di.loadSlaterKosterOrbital(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode))
+			{
+				std::fprintf(stderr, "ERROR: failed to generate Slater-Koster dataset for %s\n", spec.task);
+				return 2;
+			}
+			splitTestRows = di.getTestSize();
+
+			const size_t heapBaseline = current_heap_bytes();
+			glades::NNInfo* info = make_net_info(
+			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			glades::NNetwork net(info, spec.netType);
+			delete info;
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			configure_net(net, spec, seeds[s], &quietLogger);
+			glades::Terminator term;
+			term.setEpoch(static_cast<int>(spec.epochs));
+			if (!net.setTerminator(term).ok())
+				return 3;
+
+			EpochTracker cb(1u, false, true, heapBaseline, &maxHeapDeltaBytes);
+			const double t0 = now_seconds();
+			glades::NNetworkStatus st = net.train(&di, &cb);
+			const double t1 = now_seconds();
+			if (!st.ok())
+			{
+				std::fprintf(stderr, "ERROR: train failed for %s seed=%u: %s\n", spec.id, s, st.message.c_str());
+				return 4;
+			}
+			trainMs.push_back((t1 - t0) * 1000.0);
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			const double p0 = now_seconds();
+			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
+			{
+				st = net.test(&di);
+				if (!st.ok())
+					return 5;
+			}
+			const double p1 = now_seconds();
+			predictSplitUs.push_back(((p1 - p0) * 1e6) / static_cast<double>(predictRepeats));
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			double trRmse = 0.0, trMae = 0.0, trR2 = 0.0, trMse = 0.0;
+			double teRmse = 0.0, teMae = 0.0, teR2 = 0.0, teMse = 0.0;
+			if (!eval_scalar_reg_split(net, di, true, trRmse, trMae, trR2, trMse))
+				return 6;
+			if (!eval_scalar_reg_split(net, di, false, teRmse, teMae, teR2, teMse))
+				return 6;
+			const double invErr = measure_so3_symmetry_error(net, 3u, 1u, true, 61000ULL + seeds[s]);
+
+			trainLosses.push_back(trMse);
+			testLosses.push_back(teMse);
+			regRmses.push_back(teRmse);
+			regAuxs.push_back(teMae);
+			regR2s.push_back(teR2);
+			equivErrs.push_back(invErr);
+			trainAccs.push_back(trR2 * 100.0);
+			testAccs.push_back(teR2 * 100.0);
+			if (teR2 >= 0.90)
+				++convergedRuns;
+
+			if (s == 4u)
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
+		}
+		totalRuns = static_cast<unsigned int>(regRmses.size());
+	}
+	else if (isTier2Chiral)
+	{
+		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
+		const unsigned int nTrain = (spec.taskParam > 0u) ? spec.taskParam : 180u;
+		const unsigned int nTest = 240u;
+		const bool isOod = isMolChiralOod;
+
+		for (unsigned int s = 0u; s < 5u; ++s)
+		{
+			glades::QuaternionInput di;
+			if (!di.loadMolecularChirality(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode))
+			{
+				std::fprintf(stderr, "ERROR: failed to generate molecular chirality dataset for %s\n", spec.task);
+				return 2;
+			}
+			splitTestRows = di.getTestSize();
+
+			const size_t heapBaseline = current_heap_bytes();
+			glades::NNInfo* info = make_net_info(
+			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			glades::NNetwork net(info, spec.netType);
+			delete info;
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			configure_net(net, spec, seeds[s], &quietLogger);
+			glades::Terminator term;
+			term.setEpoch(static_cast<int>(spec.epochs));
+			if (!net.setTerminator(term).ok())
+				return 3;
+
+			EpochTracker cb(3u, false, false, heapBaseline, &maxHeapDeltaBytes);
+			const double t0 = now_seconds();
+			glades::NNetworkStatus st = net.train(&di, &cb);
+			const double t1 = now_seconds();
+			if (!st.ok())
+			{
+				std::fprintf(stderr, "ERROR: train failed for %s seed=%u: %s\n", spec.id, s, st.message.c_str());
+				return 4;
+			}
+			trainMs.push_back((t1 - t0) * 1000.0);
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			const double p0 = now_seconds();
+			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
+			{
+				st = net.test(&di);
+				if (!st.ok())
+					return 5;
+			}
+			const double p1 = now_seconds();
+			predictSplitUs.push_back(((p1 - p0) * 1e6) / static_cast<double>(predictRepeats));
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			EvalStats trainEv;
+			EvalStats testEv;
+			if (!eval_split_exact(net, di, true, NULL, trainEv))
+				return 6;
+			if (!eval_split_exact(net, di, false, NULL, testEv))
+				return 6;
+			const double invErr = measure_so3_symmetry_error(net, 3u, 3u, true, 62000ULL + seeds[s]);
+
+			trainAccs.push_back(trainEv.accPct);
+			testAccs.push_back(testEv.accPct);
+			if (s == 0u)
+				canonTestAccs.push_back(testEv.accPct);
+			trainLosses.push_back(trainEv.loss);
+			testLosses.push_back(testEv.loss);
+			testBriers.push_back(testEv.brier);
+			f1C0.push_back(testEv.f1[0]);
+			f1C1.push_back(testEv.f1[1]);
+			f1C2.push_back(testEv.f1[2]);
+			macroF1s.push_back(testEv.macroF1);
+			equivErrs.push_back(invErr);
+			if (testEv.accPct >= 95.0)
+				++convergedRuns;
+
+			epM1.push_back(cb.epTrain95 > 0u ? static_cast<double>(cb.epTrain95) : static_cast<double>(spec.epochs));
+			epM2.push_back(cb.epTrain98 > 0u ? static_cast<double>(cb.epTrain98) : static_cast<double>(spec.epochs));
+
+			if (s == 4u)
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
+		}
+		totalRuns = static_cast<unsigned int>(testAccs.size());
+	}
 	else if (isDow)
 	{
 		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
@@ -1330,7 +1862,7 @@ static int run_worker(const ModelSpec& spec,
 			const size_t heapBaseline = current_heap_bytes();
 			glades::NNInfo* info = make_net_info(
 			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			    spec.hiddenSize, spec.hiddenSize2, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 			glades::NNetwork net(info, spec.netType);
 			delete info;
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
@@ -1522,7 +2054,9 @@ int main(int argc, char** argv)
 			{
 				if (task == "xor" || task == "xorparity3" || task == "parity3_odd" || task == "parity4")
 					predictRepeats = 100u;
-				else if (task == "so3_rot_curve" || task == "so3_rot_ood" || task == "so3_comp_id" || task == "so3_comp_ood" || task == "dow_ohlc")
+				else if (task == "so3_rot_curve" || task == "so3_rot_ood" || task == "so3_comp_id" || task == "so3_comp_ood" || task == "dow_ohlc" ||
+				         task == "mol_pes_id" || task == "mol_pes_ood" || task == "orbital_slater_id" || task == "orbital_slater_ood" ||
+				         task == "orbital_kepler_id" || task == "orbital_kepler_ood")
 					predictRepeats = 20u;
 				else
 					predictRepeats = 50u;

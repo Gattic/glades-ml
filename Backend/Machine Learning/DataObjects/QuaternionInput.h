@@ -121,6 +121,62 @@ public:
 	                        QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
 	                        QuaternionOutputReadoutMode readout = QUAT_READOUT_SPLIT_COMPONENTS);
 
+	// Tier 2A: Triatomic H2O-like Potential Energy Surface & Exact Central-Atom Force:
+	//   Input  (8 reals -> 2 quats): (0, r1x, r1y, r1z), (0, r2x, r2y, r2z)
+	//   Target (4 reals -> 1 quat) : (E, Fx, Fy, Fz) where E is SO(3)-invariant Morse+bend
+	//     potential energy and F = -dE/dx_O = dE/dr1 + dE/dr2 is the SO(3)-equivariant force.
+	// When oodOrientation is true:
+	//   Train: molecules rotated within [0, 30 deg] of canonical frame
+	//   Test : molecules rotated by unseen [60, 180 deg] rotations in SO(3)
+	bool loadMolecularPES(unsigned int nTrain,
+	                      unsigned int nTest,
+	                      unsigned int seed,
+	                      bool oodOrientation = false,
+	                      QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                      QuaternionOutputReadoutMode readout = QUAT_READOUT_SPLIT_COMPONENTS);
+
+	// Tier 2B: Chiral Molecular Center (C-L1L2L3) 3-Class Classification:
+	//   Input  (12 reals -> 3 quats): (c1, r1), (c2, r2), (c3, r3) with distinct ligand scalars
+	//   Target (3 one-hot classes)  : 0=Planar, 1=R-Enantiomer (tau > 0), 2=S-Enantiomer (tau < 0)
+	//   Strictly SO(3)-invariant and parity-sensitive (mirror reflection swaps R <-> S).
+	// When oodOrientation is true:
+	//   Train: orientations within [0, 35 deg] of canonical frame
+	//   Test : unseen orientations in [60, 180 deg]
+	bool loadMolecularChirality(unsigned int nTrain,
+	                            unsigned int nTest,
+	                            unsigned int seed,
+	                            bool oodOrientation = false,
+	                            QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                            QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Tier 2C: Quantum Slater-Koster p-p Molecular Orbital Overlap Integral:
+	//   Input  (12 reals -> 3 quats): (0, r), (0, p1), (0, p2)
+	//   Target (1 scalar -> 1 quat) : S_pp(r, p1, p2) (strictly SO(3)-invariant)
+	// When oodOrientation is true:
+	//   Train: bond direction r_hat.z > 0.65 (upper polar cone)
+	//   Test : bond direction r_hat.z < -0.35 (lower hemisphere)
+	bool loadSlaterKosterOrbital(unsigned int nTrain,
+	                             unsigned int nTest,
+	                             unsigned int seed,
+	                             bool oodOrientation = false,
+	                             QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                             QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Tier 2D: 3D Keplerian Orbital Mechanics (mu = 1):
+	//   Input  (8 reals -> 2 quats): (0, rx, ry, rz), (0, vx, vy, vz)
+	//   Target (4 reals -> 1 quat) : (eps, ex, ey, ez) where eps = 0.5*||v||^2 - 1/||r|| is the
+	//     SO(3)-invariant specific orbital energy and e = v x (r x v) - r/||r|| is the
+	//     SO(3)-equivariant Laplace-Runge-Lenz eccentricity vector.
+	// When oodOrbitalPlane is true:
+	//   Train: near-equatorial prograde orbits (inclination i in [0, 25 deg])
+	//   Test : steeply inclined / polar / retrograde orbits (inclination i in [65, 180 deg])
+	bool loadKeplerOrbit(unsigned int nTrain,
+	                     unsigned int nTest,
+	                     unsigned int seed,
+	                     bool oodOrbitalPlane = false,
+	                     QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                     QuaternionOutputReadoutMode readout = QUAT_READOUT_SPLIT_COMPONENTS);
+
 	// Materialize/re-encode quaternion input & target buffers from the currently
 	// loaded NumberInput train/test matrices.
 	bool rebuildQuaternionBuffers(QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,

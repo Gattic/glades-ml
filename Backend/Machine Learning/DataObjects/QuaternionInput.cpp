@@ -105,6 +105,113 @@ static glades::Quaternion sample_signed_k_unit_quaternion(glades::rng::Engine& e
 	    : glades::Quaternion(0.70710678f, 0.0f, 0.0f, -0.70710678f);
 }
 
+static glades::Quaternion quat_rot_z(float angleRad)
+{
+	const float half = 0.5f * angleRad;
+	return glades::Quaternion(cosf(half), 0.0f, 0.0f, sinf(half));
+}
+
+static glades::Quaternion quat_rot_x(float angleRad)
+{
+	const float half = 0.5f * angleRad;
+	return glades::Quaternion(cosf(half), sinf(half), 0.0f, 0.0f);
+}
+
+static glades::Quaternion sample_inclination_rotation(glades::rng::Engine& eng,
+                                                      float minIncRad,
+                                                      float maxIncRad)
+{
+	static const float kTwoPi = 6.28318530717958647692f;
+	const float omegaBig = glades::rng::uniform_float(eng, 0.0f, kTwoPi);
+	const float omegaSmall = glades::rng::uniform_float(eng, 0.0f, kTwoPi);
+	const float cosHi = cosf(minIncRad);
+	const float cosLo = cosf(maxIncRad);
+	const float cosInc = glades::rng::uniform_float(eng, cosLo, cosHi);
+	const float clamped = (cosInc > 1.0f) ? 1.0f : ((cosInc < -1.0f) ? -1.0f : cosInc);
+	const float inc = acosf(clamped);
+	glades::Quaternion q = glades::Quaternion::mul(
+	    quat_rot_z(omegaBig),
+	    glades::Quaternion::mul(quat_rot_x(inc), quat_rot_z(omegaSmall)));
+	q = q.normalized();
+	if (q.r < 0.0f)
+		q = -q;
+	return q;
+}
+
+static float pure_vec_dot(const glades::Quaternion& a, const glades::Quaternion& b)
+{
+	return (a.i * b.i) + (a.j * b.j) + (a.k * b.k);
+}
+
+static glades::Quaternion pure_vec_cross(const glades::Quaternion& a, const glades::Quaternion& b)
+{
+	return glades::Quaternion(
+	    0.0f,
+	    (a.j * b.k) - (a.k * b.j),
+	    (a.k * b.i) - (a.i * b.k),
+	    (a.i * b.j) - (a.j * b.i));
+}
+
+static void compute_h2o_pes_and_force(const glades::Quaternion& r1,
+                                      const glades::Quaternion& r2,
+                                      float& outEnergy,
+                                      glades::Quaternion& outForceO)
+{
+	// Triatomic H2O-like anharmonic Morse stretch + harmonic cosine-angle bend:
+	//   E = De * [(1 - exp(-alpha*(d1 - r0)))^2 + (1 - exp(-alpha*(d2 - r0)))^2]
+	//       + kTheta * (cos(theta) - cos(theta0))^2
+	// Central Oxygen atom force: F_O = -dE/dx_O = dE/dr1 + dE/dr2.
+	static const double kR0 = 0.9584;
+	static const double kCosTheta0 = -0.2495354328; // cos(104.45 deg)
+	static const double kDe = 1.0;
+	static const double kAlpha = 1.6;
+	static const double kTheta = 0.9;
+
+	const double r1x = static_cast<double>(r1.i);
+	const double r1y = static_cast<double>(r1.j);
+	const double r1z = static_cast<double>(r1.k);
+	const double r2x = static_cast<double>(r2.i);
+	const double r2y = static_cast<double>(r2.j);
+	const double r2z = static_cast<double>(r2.k);
+
+	const double d1 = sqrt((r1x * r1x) + (r1y * r1y) + (r1z * r1z));
+	const double d2 = sqrt((r2x * r2x) + (r2y * r2y) + (r2z * r2z));
+	const double invD1 = (d1 > 1e-12) ? (1.0 / d1) : 0.0;
+	const double invD2 = (d2 > 1e-12) ? (1.0 / d2) : 0.0;
+
+	const double u1x = r1x * invD1, u1y = r1y * invD1, u1z = r1z * invD1;
+	const double u2x = r2x * invD2, u2y = r2y * invD2, u2z = r2z * invD2;
+
+	const double cosT = (u1x * u2x) + (u1y * u2y) + (u1z * u2z);
+	const double dc = cosT - kCosTheta0;
+
+	const double e1 = exp(-kAlpha * (d1 - kR0));
+	const double e2 = exp(-kAlpha * (d2 - kR0));
+	const double m1 = 1.0 - e1;
+	const double m2 = 1.0 - e2;
+
+	const double energy = kDe * ((m1 * m1) + (m2 * m2)) + kTheta * (dc * dc);
+
+	const double rad1 = 2.0 * kDe * kAlpha * m1 * e1;
+	const double rad2 = 2.0 * kDe * kAlpha * m2 * e2;
+	const double angCoeff = 2.0 * kTheta * dc;
+
+	const double dEdr1x = rad1 * u1x + angCoeff * (u2x - cosT * u1x) * invD1;
+	const double dEdr1y = rad1 * u1y + angCoeff * (u2y - cosT * u1y) * invD1;
+	const double dEdr1z = rad1 * u1z + angCoeff * (u2z - cosT * u1z) * invD1;
+
+	const double dEdr2x = rad2 * u2x + angCoeff * (u1x - cosT * u2x) * invD2;
+	const double dEdr2y = rad2 * u2y + angCoeff * (u1y - cosT * u2y) * invD2;
+	const double dEdr2z = rad2 * u2z + angCoeff * (u1z - cosT * u2z) * invD2;
+
+	outEnergy = static_cast<float>(energy);
+	outForceO = glades::Quaternion(
+	    0.0f,
+	    static_cast<float>(dEdr1x + dEdr2x),
+	    static_cast<float>(dEdr1y + dEdr2y),
+	    static_cast<float>(dEdr1z + dEdr2z));
+}
+
 } // namespace
 
 namespace glades {
@@ -789,6 +896,362 @@ bool QuaternionInput::loadSO3Composition(unsigned int nTrain,
 		testExpectedMatrix[r][1] = qOut.i;
 		testExpectedMatrix[r][2] = qOut.j;
 		testExpectedMatrix[r][3] = qOut.k;
+	}
+
+	featureCountCached = 8u;
+	expectedCountCached = 4u;
+	loaded = true;
+
+	if (!rebuildQuaternionBuffers(packing, readout))
+		return false;
+
+	classLabels.clear();
+	lastStatus = NNetworkStatus();
+	return true;
+}
+
+bool QuaternionInput::loadMolecularPES(unsigned int nTrain,
+                                       unsigned int nTest,
+                                       unsigned int seed,
+                                       bool oodOrientation,
+                                       QuaternionInputPackingMode packing,
+                                       QuaternionOutputReadoutMode readout)
+{
+	clearQuaternionBuffers();
+	if (nTrain == 0u || nTest == 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		                            "QuaternionInput::loadMolecularPES: nTrain and nTest must be > 0");
+		return false;
+	}
+
+	static const float kDegToRad = 3.14159265358979323846f / 180.0f;
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, static_cast<uint64_t>(seed));
+
+	trainMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(8u, 0.0f));
+	trainExpectedMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(4u, 0.0f));
+	testMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(8u, 0.0f));
+	testExpectedMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(4u, 0.0f));
+
+	for (unsigned int split = 0u; split < 2u; ++split)
+	{
+		const bool isTrain = (split == 0u);
+		const unsigned int nRows = isTrain ? nTrain : nTest;
+		shmea::GMatrix& xMat = isTrain ? trainMatrix : testMatrix;
+		shmea::GMatrix& yMat = isTrain ? trainExpectedMatrix : testExpectedMatrix;
+
+		for (unsigned int r = 0u; r < nRows; ++r)
+		{
+			const float d1 = glades::rng::uniform_float(eng, 0.76f, 1.24f);
+			const float d2 = glades::rng::uniform_float(eng, 0.76f, 1.24f);
+			const float theta = glades::rng::uniform_float(eng, 75.0f * kDegToRad, 135.0f * kDegToRad);
+			const float halfT = 0.5f * theta;
+
+			const Quaternion r1Loc(0.0f, d1 * cosf(halfT), d1 * sinf(halfT), 0.0f);
+			const Quaternion r2Loc(0.0f, d2 * cosf(halfT), -d2 * sinf(halfT), 0.0f);
+
+			const Quaternion uRot = oodOrientation
+			    ? (isTrain ? sample_axis_angle_quaternion(eng, 0.0f, 30.0f * kDegToRad)
+			               : sample_axis_angle_quaternion(eng, 60.0f * kDegToRad, 180.0f * kDegToRad))
+			    : sample_unit_quaternion(eng);
+
+			const Quaternion r1 = Quaternion::rotateVec(uRot, r1Loc);
+			const Quaternion r2 = Quaternion::rotateVec(uRot, r2Loc);
+
+			float energy = 0.0f;
+			Quaternion forceO;
+			compute_h2o_pes_and_force(r1, r2, energy, forceO);
+
+			xMat[r][0] = 0.0f;
+			xMat[r][1] = r1.i;
+			xMat[r][2] = r1.j;
+			xMat[r][3] = r1.k;
+			xMat[r][4] = 0.0f;
+			xMat[r][5] = r2.i;
+			xMat[r][6] = r2.j;
+			xMat[r][7] = r2.k;
+
+			yMat[r][0] = energy;
+			yMat[r][1] = forceO.i;
+			yMat[r][2] = forceO.j;
+			yMat[r][3] = forceO.k;
+		}
+	}
+
+	featureCountCached = 8u;
+	expectedCountCached = 4u;
+	loaded = true;
+
+	if (!rebuildQuaternionBuffers(packing, readout))
+		return false;
+
+	classLabels.clear();
+	lastStatus = NNetworkStatus();
+	return true;
+}
+
+bool QuaternionInput::loadMolecularChirality(unsigned int nTrain,
+                                             unsigned int nTest,
+                                             unsigned int seed,
+                                             bool oodOrientation,
+                                             QuaternionInputPackingMode packing,
+                                             QuaternionOutputReadoutMode readout)
+{
+	clearQuaternionBuffers();
+	if (nTrain == 0u || nTest == 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		                            "QuaternionInput::loadMolecularChirality: nTrain and nTest must be > 0");
+		return false;
+	}
+
+	static const float kDegToRad = 3.14159265358979323846f / 180.0f;
+	static const float kLigandCharge[3] = { 0.25f, 0.50f, 0.75f };
+	static const float kBaseAzimuthDeg[3] = { 0.0f, 120.0f, 240.0f };
+
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, static_cast<uint64_t>(seed));
+
+	trainMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(12u, 0.0f));
+	trainExpectedMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(3u, 0.0f));
+	testMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(12u, 0.0f));
+	testExpectedMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(3u, 0.0f));
+
+	for (unsigned int split = 0u; split < 2u; ++split)
+	{
+		const bool isTrain = (split == 0u);
+		const unsigned int nRows = isTrain ? nTrain : nTest;
+		shmea::GMatrix& xMat = isTrain ? trainMatrix : testMatrix;
+		shmea::GMatrix& yMat = isTrain ? trainExpectedMatrix : testExpectedMatrix;
+
+		// Build balanced class schedule and Fisher-Yates shuffle deterministically.
+		std::vector<unsigned int> clsOrder(nRows, 0u);
+		for (unsigned int r = 0u; r < nRows; ++r)
+			clsOrder[r] = r % 3u;
+		for (unsigned int r = nRows; r > 1u; --r)
+		{
+			const unsigned int j = glades::rng::uniform_uint(eng, 0u, r - 1u);
+			const unsigned int tmp = clsOrder[r - 1u];
+			clsOrder[r - 1u] = clsOrder[j];
+			clsOrder[j] = tmp;
+		}
+
+		for (unsigned int r = 0u; r < nRows; ++r)
+		{
+			const unsigned int cls = clsOrder[r];
+			float hApex = 0.0f;
+			if (cls == 0u)
+				hApex = glades::rng::uniform_float(eng, -0.04f, 0.04f);
+			else if (cls == 1u)
+				hApex = glades::rng::uniform_float(eng, 0.28f, 0.60f);
+			else
+				hApex = -glades::rng::uniform_float(eng, 0.28f, 0.60f);
+
+			const Quaternion uRot = oodOrientation
+			    ? (isTrain ? sample_axis_angle_quaternion(eng, 0.0f, 35.0f * kDegToRad)
+			               : sample_axis_angle_quaternion(eng, 60.0f * kDegToRad, 180.0f * kDegToRad))
+			    : sample_unit_quaternion(eng);
+
+			for (unsigned int k = 0u; k < 3u; ++k)
+			{
+				const float az = (kBaseAzimuthDeg[k] + glades::rng::uniform_float(eng, -14.0f, 14.0f)) * kDegToRad;
+				const float radial = glades::rng::uniform_float(eng, 0.85f, 1.15f);
+				const float zNoise = glades::rng::uniform_float(eng, -0.025f, 0.025f);
+				const Quaternion bLoc(0.0f, radial * cosf(az), radial * sinf(az), hApex + zNoise);
+				const Quaternion bRot = Quaternion::rotateVec(uRot, bLoc);
+
+				const unsigned int off = k * 4u;
+				xMat[r][off + 0u] = kLigandCharge[k];
+				xMat[r][off + 1u] = bRot.i;
+				xMat[r][off + 2u] = bRot.j;
+				xMat[r][off + 3u] = bRot.k;
+			}
+
+			yMat[r][0] = (cls == 0u) ? 1.0f : 0.0f;
+			yMat[r][1] = (cls == 1u) ? 1.0f : 0.0f;
+			yMat[r][2] = (cls == 2u) ? 1.0f : 0.0f;
+		}
+	}
+
+	featureCountCached = 12u;
+	expectedCountCached = 3u;
+	loaded = true;
+
+	if (!rebuildQuaternionBuffers(packing, readout))
+		return false;
+
+	classLabels.clear();
+	classLabels.push_back("Planar");
+	classLabels.push_back("R-Enantiomer");
+	classLabels.push_back("S-Enantiomer");
+	lastStatus = NNetworkStatus();
+	return true;
+}
+
+bool QuaternionInput::loadSlaterKosterOrbital(unsigned int nTrain,
+                                              unsigned int nTest,
+                                              unsigned int seed,
+                                              bool oodOrientation,
+                                              QuaternionInputPackingMode packing,
+                                              QuaternionOutputReadoutMode readout)
+{
+	clearQuaternionBuffers();
+	if (nTrain == 0u || nTest == 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		                            "QuaternionInput::loadSlaterKosterOrbital: nTrain and nTest must be > 0");
+		return false;
+	}
+
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, static_cast<uint64_t>(seed));
+
+	trainMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(12u, 0.0f));
+	trainExpectedMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(1u, 0.0f));
+	testMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(12u, 0.0f));
+	testExpectedMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(1u, 0.0f));
+
+	for (unsigned int split = 0u; split < 2u; ++split)
+	{
+		const bool isTrain = (split == 0u);
+		const unsigned int nRows = isTrain ? nTrain : nTest;
+		shmea::GMatrix& xMat = isTrain ? trainMatrix : testMatrix;
+		shmea::GMatrix& yMat = isTrain ? trainExpectedMatrix : testExpectedMatrix;
+
+		for (unsigned int r = 0u; r < nRows; ++r)
+		{
+			const float d = glades::rng::uniform_float(eng, 0.80f, 1.80f);
+			const Quaternion rHat = oodOrientation
+			    ? (isTrain ? sample_hemisphere_vec3(eng, true, 0.65f)
+			               : sample_hemisphere_vec3(eng, false, 0.35f))
+			    : sample_unit_vec3_pure(eng);
+			const Quaternion bond(0.0f, rHat.i * d, rHat.j * d, rHat.k * d);
+			const Quaternion p1 = sample_unit_vec3_pure(eng);
+			const Quaternion p2 = sample_unit_vec3_pure(eng);
+
+			const float p1DotR = pure_vec_dot(p1, rHat);
+			const float p2DotR = pure_vec_dot(p2, rHat);
+			const float p1DotP2 = pure_vec_dot(p1, p2);
+			const float sigmaTerm = p1DotR * p2DotR;
+			const float piTerm = p1DotP2 - sigmaTerm;
+
+			const float vSigma = -1.2f * expf(-1.1f * (d - 1.0f));
+			const float vPi = 0.6f * expf(-1.4f * (d - 1.0f));
+			const float overlap = (vSigma * sigmaTerm) + (vPi * piTerm);
+
+			xMat[r][0] = 0.0f;
+			xMat[r][1] = bond.i;
+			xMat[r][2] = bond.j;
+			xMat[r][3] = bond.k;
+			xMat[r][4] = 0.0f;
+			xMat[r][5] = p1.i;
+			xMat[r][6] = p1.j;
+			xMat[r][7] = p1.k;
+			xMat[r][8] = 0.0f;
+			xMat[r][9] = p2.i;
+			xMat[r][10] = p2.j;
+			xMat[r][11] = p2.k;
+
+			yMat[r][0] = overlap;
+		}
+	}
+
+	featureCountCached = 12u;
+	expectedCountCached = 1u;
+	loaded = true;
+
+	if (!rebuildQuaternionBuffers(packing, readout))
+		return false;
+
+	classLabels.clear();
+	lastStatus = NNetworkStatus();
+	return true;
+}
+
+bool QuaternionInput::loadKeplerOrbit(unsigned int nTrain,
+                                      unsigned int nTest,
+                                      unsigned int seed,
+                                      bool oodOrbitalPlane,
+                                      QuaternionInputPackingMode packing,
+                                      QuaternionOutputReadoutMode readout)
+{
+	clearQuaternionBuffers();
+	if (nTrain == 0u || nTest == 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
+		                            "QuaternionInput::loadKeplerOrbit: nTrain and nTest must be > 0");
+		return false;
+	}
+
+	static const float kPi = 3.14159265358979323846f;
+	static const float kTwoPi = 2.0f * kPi;
+	static const float kDegToRad = kPi / 180.0f;
+
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, static_cast<uint64_t>(seed));
+
+	trainMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(8u, 0.0f));
+	trainExpectedMatrix = shmea::GMatrix(nTrain, shmea::GVector<float>(4u, 0.0f));
+	testMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(8u, 0.0f));
+	testExpectedMatrix = shmea::GMatrix(nTest, shmea::GVector<float>(4u, 0.0f));
+
+	for (unsigned int split = 0u; split < 2u; ++split)
+	{
+		const bool isTrain = (split == 0u);
+		const unsigned int nRows = isTrain ? nTrain : nTest;
+		shmea::GMatrix& xMat = isTrain ? trainMatrix : testMatrix;
+		shmea::GMatrix& yMat = isTrain ? trainExpectedMatrix : testExpectedMatrix;
+
+		for (unsigned int r = 0u; r < nRows; ++r)
+		{
+			const float a = glades::rng::uniform_float(eng, 1.0f, 1.8f);
+			const float ecc = glades::rng::uniform_float(eng, 0.10f, 0.55f);
+			const float nu = glades::rng::uniform_float(eng, 0.0f, kTwoPi);
+
+			const float p = a * (1.0f - (ecc * ecc));
+			const float rad = p / (1.0f + (ecc * cosf(nu)));
+			const float vScale = sqrtf(1.0f / p);
+
+			const Quaternion rPf(0.0f, rad * cosf(nu), rad * sinf(nu), 0.0f);
+			const Quaternion vPf(0.0f, -vScale * sinf(nu), vScale * (ecc + cosf(nu)), 0.0f);
+
+			const Quaternion uRot = oodOrbitalPlane
+			    ? (isTrain ? sample_inclination_rotation(eng, 0.0f, 25.0f * kDegToRad)
+			               : sample_inclination_rotation(eng, 65.0f * kDegToRad, 180.0f * kDegToRad))
+			    : sample_unit_quaternion(eng);
+
+			const Quaternion pos = Quaternion::rotateVec(uRot, rPf);
+			const Quaternion vel = Quaternion::rotateVec(uRot, vPf);
+
+			// Exact conserved Keplerian quantities (mu = 1):
+			//   eps = 0.5 * ||v||^2 - 1 / ||r|| = -1 / (2a)
+			//   e   = v x (r x v) - r / ||r||
+			const float posNorm = pos.norm();
+			const float velNormSq = vel.normSq();
+			const float energy = (0.5f * velNormSq) - (1.0f / posNorm);
+			const Quaternion angMom = pure_vec_cross(pos, vel);
+			const Quaternion vCrossL = pure_vec_cross(vel, angMom);
+			const Quaternion lrl(
+			    0.0f,
+			    vCrossL.i - (pos.i / posNorm),
+			    vCrossL.j - (pos.j / posNorm),
+			    vCrossL.k - (pos.k / posNorm));
+
+			xMat[r][0] = 0.0f;
+			xMat[r][1] = pos.i;
+			xMat[r][2] = pos.j;
+			xMat[r][3] = pos.k;
+			xMat[r][4] = 0.0f;
+			xMat[r][5] = vel.i;
+			xMat[r][6] = vel.j;
+			xMat[r][7] = vel.k;
+
+			yMat[r][0] = energy;
+			yMat[r][1] = lrl.i;
+			yMat[r][2] = lrl.j;
+			yMat[r][3] = lrl.k;
+		}
 	}
 
 	featureCountCached = 8u;

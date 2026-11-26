@@ -1672,6 +1672,547 @@ static void test_qnn_tier1_suite()
 	printf("[PASS] All Tier 1 functional benchmarks verified.\n");
 }
 
+static void eval_multi_quat_net(glades::NNetwork& net,
+                                const std::vector<glades::Quaternion>& qIn,
+                                unsigned int realOut,
+                                std::vector<float>& outVals)
+{
+	const unsigned int realIn = static_cast<unsigned int>(qIn.size()) * 4u;
+	glades::NumberInput single;
+	single.testMatrix = shmea::GMatrix(1, shmea::GVector<float>(realIn, 0.0f));
+	single.testExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(realOut, 0.0f));
+	for (size_t q = 0u; q < qIn.size(); ++q)
+	{
+		single.testMatrix[0][q * 4u + 0u] = qIn[q].r;
+		single.testMatrix[0][q * 4u + 1u] = qIn[q].i;
+		single.testMatrix[0][q * 4u + 2u] = qIn[q].j;
+		single.testMatrix[0][q * 4u + 3u] = qIn[q].k;
+	}
+	single.trainMatrix = single.testMatrix;
+	single.trainExpectedMatrix = single.testExpectedMatrix;
+	single.loaded = true;
+
+	ASSERT("Single-sample multi-quat net.test succeeds", net.test(&single).ok());
+	shmea::GList res = net.getResults();
+	ASSERT("Single-sample multi-quat results size == 2*realOut", res.size() == realOut * 2u);
+	outVals.assign(realOut, 0.0f);
+	for (unsigned int k = 0u; k < realOut; ++k)
+		outVals[k] = res.getFloat(k * 2u + 1u);
+}
+
+static double measure_so3_symmetry_error(glades::NNetwork& net,
+                                         unsigned int qInCount,
+                                         unsigned int realOut,
+                                         bool invariantOutput,
+                                         unsigned int seed)
+{
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, static_cast<uint64_t>(seed));
+	double maxErr = 0.0;
+	std::vector<glades::Quaternion> baseIn(qInCount);
+	std::vector<glades::Quaternion> rotIn(qInCount);
+	std::vector<float> baseOut;
+	std::vector<float> rotInOut;
+
+	for (unsigned int t = 0u; t < 16u; ++t)
+	{
+		for (unsigned int q = 0u; q < qInCount; ++q)
+		{
+			baseIn[q] = glades::Quaternion(
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+			    glades::rng::uniform_float(eng, -1.0f, 1.0f));
+		}
+		glades::Quaternion u(
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng));
+		u = u.normalized();
+
+		for (unsigned int q = 0u; q < qInCount; ++q)
+			rotIn[q] = glades::Quaternion::conjugateAction(u, baseIn[q]);
+
+		eval_multi_quat_net(net, baseIn, realOut, baseOut);
+		eval_multi_quat_net(net, rotIn, realOut, rotInOut);
+
+		double err = 0.0;
+		if (invariantOutput || realOut != 4u)
+		{
+			double sq = 0.0;
+			for (unsigned int k = 0u; k < realOut; ++k)
+			{
+				const double d = static_cast<double>(rotInOut[k]) - static_cast<double>(baseOut[k]);
+				sq += d * d;
+			}
+			err = sqrt(sq);
+		}
+		else
+		{
+			const glades::Quaternion qBase(baseOut[0], baseOut[1], baseOut[2], baseOut[3]);
+			const glades::Quaternion qRotIn(rotInOut[0], rotInOut[1], rotInOut[2], rotInOut[3]);
+			const glades::Quaternion qRotBase = glades::Quaternion::conjugateAction(u, qBase);
+			err = static_cast<double>((qRotIn - qRotBase).norm());
+		}
+		if (err > maxErr)
+			maxErr = err;
+	}
+	return maxErr;
+}
+
+static void eval_scalar_reg_metrics(glades::NNetwork& net,
+                                    const glades::NumberInput& di,
+                                    double& outRmse,
+                                    double& outMae,
+                                    double& outR2)
+{
+	std::vector< std::vector<float> > preds;
+	eval_single_row_predictions(net, di, preds);
+	const unsigned int n = di.getTestSize();
+	double meanY = 0.0;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int ySz = 0u;
+		di.getTestExpectedRowView(r, y, ySz);
+		meanY += static_cast<double>(y[0]);
+	}
+	meanY /= static_cast<double>(n);
+
+	double sse = 0.0, sst = 0.0, sae = 0.0;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int ySz = 0u;
+		di.getTestExpectedRowView(r, y, ySz);
+		const double p = static_cast<double>(preds[r][0]);
+		const double t = static_cast<double>(y[0]);
+		const double d = p - t;
+		sse += d * d;
+		sae += fabs(d);
+		const double dy = t - meanY;
+		sst += dy * dy;
+	}
+	outRmse = sqrt(sse / static_cast<double>(n));
+	outMae = sae / static_cast<double>(n);
+	outR2 = (sst > 1e-12) ? (1.0 - (sse / sst)) : 0.0;
+}
+
+static void eval_joint_scalar_vec3_metrics(glades::NNetwork& net,
+                                           const glades::NumberInput& di,
+                                           double& outRmse4D,
+                                           double& outScalarRmse,
+                                           double& outVecAngleDeg,
+                                           double& outR2)
+{
+	std::vector< std::vector<float> > preds;
+	eval_single_row_predictions(net, di, preds);
+	const unsigned int n = di.getTestSize();
+	double meanY[4] = { 0.0, 0.0, 0.0, 0.0 };
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int ySz = 0u;
+		di.getTestExpectedRowView(r, y, ySz);
+		for (unsigned int c = 0u; c < 4u; ++c)
+			meanY[c] += static_cast<double>(y[c]);
+	}
+	for (unsigned int c = 0u; c < 4u; ++c)
+		meanY[c] /= static_cast<double>(n);
+
+	double sse4 = 0.0, sst4 = 0.0, sseScalar = 0.0, sumAngleDeg = 0.0;
+	unsigned int angleCount = 0u;
+	static const double kRadToDeg = 180.0 / 3.14159265358979323846;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int ySz = 0u;
+		di.getTestExpectedRowView(r, y, ySz);
+		const double ds = static_cast<double>(preds[r][0]) - static_cast<double>(y[0]);
+		sseScalar += ds * ds;
+		double dotv = 0.0, np2 = 0.0, ny2 = 0.0;
+		for (unsigned int c = 0u; c < 4u; ++c)
+		{
+			const double p = static_cast<double>(preds[r][c]);
+			const double t = static_cast<double>(y[c]);
+			const double d = p - t;
+			sse4 += d * d;
+			const double dy = t - meanY[c];
+			sst4 += dy * dy;
+			if (c >= 1u)
+			{
+				dotv += p * t;
+				np2 += p * p;
+				ny2 += t * t;
+			}
+		}
+		if (np2 > 1e-10 && ny2 > 1e-10)
+		{
+			double cosA = dotv / sqrt(np2 * ny2);
+			if (cosA > 1.0) cosA = 1.0;
+			if (cosA < -1.0) cosA = -1.0;
+			sumAngleDeg += acos(cosA) * kRadToDeg;
+			++angleCount;
+		}
+	}
+	outRmse4D = sqrt(sse4 / static_cast<double>(n * 4u));
+	outScalarRmse = sqrt(sseScalar / static_cast<double>(n));
+	outVecAngleDeg = (angleCount > 0u) ? (sumAngleDeg / static_cast<double>(angleCount)) : 0.0;
+	outR2 = (sst4 > 1e-12) ? (1.0 - (sse4 / sst4)) : 0.0;
+}
+
+static void test_qnn_tier2_suite()
+{
+	printf("-----------------------------------\n");
+	printf("QNN Phase 4: Tier 2 SO(3)-Symmetric Molecular & Orbital Benchmarks\n");
+	printf("-----------------------------------\n");
+
+	// 4a) Loader physics, conservation, and symmetry sanity checks
+	{
+		// Molecular PES & Force: verify exact force = -dE/dx_O via central FD on H2O potential
+		glades::QuaternionInput pes;
+		ASSERT("loadMolecularPES succeeds", pes.loadMolecularPES(32u, 32u, 101u, true));
+		ASSERT("Molecular PES has 8 inputs (2 quats) and 4 outputs (1 quat)",
+		       pes.getFeatureCount() == 8u && pes.getQuatInputCount() == 2u &&
+		       pes.getRealOutputCount() == 4u && pes.getQuatOutputCount() == 1u);
+
+		// Verify conservative force identity F_O = dE/dr1 + dE/dr2 numerically on a sample
+		const glades::Quaternion* qIn = NULL;
+		const glades::Quaternion* qTar = NULL;
+		unsigned int nIn = 0u, nOut = 0u;
+		ASSERT("Molecular PES train quat row 0 readable",
+		       pes.getTrainQuatInputRow(0u, qIn, nIn) && pes.getTrainQuatTargetRow(0u, qTar, nOut));
+		const double r1[3] = { qIn[0].i, qIn[0].j, qIn[0].k };
+		const double r2[3] = { qIn[1].i, qIn[1].j, qIn[1].k };
+		double fdForce[3] = { 0.0, 0.0, 0.0 };
+		static const double kEps = 1e-5;
+		static const double kR0 = 0.9584;
+		static const double kCosT0 = -0.2495354328;
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			double eVals[2] = { 0.0, 0.0 };
+			for (int sgn = 0; sgn < 2; ++sgn)
+			{
+				const double delta = (sgn == 0) ? kEps : -kEps;
+				double a1[3] = { r1[0], r1[1], r1[2] };
+				double a2[3] = { r2[0], r2[1], r2[2] };
+				// Shifting Oxygen by +delta shifts both bond vectors r_k = x_Hk - x_O by -delta
+				a1[axis] -= delta;
+				a2[axis] -= delta;
+				const double d1 = sqrt(a1[0] * a1[0] + a1[1] * a1[1] + a1[2] * a1[2]);
+				const double d2 = sqrt(a2[0] * a2[0] + a2[1] * a2[1] + a2[2] * a2[2]);
+				const double cT = (a1[0] * a2[0] + a1[1] * a2[1] + a1[2] * a2[2]) / (d1 * d2);
+				const double m1 = 1.0 - exp(-1.6 * (d1 - kR0));
+				const double m2 = 1.0 - exp(-1.6 * (d2 - kR0));
+				const double dc = cT - kCosT0;
+				eVals[sgn] = (m1 * m1 + m2 * m2) + 0.9 * dc * dc;
+			}
+			fdForce[axis] = -(eVals[0] - eVals[1]) / (2.0 * kEps);
+		}
+		const double forceErr = sqrt(
+		    (fdForce[0] - qTar[0].i) * (fdForce[0] - qTar[0].i) +
+		    (fdForce[1] - qTar[0].j) * (fdForce[1] - qTar[0].j) +
+		    (fdForce[2] - qTar[0].k) * (fdForce[2] - qTar[0].k));
+		ASSERT("Molecular PES analytic force matches -dE/dx_O central FD (< 1e-4)", forceErr < 1e-4);
+
+		// Molecular Chirality: verify balanced 3 classes & clean signed-volume separation
+		glades::QuaternionInput chiral;
+		ASSERT("loadMolecularChirality succeeds", chiral.loadMolecularChirality(90u, 90u, 202u, true));
+		ASSERT("Molecular Chirality has 12 inputs (3 quats), 3 classes, 3 labels",
+		       chiral.getFeatureCount() == 12u && chiral.getQuatInputCount() == 3u &&
+		       chiral.getRealOutputCount() == 3u && chiral.getClassLabels().size() == 3u);
+		unsigned int clsCounts[3] = { 0u, 0u, 0u };
+		for (unsigned int r = 0u; r < chiral.getTestSize(); ++r)
+		{
+			const glades::Quaternion* qi = NULL;
+			unsigned int qiN = 0u;
+			const float* y = NULL;
+			unsigned int yN = 0u;
+			ASSERT("Chiral row readable",
+			       chiral.getTestQuatInputRow(r, qi, qiN) && chiral.getTestExpectedRowView(r, y, yN));
+			unsigned int cls = (y[0] > 0.5f) ? 0u : ((y[1] > 0.5f) ? 1u : 2u);
+			++clsCounts[cls];
+			const double n1 = sqrt(qi[0].i * qi[0].i + qi[0].j * qi[0].j + qi[0].k * qi[0].k);
+			const double n2 = sqrt(qi[1].i * qi[1].i + qi[1].j * qi[1].j + qi[1].k * qi[1].k);
+			const double n3 = sqrt(qi[2].i * qi[2].i + qi[2].j * qi[2].j + qi[2].k * qi[2].k);
+			const double cx = qi[1].j * qi[2].k - qi[1].k * qi[2].j;
+			const double cy = qi[1].k * qi[2].i - qi[1].i * qi[2].k;
+			const double cz = qi[1].i * qi[2].j - qi[1].j * qi[2].i;
+			const double tau = (qi[0].i * cx + qi[0].j * cy + qi[0].k * cz) / (n1 * n2 * n3);
+			if (cls == 0u)
+				ASSERT("Planar sample has small |tau| < 0.25", fabs(tau) < 0.25);
+			else if (cls == 1u)
+				ASSERT("R-Enantiomer sample has positive tau > 0.30", tau > 0.30);
+			else
+				ASSERT("S-Enantiomer sample has negative tau < -0.30", tau < -0.30);
+		}
+		ASSERT("Molecular Chirality test classes are balanced (30/30/30)",
+		       clsCounts[0] == 30u && clsCounts[1] == 30u && clsCounts[2] == 30u);
+
+		// Slater-Koster Orbital Overlap: verify OOD polar cone separation
+		glades::QuaternionInput sk;
+		ASSERT("loadSlaterKosterOrbital succeeds", sk.loadSlaterKosterOrbital(64u, 64u, 303u, true));
+		ASSERT("Slater-Koster has 12 inputs (3 quats) and 1 scalar output",
+		       sk.getFeatureCount() == 12u && sk.getQuatInputCount() == 3u &&
+		       sk.getRealOutputCount() == 1u && sk.getQuatOutputCount() == 1u);
+		for (unsigned int r = 0u; r < sk.getTrainSize(); ++r)
+		{
+			const glades::Quaternion* qi = NULL;
+			unsigned int qiN = 0u;
+			sk.getTrainQuatInputRow(r, qi, qiN);
+			const float d = qi[0].norm();
+			ASSERT("Slater-Koster OOD train r_hat.z > 0.64", (qi[0].k / d) > 0.64f);
+		}
+		for (unsigned int r = 0u; r < sk.getTestSize(); ++r)
+		{
+			const glades::Quaternion* qi = NULL;
+			unsigned int qiN = 0u;
+			sk.getTestQuatInputRow(r, qi, qiN);
+			const float d = qi[0].norm();
+			ASSERT("Slater-Koster OOD test r_hat.z < -0.34", (qi[0].k / d) < -0.34f);
+		}
+
+		// Kepler Orbit: verify exact orbital invariants (e . L == 0, r . L == 0, OOD inclination split)
+		glades::QuaternionInput kep;
+		ASSERT("loadKeplerOrbit succeeds", kep.loadKeplerOrbit(64u, 64u, 404u, true));
+		ASSERT("Kepler Orbit has 8 inputs (2 quats) and 4 outputs (1 quat)",
+		       kep.getFeatureCount() == 8u && kep.getQuatInputCount() == 2u &&
+		       kep.getRealOutputCount() == 4u && kep.getQuatOutputCount() == 1u);
+		for (unsigned int r = 0u; r < kep.getTrainSize(); ++r)
+		{
+			const glades::Quaternion* qi = NULL;
+			const glades::Quaternion* qt = NULL;
+			unsigned int qiN = 0u, qtN = 0u;
+			kep.getTrainQuatInputRow(r, qi, qiN);
+			kep.getTrainQuatTargetRow(r, qt, qtN);
+			const double lx = qi[0].j * qi[1].k - qi[0].k * qi[1].j;
+			const double ly = qi[0].k * qi[1].i - qi[0].i * qi[1].k;
+			const double lz = qi[0].i * qi[1].j - qi[0].j * qi[1].i;
+			const double lNorm = sqrt(lx * lx + ly * ly + lz * lz);
+			const double eDotL = (qt[0].i * lx + qt[0].j * ly + qt[0].k * lz) / lNorm;
+			ASSERT("Kepler LRL vector is orthogonal to angular momentum L", fabs(eDotL) < 1e-5);
+			ASSERT("Kepler energy is negative (bound orbit)", qt[0].r < -0.20f && qt[0].r > -0.55f);
+			ASSERT("Kepler OOD train orbit is near-equatorial (cos(i) > 0.90)", (lz / lNorm) > 0.90);
+		}
+		for (unsigned int r = 0u; r < kep.getTestSize(); ++r)
+		{
+			const glades::Quaternion* qi = NULL;
+			unsigned int qiN = 0u;
+			kep.getTestQuatInputRow(r, qi, qiN);
+			const double lx = qi[0].j * qi[1].k - qi[0].k * qi[1].j;
+			const double ly = qi[0].k * qi[1].i - qi[0].i * qi[1].k;
+			const double lz = qi[0].i * qi[1].j - qi[0].j * qi[1].i;
+			const double lNorm = sqrt(lx * lx + ly * ly + lz * lz);
+			ASSERT("Kepler OOD test orbit is inclined/polar/retrograde (cos(i) < 0.43)", (lz / lNorm) < 0.43);
+		}
+		printf("  [Loaders] Molecular PES force-FD (err=%.2e), Chirality, Slater-Koster, and Kepler invariants verified.\n",
+		       forceErr);
+	}
+
+	// 4b) Tier 2A: Molecular H2O PES + Force (OOD arbitrary rotations) — QNN-SO3-Equiv vs DFF
+	{
+		glades::QuaternionInput pesOod;
+		ASSERT("Tier2 Molecular PES OOD load succeeds", pesOod.loadMolecularPES(192u, 192u, 42u, true));
+
+		std::vector<unsigned int> qH;
+		qH.push_back(8u);
+		qH.push_back(6u);
+		glades::NNInfo* qInfo = make_qnn_info(
+		    "qnn_mol_pes_ood", 16, 0.015f, 0.0f, 1e-5f,
+		    qH, glades::GMath::TANH, 4, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork qNet(qInfo, glades::NNetwork::TYPE_QNN);
+		delete qInfo;
+		qNet.setSeed(42u);
+		glades::TrainingConfig qCfg = qNet.getTrainingConfig();
+		qCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+		qCfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
+		qCfg.qnn.outputReadout = glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS;
+		qCfg.qnn.layerMode = glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT;
+		qCfg.qnn.activationMode = glades::QuaternionConfig::ACT_POLAR_TANH;
+		ASSERT("Mol PES QNN setTrainingConfig succeeds", qNet.setTrainingConfig(qCfg).ok());
+		glades::Terminator term;
+		term.setEpoch(350);
+		ASSERT("Mol PES QNN setTerminator succeeds", qNet.setTerminator(term).ok());
+		ASSERT("Mol PES QNN train succeeds", qNet.train(&pesOod).ok());
+
+		std::vector<unsigned int> dH;
+		dH.push_back(14u);
+		dH.push_back(11u);
+		glades::NNInfo* dInfo = make_qnn_info(
+		    "dff_mol_pes_ood", 16, 0.03f, 0.9f, 1e-5f,
+		    dH, glades::GMath::TANH, 4, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork dNet(dInfo, glades::NNetwork::TYPE_DFF);
+		delete dInfo;
+		dNet.setSeed(42u);
+		ASSERT("Mol PES DFF setTerminator succeeds", dNet.setTerminator(term).ok());
+		ASSERT("Mol PES DFF train succeeds", dNet.train(&pesOod).ok());
+
+		double qRmse4 = 0.0, qERmse = 0.0, qFAng = 0.0, qR2 = 0.0;
+		double dRmse4 = 0.0, dERmse = 0.0, dFAng = 0.0, dR2 = 0.0;
+		eval_joint_scalar_vec3_metrics(qNet, pesOod, qRmse4, qERmse, qFAng, qR2);
+		eval_joint_scalar_vec3_metrics(dNet, pesOod, dRmse4, dERmse, dFAng, dR2);
+		const double eqErr = measure_so3_symmetry_error(qNet, 2u, 4u, false, 9101u);
+		printf("  [Mol H2O PES OOD]  QNN-SO3-Equiv: 4D_RMSE=%.4f E_RMSE=%.4f F_Ang=%.2f deg R2=%.4f EqErr=%.2e | DFF: 4D_RMSE=%.4f R2=%.4f\n",
+		       qRmse4, qERmse, qFAng, qR2, eqErr, dRmse4, dR2);
+		ASSERT("Mol PES OOD QNN-SO3-Equiv preserves exact float32 equivariance (< 1e-5)", eqErr < 1e-5);
+		ASSERT("Mol PES OOD QNN-SO3-Equiv achieves strong OOD R2 > 0.96", qR2 > 0.96);
+		ASSERT("Mol PES OOD QNN-SO3-Equiv decisively beats DFF (< 0.25x DFF RMSE)", qRmse4 < 0.25 * dRmse4);
+	}
+
+	// 4c) Tier 2B: Molecular Chirality 3-Class (OOD arbitrary rotations) — SO(3)-Invariant Classification
+	{
+		glades::QuaternionInput chOod;
+		ASSERT("Tier2 Molecular Chirality OOD load succeeds", chOod.loadMolecularChirality(180u, 240u, 1337u, true));
+
+		std::vector<unsigned int> qH;
+		qH.push_back(8u);
+		glades::NNInfo* qInfo = make_qnn_info(
+		    "qnn_mol_chiral_ood", 16, 0.02f, 0.0f, 1e-4f,
+		    qH, glades::GMath::TANH, 3, glades::OutputLayerInfo::CLASSIFICATION, glades::GMath::LINEAR);
+		glades::NNetwork qNet(qInfo, glades::NNetwork::TYPE_QNN);
+		delete qInfo;
+		qNet.setSeed(1337u);
+		glades::TrainingConfig qCfg = qNet.getTrainingConfig();
+		qCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+		qCfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
+		qCfg.qnn.outputReadout = glades::QuaternionConfig::READOUT_REAL_PART;
+		qCfg.qnn.layerMode = glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT;
+		qCfg.qnn.activationMode = glades::QuaternionConfig::ACT_POLAR_TANH;
+		ASSERT("Mol Chiral QNN setTrainingConfig succeeds", qNet.setTrainingConfig(qCfg).ok());
+		glades::Terminator term;
+		term.setEpoch(250);
+		ASSERT("Mol Chiral QNN setTerminator succeeds", qNet.setTerminator(term).ok());
+		ASSERT("Mol Chiral QNN train succeeds", qNet.train(&chOod).ok());
+
+		std::vector<unsigned int> dH;
+		dH.push_back(14u);
+		glades::NNInfo* dInfo = make_qnn_info(
+		    "dff_mol_chiral_ood", 16, 0.05f, 0.9f, 1e-4f,
+		    dH, glades::GMath::TANH, 3, glades::OutputLayerInfo::CLASSIFICATION, glades::GMath::LINEAR);
+		glades::NNetwork dNet(dInfo, glades::NNetwork::TYPE_DFF);
+		delete dInfo;
+		dNet.setSeed(1337u);
+		ASSERT("Mol Chiral DFF setTerminator succeeds", dNet.setTerminator(term).ok());
+		ASSERT("Mol Chiral DFF train succeeds", dNet.train(&chOod).ok());
+
+		std::vector< std::vector<float> > qPreds, dPreds;
+		unsigned int qCorr = 0u, qTot = 0u, dCorr = 0u, dTot = 0u;
+		eval_split_predictions(qNet, chOod, false, qPreds, qCorr, qTot, NULL, NULL);
+		eval_split_predictions(dNet, chOod, false, dPreds, dCorr, dTot, NULL, NULL);
+		const double qAcc = 100.0 * static_cast<double>(qCorr) / static_cast<double>(qTot);
+		const double dAcc = 100.0 * static_cast<double>(dCorr) / static_cast<double>(dTot);
+		const double invErr = measure_so3_symmetry_error(qNet, 3u, 3u, true, 9202u);
+		printf("  [Mol Chiral OOD]   QNN-SO3-Equiv: Acc=%.2f%% (%u/%u) InvErr=%.2e | DFF: Acc=%.2f%% (%u/%u)\n",
+		       qAcc, qCorr, qTot, invErr, dAcc, dCorr, dTot);
+		ASSERT("Mol Chiral OOD QNN-SO3-Equiv preserves exact float32 SO(3) invariance (< 1e-5)", invErr < 1e-5);
+		ASSERT("Mol Chiral OOD QNN-SO3-Equiv achieves >= 95% OOD enantiomer accuracy", qAcc >= 95.0);
+		ASSERT("Mol Chiral OOD QNN-SO3-Equiv decisively beats DFF (+30% acc)", qAcc >= dAcc + 30.0);
+	}
+
+	// 4d) Tier 2C: Slater-Koster Quantum p-p Orbital Overlap (OOD hemisphere) — SO(3)-Invariant Scalar Regression
+	{
+		glades::QuaternionInput skOod;
+		ASSERT("Tier2 Slater-Koster OOD load succeeds", skOod.loadSlaterKosterOrbital(192u, 192u, 2024u, true));
+
+		std::vector<unsigned int> qH;
+		qH.push_back(8u);
+		qH.push_back(6u);
+		glades::NNInfo* qInfo = make_qnn_info(
+		    "qnn_slater_ood", 16, 0.015f, 0.0f, 1e-5f,
+		    qH, glades::GMath::TANH, 1, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork qNet(qInfo, glades::NNetwork::TYPE_QNN);
+		delete qInfo;
+		qNet.setSeed(2024u);
+		glades::TrainingConfig qCfg = qNet.getTrainingConfig();
+		qCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+		qCfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
+		qCfg.qnn.outputReadout = glades::QuaternionConfig::READOUT_REAL_PART;
+		qCfg.qnn.layerMode = glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT;
+		qCfg.qnn.activationMode = glades::QuaternionConfig::ACT_POLAR_TANH;
+		ASSERT("Slater-Koster QNN setTrainingConfig succeeds", qNet.setTrainingConfig(qCfg).ok());
+		glades::Terminator term;
+		term.setEpoch(350);
+		ASSERT("Slater-Koster QNN setTerminator succeeds", qNet.setTerminator(term).ok());
+		ASSERT("Slater-Koster QNN train succeeds", qNet.train(&skOod).ok());
+
+		std::vector<unsigned int> dH;
+		dH.push_back(14u);
+		dH.push_back(11u);
+		glades::NNInfo* dInfo = make_qnn_info(
+		    "dff_slater_ood", 16, 0.03f, 0.9f, 1e-5f,
+		    dH, glades::GMath::TANH, 1, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork dNet(dInfo, glades::NNetwork::TYPE_DFF);
+		delete dInfo;
+		dNet.setSeed(2024u);
+		ASSERT("Slater-Koster DFF setTerminator succeeds", dNet.setTerminator(term).ok());
+		ASSERT("Slater-Koster DFF train succeeds", dNet.train(&skOod).ok());
+
+		double qRmse = 0.0, qMae = 0.0, qR2 = 0.0;
+		double dRmse = 0.0, dMae = 0.0, dR2 = 0.0;
+		eval_scalar_reg_metrics(qNet, skOod, qRmse, qMae, qR2);
+		eval_scalar_reg_metrics(dNet, skOod, dRmse, dMae, dR2);
+		const double invErr = measure_so3_symmetry_error(qNet, 3u, 1u, true, 9303u);
+		printf("  [Slater-Koster OOD] QNN-SO3-Equiv: RMSE=%.4f MAE=%.4f R2=%.4f InvErr=%.2e | DFF: RMSE=%.4f R2=%.4f\n",
+		       qRmse, qMae, qR2, invErr, dRmse, dR2);
+		ASSERT("Slater-Koster OOD QNN-SO3-Equiv preserves exact float32 SO(3) invariance (< 1e-5)", invErr < 1e-5);
+		ASSERT("Slater-Koster OOD QNN-SO3-Equiv achieves strong OOD R2 > 0.95", qR2 > 0.95);
+		ASSERT("Slater-Koster OOD QNN-SO3-Equiv decisively beats DFF (< 0.25x DFF RMSE)", qRmse < 0.25 * dRmse);
+	}
+
+	// 4e) Tier 2D: Keplerian Orbital Energy + Laplace-Runge-Lenz Eccentricity Vector (OOD orbital plane)
+	{
+		glades::QuaternionInput kepOod;
+		ASSERT("Tier2 Kepler Orbit OOD load succeeds", kepOod.loadKeplerOrbit(192u, 192u, 7777u, true));
+
+		std::vector<unsigned int> qH;
+		qH.push_back(8u);
+		qH.push_back(6u);
+		glades::NNInfo* qInfo = make_qnn_info(
+		    "qnn_kepler_ood", 16, 0.015f, 0.0f, 1e-5f,
+		    qH, glades::GMath::TANH, 4, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork qNet(qInfo, glades::NNetwork::TYPE_QNN);
+		delete qInfo;
+		qNet.setSeed(7777u);
+		glades::TrainingConfig qCfg = qNet.getTrainingConfig();
+		qCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+		qCfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
+		qCfg.qnn.outputReadout = glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS;
+		qCfg.qnn.layerMode = glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT;
+		qCfg.qnn.activationMode = glades::QuaternionConfig::ACT_POLAR_TANH;
+		ASSERT("Kepler QNN setTrainingConfig succeeds", qNet.setTrainingConfig(qCfg).ok());
+		glades::Terminator term;
+		term.setEpoch(350);
+		ASSERT("Kepler QNN setTerminator succeeds", qNet.setTerminator(term).ok());
+		ASSERT("Kepler QNN train succeeds", qNet.train(&kepOod).ok());
+
+		std::vector<unsigned int> dH;
+		dH.push_back(14u);
+		dH.push_back(11u);
+		glades::NNInfo* dInfo = make_qnn_info(
+		    "dff_kepler_ood", 16, 0.03f, 0.9f, 1e-5f,
+		    dH, glades::GMath::TANH, 4, glades::OutputLayerInfo::REGRESSION, glades::GMath::LINEAR);
+		glades::NNetwork dNet(dInfo, glades::NNetwork::TYPE_DFF);
+		delete dInfo;
+		dNet.setSeed(7777u);
+		ASSERT("Kepler DFF setTerminator succeeds", dNet.setTerminator(term).ok());
+		ASSERT("Kepler DFF train succeeds", dNet.train(&kepOod).ok());
+
+		double qRmse4 = 0.0, qERmse = 0.0, qEAng = 0.0, qR2 = 0.0;
+		double dRmse4 = 0.0, dERmse = 0.0, dEAng = 0.0, dR2 = 0.0;
+		eval_joint_scalar_vec3_metrics(qNet, kepOod, qRmse4, qERmse, qEAng, qR2);
+		eval_joint_scalar_vec3_metrics(dNet, kepOod, dRmse4, dERmse, dEAng, dR2);
+		const double eqErr = measure_so3_symmetry_error(qNet, 2u, 4u, false, 9404u);
+		printf("  [Kepler Orbit OOD] QNN-SO3-Equiv: 4D_RMSE=%.4f E_RMSE=%.4f LRL_Ang=%.2f deg R2=%.4f EqErr=%.2e | DFF: 4D_RMSE=%.4f R2=%.4f\n",
+		       qRmse4, qERmse, qEAng, qR2, eqErr, dRmse4, dR2);
+		ASSERT("Kepler OOD QNN-SO3-Equiv preserves exact float32 equivariance (< 1e-5)", eqErr < 1e-5);
+		ASSERT("Kepler OOD QNN-SO3-Equiv achieves strong OOD R2 > 0.95", qR2 > 0.95);
+		ASSERT("Kepler OOD QNN-SO3-Equiv decisively beats DFF (< 0.25x DFF RMSE)", qRmse4 < 0.25 * dRmse4);
+	}
+
+	printf("[PASS] All Tier 2 SO(3)-symmetric molecular and orbital benchmarks verified.\n");
+}
+
 } // namespace
 
 void QNNUnitTest()
@@ -1998,6 +2539,9 @@ void QNNUnitTest()
 
 	// Phase 3: Tier 1 Functional Benchmarks (SO(3) Rotation/Composition, Parity, Wine, Dow OHLC)
 	test_qnn_tier1_suite();
+
+	// Phase 4: Tier 2 SO(3)-Symmetric Molecular & Orbital Benchmarks
+	test_qnn_tier2_suite();
 
 	printf("====================================================================================================\n");
 	printf("QNN Convergence Summary (XOR & Iris)\n");
