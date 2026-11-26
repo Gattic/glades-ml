@@ -30,30 +30,32 @@ Controlled head-to-head comparisons execute each `(task, model)` in an isolated 
 
 ### 1. $\mathrm{SO}(3)$ 3D Rotation & Quaternion Composition (Decisive `TYPE_QNN` Win)
 
-#### $\mathrm{SO}(3)$ 3D Vector Rotation Sample-Efficiency ($v' = q_{\text{rot}} v q_{\text{rot}}^*$, $N_{\text{test}}=256$, 5 seeds, 400 epochs)
+Entries in both tables report `Test RMSE (Mean Angular Error, R²)` across 5 seeds (`400` epochs, $N_{\text{test}}=256$).
 
-| $N_{\text{train}}$ | `QNN-SO3-Equiv` (`2->8->1`, 123 act, `SGD+M`) | `QNN-SO3-Equiv` (`2->8->1`, 123 act, `AdamW`) | `QNN-Std Polar` (`2->8->1`, 132 act, `AdamW`) | `DFF` `[width=]` (`8->32->4`, 420p, `SGD+M`) | `DFF` `[param=]` (`8->10->4`, 134p, `SGD+M`) |
-|---:|---|---|---|---|---|
-| **32** | `0.0114` (`0.54°`, $R^2=0.9996$) | **`0.0105`** (`0.59°`, $R^2=0.9996$) | `0.4927` (`44.3°`, $R^2=0.305$) | `0.7611` (`74.3°`, $R^2=-0.634$) | `0.9174` (`77.5°`, $R^2=-1.378$) |
-| **64** | **`0.0081`** (`0.39°`, $R^2=0.9998$) | `0.0110` (`0.73°`, $R^2=0.9997$) | `0.3401` (`28.0°`, $R^2=0.675$) | `0.6709` (`60.4°`, $R^2=-0.257$) | `0.8210` (`70.3°`, $R^2=-0.889$) |
-| **128** | **`0.0054`** (`0.29°`, $R^2=0.9999$) | `0.0073` (`0.51°`, $R^2=0.9998$) | `0.2833` (`22.0°`, $R^2=0.776$) | `0.5358` (`47.0°`, $R^2=0.198$) | `0.6265` (`63.9°`, $R^2=-0.096$) |
-| **256** | **`0.0038`** (`0.20°`, $R^2=1.0000$) | `0.0110` (`0.80°`, $R^2=0.9995$) | `0.2950` (`23.0°`, $R^2=0.759$) | `0.6007` (`53.4°`, $R^2=-0.005$) | `0.6076` (`66.2°`, $R^2=-0.019$) |
-| **512** | **`0.0034`** (`0.21°`, $R^2=1.0000$) | `0.0096` (`0.66°`, $R^2=0.9997$) | `0.2992` (`24.0°`, $R^2=0.751$) | `0.5782` (`61.5°`, $R^2=0.082$) | `0.5672` (`62.5°`, $R^2=0.115$) |
+#### $\mathrm{SO}(3)$ 3D Vector Rotation — Sample-Efficiency Curve ($v' = q_{\text{rot}} v q_{\text{rot}}^*$)
 
-- With just **32 training samples**, `QNN-SO3-Equiv` achieves **0.54° angular error ($R^2 = 0.9996$)**, outperforming `TYPE_DFF` trained on **16× more data ($N=512$)** by **50× in RMSE**.
-- At $N=512$, `QNN-SO3-Equiv (SGD+M)` reaches **0.21° error (`RMSE 0.0034`, `167×` lower than param-matched DFF)** while maintaining max $\mathrm{SO}(3)$ equivariance error $\le 7.9 \times 10^{-7}$ (vs. `2.0–4.7` for non-equivariant models).
-- Even without equivariant layers, `ACT_POLAR_TANH` cuts standard-QNN 3D rotation RMSE nearly in half compared to `ACT_SPLIT` (`0.283` vs. `0.484` at $N=128$).
+| $N_{\text{train}}$ | `QNN-SO3-Equiv` (`2->8->1`, 123 act, `SGD+M`) | `QNN-SO3-Equiv` (`2->8->1`, 123 act, `AdamW`) | `QNN-Std Polar` (`2->8->1`, 132 act, `AdamW`) | `QNN-Std Split` (`2->8->1`, 132 act, `AdamW`) | `DFF` `[width=]` (`8->32->4`, 420p, `SGD+M`) | `DFF` `[param=]` (`8->10->4`, 134p, `SGD+M`) |
+|---:|---|---|---|---|---|---|
+| **32** | `0.0114` (`0.54°`, $R^2=0.9996$) | **`0.0105`** (`0.59°`, $R^2=0.9996$) | `0.4927` (`44.3°`, $R^2=0.305$) | `0.7948` (`73.7°`, $R^2=-0.782$) | `0.7611` (`74.3°`, $R^2=-0.634$) | `0.9174` (`77.5°`, $R^2=-1.378$) |
+| **64** | **`0.0081`** (`0.39°`, $R^2=0.9998$) | `0.0110` (`0.73°`, $R^2=0.9997$) | `0.3401` (`28.0°`, $R^2=0.675$) | `0.6475` (`62.8°`, $R^2=-0.167$) | `0.6709` (`60.4°`, $R^2=-0.257$) | `0.8210` (`70.3°`, $R^2=-0.889$) |
+| **128** | **`0.0054`** (`0.29°`, $R^2=0.9999$) | `0.0073` (`0.51°`, $R^2=0.9998$) | `0.2833` (`22.0°`, $R^2=0.776$) | `0.4839` (`46.1°`, $R^2=0.347$) | `0.5358` (`47.0°`, $R^2=0.198$) | `0.6265` (`63.9°`, $R^2=-0.096$) |
+| **256** | **`0.0038`** (`0.20°`, $R^2=1.0000$) | `0.0110` (`0.80°`, $R^2=0.9995$) | `0.2950` (`23.0°`, $R^2=0.759$) | `0.4900` (`49.8°`, $R^2=0.335$) | `0.6007` (`53.4°`, $R^2=-0.005$) | `0.6076` (`66.2°`, $R^2=-0.019$) |
+| **512** | **`0.0034`** (`0.21°`, $R^2=1.0000$) | `0.0096` (`0.66°`, $R^2=0.9997$) | `0.2992` (`24.0°`, $R^2=0.751$) | `0.5482` (`66.8°`, $R^2=0.173$) | `0.5782` (`61.5°`, $R^2=0.082$) | `0.5672` (`62.5°`, $R^2=0.115$) |
 
-#### $\mathrm{SO}(3)$ Out-of-Distribution Generalization ($N_{\text{train}}=128, N_{\text{test}}=256$, 5 seeds)
+#### $\mathrm{SO}(3)$ OOD 3D Rotation & Quaternion Composition ($N_{\text{train}}=128, N_{\text{test}}=256$, 5 seeds)
 
-| Task | `QNN-SO3-Equiv` (`AdamW`) | `QNN-SO3-Equiv` (`SGD+M`) | `QNN-Std Polar` (`AdamW`) | `DFF` `[width=]` (`SGD+M`) | `DFF` `[param=]` (`SGD+M`) |
-|---|---|---|---|---|---|
-| **3D Rot OOD** ($v_z < -0.25$, $\theta \in [\pi/2,\pi]$) | **`0.0929`** (`6.16°`, $R^2=0.9747$) | `0.1137` (`7.75°`, $R^2=0.9631$) | `0.7622` (`85.8°`, $R^2=-0.614$) | `0.9578` (`91.9°`, $R^2=-1.561$) | `1.0928` (`96.4°`, $R^2=-2.350$) |
-| **Quat Comp ID** ($q_1 \otimes q_2$) | **`0.0044`** (`0.75°`, $R^2=0.9999$) | `0.0050` (`0.77°`, $R^2=0.9999$) | `0.2661` (`52.5°`, $R^2=0.704$) | `0.2442` (`45.5°`, $R^2=0.745$) | `0.3462` (`74.1°`, $R^2=0.497$) |
-| **Quat Comp OOD** (opposite frame) | `0.0048` (`0.93°`, $R^2=0.9998$) | **`0.0045`** (`0.74°`, $R^2=0.9999$) | `0.6752` (`115.1°`, $R^2=-1.226$) | `0.7602` (`126.3°`, $R^2=-1.795$) | `0.7941` (`138.0°`, $R^2=-2.044$) |
+| Task | `QNN-SO3-Equiv` (`AdamW`) | `QNN-SO3-Equiv` (`SGD+M`) | `QNN-Std Polar` (`AdamW`) | `QNN-Std Split` (`SGD+M`) | `DFF` `[width=]` (`SGD+M`) | `DFF` `[param=]` (`SGD+M`) |
+|---|---|---|---|---|---|---|
+| **3D Rot OOD** ($v_z < -0.25$, $\theta \in [\pi/2,\pi]$) | **`0.0929`** (`6.16°`, $R^2=0.9747$) | `0.1137` (`7.75°`, $R^2=0.9631$) | `0.7622` (`85.8°`, $R^2=-0.614$) | `0.8894` (`91.0°`, $R^2=-1.210$) | `0.9578` (`91.9°`, $R^2=-1.561$) | `1.0928` (`96.4°`, $R^2=-2.350$) |
+| **Quat Comp ID** ($q_1 \otimes q_2$) | **`0.0044`** (`0.75°`, $R^2=0.9999$) | `0.0050` (`0.77°`, $R^2=0.9999$) | `0.2661` (`52.5°`, $R^2=0.704$) | `0.3799` (`82.7°`, $R^2=0.381$) | `0.2442` (`45.5°`, $R^2=0.745$) | `0.3462` (`74.1°`, $R^2=0.497$) |
+| **Quat Comp OOD** (opposite frame) | `0.0048` (`0.93°`, $R^2=0.9998$) | **`0.0045`** (`0.74°`, $R^2=0.9999$) | `0.6752` (`115.1°`, $R^2=-1.226$) | `0.6591` (`131.3°`, $R^2=-1.102$) | `0.7602` (`126.3°`, $R^2=-1.795$) | `0.7941` (`138.0°`, $R^2=-2.044$) |
 
-- On OOD quaternion composition, `QNN-SO3-Equiv` (`93` active params) exhibits **zero OOD degradation** (`0.74°` geodesic error, $R^2=0.9999$, **176× lower RMSE** than param-matched DFF).
-- On combined opposite-hemisphere + unseen-angle 3D rotation OOD, `QNN-SO3-Equiv` achieves **10.3–11.8× lower RMSE** and $R^2 = +0.975$ where every non-equivariant baseline collapses to negative $R^2$ ($\ge 85°$ error).
+#### Top Findings (Tier 1 $\mathrm{SO}(3)$-Equivariant vs. `TYPE_DFF`)
+
+1. **Extreme sample efficiency (>16× data advantage, up to 167× lower RMSE):** With only **$N=32$** training samples and `123` active parameters, `LAYER_SO3_EQUIVARIANT` + `ACT_POLAR_TANH` achieves **`0.54°`** angular error ($R^2=0.9996$), outperforming `TYPE_DFF` trained on **16× more data ($N=512$)** by **50× in RMSE** (`0.0114` vs. `0.5672`). At $N=512$, `QNN-SO3-Equiv (SGD+M)` reaches **`0.21°`** (`RMSE 0.0034`, **167× lower** than param-matched DFF).
+2. **Exact float32 $\mathrm{SO}(3)$ equivariance and zero OOD frame degradation:** Max conjugation-equivariance error stays at **`4.48e-7`–`7.90e-7`** (vs. `0.32–4.68` for `QNN-Std` and `DFF`). On opposite-frame OOD quaternion composition, `QNN-SO3-Equiv` (`93` active params) exhibits **zero OOD degradation** (`0.74°` geodesic error, $R^2=0.9999$, **176× lower RMSE** than param-matched DFF); on combined unseen-hemisphere + large-angle 3D rotation OOD, it achieves **`6.16°`** (`10.3–11.8×` lower RMSE, $R^2=+0.9747$) where every non-equivariant baseline collapses to negative $R^2$ ($\ge 85°$ error).
+3. **`ACT_POLAR_TANH` helps even without equivariant layers — but is domain-specific:** On standard `LAYER_STANDARD` QNNs, switching from `ACT_SPLIT` to `ACT_POLAR_TANH` cuts 3D-rotation RMSE nearly in half (`0.283` vs. `0.484` at $N=128$). Conversely, on discrete binary parity (e.g., 4-bit parity), `ACT_SPLIT` wins decisively (`20/20` at minimal `37` active params vs. DFF `15/20`, while `ACT_POLAR_TANH` scores `0/20`).
+4. **Complementary Tier 1 non-geometric takeaways:** On coupled 4-channel Dow Jones OHLC, `QNN 1->4->1 Split (AdamW)` matches 2×-wider DFF (`$2.08` RMSE, $R^2=0.9962$) at half the parameters (`49` vs. `97`) while beating param-matched DFF by `1.76–1.91×`; on heterogeneous tabular Wine (`13` features), pairing `ONE_QUAT_PER_FEATURE` with stronger L2 (`wd2=1e-2`) eliminates QNN's calibration gap and yields the lowest test CE overall (`0.0565`, `97.78%` accuracy).
 
 ### 2. Binary Parity & Tiny-Capacity Non-Linear Expressivity (20 Seeds Each)
 
