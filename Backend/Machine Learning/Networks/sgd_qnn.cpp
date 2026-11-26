@@ -158,6 +158,10 @@ void glades::NNetwork::SGDHelper_QNN(unsigned int inputRowCounter, int runType)
 	    (tensorQnn.inputPackingMode == static_cast<unsigned int>(QuaternionConfig::PACK_GROUPS_OF_4));
 	const bool splitReadout =
 	    (tensorQnn.outputReadoutMode == static_cast<unsigned int>(QuaternionConfig::READOUT_SPLIT_COMPONENTS));
+	const bool isSo3Equivariant =
+	    (tensorQnn.layerMode == static_cast<unsigned int>(QuaternionConfig::LAYER_SO3_EQUIVARIANT));
+	const bool usePolarTanh =
+	    (tensorQnn.activationMode == static_cast<unsigned int>(QuaternionConfig::ACT_POLAR_TANH));
 
 	// Inverted dropout masks per quaternion node (layer 0 = input, layers 1..H = hidden).
 	std::vector< std::vector<unsigned char> > keepMasks;
@@ -242,13 +246,14 @@ void glades::NNetwork::SGDHelper_QNN(unsigned int inputRowCounter, int runType)
 			}
 		}
 
-		// Dense Hamilton-product transitions.
+		// Dense Hamilton-product (or SO(3)-equivariant bilinear Hamilton) transitions.
 		for (unsigned int t = 0u; t < tensorQnn.T.size(); ++t)
 		{
 			const TensorQNNState::Transition& tr = tensorQnn.T[t];
 			const int actFx = skeleton->getActivationType(t);
 			const float actParam = skeleton->getActivationParam(t);
 			const bool softmaxThisLayer = useSoftmax && (t == lastTransition);
+			const bool polarThisLayer = usePolarTanh && (t < lastTransition);
 			const bool dropoutThisLayer = isTrain && (t < static_cast<unsigned int>(H));
 			const unsigned int outLayerIdx = t + 1u;
 			const float dropoutScale =
@@ -263,13 +268,45 @@ void glades::NNetwork::SGDHelper_QNN(unsigned int inputRowCounter, int runType)
 				{
 					tensorQnn.z[outLayerIdx][m] = Quaternion::zero();
 					tensorQnn.a[outLayerIdx][m] = Quaternion::zero();
+					if (isSo3Equivariant)
+					{
+						tensorQnn.eqL[outLayerIdx][m] = Quaternion::zero();
+						tensorQnn.eqR[outLayerIdx][m] = Quaternion::zero();
+					}
 					continue;
 				}
 
-				Quaternion zq = (m < tr.bias.size()) ? tr.bias[m] : Quaternion::zero();
+				Quaternion zq;
 				const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(tr.qIn);
-				for (unsigned int n = 0u; n < tr.qIn; ++n)
-					zq += Quaternion::mul(tr.W[rowOff + n], tensorQnn.a[t][n]);
+				if (isSo3Equivariant)
+				{
+					const Quaternion bm = (m < tr.bias.size()) ? tr.bias[m] : Quaternion::zero();
+					Quaternion lm(bm.r, 0.0f, 0.0f, 0.0f);
+					Quaternion rm(bm.i, 0.0f, 0.0f, 0.0f);
+					for (unsigned int n = 0u; n < tr.qIn; ++n)
+					{
+						const Quaternion& w = tr.W[rowOff + n];
+						const Quaternion& an = tensorQnn.a[t][n];
+						lm.r += w.r * an.r;
+						lm.i += w.i * an.i;
+						lm.j += w.i * an.j;
+						lm.k += w.i * an.k;
+						rm.r += w.j * an.r;
+						rm.i += w.k * an.i;
+						rm.j += w.k * an.j;
+						rm.k += w.k * an.k;
+					}
+					tensorQnn.eqL[outLayerIdx][m] = lm;
+					tensorQnn.eqR[outLayerIdx][m] = rm;
+					zq = Quaternion::mul(lm, rm);
+					zq.r += bm.j;
+				}
+				else
+				{
+					zq = (m < tr.bias.size()) ? tr.bias[m] : Quaternion::zero();
+					for (unsigned int n = 0u; n < tr.qIn; ++n)
+						zq += Quaternion::mul(tr.W[rowOff + n], tensorQnn.a[t][n]);
+				}
 
 				if (!zq.isFinite())
 				{
@@ -285,6 +322,19 @@ void glades::NNetwork::SGDHelper_QNN(unsigned int inputRowCounter, int runType)
 				if (softmaxThisLayer)
 				{
 					tensorQnn.a[outLayerIdx][m] = zq;
+				}
+				else if (polarThisLayer)
+				{
+					Quaternion aq = Quaternion::polarTanh(zq);
+					if (!aq.isFinite())
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_QNN: non-finite polar activation detected (NaN/Inf)");
+						running = false;
+						return;
+					}
+					if (dropoutThisLayer && dropoutScale != 1.0f)
+						aq *= dropoutScale;
+					tensorQnn.a[outLayerIdx][m] = aq;
 				}
 				else
 				{
@@ -484,86 +534,128 @@ void glades::NNetwork::SGDHelper_QNN(unsigned int inputRowCounter, int runType)
 				tensorQnn.delta[lastLayer][k].r = dL_dz;
 		}
 
-		// Hidden deltas: dL/da_n^(l) = sum_m (W_{m,n}^(l))* (x) delta_m^(l+1),
-		// then component-wise split activation derivative.
-		for (int li = static_cast<int>(lastLayer) - 1; li >= 1; --li)
+		// Unified backward pass through transitions t = lastTransition .. 0:
+		// accumulates parameter gradients (gW, gBias) and propagates delta[t+1] -> delta[t].
+		std::vector<Quaternion> gradA;
+		for (int ti = static_cast<int>(lastTransition); ti >= 0; --ti)
 		{
-			const unsigned int l = static_cast<unsigned int>(li);
-			const TensorQNNState::Transition& nextTr = tensorQnn.T[l];
-			const int actFx = skeleton->getActivationType(l - 1u);
-			const float actParam = skeleton->getActivationParam(l - 1u);
-			const float sc = (l < keepScales.size()) ? keepScales[l] : 1.0f;
-			const float invSc = (sc != 1.0f) ? (1.0f / sc) : 1.0f;
-
-			for (unsigned int n = 0u; n < tensorQnn.qSizes[l]; ++n)
-			{
-				if (l < keepMasks.size() && n < keepMasks[l].size() && keepMasks[l][n] == 0u)
-				{
-					tensorQnn.delta[l][n] = Quaternion::zero();
-					continue;
-				}
-
-				Quaternion gradA = Quaternion::zero();
-				for (unsigned int m = 0u; m < nextTr.qOut; ++m)
-				{
-					const Quaternion& w = nextTr.W[static_cast<size_t>(m) * static_cast<size_t>(nextTr.qIn) + n];
-					gradA += Quaternion::mulConjLeft(w, tensorQnn.delta[l + 1u][m]);
-				}
-
-				const Quaternion aUnscaled = (sc != 1.0f) ? (tensorQnn.a[l][n] * invSc) : tensorQnn.a[l][n];
-				const Quaternion d(
-				    clipf_maybe(gradA.r * sc * GMath::activationErrDer(aUnscaled.r, actFx, actParam), gradClip),
-				    clipf_maybe(gradA.i * sc * GMath::activationErrDer(aUnscaled.i, actFx, actParam), gradClip),
-				    clipf_maybe(gradA.j * sc * GMath::activationErrDer(aUnscaled.j, actFx, actParam), gradClip),
-				    clipf_maybe(gradA.k * sc * GMath::activationErrDer(aUnscaled.k, actFx, actParam), gradClip));
-				if (!d.isFinite())
-				{
-					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_QNN: non-finite hidden delta detected (NaN/Inf)");
-					running = false;
-					return;
-				}
-				tensorQnn.delta[l][n] = d;
-			}
-		}
-
-		// Input-layer activation gradient dL/da^(0) (pre-dropout coordinates).
-		{
-			const TensorQNNState::Transition& firstTr = tensorQnn.T[0];
-			const float sc0 = (!keepScales.empty()) ? keepScales[0] : 1.0f;
-			for (unsigned int n = 0u; n < tensorQnn.qSizes[0]; ++n)
-			{
-				if (!keepMasks[0].empty() && n < keepMasks[0].size() && keepMasks[0][n] == 0u)
-				{
-					tensorQnn.delta[0][n] = Quaternion::zero();
-					continue;
-				}
-				Quaternion gradIn = Quaternion::zero();
-				for (unsigned int m = 0u; m < firstTr.qOut; ++m)
-				{
-					const Quaternion& w = firstTr.W[static_cast<size_t>(m) * static_cast<size_t>(firstTr.qIn) + n];
-					gradIn += Quaternion::mulConjLeft(w, tensorQnn.delta[1][m]);
-				}
-				if (sc0 != 1.0f)
-					gradIn *= sc0;
-				tensorQnn.delta[0][n] = gradIn;
-			}
-		}
-
-		// Accumulate minibatch gradients:
-		//   dL/dW_{m,n}^(t) += delta_m^(t+1) (x) (a_n^(t))*
-		//   dL/db_m^(t)     += delta_m^(t+1)
-		for (unsigned int t = 0u; t < tensorQnn.T.size(); ++t)
-		{
+			const unsigned int t = static_cast<unsigned int>(ti);
 			TensorQNNState::Transition& tr = tensorQnn.T[t];
-			for (unsigned int m = 0u; m < tr.qOut; ++m)
-			{
-				const Quaternion& d = tensorQnn.delta[t + 1u][m];
-				if (m < tr.gBias.size())
-					tr.gBias[m] += d;
+			gradA.assign(tr.qIn, Quaternion::zero());
 
-				const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(tr.qIn);
-				for (unsigned int n = 0u; n < tr.qIn; ++n)
-					tr.gW[rowOff + n] += Quaternion::mulConjRight(d, tensorQnn.a[t][n]);
+			if (isSo3Equivariant)
+			{
+				for (unsigned int m = 0u; m < tr.qOut; ++m)
+				{
+					const Quaternion& d = tensorQnn.delta[t + 1u][m];
+					const Quaternion gL = Quaternion::mulConjRight(d, tensorQnn.eqR[t + 1u][m]);
+					const Quaternion gR = Quaternion::mulConjLeft(tensorQnn.eqL[t + 1u][m], d);
+
+					if (m < tr.gBias.size())
+					{
+						tr.gBias[m].r += gL.r;
+						tr.gBias[m].i += gR.r;
+						tr.gBias[m].j += d.r;
+					}
+
+					const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(tr.qIn);
+					for (unsigned int n = 0u; n < tr.qIn; ++n)
+					{
+						const Quaternion& w = tr.W[rowOff + n];
+						const Quaternion& an = tensorQnn.a[t][n];
+
+						tr.gW[rowOff + n].r += gL.r * an.r;
+						tr.gW[rowOff + n].i += (gL.i * an.i) + (gL.j * an.j) + (gL.k * an.k);
+						tr.gW[rowOff + n].j += gR.r * an.r;
+						tr.gW[rowOff + n].k += (gR.i * an.i) + (gR.j * an.j) + (gR.k * an.k);
+
+						gradA[n].r += (w.r * gL.r) + (w.j * gR.r);
+						gradA[n].i += (w.i * gL.i) + (w.k * gR.i);
+						gradA[n].j += (w.i * gL.j) + (w.k * gR.j);
+						gradA[n].k += (w.i * gL.k) + (w.k * gR.k);
+					}
+				}
+			}
+			else
+			{
+				for (unsigned int m = 0u; m < tr.qOut; ++m)
+				{
+					const Quaternion& d = tensorQnn.delta[t + 1u][m];
+					if (m < tr.gBias.size())
+						tr.gBias[m] += d;
+
+					const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(tr.qIn);
+					for (unsigned int n = 0u; n < tr.qIn; ++n)
+					{
+						const Quaternion& w = tr.W[rowOff + n];
+						tr.gW[rowOff + n] += Quaternion::mulConjRight(d, tensorQnn.a[t][n]);
+						gradA[n] += Quaternion::mulConjLeft(w, d);
+					}
+				}
+			}
+
+			if (t > 0u)
+			{
+				const unsigned int l = t;
+				const int actFx = skeleton->getActivationType(l - 1u);
+				const float actParam = skeleton->getActivationParam(l - 1u);
+				const float sc = (l < keepScales.size()) ? keepScales[l] : 1.0f;
+				const float invSc = (sc != 1.0f) ? (1.0f / sc) : 1.0f;
+
+				for (unsigned int n = 0u; n < tensorQnn.qSizes[l]; ++n)
+				{
+					if (l < keepMasks.size() && n < keepMasks[l].size() && keepMasks[l][n] == 0u)
+					{
+						tensorQnn.delta[l][n] = Quaternion::zero();
+						continue;
+					}
+
+					Quaternion d;
+					if (usePolarTanh)
+					{
+						const Quaternion gEff = (sc != 1.0f) ? (gradA[n] * sc) : gradA[n];
+						d = Quaternion::polarTanhBackward(tensorQnn.z[l][n], gEff);
+						if (gradClip > 0.0f)
+						{
+							const float dn = d.norm();
+							if (dn > gradClip)
+								d *= (gradClip / dn);
+						}
+					}
+					else
+					{
+						const Quaternion aUnscaled = (sc != 1.0f) ? (tensorQnn.a[l][n] * invSc) : tensorQnn.a[l][n];
+						d = Quaternion(
+						    clipf_maybe(gradA[n].r * sc * GMath::activationErrDer(aUnscaled.r, actFx, actParam), gradClip),
+						    clipf_maybe(gradA[n].i * sc * GMath::activationErrDer(aUnscaled.i, actFx, actParam), gradClip),
+						    clipf_maybe(gradA[n].j * sc * GMath::activationErrDer(aUnscaled.j, actFx, actParam), gradClip),
+						    clipf_maybe(gradA[n].k * sc * GMath::activationErrDer(aUnscaled.k, actFx, actParam), gradClip));
+					}
+
+					if (!d.isFinite())
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_QNN: non-finite hidden delta detected (NaN/Inf)");
+						running = false;
+						return;
+					}
+					tensorQnn.delta[l][n] = d;
+				}
+			}
+			else
+			{
+				const float sc0 = (!keepScales.empty()) ? keepScales[0] : 1.0f;
+				for (unsigned int n = 0u; n < tensorQnn.qSizes[0]; ++n)
+				{
+					if (!keepMasks[0].empty() && n < keepMasks[0].size() && keepMasks[0][n] == 0u)
+					{
+						tensorQnn.delta[0][n] = Quaternion::zero();
+						continue;
+					}
+					Quaternion gradIn = gradA[n];
+					if (sc0 != 1.0f)
+						gradIn *= sc0;
+					tensorQnn.delta[0][n] = gradIn;
+				}
 			}
 		}
 

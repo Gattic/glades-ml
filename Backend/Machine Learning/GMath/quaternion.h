@@ -144,6 +144,69 @@ struct Quaternion
 		    (a.r * b.k) - (a.i * b.j) + (a.j * b.i) - (a.k * b.r));
 	}
 
+	// SO(3) conjugation action by unit quaternion u: u (x) q (x) u*.
+	// Leaves scalar part q.r invariant and rotates vector part (q.i, q.j, q.k) in R^3.
+	static Quaternion conjugateAction(const Quaternion& uUnit, const Quaternion& q)
+	{
+		return mulConjRight(mul(uUnit, q), uUnit);
+	}
+
+	// Rotate a 3D vector encoded as a pure quaternion v = (0, vx, vy, vz) by unit quaternion qUnit.
+	static Quaternion rotateVec(const Quaternion& qUnit, const Quaternion& vPure)
+	{
+		const Quaternion rotated = conjugateAction(qUnit, vPure);
+		return Quaternion(0.0f, rotated.i, rotated.j, rotated.k);
+	}
+
+	// Singularity-free SO(3)-equivariant polar tanh activation:
+	//   Phi(z) = (tanh(||z||) / ||z||) * z
+	// Uses 4th-order Taylor expansion near ||z|| = 0 for C^inf smoothness.
+	static Quaternion polarTanh(const Quaternion& z)
+	{
+		const float r2 = z.normSq();
+		float scale = 1.0f;
+		if (r2 < 1e-6f)
+		{
+			scale = 1.0f - (r2 / 3.0f) + ((2.0f / 15.0f) * r2 * r2);
+		}
+		else
+		{
+			const float r = sqrtf(r2);
+			scale = tanhf(r) / r;
+		}
+		return Quaternion(z.r * scale, z.i * scale, z.j * scale, z.k * scale);
+	}
+
+	// Exact analytical vector-Jacobian product for polarTanh:
+	//   dL/dz = s(r) * g + (s'(r) / r) * dot(g, z) * z
+	// where s(r) = tanh(r)/r and s'(r)/r = (r * sech^2(r) - tanh(r)) / r^3.
+	static Quaternion polarTanhBackward(const Quaternion& z, const Quaternion& gradA)
+	{
+		const float r2 = z.normSq();
+		float s = 1.0f;
+		float spOverR = -2.0f / 3.0f;
+		if (r2 < 1e-6f)
+		{
+			s = 1.0f - (r2 / 3.0f) + ((2.0f / 15.0f) * r2 * r2);
+			spOverR = -(2.0f / 3.0f) + ((8.0f / 15.0f) * r2);
+		}
+		else
+		{
+			const float r = sqrtf(r2);
+			const float t = tanhf(r);
+			const float sech2 = 1.0f - (t * t);
+			s = t / r;
+			spOverR = ((r * sech2) - t) / (r2 * r);
+		}
+		const float gz = dot(gradA, z);
+		const float coeffZ = spOverR * gz;
+		return Quaternion(
+		    (s * gradA.r) + (coeffZ * z.r),
+		    (s * gradA.i) + (coeffZ * z.i),
+		    (s * gradA.j) + (coeffZ * z.j),
+		    (s * gradA.k) + (coeffZ * z.k));
+	}
+
 	Quaternion operator-() const
 	{
 		return Quaternion(-r, -i, -j, -k);
@@ -236,6 +299,26 @@ enum QuaternionOutputReadoutMode
 	// Pack up to 4 scalar outputs into each output quaternion's (r, i, j, k) lanes:
 	// Q_out = ceil(D_out / 4).
 	QUAT_READOUT_SPLIT_COMPONENTS = 1
+};
+
+enum QuaternionLayerMode
+{
+	// Standard dense left-Hamilton transition: z_m = b_m + sum_n W_{m,n} (x) a_n.
+	QUAT_LAYER_STANDARD = 0,
+	// Exact SO(3) conjugation-equivariant bilinear Hamilton transition:
+	//   L_m = (b_m.r + sum_n W.r * a_n.r, sum_n W.i * a_n.vec)
+	//   R_m = (b_m.i + sum_n W.j * a_n.r, sum_n W.k * a_n.vec)
+	//   z_m = (b_m.j, 0, 0, 0) + L_m (x) R_m
+	// Satisfies z_m(u a u*) = u z_m(a) u* identically for all unit quaternions u in S^3.
+	QUAT_LAYER_SO3_EQUIVARIANT = 1
+};
+
+enum QuaternionActivationMode
+{
+	// Component-wise split scalar activation using NNInfo's activation type.
+	QUAT_ACT_SPLIT = 0,
+	// SO(3)-equivariant polar tanh on hidden layers: Phi(z) = (tanh(||z||)/||z||) * z.
+	QUAT_ACT_POLAR_TANH = 1
 };
 
 inline unsigned int quaternionInputCount(unsigned int realFeatureCount, QuaternionInputPackingMode packing)

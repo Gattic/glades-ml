@@ -1138,6 +1138,8 @@ private:
 		unsigned int realOutSize;
 		unsigned int inputPackingMode;
 		unsigned int outputReadoutMode;
+		unsigned int layerMode;
+		unsigned int activationMode;
 		// Quaternion layer widths: [Q_in, H_1, ..., H_L, Q_out]
 		std::vector<unsigned int> qSizes;
 
@@ -1165,6 +1167,9 @@ private:
 		std::vector< std::vector<Quaternion> > z;     // pre-activations (layers 1..L+1)
 		std::vector< std::vector<Quaternion> > a;     // activations (layers 0..L+1)
 		std::vector< std::vector<Quaternion> > delta; // dL/dz (layers 1..L+1) and dL/da[0]
+		// Equivariant bilinear factor caches (allocated only when layerMode == LAYER_SO3_EQUIVARIANT)
+		std::vector< std::vector<Quaternion> > eqL;
+		std::vector< std::vector<Quaternion> > eqR;
 
 		// Scalar output readout buffer (length realOutSize)
 		std::vector<float> outReadout;
@@ -1178,6 +1183,8 @@ private:
 		      realOutSize(0u),
 		      inputPackingMode(0u),
 		      outputReadoutMode(0u),
+		      layerMode(0u),
+		      activationMode(0u),
 		      batchCount(0u),
 		      optimizerStep(0ULL)
 		{
@@ -1190,11 +1197,15 @@ private:
 			realOutSize = 0u;
 			inputPackingMode = 0u;
 			outputReadoutMode = 0u;
+			layerMode = 0u;
+			activationMode = 0u;
 			qSizes.clear();
 			T.clear();
 			z.clear();
 			a.clear();
 			delta.clear();
+			eqL.clear();
+			eqR.clear();
 			outReadout.clear();
 			batchCount = 0u;
 			optimizerStep = 0ULL;

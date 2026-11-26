@@ -2261,8 +2261,26 @@ struct QuaternionConfig
 		READOUT_SPLIT_COMPONENTS = QUAT_READOUT_SPLIT_COMPONENTS
 	};
 
+	enum LayerMode
+	{
+		// Standard dense left-Hamilton transition: z_m = b_m + sum_n W_{m,n} (x) a_n.
+		LAYER_STANDARD = QUAT_LAYER_STANDARD,
+		// Exact SO(3) conjugation-equivariant bilinear Hamilton transition.
+		LAYER_SO3_EQUIVARIANT = QUAT_LAYER_SO3_EQUIVARIANT
+	};
+
+	enum ActivationMode
+	{
+		// Component-wise split scalar activation using NNInfo's activation type.
+		ACT_SPLIT = QUAT_ACT_SPLIT,
+		// Singularity-free SO(3)-equivariant polar tanh on hidden layers.
+		ACT_POLAR_TANH = QUAT_ACT_POLAR_TANH
+	};
+
 	InputPackingMode inputPacking;
 	OutputReadoutMode outputReadout;
+	LayerMode layerMode;
+	ActivationMode activationMode;
 	// Use Quaternion He uniform init sqrt(3/(2*Q_in)) for RELU/LEAKY transitions,
 	// and Quaternion Glorot uniform init sqrt(3/(2*(Q_in+Q_out))) otherwise.
 	bool useHeInitForRelu;
@@ -2270,6 +2288,8 @@ struct QuaternionConfig
 	QuaternionConfig()
 	    : inputPacking(PACK_GROUPS_OF_4),
 	      outputReadout(READOUT_REAL_PART),
+	      layerMode(LAYER_STANDARD),
+	      activationMode(ACT_SPLIT),
 	      useHeInitForRelu(true)
 	{
 	}

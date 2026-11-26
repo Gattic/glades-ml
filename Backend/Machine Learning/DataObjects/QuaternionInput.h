@@ -68,6 +68,59 @@ public:
 	             QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
 	             QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
 
+	// Load any binary truth-table CSV with N input columns + 1 output column (e.g., xorparity3.csv).
+	bool loadParityFile(const std::string& filePath,
+	                    QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                    QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Generate complete 2^nBits odd-parity truth table (1 <= nBits <= 8).
+	bool loadBinaryParity(unsigned int nBits,
+	                      QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                      QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Dedicated Wine dataset loader (13 numeric features + 3 wine cultivar classes).
+	bool loadWine(const std::string& filePath,
+	              const TrainTestSplitConfig& splitCfg,
+	              int standardizeFlag = GMath::ZSCORE,
+	              QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	              QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Dedicated Dow Jones weekly OHLC 4-tuple regression loader:
+	// Packs train-only Z-scored (open, high, low, close) into 1 input quaternion and
+	// predicts next_weeks_close standardized by train close mean/std.
+	bool loadDowJonesOHLC(const std::string& trainPath,
+	                      const std::string& testPath,
+	                      float* outTargetMean = NULL,
+	                      float* outTargetStd = NULL,
+	                      QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                      QuaternionOutputReadoutMode readout = QUAT_READOUT_REAL_PART);
+
+	// Synthetic SO(3) 3D vector rotation regression:
+	//   Input  (8 reals -> 2 quats): (0, vx, vy, vz), (qr, qi, qj, qk) with ||q|| = 1
+	//   Target (4 reals -> 1 quat) : (0, vx', vy', vz') = q (x) (0, v) (x) q*
+	// When oodHemisphereAndAngle is true:
+	//   Train: vz > 0.25, rotation angle in [0, pi/2]
+	//   Test : vz < -0.25, rotation angle in [pi/2, pi]
+	bool loadSO3Rotation(unsigned int nTrain,
+	                     unsigned int nTest,
+	                     unsigned int seed,
+	                     bool oodHemisphereAndAngle = false,
+	                     QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                     QuaternionOutputReadoutMode readout = QUAT_READOUT_SPLIT_COMPONENTS);
+
+	// Synthetic SO(3) quaternion composition regression:
+	//   Input  (8 reals -> 2 quats): unit quaternions q1, q2
+	//   Target (4 reals -> 1 quat) : q1 (x) q2
+	// When oodRotatedFrame is true:
+	//   Train: q1.k > 0.15 and q2.k > 0.15
+	//   Test : q1.k < -0.15 and q2.k < -0.15
+	bool loadSO3Composition(unsigned int nTrain,
+	                        unsigned int nTest,
+	                        unsigned int seed,
+	                        bool oodRotatedFrame = false,
+	                        QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,
+	                        QuaternionOutputReadoutMode readout = QUAT_READOUT_SPLIT_COMPONENTS);
+
 	// Materialize/re-encode quaternion input & target buffers from the currently
 	// loaded NumberInput train/test matrices.
 	bool rebuildQuaternionBuffers(QuaternionInputPackingMode packing = QUAT_PACK_GROUPS_OF_4,

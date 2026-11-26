@@ -6,6 +6,7 @@
 // (mallinfo2) reflect each model configuration in isolation.
 
 #include "Backend/Machine Learning/main.h"
+#include "Backend/Machine Learning/rng.h"
 #include "Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "Backend/Machine Learning/DataObjects/QuaternionInput.h"
 #include "Backend/Machine Learning/GMath/gmath.h"
@@ -38,51 +39,176 @@ struct ModelSpec
 {
 	const char* id;
 	const char* label;
-	const char* task; // "xor", "iris80", "iris40"
+	const char* task; // xor, iris80, iris40, so3_rot_curve, so3_rot_ood, so3_comp_id, so3_comp_ood, xorparity3, parity3_odd, parity4, dow_ohlc, wine
 	int netType;      // NNetwork::TYPE_QNN or NNetwork::TYPE_DFF
 	unsigned int hiddenSize;
+	glades::QuaternionConfig::InputPackingMode qnnPacking;
 	glades::QuaternionConfig::OutputReadoutMode qnnReadout;
+	glades::QuaternionConfig::LayerMode qnnLayerMode;
+	glades::QuaternionConfig::ActivationMode qnnActMode;
 	glades::OptimizerConfig::Type optimizer;
 	float lr;
 	float momentum;
 	float wd2;
 	unsigned int epochs;
+	unsigned int taskParam; // e.g., N_train for so3_rot_curve
 };
+
+// Shorthand constants for concise table declarations (C++98 compatible)
+#define PK4  glades::QuaternionConfig::PACK_GROUPS_OF_4
+#define PK1  glades::QuaternionConfig::ONE_QUAT_PER_FEATURE
+#define RDR  glades::QuaternionConfig::READOUT_REAL_PART
+#define RDS  glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS
+#define LSTD glades::QuaternionConfig::LAYER_STANDARD
+#define LEQV glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT
+#define ASPL glades::QuaternionConfig::ACT_SPLIT
+#define APOL glades::QuaternionConfig::ACT_POLAR_TANH
+#define SGDM glades::OptimizerConfig::SGD_MOMENTUM
+#define ADMW glades::OptimizerConfig::ADAMW
+#define TQNN glades::NNetwork::TYPE_QNN
+#define TDFF glades::NNetwork::TYPE_DFF
+
+#define SO3_ROT_CURVE_BLOCK(N) \
+	{ "qnn_equiv_polar_adamw_n" #N, "QNN-SO3-Equiv 2->8->1 Polar (AdamW) [N=" #N "]", "so3_rot_curve", TQNN,  8u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_equiv_polar_sgdm_n"  #N, "QNN-SO3-Equiv 2->8->1 Polar (SGD+M) [N=" #N "]", "so3_rot_curve", TQNN,  8u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_polar_adamw_n"   #N, "QNN-Std 2->8->1 Polar (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_split_adamw_n"   #N, "QNN-Std 2->8->1 Split (AdamW) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, N##u }, \
+	{ "qnn_std_split_sgdm_n"    #N, "QNN-Std 2->8->1 Split (SGD+M) [N=" #N "]",       "so3_rot_curve", TQNN,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "dff_8_32_4_sgdm_n"       #N, "DFF 8->32->4 [width=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 32u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }, \
+	{ "dff_8_10_4_sgdm_n"       #N, "DFF 8->10->4 [param=] (SGD+M) [N=" #N "]",       "so3_rot_curve", TDFF, 10u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, N##u }
 
 static const ModelSpec kSpecs[] = {
 	// === XOR Gate (4 samples, batch=4, TANH -> SIGMOID, 20 seeds) ===
-	{ "qnn_1_4_1_sgdm",       "QNN 1->4->1 (SGD+M)",             "xor",    glades::NNetwork::TYPE_QNN,  4u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f,  800u },
-	{ "dff_2_16_1_sgdm",      "DFF 2->16->1 [width=] (SGD+M)",   "xor",    glades::NNetwork::TYPE_DFF, 16u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f,  800u },
-	{ "dff_2_12_1_sgdm",      "DFF 2->12->1 [param=] (SGD+M)",   "xor",    glades::NNetwork::TYPE_DFF, 12u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f,  800u },
-	{ "qnn_1_4_1_adamw",      "QNN 1->4->1 (AdamW)",             "xor",    glades::NNetwork::TYPE_QNN,  4u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::ADAMW,        0.05f, 0.0f, 0.0f,  800u },
-	{ "qnn_1_1_1_sgdm",       "QNN 1->1->1 (SGD+M)",             "xor",    glades::NNetwork::TYPE_QNN,  1u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f, 1500u },
-	{ "dff_2_4_1_sgdm",       "DFF 2->4->1 [width=] (SGD+M)",    "xor",    glades::NNetwork::TYPE_DFF,  4u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f, 1500u },
-	{ "dff_2_3_1_sgdm",       "DFF 2->3->1 [param=] (SGD+M)",    "xor",    glades::NNetwork::TYPE_DFF,  3u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f, 1500u },
-	{ "dff_2_2_1_sgdm",       "DFF 2->2->1 [min] (SGD+M)",       "xor",    glades::NNetwork::TYPE_DFF,  2u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.20f, 0.9f, 0.0f, 1500u },
-	{ "qnn_1_1_1_adamw",      "QNN 1->1->1 (AdamW)",             "xor",    glades::NNetwork::TYPE_QNN,  1u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::ADAMW,        0.05f, 0.0f, 0.0f, 1500u },
+	{ "qnn_1_4_1_sgdm",       "QNN 1->4->1 (SGD+M)",             "xor",    TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "dff_2_16_1_sgdm",      "DFF 2->16->1 [width=] (SGD+M)",   "xor",    TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "dff_2_12_1_sgdm",      "DFF 2->12->1 [param=] (SGD+M)",   "xor",    TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f,  800u, 0u },
+	{ "qnn_1_4_1_adamw",      "QNN 1->4->1 (AdamW)",             "xor",    TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f,  800u, 0u },
+	{ "qnn_1_1_1_sgdm",       "QNN 1->1->1 (SGD+M)",             "xor",    TQNN,  1u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_4_1_sgdm",       "DFF 2->4->1 [width=] (SGD+M)",    "xor",    TDFF,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_3_1_sgdm",       "DFF 2->3->1 [param=] (SGD+M)",    "xor",    TDFF,  3u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_2_2_1_sgdm",       "DFF 2->2->1 [min] (SGD+M)",       "xor",    TDFF,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "qnn_1_1_1_adamw",      "QNN 1->1->1 (AdamW)",             "xor",    TQNN,  1u, PK4, RDR, LSTD, ASPL, ADMW, 0.05f, 0.0f, 0.0f, 1500u, 0u },
 
 	// === Iris 80/20 (120 train / 30 test, batch=16, 5 splits x 5 seeds) ===
-	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris80", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris80", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS, glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris80", glades::NNetwork::TYPE_DFF, 24u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris80", glades::NNetwork::TYPE_DFF, 15u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris80", glades::NNetwork::TYPE_DFF,  9u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris80", glades::NNetwork::TYPE_DFF,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris80", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::ADAMW,        0.02f, 0.0f, 1e-4f, 300u },
-	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris80", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS, glades::OptimizerConfig::ADAMW,        0.02f, 0.0f, 1e-4f, 300u },
-	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris80", glades::NNetwork::TYPE_DFF, 15u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.03f, 0.9f, 1e-4f, 300u },
+	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris80", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris80", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris80", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris80", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris80", TDFF,  9u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris80", TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris80", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris80", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris80", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
 
 	// === Iris 40/60 (60 train / 90 test, batch=16, 5 splits x 5 seeds) ===
-	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris40", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris40", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS, glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris40", glades::NNetwork::TYPE_DFF, 24u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris40", glades::NNetwork::TYPE_DFF, 15u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris40", glades::NNetwork::TYPE_DFF,  9u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris40", glades::NNetwork::TYPE_DFF,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.10f, 0.9f, 1e-4f, 300u },
-	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris40", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::ADAMW,        0.02f, 0.0f, 1e-4f, 300u },
-	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris40", glades::NNetwork::TYPE_QNN,  6u, glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS, glades::OptimizerConfig::ADAMW,        0.02f, 0.0f, 1e-4f, 300u },
-	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris40", glades::NNetwork::TYPE_DFF, 15u, glades::QuaternionConfig::READOUT_REAL_PART,        glades::OptimizerConfig::SGD_MOMENTUM, 0.03f, 0.9f, 1e-4f, 300u }
+	{ "qnn_1_6_3_real_sgdm",  "QNN 1->6->3 Real (SGD+M)",        "iris40", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_sgdm", "QNN 1->6->1 Split (SGD+M)",       "iris40", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_24_3_sgdm",      "DFF 4->24->3 [width=] (SGD+M)",   "iris40", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm",      "DFF 4->15->3 [param=R] (SGD+M)",  "iris40", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_9_3_sgdm",       "DFF 4->9->3 [param=S] (SGD+M)",   "iris40", TDFF,  9u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_4_6_3_sgdm",       "DFF 4->6->3 [nodes=] (SGD+M)",    "iris40", TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_3_real_adamw", "QNN 1->6->3 Real (AdamW)",        "iris40", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "qnn_1_6_1_split_adamw","QNN 1->6->1 Split (AdamW)",       "iris40", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-4f, 300u, 0u },
+	{ "dff_4_15_3_sgdm_lr003","DFF 4->15->3 (SGD+M lr=0.03)",    "iris40", TDFF, 15u, PK4, RDR, LSTD, ASPL, SGDM, 0.03f, 0.9f, 1e-4f, 300u, 0u },
+
+	// === Tier 1A: SO(3) 3D Vector Rotation Sample-Efficiency Curve (N in {32,64,128,256,512}) ===
+	SO3_ROT_CURVE_BLOCK(32),
+	SO3_ROT_CURVE_BLOCK(64),
+	SO3_ROT_CURVE_BLOCK(128),
+	SO3_ROT_CURVE_BLOCK(256),
+	SO3_ROT_CURVE_BLOCK(512),
+
+	// === Tier 1B: SO(3) 3D Vector Rotation OOD (Opposite Hemisphere + Unseen Angle [pi/2, pi], N=128) ===
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->8->1 Polar (AdamW)", "so3_rot_ood", TQNN,  8u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->8->1 Polar (SGD+M)", "so3_rot_ood", TQNN,  8u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->8->1 Polar (AdamW)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->8->1 Split (AdamW)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->8->1 Split (SGD+M)",       "so3_rot_ood", TQNN,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_32_4_sgdm",       "DFF 8->32->4 [width=] (SGD+M)",       "so3_rot_ood", TDFF, 32u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_10_4_sgdm",       "DFF 8->10->4 [param=] (SGD+M)",       "so3_rot_ood", TDFF, 10u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+
+	// === Tier 1C: SO(3) Quaternion Composition q1 (x) q2 (In-Dist & OOD Rotated Frame, N=128) ===
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_id",  TQNN,  6u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_id",  TQNN,  6u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_id",  TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_id",  TDFF, 24u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_id",  TDFF,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+
+	{ "qnn_equiv_polar_adamw", "QNN-SO3-Equiv 2->6->1 Polar (AdamW)", "so3_comp_ood", TQNN,  6u, PK4, RDS, LEQV, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_equiv_polar_sgdm",  "QNN-SO3-Equiv 2->6->1 Polar (SGD+M)", "so3_comp_ood", TQNN,  6u, PK4, RDS, LEQV, APOL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "qnn_std_polar_adamw",   "QNN-Std 2->6->1 Polar (AdamW)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, APOL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_adamw",   "QNN-Std 2->6->1 Split (AdamW)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-5f, 400u, 128u },
+	{ "qnn_std_split_sgdm",    "QNN-Std 2->6->1 Split (SGD+M)",       "so3_comp_ood", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_24_4_sgdm",       "DFF 8->24->4 [width=] (SGD+M)",       "so3_comp_ood", TDFF, 24u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+	{ "dff_8_8_4_sgdm",        "DFF 8->8->4 [param=] (SGD+M)",        "so3_comp_ood", TDFF,  8u, PK4, RDS, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-5f, 400u, 128u },
+
+	// === Tier 1D: In-repo datasets/xorparity3.csv (8 rows, exact-one-bit sum==1, 20 seeds) ===
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "xorparity3",   TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 0u },
+	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "xorparity3",   TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "xorparity3",   TDFF, 10u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 0u },
+	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "xorparity3",   TQNN,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "xorparity3",   TDFF,  5u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 0u },
+
+	// === Tier 1E: Synthetic 3-bit Odd Parity (8 rows, 20 seeds) ===
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "parity3_odd",  TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1000u, 3u },
+	{ "dff_3_16_1_sgdm",       "DFF 3->16->1 [width=] (SGD+M)",       "parity3_odd",  TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "dff_3_10_1_sgdm",       "DFF 3->10->1 [param=] (SGD+M)",       "parity3_odd",  TDFF, 10u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1000u, 3u },
+	{ "qnn_1_2_1_split_sgdm",  "QNN 1->2->1 Split (SGD+M)",           "parity3_odd",  TQNN,  2u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
+	{ "dff_3_5_1_sgdm",        "DFF 3->5->1 [param=] (SGD+M)",        "parity3_odd",  TDFF,  5u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 3u },
+
+	// === Tier 1F: Synthetic 4-bit Odd Parity (16 rows, 20 seeds) ===
+	{ "qnn_1_6_1_split_sgdm",  "QNN 1->6->1 Split (SGD+M)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_6_1_polar_sgdm",  "QNN 1->6->1 Polar (SGD+M)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, APOL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_6_1_split_adamw", "QNN 1->6->1 Split (AdamW)",           "parity4",      TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.03f, 0.0f, 0.0f, 1200u, 4u },
+	{ "dff_4_24_1_sgdm",       "DFF 4->24->1 [width=] (SGD+M)",       "parity4",      TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "dff_4_12_1_sgdm",       "DFF 4->12->1 [param=] (SGD+M)",       "parity4",      TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1200u, 4u },
+	{ "qnn_1_3_1_split_sgdm",  "QNN 1->3->1 Split (SGD+M)",           "parity4",      TQNN,  3u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
+	{ "dff_4_6_1_sgdm",        "DFF 4->6->1 [param=] (SGD+M)",        "parity4",      TDFF,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.20f, 0.9f, 0.0f, 1500u, 4u },
+
+	// === Tier 1G: In-repo Dow Jones OHLC (360 Q1 train -> 390 Q2 test, 5 seeds) ===
+	{ "qnn_1_4_1_split_sgdm",  "QNN 1->4->1 Split (SGD+M)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_polar_sgdm",  "QNN 1->4->1 Polar (SGD+M)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, APOL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_equiv_sgdm",  "QNN-SO3-Equiv 1->4->1 Polar (SGD+M lr=0.01)", "dow_ohlc", TQNN, 4u, PK4, RDR, LEQV, APOL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_split_adamw", "QNN 1->4->1 Split (AdamW)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, ASPL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_polar_adamw", "QNN 1->4->1 Polar (AdamW)",           "dow_ohlc",     TQNN,  4u, PK4, RDR, LSTD, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "qnn_1_4_1_equiv_adamw", "QNN-SO3-Equiv 1->4->1 Polar (AdamW)", "dow_ohlc",     TQNN,  4u, PK4, RDR, LEQV, APOL, ADMW, 0.01f, 0.0f, 1e-4f, 200u, 0u },
+	{ "dff_4_16_1_sgdm",       "DFF 4->16->1 [width=] (SGD+M)",       "dow_ohlc",     TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_8_1_sgdm",        "DFF 4->8->1 [param=] (SGD+M)",        "dow_ohlc",     TDFF,  8u, PK4, RDR, LSTD, ASPL, SGDM, 0.05f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_16_1_sgdm_lr001", "DFF 4->16->1 [width=] (SGD+M lr=0.01)","dow_ohlc",    TDFF, 16u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+	{ "dff_4_8_1_sgdm_lr001",  "DFF 4->8->1 [param=] (SGD+M lr=0.01)", "dow_ohlc",    TDFF,  8u, PK4, RDR, LSTD, ASPL, SGDM, 0.01f, 0.9f, 1e-4f, 200u, 0u },
+
+	// === Tier 1H: In-repo Wine (178 rows, 13 feats, 3 classes, 5 splits x 5 seeds = 25 runs) ===
+	{ "qnn_4_6_3_pack4_sgdm",       "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-4)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_sgdm_wd1e2", "QNN 4->6->3 PACK4 Real (SGD+M, wd=1e-2)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_sgdm_ep60",  "QNN 4->6->3 PACK4 Real (SGD+M, 60 ep)",    "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f,  60u, 0u },
+	{ "qnn_4_6_1_pack4_split_wd1e2","QNN 4->6->1 PACK4 Split (SGD+M, wd=1e-2)", "wine", TQNN,  6u, PK4, RDS, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "qnn_4_6_3_pack4_adamw_wd1e2","QNN 4->6->3 PACK4 Real (AdamW, wd=1e-2)",  "wine", TQNN,  6u, PK4, RDR, LSTD, ASPL, ADMW, 0.02f, 0.0f, 1e-2f, 300u, 0u },
+	{ "qnn_13_6_3_1pf_sgdm",        "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-4)", "wine", TQNN,  6u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "qnn_13_6_3_1pf_sgdm_wd1e2",  "QNN 13->6->3 1-Per-Feat (SGD+M, wd=1e-2)", "wine", TQNN,  6u, PK1, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u },
+	{ "dff_13_24_3_sgdm",           "DFF 13->24->3 [width=] (SGD+M, wd=1e-4)",  "wine", TDFF, 24u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_13_12_3_sgdm",           "DFF 13->12->3 [param=] (SGD+M, wd=1e-4)",  "wine", TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-4f, 300u, 0u },
+	{ "dff_13_12_3_sgdm_wd1e2",     "DFF 13->12->3 [param=] (SGD+M, wd=1e-2)",  "wine", TDFF, 12u, PK4, RDR, LSTD, ASPL, SGDM, 0.10f, 0.9f, 1e-2f, 300u, 0u }
 };
+
+#undef PK4
+#undef PK1
+#undef RDR
+#undef RDS
+#undef LSTD
+#undef LEQV
+#undef ASPL
+#undef APOL
+#undef SGDM
+#undef ADMW
+#undef TQNN
+#undef TDFF
+#undef SO3_ROT_CURVE_BLOCK
 
 static const size_t kNumSpecs = sizeof(kSpecs) / sizeof(kSpecs[0]);
 
@@ -166,6 +292,7 @@ static glades::NNInfo* make_net_info(const char* name,
                                      unsigned int hiddenSize,
                                      int hiddenAct,
                                      int outSize,
+                                     int outType,
                                      int outAct)
 {
 	shmea::GPointer<glades::InputLayerInfo> in(new glades::InputLayerInfo(
@@ -174,7 +301,7 @@ static glades::NNInfo* make_net_info(const char* name,
 	hidden.push_back(shmea::GPointer<glades::HiddenLayerInfo>(new glades::HiddenLayerInfo(
 	    static_cast<int>(hiddenSize), lr, momentum, 0.0f, wd2, 0.0f, outAct, 1.0f)));
 	shmea::GPointer<glades::OutputLayerInfo> out(new glades::OutputLayerInfo(
-	    outSize, glades::OutputLayerInfo::CLASSIFICATION));
+	    outSize, outType));
 	return new glades::NNInfo(shmea::GString(name), in, hidden, out);
 }
 
@@ -187,7 +314,11 @@ static void compute_param_and_state_sizes(const ModelSpec& spec,
 {
 	if (spec.netType == glades::NNetwork::TYPE_QNN)
 	{
-		const unsigned int qIn = glades::quaternionInputCount(realIn, glades::QUAT_PACK_GROUPS_OF_4);
+		const glades::QuaternionInputPackingMode pMode =
+		    (spec.qnnPacking == glades::QuaternionConfig::ONE_QUAT_PER_FEATURE)
+		        ? glades::QUAT_ONE_PER_FEATURE
+		        : glades::QUAT_PACK_GROUPS_OF_4;
+		const unsigned int qIn = glades::quaternionInputCount(realIn, pMode);
 		const unsigned int qH = spec.hiddenSize;
 		const glades::QuaternionOutputReadoutMode rMode =
 		    (spec.qnnReadout == glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS)
@@ -195,24 +326,29 @@ static void compute_param_and_state_sizes(const ModelSpec& spec,
 		        : glades::QUAT_READOUT_REAL_PART;
 		const unsigned int qOut = glades::quaternionOutputCount(realOut, rMode);
 
+		const bool isEquiv = (spec.qnnLayerMode == glades::QuaternionConfig::LAYER_SO3_EQUIVARIANT);
 		const unsigned int w0 = qH * qIn * 4u;
-		const unsigned int b0 = qH * 4u;
+		const unsigned int b0Stored = qH * 4u;
+		const unsigned int b0Active = isEquiv ? (qH * 3u) : b0Stored;
 		const unsigned int w1 = qOut * qH * 4u;
 		const unsigned int b1Stored = qOut * 4u;
-		const unsigned int b1Active = realOut;
+		const unsigned int b1Active = isEquiv ? (qOut * 3u) : realOut;
 
-		outStoredParams = w0 + b0 + w1 + b1Stored;
-		outActiveParams = w0 + b0 + w1 + b1Active;
+		outStoredParams = w0 + b0Stored + w1 + b1Stored;
+		outActiveParams = w0 + b0Active + w1 + b1Active;
 
 		// TensorQNNState: per transition W,vW,v2W,gW + bias,vBias,v2Bias,gBias (16 B/quat)
-		// plus scratch z (layers 1..2), a (layers 0..2), delta (layers 0..2), outReadout (4 B/float).
+		// plus scratch z (layers 1..2), a (layers 0..2), delta (layers 0..2), outReadout (4 B/float),
+		// plus eqL, eqR for LAYER_SO3_EQUIVARIANT.
 		const unsigned int transBytes =
 		    4u * (qH * qIn + qH) * 16u +
 		    4u * (qOut * qH + qOut) * 16u;
+		const unsigned int eqScratchBytes = isEquiv ? (2u * (qH + qOut) * 16u) : 0u;
 		const unsigned int scratchBytes =
 		    (qH + qOut) * 16u +
 		    2u * (qIn + qH + qOut) * 16u +
-		    realOut * 4u;
+		    realOut * 4u +
+		    eqScratchBytes;
 		outCoreStateBytes = transBytes + scratchBytes;
 	}
 	else
@@ -244,7 +380,6 @@ static size_t measure_weights_bin_bytes(glades::NNetwork& net, glades::DataInput
 	const std::string modelName(nameBuf);
 	const std::string dir = "database/models/" + modelName;
 
-	// Ensure database/models exists in the isolated working directory.
 	(void)::mkdir("database", 0755);
 	(void)::mkdir("database/models", 0755);
 
@@ -268,7 +403,8 @@ static size_t measure_weights_bin_bytes(glades::NNetwork& net, glades::DataInput
 struct EpochTracker : public glades::ITrainingCallbacks
 {
 	unsigned int numClasses;
-	bool isXor;
+	bool isBinaryTruthTable;
+	bool isRegression;
 	size_t heapBaseline;
 	size_t* maxHeapDelta;
 
@@ -277,9 +413,10 @@ struct EpochTracker : public glades::ITrainingCallbacks
 	unsigned int epTrain98;
 	double lastError;
 
-	EpochTracker(unsigned int nCls, bool xorTask, size_t base, size_t* maxDelta)
+	EpochTracker(unsigned int nCls, bool binTruth, bool regTask, size_t base, size_t* maxDelta)
 	    : numClasses(nCls),
-	      isXor(xorTask),
+	      isBinaryTruthTable(binTruth),
+	      isRegression(regTask),
 	      heapBaseline(base),
 	      maxHeapDelta(maxDelta),
 	      epBce017(0u),
@@ -299,15 +436,13 @@ struct EpochTracker : public glades::ITrainingCallbacks
 	{
 		lastError = static_cast<double>(m.totalError);
 		const unsigned int ep = static_cast<unsigned int>(m.epoch);
-		if (isXor)
+		if (isBinaryTruthTable)
 		{
 			if (epBce017 == 0u && m.totalError <= 0.17f)
 				epBce017 = ep;
 		}
-		else
+		else if (!isRegression)
 		{
-			// Exact Top-1 accuracy from Glades one-vs-rest confusion-matrix accuracy:
-			// ovr = 100 - (2/C)*(100 - top1) => top1 = 100 - (C/2)*(100 - ovr).
 			const double top1 = 100.0 - 0.5 * static_cast<double>(numClasses) * (100.0 - static_cast<double>(m.totalAccuracy));
 			if (epTrain95 == 0u && top1 >= 95.0)
 				epTrain95 = ep;
@@ -345,7 +480,7 @@ struct EvalStats
 static bool eval_split_exact(glades::NNetwork& net,
                              const glades::NumberInput& di,
                              bool useTrainSplit,
-                             const unsigned int* classOrderMap, // canonical index -> raw class index (or NULL for identity)
+                             const unsigned int* classOrderMap,
                              EvalStats& out)
 {
 	const unsigned int nRows = useTrainSplit ? di.getTrainSize() : di.getTestSize();
@@ -481,13 +616,285 @@ static bool eval_split_exact(glades::NNetwork& net,
 	return true;
 }
 
-static void resolve_iris_class_map(const glades::QuaternionInput& di, unsigned int outMap[3])
+static bool eval_single_row_regression(glades::NNetwork& net,
+                                       const glades::NumberInput& di,
+                                       bool useTrainSplit,
+                                       std::vector< std::vector<float> >& outPreds)
+{
+	const unsigned int nRows = useTrainSplit ? di.getTrainSize() : di.getTestSize();
+	const unsigned int outSize = net.getNNInfo()->getOutputLayerSize();
+	outPreds.assign(nRows, std::vector<float>(outSize, 0.0f));
+
+	glades::NumberInput single;
+	single.testMatrix = shmea::GMatrix(1, shmea::GVector<float>(di.getFeatureCount(), 0.0f));
+	single.testExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(outSize, 0.0f));
+	single.trainMatrix = single.testMatrix;
+	single.trainExpectedMatrix = single.testExpectedMatrix;
+	single.loaded = true;
+
+	for (unsigned int r = 0u; r < nRows; ++r)
+	{
+		const float* x = NULL;
+		unsigned int xN = 0u;
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+		{
+			di.getTrainRowView(r, x, xN);
+			di.getTrainExpectedRowView(r, y, yN);
+		}
+		else
+		{
+			di.getTestRowView(r, x, xN);
+			di.getTestExpectedRowView(r, y, yN);
+		}
+		for (unsigned int c = 0u; c < xN; ++c)
+		{
+			single.testMatrix[0][c] = x[c];
+			single.trainMatrix[0][c] = x[c];
+		}
+		for (unsigned int c = 0u; c < yN; ++c)
+		{
+			single.testExpectedMatrix[0][c] = y[c];
+			single.trainExpectedMatrix[0][c] = y[c];
+		}
+
+		glades::NNetworkStatus st = net.test(&single);
+		if (!st.ok())
+			return false;
+		shmea::GList res = net.getResults();
+		if (res.size() != outSize * 2u)
+			return false;
+		for (unsigned int k = 0u; k < outSize; ++k)
+		{
+			const float p = res.getFloat(k * 2u + 1u);
+			if (!std::isfinite(p))
+				return false;
+			outPreds[r][k] = p;
+		}
+	}
+	return true;
+}
+
+static glades::Quaternion eval_two_quat_net(glades::NNetwork& net,
+                                            const glades::Quaternion& q0,
+                                            const glades::Quaternion& q1)
+{
+	glades::NumberInput single;
+	single.testMatrix = shmea::GMatrix(1, shmea::GVector<float>(8u, 0.0f));
+	single.testExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(4u, 0.0f));
+	single.trainMatrix = single.testMatrix;
+	single.trainExpectedMatrix = single.testExpectedMatrix;
+	single.testMatrix[0][0] = q0.r;
+	single.testMatrix[0][1] = q0.i;
+	single.testMatrix[0][2] = q0.j;
+	single.testMatrix[0][3] = q0.k;
+	single.testMatrix[0][4] = q1.r;
+	single.testMatrix[0][5] = q1.i;
+	single.testMatrix[0][6] = q1.j;
+	single.testMatrix[0][7] = q1.k;
+	single.trainMatrix = single.testMatrix;
+	single.loaded = true;
+
+	net.test(&single);
+	shmea::GList res = net.getResults();
+	return glades::Quaternion(res.getFloat(1u), res.getFloat(3u), res.getFloat(5u), res.getFloat(7u));
+}
+
+static double measure_so3_equivariance_error(glades::NNetwork& net, uint64_t seed)
+{
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, seed);
+	double maxErr = 0.0;
+	for (unsigned int t = 0u; t < 32u; ++t)
+	{
+		const glades::Quaternion q0(
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f));
+		const glades::Quaternion q1(
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f),
+		    glades::rng::uniform_float(eng, -1.0f, 1.0f));
+		glades::Quaternion u(
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng),
+		    glades::rng::standard_normal(eng));
+		u = u.normalized();
+
+		const glades::Quaternion baseOut = eval_two_quat_net(net, q0, q1);
+		const glades::Quaternion rotInOut = eval_two_quat_net(
+		    net,
+		    glades::Quaternion::conjugateAction(u, q0),
+		    glades::Quaternion::conjugateAction(u, q1));
+		const glades::Quaternion rotBaseOut = glades::Quaternion::conjugateAction(u, baseOut);
+		const double err = static_cast<double>((rotInOut - rotBaseOut).norm());
+		if (err > maxErr)
+			maxErr = err;
+	}
+	return maxErr;
+}
+
+static bool eval_so3_split(glades::NNetwork& net,
+                           const glades::NumberInput& di,
+                           bool useTrainSplit,
+                           bool vector3Only,
+                           double& outRmse,
+                           double& outAngleDeg,
+                           double& outR2,
+                           double& outMse)
+{
+	std::vector< std::vector<float> > preds;
+	if (!eval_single_row_regression(net, di, useTrainSplit, preds))
+		return false;
+
+	const unsigned int n = useTrainSplit ? di.getTrainSize() : di.getTestSize();
+	const unsigned int startLane = vector3Only ? 1u : 0u;
+	const unsigned int dims = vector3Only ? 3u : 4u;
+
+	double meanY[4] = { 0.0, 0.0, 0.0, 0.0 };
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+		for (unsigned int c = startLane; c < 4u; ++c)
+			meanY[c] += static_cast<double>(y[c]);
+	}
+	for (unsigned int c = startLane; c < 4u; ++c)
+		meanY[c] /= static_cast<double>(n);
+
+	double sse = 0.0;
+	double sst = 0.0;
+	double sumAngleDeg = 0.0;
+	static const double kRadToDeg = 180.0 / 3.14159265358979323846;
+
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+
+		double dotv = 0.0, np2 = 0.0, ny2 = 0.0;
+		for (unsigned int c = startLane; c < 4u; ++c)
+		{
+			const double p = static_cast<double>(preds[r][c]);
+			const double t = static_cast<double>(y[c]);
+			const double d = p - t;
+			sse += d * d;
+			const double dy = t - meanY[c];
+			sst += dy * dy;
+			dotv += p * t;
+			np2 += p * p;
+			ny2 += t * t;
+		}
+		if (np2 > 1e-12 && ny2 > 1e-12)
+		{
+			double cosA = dotv / std::sqrt(np2 * ny2);
+			if (!vector3Only)
+				cosA = std::fabs(cosA);
+			if (cosA > 1.0) cosA = 1.0;
+			if (cosA < -1.0) cosA = -1.0;
+			const double rad = vector3Only ? std::acos(cosA) : (2.0 * std::acos(cosA));
+			sumAngleDeg += rad * kRadToDeg;
+		}
+	}
+
+	outMse = sse / static_cast<double>(n * dims);
+	outRmse = std::sqrt(outMse);
+	outAngleDeg = sumAngleDeg / static_cast<double>(n);
+	outR2 = (sst > 1e-12) ? (1.0 - (sse / sst)) : 0.0;
+	return true;
+}
+
+static bool eval_dow_split(glades::NNetwork& net,
+                           const glades::NumberInput& di,
+                           bool useTrainSplit,
+                           double targetStd,
+                           double& outRmseStd,
+                           double& outRmseUsd,
+                           double& outMaeStd,
+                           double& outR2,
+                           double& outDirAccPct)
+{
+	std::vector< std::vector<float> > preds;
+	if (!eval_single_row_regression(net, di, useTrainSplit, preds))
+		return false;
+
+	const unsigned int n = useTrainSplit ? di.getTrainSize() : di.getTestSize();
+	double meanY = 0.0;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+			di.getTrainExpectedRowView(r, y, yN);
+		else
+			di.getTestExpectedRowView(r, y, yN);
+		meanY += static_cast<double>(y[0]);
+	}
+	meanY /= static_cast<double>(n);
+
+	double sse = 0.0;
+	double sst = 0.0;
+	double sae = 0.0;
+	unsigned int dirCorrect = 0u;
+	for (unsigned int r = 0u; r < n; ++r)
+	{
+		const float* x = NULL;
+		unsigned int xN = 0u;
+		const float* y = NULL;
+		unsigned int yN = 0u;
+		if (useTrainSplit)
+		{
+			di.getTrainRowView(r, x, xN);
+			di.getTrainExpectedRowView(r, y, yN);
+		}
+		else
+		{
+			di.getTestRowView(r, x, xN);
+			di.getTestExpectedRowView(r, y, yN);
+		}
+		const double p = static_cast<double>(preds[r][0]);
+		const double t = static_cast<double>(y[0]);
+		const double closeCur = static_cast<double>(x[3]);
+		const double d = p - t;
+		sse += d * d;
+		sae += std::fabs(d);
+		const double dy = t - meanY;
+		sst += dy * dy;
+
+		const bool predUp = (p >= closeCur);
+		const bool actUp = (t >= closeCur);
+		if (predUp == actUp)
+			++dirCorrect;
+	}
+
+	outRmseStd = std::sqrt(sse / static_cast<double>(n));
+	outRmseUsd = outRmseStd * targetStd;
+	outMaeStd = sae / static_cast<double>(n);
+	outR2 = (sst > 1e-12) ? (1.0 - (sse / sst)) : 0.0;
+	outDirAccPct = (100.0 * static_cast<double>(dirCorrect)) / static_cast<double>(n);
+	return true;
+}
+
+static void resolve_class_map(const glades::QuaternionInput& di,
+                              const char* const canonical[3],
+                              unsigned int outMap[3])
 {
 	outMap[0] = 0u;
 	outMap[1] = 1u;
 	outMap[2] = 2u;
 	const std::vector<std::string>& labels = di.getClassLabels();
-	const char* canonical[3] = { "Iris-setosa", "Iris-versicolor", "Iris-virginica" };
 	for (unsigned int c = 0u; c < 3u; ++c)
 	{
 		for (size_t i = 0u; i < labels.size(); ++i)
@@ -510,7 +917,8 @@ static void print_tsv_header()
 	    "train_loss_mean\ttest_loss_mean\ttest_loss_std\ttest_brier_mean\t"
 	    "f1_c0\tf1_c1\tf1_c2\tmacro_f1_mean\tmacro_f1_std\t"
 	    "train_ms_mean\ttrain_ms_std\tpredict_split_us\tpredict_sample_us\t"
-	    "peak_heap_delta_kib\tcore_state_bytes\tweights_bin_bytes\tpeak_rss_kib\n");
+	    "peak_heap_delta_kib\tcore_state_bytes\tweights_bin_bytes\tpeak_rss_kib\t"
+	    "reg_rmse_mean\treg_rmse_std\treg_aux_mean\treg_aux_std\treg_r2_mean\tequiv_err_mean\n");
 }
 
 static void print_list()
@@ -519,17 +927,83 @@ static void print_list()
 		std::printf("%s\t%s\t%s\n", kSpecs[i].task, kSpecs[i].id, kSpecs[i].label);
 }
 
-static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigned int predictRepeats)
+static void configure_net(glades::NNetwork& net,
+                          const ModelSpec& spec,
+                          uint64_t seed,
+                          shmea::GLogger* logger)
+{
+	net.setLogger(logger);
+	net.setSeed(seed);
+	glades::TrainingConfig cfg = net.getTrainingConfig();
+	cfg.optimizer.type = spec.optimizer;
+	cfg.qnn.inputPacking = spec.qnnPacking;
+	cfg.qnn.outputReadout = spec.qnnReadout;
+	cfg.qnn.layerMode = spec.qnnLayerMode;
+	cfg.qnn.activationMode = spec.qnnActMode;
+	net.setTrainingConfig(cfg);
+}
+
+static int run_worker(const ModelSpec& spec,
+                      const std::string& dataDir,
+                      const std::string& repoDataDir,
+                      unsigned int predictRepeats)
 {
 	shmea::GLogger quietLogger(shmea::GLogger::LOG_FATAL);
 	quietLogger.setPrintToConsole(false);
 
-	const bool isXor = (std::strcmp(spec.task, "xor") == 0);
-	const bool isIris80 = (std::strcmp(spec.task, "iris80") == 0);
-	const unsigned int realIn = isXor ? 2u : 4u;
-	const unsigned int realOut = isXor ? 1u : 3u;
-	const int batchSize = isXor ? 4 : 16;
-	const int outAct = isXor ? glades::GMath::SIGMOID : glades::GMath::LINEAR;
+	const std::string task(spec.task);
+	const bool isXor = (task == "xor");
+	const bool isXorParity3 = (task == "xorparity3");
+	const bool isParity3Odd = (task == "parity3_odd");
+	const bool isParity4 = (task == "parity4");
+	const bool isBinaryTruth = (isXor || isXorParity3 || isParity3Odd || isParity4);
+	const bool isIris80 = (task == "iris80");
+	const bool isIris40 = (task == "iris40");
+	const bool isWine = (task == "wine");
+	const bool isTabularCls = (isIris80 || isIris40 || isWine);
+	const bool isSO3RotCurve = (task == "so3_rot_curve");
+	const bool isSO3RotOod = (task == "so3_rot_ood");
+	const bool isSO3CompId = (task == "so3_comp_id");
+	const bool isSO3CompOod = (task == "so3_comp_ood");
+	const bool isSO3 = (isSO3RotCurve || isSO3RotOod || isSO3CompId || isSO3CompOod);
+	const bool isDow = (task == "dow_ohlc");
+
+	unsigned int realIn = 4u;
+	unsigned int realOut = 3u;
+	int batchSize = 16;
+	int outType = glades::OutputLayerInfo::CLASSIFICATION;
+	int outAct = glades::GMath::LINEAR;
+
+	if (isXor)
+	{
+		realIn = 2u; realOut = 1u; batchSize = 4;
+		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::SIGMOID;
+	}
+	else if (isXorParity3 || isParity3Odd)
+	{
+		realIn = 3u; realOut = 1u; batchSize = 8;
+		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::SIGMOID;
+	}
+	else if (isParity4)
+	{
+		realIn = 4u; realOut = 1u; batchSize = 16;
+		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::SIGMOID;
+	}
+	else if (isWine)
+	{
+		realIn = 13u; realOut = 3u; batchSize = 16;
+		outType = glades::OutputLayerInfo::CLASSIFICATION; outAct = glades::GMath::LINEAR;
+	}
+	else if (isSO3)
+	{
+		realIn = 8u; realOut = 4u; batchSize = 16;
+		outType = glades::OutputLayerInfo::REGRESSION; outAct = glades::GMath::LINEAR;
+	}
+	else if (isDow)
+	{
+		realIn = 4u; realOut = 1u; batchSize = 32;
+		outType = glades::OutputLayerInfo::REGRESSION; outAct = glades::GMath::LINEAR;
+	}
 
 	unsigned int activeParams = 0u;
 	unsigned int storedParams = 0u;
@@ -550,22 +1024,45 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 	std::vector<double> macroF1s;
 	std::vector<double> trainMs;
 	std::vector<double> predictSplitUs;
+	std::vector<double> regRmses;
+	std::vector<double> regAuxs;
+	std::vector<double> regR2s;
+	std::vector<double> equivErrs;
 
 	unsigned int convergedRuns = 0u;
 	size_t maxHeapDeltaBytes = 0u;
 	size_t weightsBinBytes = 0u;
 	unsigned int splitTestRows = 0u;
+	unsigned int totalRuns = 0u;
 
-	if (isXor)
+	const glades::QuaternionInputPackingMode pMode =
+	    (spec.qnnPacking == glades::QuaternionConfig::ONE_QUAT_PER_FEATURE)
+	        ? glades::QUAT_ONE_PER_FEATURE
+	        : glades::QUAT_PACK_GROUPS_OF_4;
+	const glades::QuaternionOutputReadoutMode rMode =
+	    (spec.qnnReadout == glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS)
+	        ? glades::QUAT_READOUT_SPLIT_COMPONENTS
+	        : glades::QUAT_READOUT_REAL_PART;
+
+	if (isBinaryTruth)
 	{
-		glades::QuaternionInput xorDi;
-		const std::string path = dataDir + "/xorgate.csv";
-		if (!xorDi.loadXOR(path, glades::QUAT_PACK_GROUPS_OF_4, glades::QUAT_READOUT_REAL_PART))
+		glades::QuaternionInput di;
+		bool loadedOk = false;
+		if (isXor)
+			loadedOk = di.loadXOR(dataDir + "/xorgate.csv", pMode, rMode);
+		else if (isXorParity3)
+			loadedOk = di.loadParityFile(repoDataDir + "/xorparity3.csv", pMode, rMode);
+		else if (isParity3Odd)
+			loadedOk = di.loadBinaryParity(3u, pMode, rMode);
+		else if (isParity4)
+			loadedOk = di.loadBinaryParity(4u, pMode, rMode);
+
+		if (!loadedOk)
 		{
-			std::fprintf(stderr, "ERROR: failed to load %s\n", path.c_str());
+			std::fprintf(stderr, "ERROR: failed to load binary truth dataset for task %s\n", spec.task);
 			return 2;
 		}
-		splitTestRows = xorDi.getTestSize();
+		splitTestRows = di.getTestSize();
 
 		for (unsigned int s = 0u; s < 20u; ++s)
 		{
@@ -573,31 +1070,20 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 			const size_t heapBaseline = current_heap_bytes();
 			glades::NNInfo* info = make_net_info(
 			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outAct);
+			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 			glades::NNetwork net(info, spec.netType);
 			delete info;
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
 
-			net.setLogger(&quietLogger);
-			net.setSeed(seed);
-			glades::TrainingConfig cfg = net.getTrainingConfig();
-			cfg.optimizer.type = spec.optimizer;
-			cfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
-			cfg.qnn.outputReadout = spec.qnnReadout;
-			if (!net.setTrainingConfig(cfg).ok())
-			{
-				std::fprintf(stderr, "ERROR: setTrainingConfig failed for %s\n", spec.id);
-				return 3;
-			}
-
+			configure_net(net, spec, seed, &quietLogger);
 			glades::Terminator term;
 			term.setEpoch(static_cast<int>(spec.epochs));
 			if (!net.setTerminator(term).ok())
 				return 3;
 
-			EpochTracker cb(2u, true, heapBaseline, &maxHeapDeltaBytes);
+			EpochTracker cb(2u, true, false, heapBaseline, &maxHeapDeltaBytes);
 			const double t0 = now_seconds();
-			glades::NNetworkStatus st = net.train(&xorDi, &cb);
+			glades::NNetworkStatus st = net.train(&di, &cb);
 			const double t1 = now_seconds();
 			if (!st.ok())
 			{
@@ -608,11 +1094,10 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 			trainMs.push_back((t1 - t0) * 1000.0);
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
 
-			// Full-split prediction latency timing.
 			const double p0 = now_seconds();
 			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
 			{
-				st = net.test(&xorDi);
+				st = net.test(&di);
 				if (!st.ok())
 					return 5;
 			}
@@ -621,7 +1106,7 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
 
 			EvalStats ev;
-			if (!eval_split_exact(net, xorDi, false, NULL, ev))
+			if (!eval_split_exact(net, di, false, NULL, ev))
 				return 6;
 
 			trainAccs.push_back(ev.accPct);
@@ -640,19 +1125,18 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 				epM1.push_back(static_cast<double>(cb.epBce017));
 
 			if (s == 19u)
-				weightsBinBytes = measure_weights_bin_bytes(net, &xorDi);
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
 		}
+		totalRuns = static_cast<unsigned int>(testAccs.size());
 	}
-	else
+	else if (isTabularCls)
 	{
 		const uint64_t splitSeeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
 		const uint64_t trainSeeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
-		const float testFrac = isIris80 ? 0.2f : 0.6f;
-		const std::string path = dataDir + "/iris.data";
-		const glades::QuaternionOutputReadoutMode rMode =
-		    (spec.qnnReadout == glades::QuaternionConfig::READOUT_SPLIT_COMPONENTS)
-		        ? glades::QUAT_READOUT_SPLIT_COMPONENTS
-		        : glades::QUAT_READOUT_REAL_PART;
+		const float testFrac = isIris40 ? 0.6f : 0.2f;
+		const std::string path = isWine ? (repoDataDir + "/wine.data") : (dataDir + "/iris.data");
+		const char* const irisCanon[3] = { "Iris-setosa", "Iris-versicolor", "Iris-virginica" };
+		const char* const wineCanon[3] = { "1", "2", "3" };
 
 		for (unsigned int sp = 0u; sp < 5u; ++sp)
 		{
@@ -662,46 +1146,38 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 			splitCfg.stratify = true;
 			splitCfg.seed = splitSeeds[sp];
 
-			glades::QuaternionInput irisDi;
-			if (!irisDi.loadIris(path, splitCfg, glades::GMath::ZSCORE, glades::QUAT_PACK_GROUPS_OF_4, rMode))
+			glades::QuaternionInput di;
+			const bool ok = isWine
+			                    ? di.loadWine(path, splitCfg, glades::GMath::ZSCORE, pMode, rMode)
+			                    : di.loadIris(path, splitCfg, glades::GMath::ZSCORE, pMode, rMode);
+			if (!ok)
 			{
 				std::fprintf(stderr, "ERROR: failed to load %s\n", path.c_str());
 				return 2;
 			}
-			splitTestRows = irisDi.getTestSize();
+			splitTestRows = di.getTestSize();
 			unsigned int classMap[3];
-			resolve_iris_class_map(irisDi, classMap);
+			resolve_class_map(di, isWine ? wineCanon : irisCanon, classMap);
 
 			for (unsigned int ts = 0u; ts < 5u; ++ts)
 			{
 				const size_t heapBaseline = current_heap_bytes();
 				glades::NNInfo* info = make_net_info(
 				    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
-				    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outAct);
+				    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
 				glades::NNetwork net(info, spec.netType);
 				delete info;
 				update_heap_delta(heapBaseline, maxHeapDeltaBytes);
 
-				net.setLogger(&quietLogger);
-				net.setSeed(trainSeeds[ts]);
-				glades::TrainingConfig cfg = net.getTrainingConfig();
-				cfg.optimizer.type = spec.optimizer;
-				cfg.qnn.inputPacking = glades::QuaternionConfig::PACK_GROUPS_OF_4;
-				cfg.qnn.outputReadout = spec.qnnReadout;
-				if (!net.setTrainingConfig(cfg).ok())
-				{
-					std::fprintf(stderr, "ERROR: setTrainingConfig failed for %s\n", spec.id);
-					return 3;
-				}
-
+				configure_net(net, spec, trainSeeds[ts], &quietLogger);
 				glades::Terminator term;
 				term.setEpoch(static_cast<int>(spec.epochs));
 				if (!net.setTerminator(term).ok())
 					return 3;
 
-				EpochTracker cb(3u, false, heapBaseline, &maxHeapDeltaBytes);
+				EpochTracker cb(3u, false, false, heapBaseline, &maxHeapDeltaBytes);
 				const double t0 = now_seconds();
-				glades::NNetworkStatus st = net.train(&irisDi, &cb);
+				glades::NNetworkStatus st = net.train(&di, &cb);
 				const double t1 = now_seconds();
 				if (!st.ok())
 				{
@@ -712,11 +1188,10 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 				trainMs.push_back((t1 - t0) * 1000.0);
 				update_heap_delta(heapBaseline, maxHeapDeltaBytes);
 
-				// Full-split prediction latency timing.
 				const double p0 = now_seconds();
 				for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
 				{
-					st = net.test(&irisDi);
+					st = net.test(&di);
 					if (!st.ok())
 						return 5;
 				}
@@ -726,9 +1201,9 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 
 				EvalStats trainEv;
 				EvalStats testEv;
-				if (!eval_split_exact(net, irisDi, true, classMap, trainEv))
+				if (!eval_split_exact(net, di, true, classMap, trainEv))
 					return 6;
-				if (!eval_split_exact(net, irisDi, false, classMap, testEv))
+				if (!eval_split_exact(net, di, false, classMap, testEv))
 					return 6;
 
 				trainAccs.push_back(trainEv.accPct);
@@ -749,9 +1224,169 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 				epM2.push_back(cb.epTrain98 > 0u ? static_cast<double>(cb.epTrain98) : static_cast<double>(spec.epochs));
 
 				if (sp == 4u && ts == 4u)
-					weightsBinBytes = measure_weights_bin_bytes(net, &irisDi);
+					weightsBinBytes = measure_weights_bin_bytes(net, &di);
 			}
 		}
+		totalRuns = static_cast<unsigned int>(testAccs.size());
+	}
+	else if (isSO3)
+	{
+		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
+		const unsigned int nTrain = (spec.taskParam > 0u) ? spec.taskParam : 128u;
+		const unsigned int nTest = 256u;
+		const bool isRot = (isSO3RotCurve || isSO3RotOod);
+		const bool isOod = (isSO3RotOod || isSO3CompOod);
+
+		for (unsigned int s = 0u; s < 5u; ++s)
+		{
+			glades::QuaternionInput di;
+			const bool ok = isRot
+			                    ? di.loadSO3Rotation(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode)
+			                    : di.loadSO3Composition(nTrain, nTest, static_cast<unsigned int>(seeds[s]), isOod, pMode, rMode);
+			if (!ok)
+			{
+				std::fprintf(stderr, "ERROR: failed to generate SO(3) dataset for %s\n", spec.task);
+				return 2;
+			}
+			splitTestRows = di.getTestSize();
+
+			const size_t heapBaseline = current_heap_bytes();
+			glades::NNInfo* info = make_net_info(
+			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
+			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			glades::NNetwork net(info, spec.netType);
+			delete info;
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			configure_net(net, spec, seeds[s], &quietLogger);
+			glades::Terminator term;
+			term.setEpoch(static_cast<int>(spec.epochs));
+			if (!net.setTerminator(term).ok())
+				return 3;
+
+			EpochTracker cb(1u, false, true, heapBaseline, &maxHeapDeltaBytes);
+			const double t0 = now_seconds();
+			glades::NNetworkStatus st = net.train(&di, &cb);
+			const double t1 = now_seconds();
+			if (!st.ok())
+			{
+				std::fprintf(stderr, "ERROR: train failed for %s seed=%u: %s\n", spec.id, s, st.message.c_str());
+				return 4;
+			}
+			trainMs.push_back((t1 - t0) * 1000.0);
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			const double p0 = now_seconds();
+			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
+			{
+				st = net.test(&di);
+				if (!st.ok())
+					return 5;
+			}
+			const double p1 = now_seconds();
+			predictSplitUs.push_back(((p1 - p0) * 1e6) / static_cast<double>(predictRepeats));
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			double trRmse = 0.0, trAng = 0.0, trR2 = 0.0, trMse = 0.0;
+			double teRmse = 0.0, teAng = 0.0, teR2 = 0.0, teMse = 0.0;
+			if (!eval_so3_split(net, di, true, isRot, trRmse, trAng, trR2, trMse))
+				return 6;
+			if (!eval_so3_split(net, di, false, isRot, teRmse, teAng, teR2, teMse))
+				return 6;
+			const double eqErr = measure_so3_equivariance_error(net, 50000ULL + seeds[s]);
+
+			trainLosses.push_back(trMse);
+			testLosses.push_back(teMse);
+			regRmses.push_back(teRmse);
+			regAuxs.push_back(teAng);
+			regR2s.push_back(teR2);
+			equivErrs.push_back(eqErr);
+			trainAccs.push_back(trR2 * 100.0);
+			testAccs.push_back(teR2 * 100.0);
+			if (teR2 >= 0.95)
+				++convergedRuns;
+
+			if (s == 4u)
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
+		}
+		totalRuns = static_cast<unsigned int>(regRmses.size());
+	}
+	else if (isDow)
+	{
+		const uint64_t seeds[5] = { 42ULL, 1337ULL, 2024ULL, 7777ULL, 9001ULL };
+		float tMean = 0.0f, tStd = 1.0f;
+		glades::QuaternionInput di;
+		if (!di.loadDowJonesOHLC(repoDataDir + "/dow_jones_index_train.csv",
+		                         repoDataDir + "/dow_jones_index_test.csv",
+		                         &tMean, &tStd, pMode, rMode))
+		{
+			std::fprintf(stderr, "ERROR: failed to load Dow Jones OHLC from %s\n", repoDataDir.c_str());
+			return 2;
+		}
+		splitTestRows = di.getTestSize();
+
+		for (unsigned int s = 0u; s < 5u; ++s)
+		{
+			const size_t heapBaseline = current_heap_bytes();
+			glades::NNInfo* info = make_net_info(
+			    spec.id, batchSize, spec.lr, spec.momentum, spec.wd2,
+			    spec.hiddenSize, glades::GMath::TANH, static_cast<int>(realOut), outType, outAct);
+			glades::NNetwork net(info, spec.netType);
+			delete info;
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			configure_net(net, spec, seeds[s], &quietLogger);
+			glades::Terminator term;
+			term.setEpoch(static_cast<int>(spec.epochs));
+			if (!net.setTerminator(term).ok())
+				return 3;
+
+			EpochTracker cb(1u, false, true, heapBaseline, &maxHeapDeltaBytes);
+			const double t0 = now_seconds();
+			glades::NNetworkStatus st = net.train(&di, &cb);
+			const double t1 = now_seconds();
+			if (!st.ok())
+			{
+				std::fprintf(stderr, "ERROR: train failed for %s seed=%u: %s\n", spec.id, s, st.message.c_str());
+				return 4;
+			}
+			trainMs.push_back((t1 - t0) * 1000.0);
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			const double p0 = now_seconds();
+			for (unsigned int rep = 0u; rep < predictRepeats; ++rep)
+			{
+				st = net.test(&di);
+				if (!st.ok())
+					return 5;
+			}
+			const double p1 = now_seconds();
+			predictSplitUs.push_back(((p1 - p0) * 1e6) / static_cast<double>(predictRepeats));
+			update_heap_delta(heapBaseline, maxHeapDeltaBytes);
+
+			double trRmseS = 0.0, trRmseU = 0.0, trMae = 0.0, trR2 = 0.0, trDir = 0.0;
+			double teRmseS = 0.0, teRmseU = 0.0, teMae = 0.0, teR2 = 0.0, teDir = 0.0;
+			if (!eval_dow_split(net, di, true, static_cast<double>(tStd), trRmseS, trRmseU, trMae, trR2, trDir))
+				return 6;
+			if (!eval_dow_split(net, di, false, static_cast<double>(tStd), teRmseS, teRmseU, teMae, teR2, teDir))
+				return 6;
+
+			trainAccs.push_back(trDir);
+			testAccs.push_back(teDir);
+			trainLosses.push_back(trRmseS * trRmseS);
+			testLosses.push_back(teRmseS * teRmseS);
+			testBriers.push_back(teMae); // MAE in sigma units for dow_ohlc
+			regRmses.push_back(teRmseS);
+			regAuxs.push_back(teRmseU);  // USD RMSE
+			regR2s.push_back(teR2);
+			equivErrs.push_back(0.0);
+			if (teR2 >= 0.95)
+				++convergedRuns;
+
+			if (s == 4u)
+				weightsBinBytes = measure_weights_bin_bytes(net, &di);
+		}
+		totalRuns = static_cast<unsigned int>(regRmses.size());
 	}
 
 	const double meanPredSplitUs = vec_mean(predictSplitUs);
@@ -766,14 +1401,15 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 	    "%.6f\t%.6f\t%.6f\t%.6f\t"
 	    "%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t"
 	    "%.4f\t%.4f\t%.4f\t%.4f\t"
-	    "%.2f\t%u\t%lu\t%ld\n",
+	    "%.2f\t%u\t%lu\t%ld\t"
+	    "%.6f\t%.6f\t%.4f\t%.4f\t%.6f\t%.6e\n",
 	    spec.task,
 	    spec.id,
 	    spec.label,
 	    activeParams,
 	    storedParams,
 	    spec.epochs,
-	    static_cast<unsigned int>(testAccs.size()),
+	    totalRuns,
 	    convergedRuns,
 	    vec_mean(trainAccs),
 	    vec_std(trainAccs),
@@ -799,7 +1435,13 @@ static int run_worker(const ModelSpec& spec, const std::string& dataDir, unsigne
 	    peakHeapKib,
 	    coreStateBytes,
 	    static_cast<unsigned long>(weightsBinBytes),
-	    rssKib);
+	    rssKib,
+	    vec_mean(regRmses),
+	    vec_std(regRmses),
+	    vec_mean(regAuxs),
+	    vec_std(regAuxs),
+	    vec_mean(regR2s),
+	    vec_mean(equivErrs));
 
 	return 0;
 }
@@ -813,6 +1455,7 @@ int main(int argc, char** argv)
 	std::string task;
 	std::string modelId;
 	std::string dataDir = "unit-tests/datasets";
+	std::string repoDataDir = "datasets";
 	unsigned int predictRepeats = 0u;
 	bool doList = false;
 	bool doHeader = false;
@@ -839,6 +1482,10 @@ int main(int argc, char** argv)
 		{
 			dataDir = argv[++i];
 		}
+		else if (std::strcmp(argv[i], "--repo-data-dir") == 0 && i + 1 < argc)
+		{
+			repoDataDir = argv[++i];
+		}
 		else if (std::strcmp(argv[i], "--predict-repeats") == 0 && i + 1 < argc)
 		{
 			predictRepeats = static_cast<unsigned int>(std::atoi(argv[++i]));
@@ -863,7 +1510,7 @@ int main(int argc, char** argv)
 
 	if (task.empty() || modelId.empty())
 	{
-		std::fprintf(stderr, "Usage: %s --task <xor|iris80|iris40> --model <id> [--data-dir PATH] [--predict-repeats N]\n", argv[0]);
+		std::fprintf(stderr, "Usage: %s --task <task> --model <id> [--data-dir PATH] [--repo-data-dir PATH] [--predict-repeats N]\n", argv[0]);
 		return 1;
 	}
 
@@ -872,8 +1519,15 @@ int main(int argc, char** argv)
 		if (task == kSpecs[i].task && modelId == kSpecs[i].id)
 		{
 			if (predictRepeats == 0u)
-				predictRepeats = (task == "xor") ? 100u : 50u;
-			return run_worker(kSpecs[i], dataDir, predictRepeats);
+			{
+				if (task == "xor" || task == "xorparity3" || task == "parity3_odd" || task == "parity4")
+					predictRepeats = 100u;
+				else if (task == "so3_rot_curve" || task == "so3_rot_ood" || task == "so3_comp_id" || task == "so3_comp_ood" || task == "dow_ohlc")
+					predictRepeats = 20u;
+				else
+					predictRepeats = 50u;
+			}
+			return run_worker(kSpecs[i], dataDir, repoDataDir, predictRepeats);
 		}
 	}
 

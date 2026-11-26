@@ -3310,6 +3310,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 
 		const unsigned int packMode = static_cast<unsigned int>(trainingConfig.qnn.inputPacking);
 		const unsigned int readoutMode = static_cast<unsigned int>(trainingConfig.qnn.outputReadout);
+		const unsigned int layerMode = static_cast<unsigned int>(trainingConfig.qnn.layerMode);
+		const unsigned int actMode = static_cast<unsigned int>(trainingConfig.qnn.activationMode);
 		const unsigned int qIn = quaternionInputCount(
 		    inputSize, static_cast<QuaternionInputPackingMode>(trainingConfig.qnn.inputPacking));
 		const unsigned int qOut = quaternionOutputCount(
@@ -3339,7 +3341,9 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		    tensorQnn.realInputSize == inputSize &&
 		    tensorQnn.realOutSize == outSize &&
 		    tensorQnn.inputPackingMode == packMode &&
-		    tensorQnn.outputReadoutMode == readoutMode)
+		    tensorQnn.outputReadoutMode == readoutMode &&
+		    tensorQnn.layerMode == layerMode &&
+		    tensorQnn.activationMode == actMode)
 			return true;
 
 		tensorQnn.reset();
@@ -3347,13 +3351,21 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorQnn.realOutSize = outSize;
 		tensorQnn.inputPackingMode = packMode;
 		tensorQnn.outputReadoutMode = readoutMode;
+		tensorQnn.layerMode = layerMode;
+		tensorQnn.activationMode = actMode;
 		tensorQnn.qSizes = wantQSizes;
 
+		const bool isSo3Equiv = (layerMode == static_cast<unsigned int>(QuaternionConfig::LAYER_SO3_EQUIVARIANT));
 		const unsigned int numTransitions = static_cast<unsigned int>(wantQSizes.size() - 1u);
 		tensorQnn.T.resize(numTransitions);
 		tensorQnn.z.resize(wantQSizes.size());
 		tensorQnn.a.resize(wantQSizes.size());
 		tensorQnn.delta.resize(wantQSizes.size());
+		if (isSo3Equiv)
+		{
+			tensorQnn.eqL.resize(wantQSizes.size());
+			tensorQnn.eqR.resize(wantQSizes.size());
+		}
 		tensorQnn.outReadout.assign(outSize, 0.0f);
 
 		for (unsigned int li = 0u; li < wantQSizes.size(); ++li)
@@ -3361,9 +3373,23 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			tensorQnn.a[li].assign(wantQSizes[li], Quaternion::zero());
 			tensorQnn.delta[li].assign(wantQSizes[li], Quaternion::zero());
 			if (li == 0u)
+			{
 				tensorQnn.z[li].clear();
+				if (isSo3Equiv)
+				{
+					tensorQnn.eqL[li].clear();
+					tensorQnn.eqR[li].clear();
+				}
+			}
 			else
+			{
 				tensorQnn.z[li].assign(wantQSizes[li], Quaternion::zero());
+				if (isSo3Equiv)
+				{
+					tensorQnn.eqL[li].assign(wantQSizes[li], Quaternion::zero());
+					tensorQnn.eqR[li].assign(wantQSizes[li], Quaternion::zero());
+				}
+			}
 		}
 
 		for (unsigned int t = 0u; t < numTransitions; ++t)
@@ -3380,7 +3406,13 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			tr.v2W.assign(wCount, Quaternion::zero());
 			tr.gW.assign(wCount, Quaternion::zero());
 
-			tr.bias.assign(tOut, Quaternion::zero());
+			// For SO(3)-equivariant bilinear Hamilton layers:
+			//   (0.5 + L') (x) (0.5 + R') - 0.25 = 0.5 L' + 0.5 R' + L' (x) R'
+			// provides a zero-mean initial output with strong non-vanishing linear gradients.
+			const Quaternion initBias = isSo3Equiv
+			    ? Quaternion(0.5f, 0.5f, -0.25f, 0.0f)
+			    : Quaternion::zero();
+			tr.bias.assign(tOut, initBias);
 			tr.vBias.assign(tOut, Quaternion::zero());
 			tr.v2Bias.assign(tOut, Quaternion::zero());
 			tr.gBias.assign(tOut, Quaternion::zero());
@@ -3390,7 +3422,9 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			//   Glorot: 2 / (Q_in + Q_out) => L = sqrt(3 / (2 * (Q_in + Q_out)))
 			//   He:     2 / Q_in           => L = sqrt(3 / (2 * Q_in))
 			const int actFx = skeleton->getActivationType(t);
-			const bool useHe = trainingConfig.qnn.useHeInitForRelu &&
+			const bool useHe = !isSo3Equiv &&
+			                   (actMode == static_cast<unsigned int>(QuaternionConfig::ACT_SPLIT)) &&
+			                   trainingConfig.qnn.useHeInitForRelu &&
 			                   (actFx == GMath::RELU || actFx == GMath::LEAKY);
 			const double denom = useHe
 			    ? (2.0 * static_cast<double>(tIn))
@@ -4122,6 +4156,8 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 		write_u32_le(out, qs.realOutSize);
 		write_u32_le(out, qs.inputPackingMode);
 		write_u32_le(out, qs.outputReadoutMode);
+		write_u32_le(out, qs.layerMode);
+		write_u32_le(out, qs.activationMode);
 		write_u32_le(out, static_cast<unsigned int>(qs.T.size()));
 
 		std::vector<float> flat;
@@ -4740,18 +4776,23 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 
 	if (netType == TYPE_QNN)
 	{
-		unsigned int realInU = 0u, realOutU = 0u, packModeU = 0u, readoutModeU = 0u, transitionsU = 0u;
+		unsigned int realInU = 0u, realOutU = 0u, packModeU = 0u, readoutModeU = 0u;
+		unsigned int layerModeU = 0u, actModeU = 0u, transitionsU = 0u;
 		if (!read_u32_le(in, realInU) ||
 		    !read_u32_le(in, realOutU) ||
 		    !read_u32_le(in, packModeU) ||
 		    !read_u32_le(in, readoutModeU) ||
+		    !read_u32_le(in, layerModeU) ||
+		    !read_u32_le(in, actModeU) ||
 		    !read_u32_le(in, transitionsU))
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed qnn header");
 		if (realInU == 0u || realOutU == 0u || transitionsU == 0u)
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: invalid qnn dimensions");
 		if (packModeU > static_cast<unsigned int>(QuaternionConfig::ONE_QUAT_PER_FEATURE) ||
-		    readoutModeU > static_cast<unsigned int>(QuaternionConfig::READOUT_SPLIT_COMPONENTS))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: unsupported qnn boundary mode");
+		    readoutModeU > static_cast<unsigned int>(QuaternionConfig::READOUT_SPLIT_COMPONENTS) ||
+		    layerModeU > static_cast<unsigned int>(QuaternionConfig::LAYER_SO3_EQUIVARIANT) ||
+		    actModeU > static_cast<unsigned int>(QuaternionConfig::ACT_POLAR_TANH))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: unsupported qnn mode");
 
 		const size_t transitions = static_cast<size_t>(transitionsU);
 		tensorQnn.reset();
@@ -4759,6 +4800,8 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorQnn.realOutSize = realOutU;
 		tensorQnn.inputPackingMode = packModeU;
 		tensorQnn.outputReadoutMode = readoutModeU;
+		tensorQnn.layerMode = layerModeU;
+		tensorQnn.activationMode = actModeU;
 		tensorQnn.T.resize(transitions);
 		tensorQnn.qSizes.clear();
 		tensorQnn.qSizes.reserve(transitions + 1u);
@@ -4814,26 +4857,48 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 			tr.gBias.assign(static_cast<size_t>(qOutU), Quaternion::zero());
 		}
 
+		const bool isSo3Equiv = (layerModeU == static_cast<unsigned int>(QuaternionConfig::LAYER_SO3_EQUIVARIANT));
 		tensorQnn.z.resize(tensorQnn.qSizes.size());
 		tensorQnn.a.resize(tensorQnn.qSizes.size());
 		tensorQnn.delta.resize(tensorQnn.qSizes.size());
+		if (isSo3Equiv)
+		{
+			tensorQnn.eqL.resize(tensorQnn.qSizes.size());
+			tensorQnn.eqR.resize(tensorQnn.qSizes.size());
+		}
 		for (size_t li = 0u; li < tensorQnn.qSizes.size(); ++li)
 		{
 			tensorQnn.a[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
 			tensorQnn.delta[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
 			if (li == 0u)
+			{
 				tensorQnn.z[li].clear();
+				if (isSo3Equiv)
+				{
+					tensorQnn.eqL[li].clear();
+					tensorQnn.eqR[li].clear();
+				}
+			}
 			else
+			{
 				tensorQnn.z[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+				if (isSo3Equiv)
+				{
+					tensorQnn.eqL[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+					tensorQnn.eqR[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+				}
+			}
 		}
 		tensorQnn.outReadout.assign(realOutU, 0.0f);
 		tensorQnn.batchCount = 0u;
 		tensorQnn.optimizerStep = 0ULL;
 		tensorQnn.initialized = true;
 
-		// Synchronize QNN boundary config with the loaded weights.
+		// Synchronize QNN boundary & architecture config with the loaded weights.
 		trainingConfig.qnn.inputPacking = static_cast<QuaternionConfig::InputPackingMode>(packModeU);
 		trainingConfig.qnn.outputReadout = static_cast<QuaternionConfig::OutputReadoutMode>(readoutModeU);
+		trainingConfig.qnn.layerMode = static_cast<QuaternionConfig::LayerMode>(layerModeU);
+		trainingConfig.qnn.activationMode = static_cast<QuaternionConfig::ActivationMode>(actModeU);
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 

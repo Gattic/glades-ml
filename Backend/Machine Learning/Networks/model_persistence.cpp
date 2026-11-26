@@ -702,6 +702,24 @@ static bool read_kv_manifest(const std::string& manifestPath, ModelManifest& m)
 				m.hasTrainingConfig = true;
 			}
 		}
+		else if (key == "training.qnn.layerMode")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v))
+			{
+				m.trainingConfig.qnn.layerMode = static_cast<glades::QuaternionConfig::LayerMode>(v);
+				m.hasTrainingConfig = true;
+			}
+		}
+		else if (key == "training.qnn.activationMode")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v))
+			{
+				m.trainingConfig.qnn.activationMode = static_cast<glades::QuaternionConfig::ActivationMode>(v);
+				m.hasTrainingConfig = true;
+			}
+		}
 		else if (key == "training.qnn.useHeInitForRelu")
 		{
 			int v = 0;
@@ -1234,6 +1252,8 @@ static glades::NNetworkStatus write_model_package_manifest(const ModelPackagePat
 	out << "training.transformer.ffnActivation=" << static_cast<int>(trainingConfig.transformer.ffnActivation) << "\n";
 	out << "training.qnn.inputPacking=" << static_cast<int>(trainingConfig.qnn.inputPacking) << "\n";
 	out << "training.qnn.outputReadout=" << static_cast<int>(trainingConfig.qnn.outputReadout) << "\n";
+	out << "training.qnn.layerMode=" << static_cast<int>(trainingConfig.qnn.layerMode) << "\n";
+	out << "training.qnn.activationMode=" << static_cast<int>(trainingConfig.qnn.activationMode) << "\n";
 	out << "training.qnn.useHeInitForRelu=" << (trainingConfig.qnn.useHeInitForRelu ? 1 : 0) << "\n";
 
 	out << "tokenizer.present=" << (tokenizerWrite.present ? 1 : 0) << "\n";
