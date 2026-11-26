@@ -44,9 +44,9 @@ set(GLADES_CUDA_SOURCES
 
 add_library(GladesCUDA STATIC ${GLADES_CUDA_SOURCES})
 
-# CUDA needs at least C++11 for device lambdas, etc.
+# Shared project headers (e.g. GPointer.h) use C++20 concepts.
 set_target_properties(GladesCUDA PROPERTIES
-	CUDA_STANDARD 17
+	CUDA_STANDARD 20
 	CUDA_STANDARD_REQUIRED ON
 	CUDA_SEPARABLE_COMPILATION OFF
 	POSITION_INDEPENDENT_CODE ON

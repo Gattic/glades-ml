@@ -34,26 +34,29 @@ public:
 	static const float INLIER;
 	static const float OUTLIER;
 
+	// Flags are constexpr (implicitly inline) so they can bind to references,
+	// e.g. forwarded through make_gpointer(), without out-of-class definitions.
+
 	// cost function flags
-	static const int REGRESSION = 0;
-	static const int CLASSIFICATION = 1;
-	static const int KL = 2;
+	static constexpr int REGRESSION = 0;
+	static constexpr int CLASSIFICATION = 1;
+	static constexpr int KL = 2;
 
 	// activation function flags
-	static const int TANH = 0;
-	static const int TANHP = 1;
-	static const int SIGMOID = 2;
-	static const int SIGMOIDP = 3;
-	static const int LINEAR = 4;
-	static const int RELU = 5;
-	static const int LEAKY = 6;
-	static const int STEP = 7;
+	static constexpr int TANH = 0;
+	static constexpr int TANHP = 1;
+	static constexpr int SIGMOID = 2;
+	static constexpr int SIGMOIDP = 3;
+	static constexpr int LINEAR = 4;
+	static constexpr int RELU = 5;
+	static constexpr int LEAKY = 6;
+	static constexpr int STEP = 7;
 
 	// standardization flags
-	static const int MINMAX = 0;
-	static const int ZSCORE = 1;
+	static constexpr int MINMAX = 0;
+	static constexpr int ZSCORE = 1;
 	// Disable standardization/normalization.
-	static const int NONE = 2;
+	static constexpr int NONE = 2;
 
 	static float squash(float, int, float = 0.1f);
 	static float unsquash(float, int, float = 0.1f);
