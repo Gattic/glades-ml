@@ -1435,6 +1435,9 @@ glades::NNetworkStatus glades::NNetwork::SGDHelper(unsigned int inputRowCounter,
 	case TYPE_CNN:
 		SGDHelper_CNN(inputRowCounter, runType);
 		return lastStatus;
+	case TYPE_QNN:
+		SGDHelper_QNN(inputRowCounter, runType);
+		return lastStatus;
 	default:
 		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "NNetwork::SGDHelper: unknown netType");
 	}
@@ -2178,6 +2181,7 @@ void glades::NNetwork::clean()
 	tensorLstm.reset();
 	tensorTransformer.reset();
 	tensorCnn.reset();
+	tensorQnn.reset();
 	transformerPosEncCache.reset();
 	freeGpuState();
 
@@ -3295,6 +3299,119 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		return true;
 	}
 
+	// === QNN (Quaternion Neural Network) ===
+	if (netType == TYPE_QNN)
+	{
+		if (inputSize == 0u || outSize == 0u)
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: invalid QNN input/output size (0)");
+			return false;
+		}
+
+		const unsigned int packMode = static_cast<unsigned int>(trainingConfig.qnn.inputPacking);
+		const unsigned int readoutMode = static_cast<unsigned int>(trainingConfig.qnn.outputReadout);
+		const unsigned int qIn = quaternionInputCount(
+		    inputSize, static_cast<QuaternionInputPackingMode>(trainingConfig.qnn.inputPacking));
+		const unsigned int qOut = quaternionOutputCount(
+		    outSize, static_cast<QuaternionOutputReadoutMode>(trainingConfig.qnn.outputReadout));
+
+		std::vector<unsigned int> wantQSizes;
+		wantQSizes.reserve(static_cast<size_t>(H) + 2u);
+		wantQSizes.push_back(qIn);
+		for (int l = 0; l < H; ++l)
+		{
+			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(l));
+			wantQSizes.push_back(hs > 0 ? static_cast<unsigned int>(hs) : 0u);
+		}
+		wantQSizes.push_back(qOut);
+
+		for (size_t i = 0u; i < wantQSizes.size(); ++i)
+		{
+			if (wantQSizes[i] == 0u)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: invalid QNN quaternion layer size (0)");
+				return false;
+			}
+		}
+
+		if (tensorQnn.initialized &&
+		    tensorQnn.qSizes == wantQSizes &&
+		    tensorQnn.realInputSize == inputSize &&
+		    tensorQnn.realOutSize == outSize &&
+		    tensorQnn.inputPackingMode == packMode &&
+		    tensorQnn.outputReadoutMode == readoutMode)
+			return true;
+
+		tensorQnn.reset();
+		tensorQnn.realInputSize = inputSize;
+		tensorQnn.realOutSize = outSize;
+		tensorQnn.inputPackingMode = packMode;
+		tensorQnn.outputReadoutMode = readoutMode;
+		tensorQnn.qSizes = wantQSizes;
+
+		const unsigned int numTransitions = static_cast<unsigned int>(wantQSizes.size() - 1u);
+		tensorQnn.T.resize(numTransitions);
+		tensorQnn.z.resize(wantQSizes.size());
+		tensorQnn.a.resize(wantQSizes.size());
+		tensorQnn.delta.resize(wantQSizes.size());
+		tensorQnn.outReadout.assign(outSize, 0.0f);
+
+		for (unsigned int li = 0u; li < wantQSizes.size(); ++li)
+		{
+			tensorQnn.a[li].assign(wantQSizes[li], Quaternion::zero());
+			tensorQnn.delta[li].assign(wantQSizes[li], Quaternion::zero());
+			if (li == 0u)
+				tensorQnn.z[li].clear();
+			else
+				tensorQnn.z[li].assign(wantQSizes[li], Quaternion::zero());
+		}
+
+		for (unsigned int t = 0u; t < numTransitions; ++t)
+		{
+			const unsigned int tIn = wantQSizes[t];
+			const unsigned int tOut = wantQSizes[t + 1u];
+			TensorQNNState::Transition& tr = tensorQnn.T[t];
+			tr.qIn = tIn;
+			tr.qOut = tOut;
+
+			const size_t wCount = static_cast<size_t>(tOut) * static_cast<size_t>(tIn);
+			tr.W.assign(wCount, Quaternion::zero());
+			tr.vW.assign(wCount, Quaternion::zero());
+			tr.v2W.assign(wCount, Quaternion::zero());
+			tr.gW.assign(wCount, Quaternion::zero());
+
+			tr.bias.assign(tOut, Quaternion::zero());
+			tr.vBias.assign(tOut, Quaternion::zero());
+			tr.v2Bias.assign(tOut, Quaternion::zero());
+			tr.gBias.assign(tOut, Quaternion::zero());
+
+			// Variance-preserving 4D isotropic Quaternion Glorot / He uniform initialization:
+			// E[||w||^2] = 4 * L^2 / 3.
+			//   Glorot: 2 / (Q_in + Q_out) => L = sqrt(3 / (2 * (Q_in + Q_out)))
+			//   He:     2 / Q_in           => L = sqrt(3 / (2 * Q_in))
+			const int actFx = skeleton->getActivationType(t);
+			const bool useHe = trainingConfig.qnn.useHeInitForRelu &&
+			                   (actFx == GMath::RELU || actFx == GMath::LEAKY);
+			const double denom = useHe
+			    ? (2.0 * static_cast<double>(tIn))
+			    : (2.0 * (static_cast<double>(tIn) + static_cast<double>(tOut)));
+			const double limit = sqrt(3.0 / denom);
+
+			for (size_t idx = 0u; idx < wCount; ++idx)
+			{
+				tr.W[idx].r = static_cast<float>(glades::rng::uniform_double(rngEngine, -limit, limit));
+				tr.W[idx].i = static_cast<float>(glades::rng::uniform_double(rngEngine, -limit, limit));
+				tr.W[idx].j = static_cast<float>(glades::rng::uniform_double(rngEngine, -limit, limit));
+				tr.W[idx].k = static_cast<float>(glades::rng::uniform_double(rngEngine, -limit, limit));
+			}
+		}
+
+		tensorQnn.batchCount = 0u;
+		tensorQnn.optimizerStep = 0ULL;
+		tensorQnn.initialized = true;
+		return true;
+	}
+
 	lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "ensureTensorParametersInitialized: unknown netType");
 	return false;
 }
@@ -3754,7 +3871,8 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 		const bool hasLstm = (netType == TYPE_LSTM) && tensorLstm.initialized;
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
 		const bool hasCnn = (netType == TYPE_CNN) && tensorCnn.initialized;
-		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn)
+		const bool hasQnn = (netType == TYPE_QNN) && tensorQnn.initialized;
+		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn && !hasQnn)
 		{
 			if (!const_cast<glades::NNetwork*>(this)->ensureTensorParametersInitialized())
 				return lastStatus;
@@ -3987,6 +4105,55 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 			if (!write_vec_f32(out, fc.W)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN FC W)");
 			if (!write_vec_f32(out, fc.bias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN FC bias)");
 		}
+		out.flush();
+		out.close();
+		if (!out || ::rename(tmpPath.c_str(), filePath.c_str()) != 0)
+		{
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: failed to publish file (rename failed)");
+		}
+		tmpGuard.dismiss();
+		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
+
+	if (netType == TYPE_QNN)
+	{
+		const TensorQNNState& qs = tensorQnn;
+		write_u32_le(out, qs.realInputSize);
+		write_u32_le(out, qs.realOutSize);
+		write_u32_le(out, qs.inputPackingMode);
+		write_u32_le(out, qs.outputReadoutMode);
+		write_u32_le(out, static_cast<unsigned int>(qs.T.size()));
+
+		std::vector<float> flat;
+		for (size_t t = 0u; t < qs.T.size(); ++t)
+		{
+			const TensorQNNState::Transition& tr = qs.T[t];
+			write_u32_le(out, tr.qIn);
+			write_u32_le(out, tr.qOut);
+
+			flat.resize(tr.W.size() * 4u);
+			for (size_t i = 0u; i < tr.W.size(); ++i)
+			{
+				flat[i * 4u + 0u] = tr.W[i].r;
+				flat[i * 4u + 1u] = tr.W[i].i;
+				flat[i * 4u + 2u] = tr.W[i].j;
+				flat[i * 4u + 3u] = tr.W[i].k;
+			}
+			if (!write_vec_f32(out, flat))
+				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (QNN W)");
+
+			flat.resize(tr.bias.size() * 4u);
+			for (size_t i = 0u; i < tr.bias.size(); ++i)
+			{
+				flat[i * 4u + 0u] = tr.bias[i].r;
+				flat[i * 4u + 1u] = tr.bias[i].i;
+				flat[i * 4u + 2u] = tr.bias[i].j;
+				flat[i * 4u + 3u] = tr.bias[i].k;
+			}
+			if (!write_vec_f32(out, flat))
+				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (QNN bias)");
+		}
+
 		out.flush();
 		out.close();
 		if (!out || ::rename(tmpPath.c_str(), filePath.c_str()) != 0)
@@ -4568,6 +4735,105 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorCnn.batchCount = 0u;
 		tensorCnn.optimizerStep = 0ULL;
 		tensorCnn.initialized = true;
+		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
+
+	if (netType == TYPE_QNN)
+	{
+		unsigned int realInU = 0u, realOutU = 0u, packModeU = 0u, readoutModeU = 0u, transitionsU = 0u;
+		if (!read_u32_le(in, realInU) ||
+		    !read_u32_le(in, realOutU) ||
+		    !read_u32_le(in, packModeU) ||
+		    !read_u32_le(in, readoutModeU) ||
+		    !read_u32_le(in, transitionsU))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed qnn header");
+		if (realInU == 0u || realOutU == 0u || transitionsU == 0u)
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: invalid qnn dimensions");
+		if (packModeU > static_cast<unsigned int>(QuaternionConfig::ONE_QUAT_PER_FEATURE) ||
+		    readoutModeU > static_cast<unsigned int>(QuaternionConfig::READOUT_SPLIT_COMPONENTS))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: unsupported qnn boundary mode");
+
+		const size_t transitions = static_cast<size_t>(transitionsU);
+		tensorQnn.reset();
+		tensorQnn.realInputSize = realInU;
+		tensorQnn.realOutSize = realOutU;
+		tensorQnn.inputPackingMode = packModeU;
+		tensorQnn.outputReadoutMode = readoutModeU;
+		tensorQnn.T.resize(transitions);
+		tensorQnn.qSizes.clear();
+		tensorQnn.qSizes.reserve(transitions + 1u);
+
+		std::vector<float> flat;
+		for (size_t t = 0u; t < transitions; ++t)
+		{
+			unsigned int qInU = 0u, qOutU = 0u;
+			if (!read_u32_le(in, qInU) || !read_u32_le(in, qOutU) || qInU == 0u || qOutU == 0u)
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed qnn transition header");
+			if (t > 0u && qInU != tensorQnn.qSizes.back())
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: qnn transition dimension mismatch");
+
+			TensorQNNState::Transition& tr = tensorQnn.T[t];
+			tr.qIn = qInU;
+			tr.qOut = qOutU;
+
+			if (t == 0u)
+				tensorQnn.qSizes.push_back(qInU);
+			tensorQnn.qSizes.push_back(qOutU);
+
+			size_t wQuatCount = 0u;
+			size_t wFloatCount = 0u;
+			if (!mul_size_checked(static_cast<size_t>(qOutU), static_cast<size_t>(qInU), wQuatCount) ||
+			    !mul_size_checked(wQuatCount, 4u, wFloatCount))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: QNN W size overflow");
+			if (!read_vec_f32_exact(in, flat, wFloatCount))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read QNN W (size mismatch/corrupt)");
+
+			tr.W.resize(wQuatCount);
+			for (size_t i = 0u; i < wQuatCount; ++i)
+			{
+				tr.W[i] = Quaternion(flat[i * 4u + 0u], flat[i * 4u + 1u], flat[i * 4u + 2u], flat[i * 4u + 3u]);
+			}
+
+			size_t bFloatCount = 0u;
+			if (!mul_size_checked(static_cast<size_t>(qOutU), 4u, bFloatCount))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: QNN bias size overflow");
+			if (!read_vec_f32_exact(in, flat, bFloatCount))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read QNN bias (size mismatch/corrupt)");
+
+			tr.bias.resize(static_cast<size_t>(qOutU));
+			for (size_t i = 0u; i < static_cast<size_t>(qOutU); ++i)
+			{
+				tr.bias[i] = Quaternion(flat[i * 4u + 0u], flat[i * 4u + 1u], flat[i * 4u + 2u], flat[i * 4u + 3u]);
+			}
+
+			tr.vW.assign(wQuatCount, Quaternion::zero());
+			tr.v2W.assign(wQuatCount, Quaternion::zero());
+			tr.gW.assign(wQuatCount, Quaternion::zero());
+			tr.vBias.assign(static_cast<size_t>(qOutU), Quaternion::zero());
+			tr.v2Bias.assign(static_cast<size_t>(qOutU), Quaternion::zero());
+			tr.gBias.assign(static_cast<size_t>(qOutU), Quaternion::zero());
+		}
+
+		tensorQnn.z.resize(tensorQnn.qSizes.size());
+		tensorQnn.a.resize(tensorQnn.qSizes.size());
+		tensorQnn.delta.resize(tensorQnn.qSizes.size());
+		for (size_t li = 0u; li < tensorQnn.qSizes.size(); ++li)
+		{
+			tensorQnn.a[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+			tensorQnn.delta[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+			if (li == 0u)
+				tensorQnn.z[li].clear();
+			else
+				tensorQnn.z[li].assign(tensorQnn.qSizes[li], Quaternion::zero());
+		}
+		tensorQnn.outReadout.assign(realOutU, 0.0f);
+		tensorQnn.batchCount = 0u;
+		tensorQnn.optimizerStep = 0ULL;
+		tensorQnn.initialized = true;
+
+		// Synchronize QNN boundary config with the loaded weights.
+		trainingConfig.qnn.inputPacking = static_cast<QuaternionConfig::InputPackingMode>(packModeU);
+		trainingConfig.qnn.outputReadout = static_cast<QuaternionConfig::OutputReadoutMode>(readoutModeU);
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 

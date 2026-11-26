@@ -35,6 +35,7 @@
 #include "Backend/Machine Learning/transformer-improvements-test.h"
 #include "Backend/Machine Learning/gpu-training-test.h"
 #include "Backend/Machine Learning/cnn-test.h"
+#include "Backend/Machine Learning/qnn-test.h"
 #include "Backend/Machine Learning/garch-test.h"
 #include "Backend/Machine Learning/egarch-test.h"
 #include "Backend/Machine Learning/gan-test.h"
@@ -144,6 +145,8 @@ int main(int argc, char* argv[])
 		NNCNNUnitTest();
 	    else if (strcmp(argv[1], "cnn-mnist") == 0)
 		NNCNNMNISTUnitTest();
+	    else if (strcmp(argv[1], "qnn") == 0)
+		QNNUnitTest();
 	    else if (strcmp(argv[1], "garch") == 0)
 		GARCHUnitTest();
 	    else if (strcmp(argv[1], "egarch") == 0)
@@ -507,6 +510,7 @@ int main(int argc, char* argv[])
 		    TransformerImprovementsUnitTest();
 		    TransformerGradientUnitTest();
 		    NNCNNUnitTest();
+		    QNNUnitTest();
         }
 	    else
 		printf("Invalid test: %s\n", argv[1]);

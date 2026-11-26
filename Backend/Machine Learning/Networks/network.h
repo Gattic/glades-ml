@@ -22,6 +22,7 @@
 #include "Backend/Database/GTable.h"
 #include "../State/Terminator.h"
 #include "../GMath/cmatrix.h"
+#include "../GMath/quaternion.h"
 #include "../Structure/nninfo.h" // ensure NNInfo is a complete type for ownedSkeleton deletion
 #include "../rng.h"
 #include "training_callbacks.h"
@@ -81,6 +82,7 @@ class Connection;
 };
 
 void GANUnitTest();
+void QNNUnitTest();
 
 namespace glades {
 
@@ -105,6 +107,7 @@ private:
 	friend GradientBuffer;
 	friend DeconvScratchArena;
 	friend void ::GANUnitTest();
+	friend void ::QNNUnitTest();
 
 public:
 	struct TrainerRunDiagnostics
@@ -1127,6 +1130,79 @@ private:
 	TensorCNNState tensorCnn;
 	CNNScratch cnnScratch;
 
+	// === Quaternion Neural Network (TYPE_QNN) state ===
+	struct TensorQNNState
+	{
+		bool initialized;
+		unsigned int realInputSize;
+		unsigned int realOutSize;
+		unsigned int inputPackingMode;
+		unsigned int outputReadoutMode;
+		// Quaternion layer widths: [Q_in, H_1, ..., H_L, Q_out]
+		std::vector<unsigned int> qSizes;
+
+		struct Transition
+		{
+			unsigned int qIn;
+			unsigned int qOut;
+			// Row-major [qOut][qIn]
+			std::vector<Quaternion> W;
+			std::vector<Quaternion> vW;   // momentum / Adam first moment m
+			std::vector<Quaternion> v2W;  // Adam second moment v
+			std::vector<Quaternion> gW;   // accumulated minibatch gradients
+
+			std::vector<Quaternion> bias;
+			std::vector<Quaternion> vBias;
+			std::vector<Quaternion> v2Bias;
+			std::vector<Quaternion> gBias;
+
+			Transition() : qIn(0u), qOut(0u) {}
+		};
+
+		std::vector<Transition> T;
+
+		// Per-sample forward/backward scratch buffers (quaternion nodes per layer)
+		std::vector< std::vector<Quaternion> > z;     // pre-activations (layers 1..L+1)
+		std::vector< std::vector<Quaternion> > a;     // activations (layers 0..L+1)
+		std::vector< std::vector<Quaternion> > delta; // dL/dz (layers 1..L+1) and dL/da[0]
+
+		// Scalar output readout buffer (length realOutSize)
+		std::vector<float> outReadout;
+
+		unsigned int batchCount;
+		unsigned long long optimizerStep;
+
+		TensorQNNState()
+		    : initialized(false),
+		      realInputSize(0u),
+		      realOutSize(0u),
+		      inputPackingMode(0u),
+		      outputReadoutMode(0u),
+		      batchCount(0u),
+		      optimizerStep(0ULL)
+		{
+		}
+
+		void reset()
+		{
+			initialized = false;
+			realInputSize = 0u;
+			realOutSize = 0u;
+			inputPackingMode = 0u;
+			outputReadoutMode = 0u;
+			qSizes.clear();
+			T.clear();
+			z.clear();
+			a.clear();
+			delta.clear();
+			outReadout.clear();
+			batchCount = 0u;
+			optimizerStep = 0ULL;
+		}
+	};
+
+	TensorQNNState tensorQnn;
+
 	// === Transposed-convolution (deconv) generator state ===
 	struct TensorDeconvState
 	{
@@ -2036,6 +2112,7 @@ private:
 	void SGDHelper_LSTM(unsigned int inputRowCounter, int runType);
 	void SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int runType);
 	void SGDHelper_CNN(unsigned int inputRowCounter, int runType);
+	void SGDHelper_QNN(unsigned int inputRowCounter, int runType);
 
 	// Transformer SGD sub-functions (split from SGDHelper_TRANSFORMER for readability).
 	// The config struct bundles per-epoch derived values so the extracted methods
@@ -2194,7 +2271,10 @@ public:
 		// chiron_reln_forward/inverse/backward, chiron_attention_shear_backward)
 		// instead of storing activations. Phase A: dispatch enum + feature
 		// flag. Phase B: full forward/backward orchestration.
-		TYPE_TRANSFORMER_CHIRON = 7
+		TYPE_TRANSFORMER_CHIRON = 7,
+		// Quaternion Neural Network: quaternion-valued nodes, weights, biases,
+		// Hamilton-product dense transitions, and exact H-space backpropagation.
+		TYPE_QNN = 8
 	};
 
 	enum

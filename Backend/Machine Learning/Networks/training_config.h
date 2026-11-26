@@ -13,6 +13,7 @@
 #include <cmath>
 #include <stdint.h> // uint64_t (C++98-friendly)
 #include <vector>
+#include "../GMath/quaternion.h"
 
 namespace glades {
 
@@ -2238,6 +2239,42 @@ struct ChironConfig
 	}
 };
 
+// Quaternion Neural Network (TYPE_QNN) boundary & initialization configuration.
+struct QuaternionConfig
+{
+	enum InputPackingMode
+	{
+		// Pack up to 4 real input features per quaternion's (r, i, j, k) lanes
+		// with zero-padding for trailing lanes: Q_in = ceil(D_real / 4).
+		PACK_GROUPS_OF_4 = QUAT_PACK_GROUPS_OF_4,
+		// Embed each real input feature into the real lane of its own quaternion:
+		// x_f -> (x_f, 0, 0, 0), Q_in = D_real.
+		ONE_QUAT_PER_FEATURE = QUAT_ONE_PER_FEATURE
+	};
+
+	enum OutputReadoutMode
+	{
+		// One output quaternion per scalar output (Q_out = D_out); read .r.
+		READOUT_REAL_PART = QUAT_READOUT_REAL_PART,
+		// Pack up to 4 scalar outputs into each output quaternion's (r, i, j, k) lanes:
+		// Q_out = ceil(D_out / 4).
+		READOUT_SPLIT_COMPONENTS = QUAT_READOUT_SPLIT_COMPONENTS
+	};
+
+	InputPackingMode inputPacking;
+	OutputReadoutMode outputReadout;
+	// Use Quaternion He uniform init sqrt(3/(2*Q_in)) for RELU/LEAKY transitions,
+	// and Quaternion Glorot uniform init sqrt(3/(2*(Q_in+Q_out))) otherwise.
+	bool useHeInitForRelu;
+
+	QuaternionConfig()
+	    : inputPacking(PACK_GROUPS_OF_4),
+	      outputReadout(READOUT_REAL_PART),
+	      useHeInitForRelu(true)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -2335,6 +2372,9 @@ struct TrainingConfig
 	// CNN run config (used only for TYPE_CNN).
 	CNNConfig cnn;
 
+	// Quaternion Neural Network config (used only for TYPE_QNN).
+	QuaternionConfig qnn;
+
 	TrainingConfig()
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
@@ -2354,7 +2394,8 @@ struct TrainingConfig
 	      ddp(),
 	      gradientCheckpointing(false),
 	      chiron(),
-	      cnn()
+	      cnn(),
+	      qnn()
 	{
 	}
 };

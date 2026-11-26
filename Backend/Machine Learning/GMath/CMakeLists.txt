@@ -27,6 +27,7 @@ set(GMath_src_files
 	permutation_entropy.h
 	wasserstein.cpp
 	wasserstein.h
+	quaternion.h
 )
 add_library(GMath ${GMath_src_files})
 

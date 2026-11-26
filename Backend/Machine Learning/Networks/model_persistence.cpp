@@ -684,6 +684,29 @@ static bool read_kv_manifest(const std::string& manifestPath, ModelManifest& m)
 			int v = 0;
 			if (parse_int_strict(val, v)) { m.trainingConfig.transformer.tokenLmAllowHugeFullSoftmax = (v != 0); m.hasTrainingConfig = true; }
 		}
+		else if (key == "training.qnn.inputPacking")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v))
+			{
+				m.trainingConfig.qnn.inputPacking = static_cast<glades::QuaternionConfig::InputPackingMode>(v);
+				m.hasTrainingConfig = true;
+			}
+		}
+		else if (key == "training.qnn.outputReadout")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v))
+			{
+				m.trainingConfig.qnn.outputReadout = static_cast<glades::QuaternionConfig::OutputReadoutMode>(v);
+				m.hasTrainingConfig = true;
+			}
+		}
+		else if (key == "training.qnn.useHeInitForRelu")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v)) { m.trainingConfig.qnn.useHeInitForRelu = (v != 0); m.hasTrainingConfig = true; }
+		}
 	}
 
 	return true;
@@ -1209,6 +1232,9 @@ static glades::NNetworkStatus write_model_package_manifest(const ModelPackagePat
 	out << "training.transformer.ropeTheta=" << trainingConfig.transformer.ropeTheta << "\n";
 	out << "training.transformer.ffnKind=" << static_cast<int>(trainingConfig.transformer.ffnKind) << "\n";
 	out << "training.transformer.ffnActivation=" << static_cast<int>(trainingConfig.transformer.ffnActivation) << "\n";
+	out << "training.qnn.inputPacking=" << static_cast<int>(trainingConfig.qnn.inputPacking) << "\n";
+	out << "training.qnn.outputReadout=" << static_cast<int>(trainingConfig.qnn.outputReadout) << "\n";
+	out << "training.qnn.useHeInitForRelu=" << (trainingConfig.qnn.useHeInitForRelu ? 1 : 0) << "\n";
 
 	out << "tokenizer.present=" << (tokenizerWrite.present ? 1 : 0) << "\n";
 	if (tokenizerWrite.present && tokenizerArtifacts)
@@ -1403,7 +1429,8 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		const bool hasLstm = (netType == TYPE_LSTM) && tensorLstm.initialized;
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
 		const bool hasCnn = (netType == TYPE_CNN) && tensorCnn.initialized;
-		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn)
+		const bool hasQnn = (netType == TYPE_QNN) && tensorQnn.initialized;
+		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn && !hasQnn)
 		{
 			// If caller provided an external DataInput (e.g. after test() detached the
 			// internal pointer via RunDataAttachmentGuard), temporarily attach it so
@@ -1679,6 +1706,13 @@ NNetworkStatus NNetwork::loadModelPackage(const std::string& directory, const st
 		expectedSizes.push_back(skeleton->getOutputLayerSize());
 		if (!tensorDff.initialized || tensorDff.sizes != expectedSizes)
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadModelDirectory: DFF input/architecture shape mismatch");
+	}
+	if (requireIntegrity && netType == TYPE_QNN)
+	{
+		if (!tensorQnn.initialized ||
+		    tensorQnn.realInputSize != forShape->getFeatureCount() ||
+		    tensorQnn.realOutSize != skeleton->getOutputLayerSize())
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadModelDirectory: QNN input/architecture shape mismatch");
 	}
 
 	// Restore metadata/config from manifest (best-effort; missing keys keep defaults).

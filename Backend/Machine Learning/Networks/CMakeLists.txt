@@ -23,6 +23,7 @@ set(Networks_src_files
 	sgd_gru.cpp
 	sgd_lstm.cpp
 	sgd_cnn.cpp
+	sgd_qnn.cpp
 	sgd_transformer.cpp
 	transformer_train_detail.cpp
 	atlas_optimizer.cpp

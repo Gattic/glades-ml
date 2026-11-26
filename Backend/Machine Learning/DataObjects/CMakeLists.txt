@@ -1,6 +1,7 @@
 set(DO_src_files
 	DataInput.cpp
 	NumberInput.cpp
+	QuaternionInput.cpp
 	ImageInput.cpp
 	TokenInput.cpp
 	tabular_preprocessing.cpp

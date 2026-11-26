@@ -529,7 +529,13 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 
 	// Build empty confusion matrix
 	if (useConfusionMatrix)
-		net.confusionMatrix.build(net.skeleton->getOutputLayerSize());
+	{
+		const unsigned int cmClasses =
+		    (net.netType == glades::NNetwork::TYPE_QNN && net.skeleton->getOutputLayerSize() == 1u)
+		        ? 2u
+		        : net.skeleton->getOutputLayerSize();
+		net.confusionMatrix.build(cmClasses);
+	}
 
 	// Reset graphs (e.g. learning curve) for TRAIN runs only.
 	// Evaluation should be side-effect-free w.r.t. training graph history.

@@ -24,6 +24,7 @@ transformer-improvements-test.cpp
 transformer-gradient-test.cpp
 gpu-training-test.cpp
 cnn-test.cpp
+qnn-test.cpp
 garch-test.cpp
 egarch-test.cpp
 gan-test.cpp

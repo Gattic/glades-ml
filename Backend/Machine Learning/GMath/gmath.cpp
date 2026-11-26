@@ -51,6 +51,20 @@ static inline float safe_div(float num, float den)
 // Define static class constants
 const float glades::GMath::INLIER = 0.954f;
 const float glades::GMath::OUTLIER = 0.046f;
+const int glades::GMath::REGRESSION;
+const int glades::GMath::CLASSIFICATION;
+const int glades::GMath::KL;
+const int glades::GMath::TANH;
+const int glades::GMath::TANHP;
+const int glades::GMath::SIGMOID;
+const int glades::GMath::SIGMOIDP;
+const int glades::GMath::LINEAR;
+const int glades::GMath::RELU;
+const int glades::GMath::LEAKY;
+const int glades::GMath::STEP;
+const int glades::GMath::MINMAX;
+const int glades::GMath::ZSCORE;
+const int glades::GMath::NONE;
 
 float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 {
