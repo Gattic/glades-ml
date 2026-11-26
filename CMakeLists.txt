@@ -35,6 +35,24 @@ if(GLADES_ENABLE_CUDA)
 		set(CMAKE_CUDA_ARCHITECTURES native)
 	endif()
 
+	# The 1-bit WMMA GEMM kernel (wmma_b1_gemm_kernel) uses bmmaBitOpAND,
+	# which requires sm_80 or newer; sm_75 only supports the XOR bit
+	# operation. Reject lower targets at configure time rather than letting
+	# the build succeed and trap at run time. Non-numeric tokens ("native",
+	# "all") are resolved by CMake at build time and are left to it.
+	foreach(_glades_cuda_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+		string(REGEX REPLACE "-(real|virtual)$" "" _glades_cuda_arch_num "${_glades_cuda_arch}")
+		if(_glades_cuda_arch_num MATCHES "^[0-9]+$")
+			if(_glades_cuda_arch_num LESS 80)
+				message(FATAL_ERROR
+					"GLADES_ENABLE_CUDA requires CUDA architectures >= 80 (sm_80): "
+					"the 1-bit WMMA GEMM kernel uses bmmaBitOpAND, which is not "
+					"available on sm_75 and older. Got CMAKE_CUDA_ARCHITECTURES="
+					"${CMAKE_CUDA_ARCHITECTURES}.")
+			endif()
+		endif()
+	endforeach()
+
 	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
 	cuda_glibc_compat_apply()
 

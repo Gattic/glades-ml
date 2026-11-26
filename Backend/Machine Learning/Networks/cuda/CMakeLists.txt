@@ -89,10 +89,11 @@ else()
 	target_link_libraries(GladesCUDA cudart)
 endif()
 
-# Generate code for common architectures.
-# Users can override via CMAKE_CUDA_ARCHITECTURES.
+# Generate code for common architectures (sm_80+ is required by the 1-bit
+# WMMA GEMM kernel; see the CMAKE_CUDA_ARCHITECTURES guard in the root
+# CMakeLists.txt). Users can override via CMAKE_CUDA_ARCHITECTURES.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
+	set_target_properties(GladesCUDA PROPERTIES CUDA_ARCHITECTURES "80;86;89;90")
 endif()
 
 install(TARGETS GladesCUDA EXPORT gladesConfig
