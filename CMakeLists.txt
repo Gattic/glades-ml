@@ -30,28 +30,17 @@ if(GLADES_ENABLE_CUDA)
 	endif()
 
 	# CMake >= 3.18 requires CMAKE_CUDA_ARCHITECTURES to be non-empty.
-	# Default to "native" (detect at build time) when not explicitly set.
+	# Honour the CUDAARCHS environment variable; otherwise default to "native"
+	# (the compute capability of the visible GPU(s)). Non-numeric tokens are
+	# resolved to concrete architecture numbers once CUDA is enabled, so the
+	# sm_80 requirement below applies to every requested target.
 	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
-		set(CMAKE_CUDA_ARCHITECTURES native)
-	endif()
-
-	# The 1-bit WMMA GEMM kernel (wmma_b1_gemm_kernel) uses bmmaBitOpAND,
-	# which requires sm_80 or newer; sm_75 only supports the XOR bit
-	# operation. Reject lower targets at configure time rather than letting
-	# the build succeed and trap at run time. Non-numeric tokens ("native",
-	# "all") are resolved by CMake at build time and are left to it.
-	foreach(_glades_cuda_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-		string(REGEX REPLACE "-(real|virtual)$" "" _glades_cuda_arch_num "${_glades_cuda_arch}")
-		if(_glades_cuda_arch_num MATCHES "^[0-9]+$")
-			if(_glades_cuda_arch_num LESS 80)
-				message(FATAL_ERROR
-					"GLADES_ENABLE_CUDA requires CUDA architectures >= 80 (sm_80): "
-					"the 1-bit WMMA GEMM kernel uses bmmaBitOpAND, which is not "
-					"available on sm_75 and older. Got CMAKE_CUDA_ARCHITECTURES="
-					"${CMAKE_CUDA_ARCHITECTURES}.")
-			endif()
+		if(DEFINED ENV{CUDAARCHS} AND NOT "$ENV{CUDAARCHS}" STREQUAL "")
+			set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}")
+		else()
+			set(CMAKE_CUDA_ARCHITECTURES native)
 		endif()
-	endforeach()
+	endif()
 
 	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
 	cuda_glibc_compat_apply()
@@ -92,6 +81,97 @@ if(GLADES_ENABLE_CUDA)
 	endif()
 
 	enable_language(CUDA)
+
+	# Resolve non-numeric architecture tokens to concrete numbers. The 1-bit
+	# WMMA GEMM kernel (wmma_b1_gemm_kernel) uses bmmaBitOpAND, which requires
+	# sm_80 or newer (sm_75 only supports XOR). Validating only numeric tokens
+	# would let "native"/"all" reach the build unchecked and trap at run time,
+	# so every token is resolved here and then checked.
+	#   native    -> compute capability of the visible GPU(s), via nvidia-smi
+	#   all       -> every architecture supported by the toolkit
+	#   all-major -> one architecture per supported major version
+	set(_glades_cuda_archs_resolved "")
+	foreach(_glades_cuda_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+		string(REGEX REPLACE "-(real|virtual)$" "" _glades_cuda_arch_base "${_glades_cuda_arch}")
+		string(TOLOWER "${_glades_cuda_arch_base}" _glades_cuda_arch_lc)
+		if(_glades_cuda_arch_lc STREQUAL "native")
+			execute_process(
+				COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+				OUTPUT_VARIABLE _glades_cuda_caps
+				OUTPUT_STRIP_TRAILING_WHITESPACE
+				ERROR_QUIET RESULT_VARIABLE _glades_cuda_caps_rc)
+			if(NOT _glades_cuda_caps_rc EQUAL 0 OR "${_glades_cuda_caps}" STREQUAL "")
+				message(FATAL_ERROR
+					"Cannot resolve CMAKE_CUDA_ARCHITECTURES=native: no visible GPU "
+					"compute capability could be detected (nvidia-smi failed). Set "
+					"the architecture explicitly, e.g. "
+					"-DCMAKE_CUDA_ARCHITECTURES=89.")
+			endif()
+			string(REPLACE "\n" ";" _glades_cuda_caps "${_glades_cuda_caps}")
+			foreach(_glades_cuda_cap IN LISTS _glades_cuda_caps)
+				string(STRIP "${_glades_cuda_cap}" _glades_cuda_cap)
+				if(NOT _glades_cuda_cap MATCHES "^([0-9]+)\\.([0-9]+)$")
+					message(FATAL_ERROR
+						"Cannot parse compute capability '${_glades_cuda_cap}' reported "
+						"by nvidia-smi. Set CMAKE_CUDA_ARCHITECTURES explicitly.")
+				endif()
+				math(EXPR _glades_cuda_cap_num "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")
+				list(APPEND _glades_cuda_archs_resolved "${_glades_cuda_cap_num}")
+			endforeach()
+		elseif(_glades_cuda_arch_lc STREQUAL "all")
+			if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES_ALL)
+				message(FATAL_ERROR
+					"CMAKE_CUDA_ARCHITECTURES=all requires CMake >= 3.23. Set the "
+					"architectures explicitly, e.g. -DCMAKE_CUDA_ARCHITECTURES=89.")
+			endif()
+			list(APPEND _glades_cuda_archs_resolved ${CMAKE_CUDA_ARCHITECTURES_ALL})
+		elseif(_glades_cuda_arch_lc STREQUAL "all-major")
+			if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR)
+				message(FATAL_ERROR
+					"CMAKE_CUDA_ARCHITECTURES=all-major requires CMake >= 3.23. Set "
+					"the architectures explicitly, e.g. "
+					"-DCMAKE_CUDA_ARCHITECTURES=89.")
+			endif()
+			list(APPEND _glades_cuda_archs_resolved ${CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR})
+		elseif(_glades_cuda_arch_base MATCHES "^[0-9]+$")
+			# Keep any -real/-virtual suffix; only the numeric part is validated.
+			list(APPEND _glades_cuda_archs_resolved "${_glades_cuda_arch}")
+		else()
+			message(FATAL_ERROR
+				"Unrecognised CMAKE_CUDA_ARCHITECTURES token '${_glades_cuda_arch}'. "
+				"Use numeric architectures (e.g. 80, 86, 89, 90), native, all, or "
+				"all-major.")
+		endif()
+	endforeach()
+	list(REMOVE_DUPLICATES _glades_cuda_archs_resolved)
+	list(SORT _glades_cuda_archs_resolved)
+
+	set(_glades_cuda_bad_archs "")
+	foreach(_glades_cuda_arch IN LISTS _glades_cuda_archs_resolved)
+		string(REGEX REPLACE "-(real|virtual)$" "" _glades_cuda_arch_num "${_glades_cuda_arch}")
+		if(NOT _glades_cuda_arch_num MATCHES "^[0-9]+$")
+			message(FATAL_ERROR
+				"Internal: unresolved CUDA architecture '${_glades_cuda_arch}'.")
+		endif()
+		if(_glades_cuda_arch_num LESS 80)
+			list(APPEND _glades_cuda_bad_archs "${_glades_cuda_arch_num}")
+		endif()
+	endforeach()
+	if(_glades_cuda_bad_archs)
+		message(FATAL_ERROR
+			"GLADES_ENABLE_CUDA requires CUDA architectures >= 80 (sm_80): the "
+			"1-bit WMMA GEMM kernel uses bmmaBitOpAND, which is not available on "
+			"sm_75 and older. Requested CMAKE_CUDA_ARCHITECTURES="
+			"${CMAKE_CUDA_ARCHITECTURES} resolves to "
+			"${_glades_cuda_archs_resolved}, which includes sub-sm_80 "
+			"architecture(s): ${_glades_cuda_bad_archs}.")
+	endif()
+
+	# Pin the resolved concrete numbers so the build targets exactly what was
+	# validated instead of letting CMake re-resolve native/all at build time.
+	set(CMAKE_CUDA_ARCHITECTURES "${_glades_cuda_archs_resolved}"
+		CACHE STRING "CUDA architectures to compile for" FORCE)
+
 	add_definitions(-DGLADES_HAVE_CUDA=1)
 	message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER}")
 endif()

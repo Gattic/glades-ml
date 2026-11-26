@@ -50,11 +50,20 @@ cmake .. -DGLADES_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
 make -j$(nproc)
 ```
 
-`CMAKE_CUDA_ARCHITECTURES` defaults to `native` when unset. Every requested
+`CMAKE_CUDA_ARCHITECTURES` defaults to `native`, which is resolved at
+configure time to the compute capability of the visible GPU(s) (e.g. `8.9`
+→ `89`); the resolved numbers are pinned in the cache. Every requested
 architecture must be **sm_80 or newer**: the 1-bit WMMA GEMM kernel uses
 `bmmaBitOpAND`, which is unavailable on sm_75 and older, so configuration
-fails with an explicit error for lower targets (e.g. `75`, `70`). Use values
-such as `80`, `86`, `89`, `90`, or a list like `80;86;89;90`.
+fails with an explicit error for lower targets (e.g. `75`, `70`).
+
+Non-numeric tokens are resolved before the check, so they cannot slip past
+it: `native` becomes the detected GPU architecture (configuration fails if
+no GPU can be detected — set the value explicitly in that case), while
+`all` and `all-major` expand to every toolkit-supported architecture and are
+therefore rejected because they include sub-sm_80 targets. Use values such
+as `80`, `86`, `89`, `90`, or a list like `80;86;89;90`. The `CUDAARCHS`
+environment variable is honoured when the cache value is unset.
 
 ---
 
