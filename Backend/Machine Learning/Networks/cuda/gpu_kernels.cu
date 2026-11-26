@@ -8834,7 +8834,7 @@ __global__ void wmma_b1_gemm_kernel(const unsigned int* __restrict__ A_bits,
 	const int blkN = blockIdx.x * 8;
 	if (blkM >= M || blkN >= N) return;
 
-#if __CUDA_ARCH__ >= 750
+#if __CUDA_ARCH__ >= 800 // bmmaBitOpAND requires sm_80+; sm_75 supports only XOR.
 	wmma::fragment<wmma::matrix_a, 8, 8, 128, wmma::experimental::precision::b1, wmma::row_major> a_frag;
 	wmma::fragment<wmma::matrix_b, 8, 8, 128, wmma::experimental::precision::b1, wmma::col_major> b_frag;
 	wmma::fragment<wmma::accumulator, 8, 8, 128, int> c_frag;
@@ -8860,7 +8860,8 @@ __global__ void wmma_b1_gemm_kernel(const unsigned int* __restrict__ A_bits,
 		wmma::store_matrix_sync(C + (size_t)blkM * N + blkN, c_frag, N, wmma::mem_row_major);
 	}
 #else
-	(void)A_bits; (void)B_bits; (void)M; (void)N; (void)K_bits; (void)C;
+	// Fail loudly instead of leaving C unwritten when built for an older target.
+	__trap();
 #endif
 }
 } // anonymous
