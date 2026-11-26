@@ -2,6 +2,8 @@
 
 This harness runs a controlled, repeatable head-to-head comparison between `glades::NNetwork::TYPE_QNN` (Quaternion Neural Network) and `glades::NNetwork::TYPE_DFF` (traditional real-valued Dense Feed-Forward Neural Network) across the XOR gate and two Iris classification regimes.
 
+For architectural trade-offs and guidance on when to pick `TYPE_QNN` over `TYPE_DFF`, see [`docs/qnn-vs-dff.md`](../../docs/qnn-vs-dff.md).
+
 ## Files
 
 - `scripts/benchqnnvsdff.sh` — Entry-point driver that builds `glades` and the standalone worker binary, spawns one fresh OS process per `(task, model)`, writes `results.tsv`, and renders Markdown summary tables (`report.md`).
