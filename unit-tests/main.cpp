@@ -75,6 +75,7 @@ int main(int argc, char* argv[])
 	    NNTransformerUnitTest();
 	    TransformerVerificationUnitTest();
 	    TransformerServingLayerUnitTest();
+	    TransformerGpuSessionParityUnitTest();
 	    PCAUnitTest();
 	    KMeansUnitTest();
 	    BayesUnitTest();
